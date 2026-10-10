@@ -158,7 +158,8 @@ class Me(_M):
 
 
 class SetKey(_M):
-    """``PUT /v1/me/key``: the party's age X25519 recipient (``age1...``)."""
+    """``PUT /v1/me/key``: the party's age X25519 recipient (``age1...``). Needs a fresh
+    human session: the key decides who can read future deliveries."""
 
     public_key: str
 
