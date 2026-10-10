@@ -57,7 +57,7 @@ ROUTES: tuple[Route, ...] = (
         m.TemporalToken,
     ),
     Route("me", "GET", f"{P}/me", "party|worker", None, m.Me),
-    Route("set_key", "PUT", f"{P}/me/key", "party", m.SetKey, m.Me),
+    Route("set_key", "PUT", f"{P}/me/key", "fresh", m.SetKey, m.Me),
     Route("party", "GET", f"{P}/parties/{{party}}", "none", None, m.PartyView),
     # catalog
     Route("publish", "POST", f"{P}/catalog", "fresh", m.PublishRequest, m.CatalogEntry),

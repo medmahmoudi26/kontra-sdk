@@ -83,6 +83,8 @@ ignore = ["S101", "E501", "RUF012"]
 
 [tool.pyright]
 include = ["kontra"]
+venvPath = "."
+venv = ".venv"
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
 reportMissingTypeStubs = false
