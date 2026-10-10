@@ -1,0 +1,303 @@
+"""The job lifecycle and escrow rules (PRD §8), as pure functions.
+
+The gate (platform) and the fake gate (:mod:`kontra.testing`) both drive jobs with these
+functions, so "who gets paid when" has one implementation, readable by every seller and
+buyer. Nothing here does I/O: callers persist the returned :class:`JobRecord` and then
+carry out the returned :class:`Effect` s (ledger calls, workflow cancellation). Ledger calls
+are idempotent, so a crash between the two is repaired by :func:`reconcile` on the next
+sweep.
+
+Every input is a fact the platform can observe without reading a payload (§8.3): the
+state of the seller's handler workflow ``job-<id>`` in the seller's namespace, the clock,
+and the buyer's accept / reject / cancel calls.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
+from enum import StrEnum
+
+from kontra.gate_client.models import Escrow, JobState
+from kontra.ledger import HoldState, Money
+
+__all__ = [
+    "DEFAULT_GRACE",
+    "Effect",
+    "EffectKind",
+    "EscrowError",
+    "JobRecord",
+    "Observation",
+    "ObservedStatus",
+    "accept",
+    "cancel",
+    "new_job",
+    "observe",
+    "reconcile",
+    "reject",
+    "tick",
+]
+
+#: Added to ``max_duration`` for the refund deadline (acceptance criterion 4 allows one
+#: minute; the sweeper interval must stay well below what is left).
+DEFAULT_GRACE = timedelta(seconds=30)
+
+_OPEN = frozenset({JobState.SUBMITTED, JobState.WORKING})
+
+
+class EscrowError(Exception):
+    """A buyer call that the rules refuse (wrong state, window closed, not the buyer)."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
+
+
+class ObservedStatus(StrEnum):
+    NOT_FOUND = "not_found"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELED = "canceled"
+    TERMINATED = "terminated"
+    TIMED_OUT = "timed_out"
+
+
+@dataclass(frozen=True, slots=True)
+class Observation:
+    """What the platform saw of ``job-<id>`` in the seller's namespace (latest run of the
+    continue-as-new chain)."""
+
+    status: ObservedStatus
+    started_at: datetime | None = None
+    closed_at: datetime | None = None
+    #: sha256 / size of the completion's result payload as stored (ciphertext).
+    result_sha256: str | None = None
+    result_size: int | None = None
+
+
+class EffectKind(StrEnum):
+    RELEASE = "release"
+    REFUND = "refund"
+    DISPUTE = "dispute"
+    CANCEL_WORKFLOW = "cancel_workflow"
+    TERMINATE_WORKFLOW = "terminate_workflow"
+
+
+@dataclass(frozen=True, slots=True)
+class Effect:
+    kind: EffectKind
+    job_id: str
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class JobRecord:
+    job_id: str
+    offering: str
+    buyer: str
+    seller: str
+    seller_ns: str
+    amount: Money
+    review_window: timedelta
+    created_at: datetime
+    deadline: datetime
+    state: JobState = JobState.SUBMITTED
+    escrow: Escrow = Escrow.HELD
+    started_at: datetime | None = None
+    delivered_at: datetime | None = None
+    review_deadline: datetime | None = None
+    delivery_sha256: str | None = None
+    delivery_size: int | None = None
+    reason: str | None = None
+
+    @property
+    def open(self) -> bool:
+        return self.state in _OPEN
+
+
+def new_job(
+    *,
+    job_id: str,
+    offering: str,
+    buyer: str,
+    seller: str,
+    seller_ns: str,
+    amount: Money,
+    max_duration: timedelta,
+    review_window: timedelta,
+    now: datetime,
+    grace: timedelta = DEFAULT_GRACE,
+) -> JobRecord:
+    """A job right after its hold was locked: ``submitted``, escrow ``held``."""
+    return JobRecord(
+        job_id=job_id,
+        offering=offering,
+        buyer=buyer,
+        seller=seller,
+        seller_ns=seller_ns,
+        amount=amount,
+        review_window=review_window,
+        created_at=now,
+        deadline=now + max_duration + grace,
+    )
+
+
+def _fail(
+    job: JobRecord, reason: str, *, terminate: bool = False
+) -> tuple[JobRecord, list[Effect]]:
+    effects = [Effect(EffectKind.REFUND, job.job_id, reason)]
+    if terminate:
+        effects.insert(0, Effect(EffectKind.TERMINATE_WORKFLOW, job.job_id, reason))
+    return replace(job, state=JobState.FAILED, escrow=Escrow.REFUNDED, reason=reason), effects
+
+
+def _deliver(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord, list[Effect]]:
+    delivered_at = obs.closed_at or now
+    job = replace(
+        job,
+        state=JobState.COMPLETED,
+        started_at=job.started_at or obs.started_at,
+        delivered_at=delivered_at,
+        review_deadline=delivered_at + job.review_window,
+        delivery_sha256=obs.result_sha256,
+        delivery_size=obs.result_size,
+    )
+    # A zero review window means "accept on delivery"; otherwise the window may already
+    # have passed if the platform was down when the job completed.
+    return tick(job, now)
+
+
+def observe(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord, list[Effect]]:
+    """Apply one observation of the seller's handler workflow."""
+    if not job.open:
+        return job, []
+    match obs.status:
+        case ObservedStatus.COMPLETED:
+            if obs.closed_at is not None and obs.closed_at > job.deadline:
+                return _fail(job, "delivered after max_duration")
+            return _deliver(job, obs, now)
+        case ObservedStatus.RUNNING:
+            if now >= job.deadline:
+                return _fail(job, "max_duration exceeded", terminate=True)
+            if job.state is JobState.SUBMITTED:
+                job = replace(job, state=JobState.WORKING, started_at=obs.started_at or now)
+            return job, []
+        case ObservedStatus.NOT_FOUND:
+            if now >= job.deadline:
+                return _fail(job, "seller never started the job")
+            return job, []
+        case ObservedStatus.CANCELED:
+            return (
+                replace(
+                    job,
+                    state=JobState.CANCELED,
+                    escrow=Escrow.REFUNDED,
+                    reason=job.reason or "canceled",
+                ),
+                [Effect(EffectKind.REFUND, job.job_id, "canceled")],
+            )
+        case ObservedStatus.TIMED_OUT:
+            return _fail(job, "seller workflow timed out")
+        case ObservedStatus.TERMINATED:
+            return _fail(job, "seller workflow terminated")
+        case ObservedStatus.FAILED:
+            return _fail(job, "seller workflow failed")
+
+
+def tick(job: JobRecord, now: datetime) -> tuple[JobRecord, list[Effect]]:
+    """Clock-driven transitions with no new observation: the review window closing, and
+    the refund deadline of a job the observer cannot see."""
+    if job.state is JobState.COMPLETED and job.escrow is Escrow.HELD:
+        assert job.review_deadline is not None
+        if now >= job.review_deadline:
+            return replace(job, escrow=Escrow.RELEASED), [
+                Effect(EffectKind.RELEASE, job.job_id, "review window closed")
+            ]
+    elif job.open and now >= job.deadline:
+        return _fail(job, "max_duration exceeded", terminate=job.state is JobState.WORKING)
+    return job, []
+
+
+def _require_buyer(job: JobRecord, party: str) -> None:
+    if party != job.buyer:
+        raise EscrowError("forbidden", "only the buyer can do that")
+
+
+def accept(job: JobRecord, party: str, now: datetime) -> tuple[JobRecord, list[Effect]]:
+    _require_buyer(job, party)
+    if job.state is not JobState.COMPLETED:
+        raise EscrowError(
+            "not_delivered", f"job is {job.state.value}; only a delivered job can be accepted"
+        )
+    if job.escrow is Escrow.RELEASED:
+        return job, []  # idempotent
+    if job.escrow is not Escrow.HELD:
+        raise EscrowError("escrow_closed", f"escrow is {job.escrow.value}")
+    return replace(job, escrow=Escrow.RELEASED), [
+        Effect(EffectKind.RELEASE, job.job_id, "accepted")
+    ]
+
+
+def reject(
+    job: JobRecord, party: str, reason: str, now: datetime
+) -> tuple[JobRecord, list[Effect]]:
+    _require_buyer(job, party)
+    if job.state is not JobState.COMPLETED:
+        raise EscrowError(
+            "not_delivered", f"job is {job.state.value}; only a delivered job can be rejected"
+        )
+    if job.escrow is Escrow.DISPUTED:
+        return job, []  # idempotent
+    if job.escrow is not Escrow.HELD:
+        raise EscrowError("escrow_closed", f"escrow is {job.escrow.value}")
+    assert job.review_deadline is not None
+    if now >= job.review_deadline:
+        raise EscrowError(
+            "window_closed", "the review window has closed; the delivery was accepted"
+        )
+    return replace(job, escrow=Escrow.DISPUTED, reason=reason), [
+        Effect(EffectKind.DISPUTE, job.job_id, reason)
+    ]
+
+
+def cancel(job: JobRecord, party: str, now: datetime) -> tuple[JobRecord, list[Effect]]:
+    """Buyer cancels before delivery: refund now (no partial payment, §2) and ask the
+    seller's workflow to stop. A delivery that lands afterwards is ignored."""
+    _require_buyer(job, party)
+    if job.state is JobState.CANCELED:
+        return job, []
+    if not job.open:
+        raise EscrowError("not_open", f"job is {job.state.value}")
+    return (
+        replace(job, state=JobState.CANCELED, escrow=Escrow.REFUNDED, reason="canceled by buyer"),
+        [
+            Effect(EffectKind.CANCEL_WORKFLOW, job.job_id, "canceled by buyer"),
+            Effect(EffectKind.REFUND, job.job_id, "canceled by buyer"),
+        ],
+    )
+
+
+_ESCROW_TO_HOLD = {
+    Escrow.HELD: HoldState.HELD,
+    Escrow.RELEASED: HoldState.RELEASED,
+    Escrow.REFUNDED: HoldState.REFUNDED,
+    Escrow.DISPUTED: HoldState.DISPUTED,
+    Escrow.RESOLVED: HoldState.RESOLVED,
+}
+
+
+def reconcile(job: JobRecord, hold_state: HoldState | None) -> list[Effect]:
+    """Ledger calls still owed: the job record says the escrow should be X, the ledger
+    says Y. Re-issuing is safe because ledger calls are idempotent."""
+    want = _ESCROW_TO_HOLD[job.escrow]
+    if hold_state is want or hold_state is None:
+        return []
+    if hold_state is HoldState.HELD:
+        kind = {
+            HoldState.RELEASED: EffectKind.RELEASE,
+            HoldState.REFUNDED: EffectKind.REFUND,
+            HoldState.DISPUTED: EffectKind.DISPUTE,
+        }.get(want)
+        return [Effect(kind, job.job_id, "reconcile")] if kind else []
+    return []
