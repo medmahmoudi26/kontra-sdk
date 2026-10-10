@@ -1,0 +1,10 @@
+# The old `probe` actor (kontra-actors/python/probe), as an offering.
+name: acme/probe
+version: 1.0.0
+description: HEAD each target and report status and server, without downloading bodies
+pricing_hint: "$0.0005 per target, $0.01 minimum"
+max_duration: 30m
+review_window: 1h
+max_concurrent_jobs: 20
+max_output_bytes: 10MB
+artifact_retention: 1d

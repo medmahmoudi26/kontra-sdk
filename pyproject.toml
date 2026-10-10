@@ -1,0 +1,104 @@
+[project]
+name = "kontra-sdk"
+version = "0.1.0"
+description = "Sell and hire durable, quoted jobs: plain Temporal workers behind Nexus, with escrow and end-to-end encryption."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Mohamed Mahmoudi" }]
+keywords = ["temporal", "nexus", "marketplace", "escrow", "workflows"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Framework :: AsyncIO",
+  "Typing :: Typed",
+]
+# temporalio is pinned to a minor: standalone Nexus operations and serialization
+# context are experimental there, and a minor bump may change them.
+dependencies = [
+  "temporalio>=1.34,<1.35",
+  "pydantic>=2.9,<3",
+  "httpx>=0.27,<1",
+  "pyyaml>=6",
+  "pyrage>=1.2,<2",
+  "pyjwt[crypto]>=2.9,<3",
+  "jsonschema>=4.23,<5",
+  "rfc8785>=0.1.4,<0.2",
+  "click>=8.1,<9",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.20,<3"]
+testing = ["fastapi>=0.115", "uvicorn>=0.30", "hypothesis>=6.100"]
+
+[project.scripts]
+kontra = "kontra.cli:main"
+
+[project.urls]
+Homepage = "https://kontra.run"
+Source = "https://github.com/medmahmoudi26/kontra-sdk"
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=1.0",
+  "pytest-timeout>=2.3",
+  "hypothesis>=6.100",
+  "ruff>=0.6",
+  "pyright>=1.1.380",
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "mcp>=1.20,<3",
+  "a2a-sdk>=1.0",
+  "psutil>=6",
+  "boto3>=1.35",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kontra"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"spec" = "kontra/_spec"
+
+[tool.hatch.build.targets.sdist]
+include = ["kontra", "spec", "README.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["examples/*/gen", "tests/golden"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "S", "RUF", "SIM", "PT"]
+ignore = ["S101", "E501", "RUF012"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B011"]
+"examples/**" = ["S"]
+
+[tool.pyright]
+include = ["kontra"]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportPrivateUsage = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+timeout = 300
+markers = [
+  "e2e: needs the `kontra dev` stack (compose) running",
+  "temporal: starts a local Temporal dev server (no containers)",
+  "slow: long-running (large artifacts, property tests at full size)",
+]
+addopts = "-m 'not e2e'"
