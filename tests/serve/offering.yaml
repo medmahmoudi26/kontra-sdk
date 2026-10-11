@@ -1,0 +1,9 @@
+# The test seller's offering (tests write per-version copies to keep task queues apart).
+name: acme/upper
+version: 1.0.0
+description: Upper-cases text, through an activity, a local activity and a child workflow
+pricing_hint: "$0.01 per character"
+max_duration: 10m
+review_window: 1h
+max_output_bytes: 1MB
+artifact_retention: 1d
