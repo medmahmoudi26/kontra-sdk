@@ -1,0 +1,124 @@
+# GOLDEN FILE (seam ③), checked by tests/examples/test_golden.py: the contract `kontra
+# publish` derives from models.py and offering.yaml, sealed with the EXAMPLE key in
+# ../example-public-key.txt. Publishing seals your key, so your contract_hash differs.
+# Regenerate after a deliberate contract change:
+#   UPDATE_GOLDEN=1 pytest tests/examples/test_golden.py
+nexusrpc: "1.0.0"
+$schema: https://json-schema.org/draft/2020-12/schema
+services:
+  AcmeEnrich:
+    fqn: acme.enrich
+    description: Resolve a URL list to company records
+    operations:
+      quote:
+        fqn: quote
+        description: 'Price this input. Cheap and synchronous: answers ok with a fixed price, rejected with a reason, or busy with an ETA. Nothing runs and nothing is charged.'
+        input:
+          $ref: '#/$defs/EnrichInput'
+        output:
+          $ref: '#/$defs/KontraQuote'
+      execute:
+        fqn: execute
+        description: Run the job on this input. Requires a Kontra hold token in the kontra-hold header; the result is delivered encrypted to the buyer and paid from escrow.
+        input:
+          $ref: '#/$defs/EnrichInput'
+        output:
+          $ref: '#/$defs/EnrichOutput'
+$defs:
+  EnrichInput:
+    type: object
+    additionalProperties: false
+    properties:
+      urls:
+        type: array
+        items:
+          type: string
+          maxLength: 2048
+          pattern: ^https?://[^\s]+$
+        maxItems: 10000
+        minItems: 1
+    required:
+    - urls
+  EnrichOutput:
+    type: object
+    additionalProperties: false
+    properties:
+      records:
+        $ref: '#/$defs/KontraArtifact'
+      summary:
+        type: object
+        additionalProperties:
+          type: integer
+    required:
+    - records
+    - summary
+  KontraArtifact:
+    description: 'A file in the claim-check bucket, encrypted (age) to the job''s parties: a reference, never the bytes. size and sha256 are of the plaintext; a download verifies both.'
+    type: object
+    additionalProperties: false
+    properties:
+      content_type:
+        type: string
+        maxLength: 255
+        minLength: 1
+      key:
+        type: string
+        maxLength: 32
+        minLength: 32
+        pattern: ^[0-9a-f]{32}$
+      sha256:
+        type: string
+        pattern: ^[0-9a-f]{64}$
+      size:
+        type: integer
+        minimum: 0
+    required:
+    - content_type
+    - key
+    - sha256
+    - size
+  KontraQuote:
+    description: 'The answer of the quote operation. ok: a fixed price (amount_minor in the currency''s minor unit, e.g. cents) valid for a job of at most max_duration_seconds. rejected: the seller will not take this input, with a reason. busy: try again after eta_seconds.'
+    type: object
+    additionalProperties: false
+    properties:
+      amount_minor:
+        type: integer
+        maximum: 9007199254740991
+        minimum: 0
+      currency:
+        type: string
+        pattern: ^[A-Z][A-Z0-9]{2,7}$
+      eta_seconds:
+        type: integer
+        maximum: 2592000
+        minimum: 0
+      max_duration_seconds:
+        type: integer
+        maximum: 2592000
+        minimum: 1
+      reason:
+        type: string
+        maxLength: 1000
+        minLength: 1
+      status:
+        type: string
+        enum:
+        - ok
+        - rejected
+        - busy
+    required:
+    - status
+x-kontra:
+  name: acme/enrich
+  version: "1.2.0"
+  description: Resolve a URL list to company records
+  pricing_hint: $0.001 per url, $0.01 minimum
+  tags: []
+  max_duration: "6h"
+  review_window: "1d"
+  max_concurrent_jobs: 10
+  max_output_bytes: "5GB"
+  artifact_retention: "7d"
+  public_key: age1lmxatsm78mm3tnsr7syhsc5tfetvrm2aqpur9cxl8gcymp0uufes0yme79
+  contract_hash: sha256:687797f1677f94e1b4b17ad1f451526b0316c8cb922c72fedd3742e60e297eb7

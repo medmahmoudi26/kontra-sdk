@@ -1,0 +1,25 @@
+"""Plain Temporal: no kontra import anywhere in here (D1), so this runs on any Temporal.
+Kontra starts it with the id `job-<job id>` when a buyer hires the offering; any Temporal
+feature works inside (child workflows, continue-as-new, signals, local activities)."""
+
+from datetime import timedelta
+
+from temporalio import workflow
+from temporalio.common import RetryPolicy
+
+with workflow.unsafe.imports_passed_through():
+    from activities import count_words
+    from models import {{Class}}Input, {{Class}}Output
+
+
+@workflow.defn
+class {{Class}}Flow:
+    @workflow.run
+    async def run(self, inp: {{Class}}Input) -> {{Class}}Output:
+        return await workflow.execute_activity(
+            count_words,
+            inp.text,
+            start_to_close_timeout=timedelta(minutes=5),
+            heartbeat_timeout=timedelta(minutes=1),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )

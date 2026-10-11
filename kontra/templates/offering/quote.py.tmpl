@@ -1,0 +1,18 @@
+"""The price function: cheap and deterministic. The handler runs it again on the input it
+actually receives and refuses to start a job held below that price, so a buyer cannot
+quote a small input and send a large one."""
+
+from decimal import Decimal
+
+from kontra.serve import Quote
+
+from models import {{Class}}Input
+
+PER_1000_CHARACTERS = Decimal("0.01")
+
+
+async def quote(inp: {{Class}}Input) -> Quote:
+    if not inp.text.strip():
+        return Quote.reject("the text is blank")
+    thousands = -(-len(inp.text) // 1000)  # rounded up
+    return Quote(price=thousands * PER_1000_CHARACTERS, currency="USD")

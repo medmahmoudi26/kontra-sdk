@@ -177,3 +177,38 @@ Temporal's per-namespace limits (`frontend.namespaceRPS`, history size and count
 to each namespace separately; the gate can write per-namespace overrides to the dynamic
 config file the server polls (`KONTRA_TEMPORAL_DYNAMIC_CONFIG`). Workflow duration is
 bounded per job by I6.
+
+## I13. CI gates
+
+§19.4's "every PR" checks are five required jobs, each one `make` target, and `make check` is
+their union, so local and CI cannot disagree: `lint`, `typecheck`, `test`, `seams` (② to ⑤)
+and `deny-matrix` (seam ①: the Go deny matrix and `tests/temporal` over the wire, one job so
+the Temporal server compiles once). Tests that would *skip* when their dependency is missing
+are made to *fail* in CI instead: the Makefile hands the dev-server tests a checksum-verified
+Temporal CLI 1.9.1 through `KONTRA_TEMPORAL_CLI` and the wire suite the freshly built binary
+through `KONTRA_TEMPORAL_BIN`, and both conftests raise rather than skip when told a binary.
+
+The end-to-end job needs the gate, which is private (`kontra-cloud`) and reaches this
+repository only as an image. A `gate-image` job checks the image can be read first; when it
+cannot, the run carries a warning and a summary line and `e2e` shows as skipped, never as a
+silent pass. `e2e` is therefore not a required check until the gate image is readable from
+this repository's CI.
+
+The Temporal image is pushed only from `dev` (full-SHA tag, plus `:dev`), built without a
+layer cache, for `linux/amd64`, with a BuildKit SBOM and provenance. A release is a tag that
+names `pyproject.toml`'s version and points at a commit on `dev` or `main`; it publishes by
+trusted publishing alone and attaches an SPDX SBOM. Every third-party action is pinned by
+commit SHA; Trivy's action is pinned to a release made after its March 2026 tag hijack
+(GHSA-69fq-xp46-6x23), with the Trivy version explicit.
+
+## I14. Fork code never runs next to a private gate image
+
+The gate is private, and its image is Python: whoever can pull it can read it. CI's `e2e` job
+pulls it and then runs the pull request's own code on the same runner (`make sync`, `kontra
+dev up`, `tests/e2e`), which could `docker save` it, or read the registry login. So while the
+image is private (CI first tries to read it anonymously), `e2e` runs for pushes to `dev` and
+for pull requests from branches of this repository only; a pull request from a fork is skipped
+with a warning that says so, as an unreadable gate image is (I13). Once the image is public,
+which `kontra dev` needs anyway, there is nothing to protect and forks run `e2e` too. The job
+logs out of the registry as soon as the image is pulled, so no later step can read the
+credential.

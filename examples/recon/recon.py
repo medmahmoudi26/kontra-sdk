@@ -4,8 +4,11 @@ This is buyer code, so it imports `kontra.hire`: `service()` is a Nexus client w
 resolution. Each `execute` quotes and holds in an activity (side effects cannot live in
 workflow code), then calls the seller's Nexus operation with the hold token.
 
-Both jobs run at once. If the probe fails, the enrichment is cancelled: cancelling the Nexus
-operation cancels the seller's workflow, and its hold refunds.
+Both jobs run at once. If the probe does not deliver -- it fails, its quote is refused, or
+this workflow is cancelled meanwhile -- the enrichment is cancelled while it still runs:
+its hold refunds at once and the seller's workflow is cancelled through Nexus, so nothing
+is paid for half a recon. (An enrichment that already delivered is the buyer's to accept
+or reject like any delivery.)
 """
 
 import asyncio
@@ -15,7 +18,7 @@ from typing import Any
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from kontra.hire import JobFailed, service
+    from kontra.hire import service
 
 
 @workflow.defn
@@ -29,9 +32,9 @@ class Recon:
         enrich = asyncio.ensure_future(service("acme/enrich", max_price=5).execute(urls=urls))
         try:
             heads = await probe
-        except JobFailed:
-            enrich.cancel()  # the second job's hold refunds; nothing is paid for a half-recon
-            with contextlib.suppress(JobFailed, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError):
+            enrich.cancel()  # its hold refunds; nothing is paid for half a recon
+            with contextlib.suppress(Exception, asyncio.CancelledError):
                 await enrich
             raise
         records = await enrich

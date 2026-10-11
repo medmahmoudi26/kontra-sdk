@@ -1,5 +1,5 @@
-"""Plain Temporal. No kontra import anywhere in here (D1): delete kontra and this still runs
-on any Temporal."""
+"""Plain Temporal. No kontra import anywhere in here (D1): the one Kontra type the job
+touches, `Artifact`, comes from models.py as the activity's return value."""
 
 from datetime import timedelta
 
@@ -7,7 +7,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from activities import fetch_batch, write_records
+    from activities import URL_DEADLINE_SECONDS, fetch_batch, write_records
     from models import Batch, EnrichInput, EnrichOutput, Record
 
 BATCH = 50
@@ -22,7 +22,8 @@ class EnrichFlow:
             records += await workflow.execute_activity(
                 fetch_batch,
                 Batch(urls=inp.urls[start : start + BATCH], done=start, total=len(inp.urls)),
-                start_to_close_timeout=timedelta(minutes=5),
+                # A batch of URLs that all take their full deadline still fits.
+                start_to_close_timeout=timedelta(seconds=BATCH * URL_DEADLINE_SECONDS + 60),
                 heartbeat_timeout=timedelta(minutes=1),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )

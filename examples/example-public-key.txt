@@ -1,0 +1,9 @@
+# An EXAMPLE age public key (an age recipients file: `age -R example-public-key.txt` reads it).
+#
+# It seals the golden contract files examples/*/contract.yaml, so that they are reproduced
+# byte for byte by tests/examples/test_golden.py (seam ③): a contract carries its seller's
+# public key, and a fresh key would change the document and its hash on every run.
+#
+# Its secret key was generated once and thrown away: nobody can decrypt anything encrypted
+# to it. When you publish, `kontra publish` seals YOUR key (from `kontra login`), never this one.
+age1lmxatsm78mm3tnsr7syhsc5tfetvrm2aqpur9cxl8gcymp0uufes0yme79

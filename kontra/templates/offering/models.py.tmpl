@@ -1,0 +1,24 @@
+"""The offering's input and output types. The workflow's signature is the contract:
+`kontra publish` derives the published JSON Schema from these models (`extra="forbid"`
+becomes `additionalProperties: false`), so a field added here is a field buyers see, and
+a change here needs a new `version` in offering.yaml.
+
+Files are never fields of bytes: use `kontra.types.Artifact`, the one Kontra type allowed
+in this file (D1).
+"""
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class {{Class}}Input(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=100_000, description="The text to count.")
+
+
+class {{Class}}Output(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    words: int = Field(ge=0, description="How many words the text has.")
+    lines: int = Field(ge=0, description="How many lines the text has.")
+    top: dict[str, int] = Field(description="The ten most frequent words, with their counts.")
