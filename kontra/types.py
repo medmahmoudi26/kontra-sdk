@@ -27,7 +27,9 @@ class Artifact(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, title="KontraArtifact")
 
-    key: str = Field(min_length=1, max_length=256, pattern=r"^[a-z0-9][a-z0-9/._-]*$")
+    #: Opaque, assigned by the gate: 32 lowercase hex characters. Never a path (nothing to
+    #: traverse when it names a downloaded file) and never parsed for meaning.
+    key: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
     size: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     content_type: str = Field(min_length=1, max_length=255)

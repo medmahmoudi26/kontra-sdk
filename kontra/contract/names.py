@@ -120,9 +120,9 @@ class Version:
         for part in (self.major, self.minor, self.patch):
             if (
                 isinstance(part, bool)
-                or not isinstance(part, int)
+                or not isinstance(part, int)  # pyright: ignore[reportUnnecessaryIsInstance]
                 or not 0 <= part <= _VERSION_PART_MAX
-            ):  # pyright: ignore[reportUnnecessaryIsInstance]
+            ):
                 raise NameError_("version parts must be integers between 0 and 999999999")
 
     @classmethod

@@ -35,6 +35,7 @@ __all__ = [
     "observe",
     "reconcile",
     "reject",
+    "resolve",
     "tick",
 ]
 
@@ -82,6 +83,9 @@ class EffectKind(StrEnum):
     DISPUTE = "dispute"
     CANCEL_WORKFLOW = "cancel_workflow"
     TERMINATE_WORKFLOW = "terminate_workflow"
+    #: Carry out the resolver's split (``Ledger.resolve``). The split is the resolver's
+    #: decision, recorded by the caller with it; the effect only names the job.
+    RESOLVE = "resolve"
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +282,21 @@ def cancel(job: JobRecord, party: str, now: datetime) -> tuple[JobRecord, list[E
     )
 
 
+def resolve(job: JobRecord, now: datetime) -> tuple[JobRecord, list[Effect]]:
+    """The resolver of last resort decides a disputed job (§8.3). Who may resolve, and the
+    split, are the platform's to check and record; the rule here is that only a dispute
+    is resolved, and only once."""
+    if job.escrow is Escrow.RESOLVED:
+        return job, []  # idempotent
+    if job.escrow is not Escrow.DISPUTED:
+        raise EscrowError(
+            "not_disputed", f"escrow is {job.escrow.value}; only a disputed job can be resolved"
+        )
+    return replace(job, escrow=Escrow.RESOLVED), [
+        Effect(EffectKind.RESOLVE, job.job_id, "resolved")
+    ]
+
+
 _ESCROW_TO_HOLD = {
     Escrow.HELD: HoldState.HELD,
     Escrow.RELEASED: HoldState.RELEASED,
@@ -292,6 +311,15 @@ def reconcile(job: JobRecord, hold_state: HoldState | None) -> list[Effect]:
     says Y. Re-issuing is safe because ledger calls are idempotent."""
     want = _ESCROW_TO_HOLD[job.escrow]
     if hold_state is want or hold_state is None:
+        return []
+    if want is HoldState.RESOLVED:
+        # A resolution reaches the ledger through a dispute; the split comes with the
+        # caller's record of the decision.
+        resolve_ = Effect(EffectKind.RESOLVE, job.job_id, "reconcile")
+        if hold_state is HoldState.DISPUTED:
+            return [resolve_]
+        if hold_state is HoldState.HELD:
+            return [Effect(EffectKind.DISPUTE, job.job_id, "reconcile"), resolve_]
         return []
     if hold_state is HoldState.HELD:
         kind = {

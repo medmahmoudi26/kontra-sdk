@@ -428,7 +428,7 @@ class UploadPart(_M):
 
 
 class ArtifactUpload(_M):
-    key: str
+    key: str = Field(pattern=r"^[0-9a-f]{32}$")  # opaque, gate-assigned (see kontra.types.Artifact)
     upload_id: str | None  # None: single PUT to parts[0]
     part_size: int
     parts: list[UploadPart]

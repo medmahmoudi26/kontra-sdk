@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kontra.run/spec/x-kontra.v1.json",
+  "title": "x-kontra",
+  "description": "The offering facts Kontra adds to a Nexus contract document, at its root under `x-kontra` (PRD §11.1). Written by `kontra publish` from offering.yaml; never by hand. Durations and sizes appear in canonical form only (the largest unit that divides the value exactly), so equal facts hash equally. Bounds that JSON Schema cannot express on a duration string (max_duration and review_window at most 30d, artifact_retention at most 90d, max_output_bytes at most 5TiB) are enforced by kontra.contract.XKontra.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "version",
+    "description",
+    "tags",
+    "max_duration",
+    "review_window",
+    "max_output_bytes",
+    "artifact_retention",
+    "public_key"
+  ],
+  "properties": {
+    "name": {
+      "description": "party/offering, e.g. acme/enrich. Handles are lowercase letters, digits and single hyphens, at most 32 characters each.",
+      "type": "string",
+      "maxLength": 65,
+      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*/[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+    },
+    "version": {
+      "description": "MAJOR.MINOR.PATCH. A new version is a new document, endpoint and task queue.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})$"
+    },
+    "description": {
+      "description": "What the offering does, for the catalog, agents and the A2A card.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "pricing_hint": {
+      "description": "Display only. The price of a job comes from the seller's quote.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "tags": {
+      "description": "Catalog search terms.",
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"
+      }
+    },
+    "max_duration": {
+      "description": "The Nexus schedule-to-close timeout of execute; a job not delivered by then is refunded.",
+      "$ref": "#/$defs/duration"
+    },
+    "review_window": {
+      "description": "How long the buyer may reject a delivery; silence is acceptance. 0s accepts on delivery.",
+      "$ref": "#/$defs/duration"
+    },
+    "max_concurrent_jobs": {
+      "description": "Open jobs beyond this make quote answer busy (enforced by the gate). Absent: no limit.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000
+    },
+    "max_output_bytes": {
+      "description": "The gate refuses artifact uploads beyond this size.",
+      "$ref": "#/$defs/size"
+    },
+    "artifact_retention": {
+      "description": "How long delivered artifacts are kept after acceptance.",
+      "$ref": "#/$defs/duration"
+    },
+    "public_key": {
+      "description": "The seller's age X25519 recipient; inputs are encrypted to it.",
+      "type": "string",
+      "pattern": "^age1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}$"
+    },
+    "contract_hash": {
+      "description": "sha256 of the RFC 8785 canonical JSON of the whole document without this member (PRD §11.2).",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "duration": {
+      "description": "Canonical duration: a whole number and the largest unit that divides it exactly (90s, 30m, 6h, 7d).",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,9})(s|m|h|d)$"
+    },
+    "size": {
+      "description": "Canonical size: a whole number and the unit giving the smallest number, decimal on a tie (512MB, 5GB, 1GiB).",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,15})(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)$"
+    }
+  }
+}
