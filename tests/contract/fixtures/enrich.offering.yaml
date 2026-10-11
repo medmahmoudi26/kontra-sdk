@@ -1,0 +1,11 @@
+# offering.yaml -- no Python symbol names in here (PRD §6.3)
+name: acme/enrich
+version: 1.2.0
+description: Resolve a URL list to company records
+pricing_hint: "$0.001 per url"
+tags: [enrichment, companies]
+max_duration: 6h
+review_window: 24h
+max_concurrent_jobs: 10
+max_output_bytes: 5GB
+artifact_retention: 7d

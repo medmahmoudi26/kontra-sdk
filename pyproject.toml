@@ -26,6 +26,9 @@ dependencies = [
   "jsonschema>=4.23,<5",
   "rfc8785>=0.1.4,<0.2",
   "click>=8.1,<9",
+  # Seller-supplied contract patterns run on buyers' and sellers' machines: RE2 matches in
+  # linear time, so no pattern can stall a handler (Python's re backtracks).
+  "google-re2>=1.1,<2",
 ]
 
 [project.optional-dependencies]

@@ -13,3 +13,4 @@ dist/
 examples/*/gen/
 node_modules/
 temporal/authorizer/bin/
+.hypothesis/
