@@ -1,0 +1,147 @@
+# Release: a tag v<version> publishes the package to PyPI as `kontra-sdk` (PRD §19.4).
+#
+# Trusted publishing (OIDC): no PyPI token exists anywhere. PyPI trusts exactly this
+# workflow file, in this repository, running in the `pypi` environment; configure that once
+# as the project's trusted publisher (https://docs.pypi.org/trusted-publishers/). The
+# distribution is `kontra-sdk` -- PyPI `kontra` is an unrelated project.
+#
+# The tag must name the version in pyproject.toml and point at a commit on `dev` or `main`.
+# The GitHub release carries the sdist, the wheel and the SBOM.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.11.7"
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the branches, to check where the tag points
+          persist-credentials: false
+      - name: The tag names this version and is on dev or main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match the version in pyproject.toml ($version)"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/dev \
+             && ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$TAG points at a commit that is on neither dev nor main"
+            exit 1
+          fi
+      # No cache in a publishing workflow: nothing another run wrote goes into the release.
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Build the sdist and the wheel
+        run: uv build --out-dir dist
+      - name: The wheel installs, runs, and carries what `kontra dev` and the contract need
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke/bin/python" dist/*.whl
+          "$RUNNER_TEMP/smoke/bin/kontra" --version
+          "$RUNNER_TEMP/smoke/bin/python" - <<'EOF'
+          from pathlib import Path
+          import kontra
+          root = Path(kontra.__file__).parent
+          for f in ("_dev/compose.yaml", "_spec/x-kontra.v1.json", "_spec/kontra-types.v1.json"):
+              assert (root / f).is_file(), f"the wheel lacks kontra/{f}"
+          print("wheel contents ok")
+          EOF
+          # `kontra init` renders the templates the wheel must carry (kontra/templates).
+          mkdir "$RUNNER_TEMP/init"
+          (cd "$RUNNER_TEMP/init" && "$RUNNER_TEMP/smoke/bin/kontra" init smoke --party release)
+          test -f "$RUNNER_TEMP/init/smoke/worker.py"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  sbom:
+    name: sbom
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: spdx-json
+          output-file: kontra-sdk.spdx.json
+          upload-artifact: false
+          dependency-snapshot: false
+          upload-release-assets: false
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: kontra-sdk.spdx.json
+          if-no-files-found: error
+
+  pypi:
+    name: pypi
+    needs: [build, sbom]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/kontra-sdk/
+    permissions:
+      id-token: write # the OIDC token PyPI exchanges for a short-lived upload credential
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      # Also uploads PEP 740 attestations (Sigstore) for each file.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  github-release:
+    name: github-release
+    needs: [pypi]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom
+          path: sbom/
+      - name: Create the release with the sdist, the wheel and the SBOM
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$TAG" --generate-notes \
+            dist/* sbom/kontra-sdk.spdx.json

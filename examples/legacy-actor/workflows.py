@@ -1,5 +1,6 @@
 """The old Batch loop, as a workflow. Retries, heartbeats and resumption are Temporal's; the
-old Session/checkpoint machinery has no counterpart because it is not needed."""
+old Session/checkpoint machinery has no counterpart because it is not needed. Nothing here
+imports kontra (D1): delete kontra and this still runs on any Temporal."""
 
 from datetime import timedelta
 
@@ -8,7 +9,7 @@ from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from activities import head_batch
-    from models import Head, ProbeInput, ProbeOutput
+    from models import Batch, Head, ProbeInput, ProbeOutput
 
 BATCH = 100
 
@@ -21,7 +22,11 @@ class ProbeFlow:
         for start in range(0, len(inp.targets), BATCH):
             heads += await workflow.execute_activity(
                 head_batch,
-                inp.targets[start : start + BATCH],
+                Batch(
+                    targets=inp.targets[start : start + BATCH],
+                    done=start,
+                    total=len(inp.targets),
+                ),
                 start_to_close_timeout=timedelta(minutes=10),
                 heartbeat_timeout=timedelta(minutes=1),
                 retry_policy=RetryPolicy(maximum_attempts=3),

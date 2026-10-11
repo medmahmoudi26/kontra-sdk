@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.20,<3"]
+mcp = ["mcp>=2.3,<3"]  # kontra.mcp is written on MCPServer (mcp 2.x)
 testing = ["fastapi>=0.115", "uvicorn>=0.30", "hypothesis>=6.100"]
 
 [project.scripts]
@@ -52,7 +52,7 @@ dev = [
   "pyright>=1.1.380",
   "fastapi>=0.115",
   "uvicorn>=0.30",
-  "mcp>=1.20,<3",
+  "mcp>=2.3,<3",
   "a2a-sdk>=1.0",
   "psutil>=6",
   "boto3>=1.35",
@@ -67,9 +67,11 @@ packages = ["kontra"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "spec" = "kontra/_spec"
+# `kontra dev` loads the stack from the package: the root compose.yaml is the only copy.
+"compose.yaml" = "kontra/_dev/compose.yaml"
 
 [tool.hatch.build.targets.sdist]
-include = ["kontra", "spec", "README.md", "LICENSE"]
+include = ["kontra", "spec", "compose.yaml", "README.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 100

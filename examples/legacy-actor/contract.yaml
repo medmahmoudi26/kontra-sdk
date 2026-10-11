@@ -1,0 +1,130 @@
+# GOLDEN FILE (seam ③), checked by tests/examples/test_golden.py: the contract `kontra
+# publish` derives from models.py and offering.yaml, sealed with the EXAMPLE key in
+# ../example-public-key.txt. Publishing seals your key, so your contract_hash differs.
+# Regenerate after a deliberate contract change:
+#   UPDATE_GOLDEN=1 pytest tests/examples/test_golden.py
+nexusrpc: "1.0.0"
+$schema: https://json-schema.org/draft/2020-12/schema
+services:
+  AcmeProbe:
+    fqn: acme.probe
+    description: HEAD each target and report status and server, without downloading bodies
+    operations:
+      quote:
+        fqn: quote
+        description: 'Price this input. Cheap and synchronous: answers ok with a fixed price, rejected with a reason, or busy with an ETA. Nothing runs and nothing is charged.'
+        input:
+          $ref: '#/$defs/ProbeInput'
+        output:
+          $ref: '#/$defs/KontraQuote'
+      execute:
+        fqn: execute
+        description: Run the job on this input. Requires a Kontra hold token in the kontra-hold header; the result is delivered encrypted to the buyer and paid from escrow.
+        input:
+          $ref: '#/$defs/ProbeInput'
+        output:
+          $ref: '#/$defs/ProbeOutput'
+$defs:
+  Head:
+    type: object
+    additionalProperties: false
+    properties:
+      error:
+        oneOf:
+        - type: string
+        - type: "null"
+      server:
+        type: string
+        default: ""
+      status:
+        oneOf:
+        - type: integer
+        - type: "null"
+      url:
+        type: string
+    required:
+    - url
+  KontraQuote:
+    description: 'The answer of the quote operation. ok: a fixed price (amount_minor in the currency''s minor unit, e.g. cents) valid for a job of at most max_duration_seconds. rejected: the seller will not take this input, with a reason. busy: try again after eta_seconds.'
+    type: object
+    additionalProperties: false
+    properties:
+      amount_minor:
+        type: integer
+        maximum: 9007199254740991
+        minimum: 0
+      currency:
+        type: string
+        pattern: ^[A-Z][A-Z0-9]{2,7}$
+      eta_seconds:
+        type: integer
+        maximum: 2592000
+        minimum: 0
+      max_duration_seconds:
+        type: integer
+        maximum: 2592000
+        minimum: 1
+      reason:
+        type: string
+        maxLength: 1000
+        minLength: 1
+      status:
+        type: string
+        enum:
+        - ok
+        - rejected
+        - busy
+    required:
+    - status
+  ProbeInput:
+    type: object
+    additionalProperties: false
+    properties:
+      targets:
+        type: array
+        items:
+          $ref: '#/$defs/Target'
+        maxItems: 5000
+        minItems: 1
+    required:
+    - targets
+  ProbeOutput:
+    type: object
+    additionalProperties: false
+    properties:
+      heads:
+        type: array
+        items:
+          $ref: '#/$defs/Head'
+    required:
+    - heads
+  Target:
+    description: A URL, or a host to build one from (the old actor accepted either).
+    type: object
+    additionalProperties: false
+    properties:
+      host:
+        oneOf:
+        - type: string
+          maxLength: 253
+          pattern: ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$
+        - type: "null"
+      url:
+        oneOf:
+        - type: string
+          maxLength: 2048
+          pattern: ^https?://[^\s]+$
+        - type: "null"
+x-kontra:
+  name: acme/probe
+  version: "1.0.0"
+  description: HEAD each target and report status and server, without downloading bodies
+  pricing_hint: $0.0005 per target, $0.01 minimum
+  tags: []
+  max_duration: "30m"
+  review_window: "1h"
+  max_concurrent_jobs: 20
+  max_output_bytes: "10MB"
+  artifact_retention: "1d"
+  public_key: age1lmxatsm78mm3tnsr7syhsc5tfetvrm2aqpur9cxl8gcymp0uufes0yme79
+  contract_hash: sha256:bf133af4e3a9a9029c758994d1be55bb7e56f93893bb6204d602a33f5bbfb3a6

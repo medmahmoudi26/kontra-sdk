@@ -1,0 +1,207 @@
+# The Kontra stack: Postgres, a bucket, Kontra's Temporal server and the gate.
+#
+# This is the single environment definition (PRD §19.3): `kontra dev` runs it on a laptop,
+# CI runs it, and v1 production runs it -- the same file with different env files, never a
+# second way to bring the stack up. So it carries no default secret and no dev-only
+# behaviour except the one switch, KONTRA_DEV (the gate's dev login and play money).
+# `kontra dev up` writes $KONTRA_HOME/dev.env (KONTRA_DEV=1 and random credentials) and
+# passes it as --env-file; production passes its own. It ships in the wheel as
+# kontra/_dev/compose.yaml.
+#
+# Required: KONTRA_PG_PASSWORD, KONTRA_S3_ACCESS_KEY, KONTRA_S3_SECRET_KEY. All three are
+# pasted verbatim into a URL or a JSON file below, so use letters, digits and hyphens only:
+# a password with '@' or '/' would make the gate's database URL name another host.
+# Production (KONTRA_DEV=0) also needs KONTRA_SIGNING_KEYS: the gate refuses to start without.
+# Optional (default):
+#   KONTRA_DEV (0)                 1: dev login, play money, instant top-ups
+#   KONTRA_GATE_IMAGE              (ghcr.io/medmahmoudi26/kontra-gate:dev)
+#   KONTRA_TEMPORAL_IMAGE          (ghcr.io/medmahmoudi26/kontra-temporal:dev)
+#   KONTRA_DEV_BIND (127.0.0.1)    host address the gate, Temporal and the bucket publish on
+#   KONTRA_DEV_PG_BIND (127.0.0.1) host address Postgres publishes on
+#   KONTRA_DEV_GATE_PORT (8080), KONTRA_DEV_TEMPORAL_PORT (7233), KONTRA_DEV_S3_PORT (8333),
+#   KONTRA_DEV_PG_PORT (5432)      host ports
+#   KONTRA_PUBLIC_URL, KONTRA_TEMPORAL_PUBLIC, KONTRA_S3_PUBLIC_ENDPOINT
+#                                  what clients are told (default: localhost and the ports)
+#   KONTRA_TEMPORAL_TLS (0)        1 when clients reach Temporal through a TLS proxy
+#   KONTRA_PG_USER, KONTRA_PG_DB (kontra), KONTRA_S3_BUCKET (kontra), KONTRA_S3_REGION,
+#   KONTRA_LEDGER (postgres), KONTRA_JWKS_REFRESH (15s), and the gate's other KONTRA_*
+#   settings, passed through when set (signing keys, resolvers, fee, GitHub, Stripe).
+#
+# Start-up has a cycle that ordering alone cannot break: the gate creates each party's
+# namespace through Temporal's internal frontend, and Temporal verifies tokens with the
+# gate's JWKS. Temporal starts first and polls the JWKS (KONTRA_JWKS_REFRESH) until the
+# gate answers; the gate is restarted until Temporal's internal frontend takes its
+# connection; `kontra dev up` waits until a worker token is accepted end to end.
+#
+# The internal frontend (7236 gRPC, 7246 HTTP) has no authentication: whoever reaches it
+# controls every namespace. It is never published (only the public frontend, 7233, is) and
+# it is on no network the bucket is on: each service joins only the networks it needs,
+#   control   temporal, gate              the internal frontend; the gate's JWKS
+#   database  postgres, temporal, gate, migrate
+#   bucket    s3, gate                    SeaweedFS's own unauthenticated ports
+# so SeaweedFS -- third-party code serving the internet in production -- cannot reach
+# Temporal's internal frontend or Postgres, and only the gate reaches SeaweedFS's master,
+# volume and filer ports.
+
+name: kontra-dev
+
+x-database-url: &database-url postgresql+asyncpg://${KONTRA_PG_USER:-kontra}:${KONTRA_PG_PASSWORD:?set KONTRA_PG_PASSWORD (`kontra dev` writes one into its dev.env)}@postgres:5432/${KONTRA_PG_DB:-kontra}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${KONTRA_PG_USER:-kontra}
+      POSTGRES_PASSWORD: ${KONTRA_PG_PASSWORD:?set KONTRA_PG_PASSWORD}
+      POSTGRES_DB: ${KONTRA_PG_DB:-kontra}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    ports:
+      - "${KONTRA_DEV_PG_BIND:-127.0.0.1}:${KONTRA_DEV_PG_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+    restart: unless-stopped
+    networks: [database]
+
+  s3:
+    # The claim-check bucket (ciphertext only). SeaweedFS: MinIO's images can no longer be
+    # pulled anonymously. Credentials come from the identities config below.
+    image: chrislusf/seaweedfs:3.80
+    command:
+      - server
+      - -dir=/data
+      - -ip.bind=0.0.0.0
+      - -master.volumePreallocate=false
+      - -master.volumeSizeLimitMB=1024
+      - -volume.max=200
+      - -s3
+      - -s3.port=8333
+      - -s3.config=/etc/seaweedfs/s3.json
+    configs:
+      - source: s3-identities
+        target: /etc/seaweedfs/s3.json
+    volumes:
+      - s3:/data
+    ports:
+      - "${KONTRA_DEV_BIND:-127.0.0.1}:${KONTRA_DEV_S3_PORT:-8333}:8333"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+    restart: unless-stopped
+    networks: [bucket]
+
+  temporal:
+    # Kontra's Temporal server: every service in one process, the Authorizer on the public
+    # frontend (temporal/authorizer). Distroless: no shell for a healthcheck; readiness is
+    # proven end to end by `kontra dev up`.
+    image: ${KONTRA_TEMPORAL_IMAGE:-ghcr.io/medmahmoudi26/kontra-temporal:dev}
+    environment:
+      KONTRA_DB: postgres
+      KONTRA_DB_HOST: postgres
+      KONTRA_DB_PORT: "5432"
+      KONTRA_DB_USER: ${KONTRA_PG_USER:-kontra}
+      KONTRA_DB_PASSWORD: ${KONTRA_PG_PASSWORD:?set KONTRA_PG_PASSWORD}
+      KONTRA_AUTO_SETUP: "1"
+      KONTRA_FRONTEND_BIND_IP: 0.0.0.0
+      KONTRA_INTERNAL_FRONTEND_BIND_IP: 0.0.0.0 # control + database only; never in `ports`
+      KONTRA_JWKS_URLS: http://gate:8080/.well-known/jwks.json
+      KONTRA_JWKS_REFRESH: ${KONTRA_JWKS_REFRESH:-15s}
+      KONTRA_LOG_LEVEL: ${KONTRA_TEMPORAL_LOG_LEVEL:-warn}
+    ports:
+      - "${KONTRA_DEV_BIND:-127.0.0.1}:${KONTRA_DEV_TEMPORAL_PORT:-7233}:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [control, database]
+
+  migrate:
+    # The gate's schema (alembic), run to completion before the gate starts: in
+    # production too, migrations run as a job before the gate rolls (§19.4).
+    image: ${KONTRA_GATE_IMAGE:-ghcr.io/medmahmoudi26/kontra-gate:dev}
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      KONTRA_DATABASE_URL: *database-url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [database]
+
+  gate:
+    image: ${KONTRA_GATE_IMAGE:-ghcr.io/medmahmoudi26/kontra-gate:dev}
+    environment:
+      KONTRA_DEV: ${KONTRA_DEV:-0}
+      KONTRA_DATABASE_URL: *database-url
+      KONTRA_BIND: 0.0.0.0:8080
+      KONTRA_PUBLIC_URL: ${KONTRA_PUBLIC_URL:-http://localhost:${KONTRA_DEV_GATE_PORT:-8080}}
+      KONTRA_TEMPORAL_INTERNAL: temporal:7236
+      KONTRA_TEMPORAL_INTERNAL_HTTP: http://temporal:7246
+      KONTRA_TEMPORAL_PUBLIC: ${KONTRA_TEMPORAL_PUBLIC:-localhost:${KONTRA_DEV_TEMPORAL_PORT:-7233}}
+      KONTRA_TEMPORAL_TLS: ${KONTRA_TEMPORAL_TLS:-0}
+      KONTRA_S3_ENDPOINT: http://s3:8333
+      KONTRA_S3_PUBLIC_ENDPOINT: ${KONTRA_S3_PUBLIC_ENDPOINT:-http://localhost:${KONTRA_DEV_S3_PORT:-8333}}
+      KONTRA_S3_BUCKET: ${KONTRA_S3_BUCKET:-kontra}
+      KONTRA_S3_REGION: ${KONTRA_S3_REGION:-us-east-1}
+      KONTRA_S3_ACCESS_KEY: ${KONTRA_S3_ACCESS_KEY:?set KONTRA_S3_ACCESS_KEY}
+      KONTRA_S3_SECRET_KEY: ${KONTRA_S3_SECRET_KEY:?set KONTRA_S3_SECRET_KEY}
+      KONTRA_LEDGER: ${KONTRA_LEDGER:-postgres}
+      # Passed through when set; empty means the gate's default.
+      KONTRA_SIGNING_KEYS: ${KONTRA_SIGNING_KEYS:-}
+      KONTRA_RESOLVERS: ${KONTRA_RESOLVERS:-}
+      KONTRA_FEE_BPS: ${KONTRA_FEE_BPS:-}
+      KONTRA_GRACE_SECONDS: ${KONTRA_GRACE_SECONDS:-}
+      KONTRA_SWEEP_INTERVAL: ${KONTRA_SWEEP_INTERVAL:-}
+      KONTRA_PUBLISHER_FRESHNESS: ${KONTRA_PUBLISHER_FRESHNESS:-}
+      KONTRA_MAX_INPUT_BYTES: ${KONTRA_MAX_INPUT_BYTES:-}
+      KONTRA_GITHUB_CLIENT_ID: ${KONTRA_GITHUB_CLIENT_ID:-}
+      KONTRA_GITHUB_CLIENT_SECRET: ${KONTRA_GITHUB_CLIENT_SECRET:-}
+      KONTRA_STRIPE_SECRET: ${KONTRA_STRIPE_SECRET:-}
+      KONTRA_STRIPE_WEBHOOK_SECRET: ${KONTRA_STRIPE_WEBHOOK_SECRET:-}
+    ports:
+      - "${KONTRA_DEV_BIND:-127.0.0.1}:${KONTRA_DEV_GATE_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      temporal:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"
+      interval: 3s
+      timeout: 5s
+      retries: 100
+      start_period: 10s
+    restart: unless-stopped
+    networks: [control, database, bucket]
+
+configs:
+  s3-identities:
+    content: |
+      {"identities": [{"name": "kontra",
+        "credentials": [{"accessKey": "${KONTRA_S3_ACCESS_KEY:?set KONTRA_S3_ACCESS_KEY}",
+                         "secretKey": "${KONTRA_S3_SECRET_KEY:?set KONTRA_S3_SECRET_KEY}"}],
+        "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
+
+volumes:
+  postgres:
+  s3:
+
+networks:
+  control:
+  database:
+  bucket:
