@@ -72,3 +72,15 @@ updates:
       default-days: 7
     commit-message:
       prefix: deps(image)
+
+  # compose.yaml pins Postgres (twice: postgres and postgres-relay) and SeaweedFS by digest;
+  # without this entry those digests would never move, security fixes included.
+  - package-ecosystem: docker-compose
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: deps(compose)

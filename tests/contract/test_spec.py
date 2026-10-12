@@ -146,7 +146,7 @@ def test_the_wheel_carries_the_spec() -> None:
     config = tomllib.loads((ROOT / "pyproject.toml").read_text())
     wheel = config["tool"]["hatch"]["build"]["targets"]["wheel"]
     assert wheel["force-include"]["spec"] == "kontra/_spec"
-    assert "spec" in config["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
+    assert "/spec" in config["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
 
 
 def test_x_kontra_hash_has_the_spec_shape(enrich_spec: OfferingSpec) -> None:

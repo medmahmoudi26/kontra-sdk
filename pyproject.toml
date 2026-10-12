@@ -59,7 +59,10 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling>=1.25"]
+# Exact: the backend decides what goes into the sdist and the wheel PyPI serves, so a new
+# hatchling reaches a release only through a reviewed bump, never by being the newest
+# release on the day `uv build` runs.
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -71,7 +74,9 @@ packages = ["kontra"]
 "compose.yaml" = "kontra/_dev/compose.yaml"
 
 [tool.hatch.build.targets.sdist]
-include = ["kontra", "spec", "compose.yaml", "README.md", "LICENSE"]
+# Anchored (leading "/"): hatch reads these as gitignore patterns, so a bare "README.md"
+# also matched .scratch/README.md, examples/*/README.md and temporal/authorizer/README.md.
+include = ["/kontra", "/spec", "/compose.yaml", "/README.md", "/LICENSE"]
 
 [tool.ruff]
 line-length = 100

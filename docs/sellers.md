@@ -295,7 +295,7 @@ seller that never delivers and the refund at the deadline. Install with
 ```sh
 kontra dev                    # = kontra dev up
 kontra dev status             # containers, the gate's health, the profile
-kontra dev logs [gate|temporal|postgres|s3|migrate] [-f] [--tail N]
+kontra dev logs [gate|temporal|postgres|postgres-relay|s3|migrate] [-f] [--tail N]
 kontra dev down [--volumes]   # --volumes also deletes the stack's data
 ```
 
@@ -309,12 +309,20 @@ in the same `KONTRA_HOME`; use another home (`KONTRA_HOME=~/.kontra-dev kontra d
 Everything is published on 127.0.0.1 only: the gate on 8080, Temporal on 7233, the bucket on
 8333, Postgres on 5432. When a port is taken, set `KONTRA_DEV_GATE_PORT`,
 `KONTRA_DEV_TEMPORAL_PORT`, `KONTRA_DEV_S3_PORT` or `KONTRA_DEV_PG_PORT` (the header of
-[`compose.yaml`](../compose.yaml) lists every variable). The images are
+[`compose.yaml`](../compose.yaml) lists every variable). `kontra dev up` remembers these four
+ports in `$KONTRA_HOME/dev.env`, so `kontra dev status`, `logs`, `down` and the next `up` use
+them without being told again; set one in the environment to change it, or set it empty for
+one `up` (`KONTRA_DEV_GATE_PORT= kontra dev up`) to go back to the default. The bind addresses
+(`KONTRA_DEV_BIND`, `KONTRA_DEV_PG_BIND`) are never remembered: a stack published beyond
+loopback (dev login, play money) is one you ask for on that `up`.
+The images are
 `ghcr.io/medmahmoudi26/kontra-temporal:dev` and `ghcr.io/medmahmoudi26/kontra-gate:dev`;
 `KONTRA_TEMPORAL_IMAGE` and `KONTRA_GATE_IMAGE` name others, and `--env-file` adds variables
 from a file. The published Temporal image is `linux/amd64` only; on an arm64 machine, build a
 native one in a checkout (`make temporal`, then `KONTRA_TEMPORAL_IMAGE=kontra-temporal:dev`).
-Temporal's internal frontend, which has no authentication, is never published.
+Temporal's internal frontend, which has no authentication, is never published, and Temporal
+shares a network only with the gate and `postgres-relay`, which carries its database
+connections (see [architecture](architecture.md#one-environment-definition)).
 
 On a dev profile, `kontra serve` publishes an unpublished version itself, so
 `kontra dev && kontra serve` is a hireable offering.

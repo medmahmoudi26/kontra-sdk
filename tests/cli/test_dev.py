@@ -2,15 +2,17 @@
 
 The file is validated by ``docker compose config`` itself (skipped without Docker): it must
 refuse to run without its secrets, publish nothing but the public ports and only on the
-host's loopback by default, never publish Temporal's internal frontend, and hand the gate
-every setting it needs. The subcommands are checked for the compose invocations they make;
-``kontra dev up`` against real images is the e2e suite's.
+host's loopback by default, never publish Temporal's internal frontend nor put Temporal on a
+network with anything but the gate and its database relay, pin its third-party images by
+digest, and hand the gate every setting it needs. The subcommands are checked for the compose
+invocations they make; ``kontra dev up`` against real images is the e2e suite's.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -31,6 +33,8 @@ REQUIRED = {
     "KONTRA_S3_ACCESS_KEY": "ak-test",
     "KONTRA_S3_SECRET_KEY": "sk-test",
 }
+#: subprocess.run before any test replaces it with a Recorder.
+_REAL_RUN = subprocess.run
 
 
 def _docker_compose() -> bool:
@@ -82,40 +86,97 @@ def test_compose_refuses_to_run_without_its_secrets(tmp_path: Path) -> None:
 def test_compose_publishes_only_public_ports_on_loopback(tmp_path: Path) -> None:
     config = _resolved(tmp_path)
     services = config["services"]
-    assert set(services) == {"postgres", "s3", "temporal", "migrate", "gate"}
+    assert set(services) == {"postgres", "postgres-relay", "s3", "temporal", "migrate", "gate"}
     published: dict[str, list[tuple[str, str, int]]] = {
         name: [(p["host_ip"], str(p["published"]), int(p["target"])) for p in svc.get("ports", [])]
         for name, svc in services.items()
     }
     assert published == {
         "postgres": [("127.0.0.1", "5432", 5432)],
+        "postgres-relay": [],
         "s3": [("127.0.0.1", "8333", 8333)],
         "temporal": [("127.0.0.1", "7233", 7233)],  # the public frontend only
         "migrate": [],
         "gate": [("127.0.0.1", "8080", 8080)],
     }
     temporal = services["temporal"]["environment"]
-    # The internal frontend (no authentication) listens on the compose network, unpublished.
+    # The internal frontend (no authentication) listens on every interface Temporal has
+    # (its own services dial it on loopback), unpublished ...
     assert temporal["KONTRA_INTERNAL_FRONTEND_BIND_IP"] == "0.0.0.0"
     assert all(target not in (7236, 7246) for ports in published.values() for _, _, target in ports)
     assert temporal["KONTRA_JWKS_URLS"] == "http://gate:8080/.well-known/jwks.json"
-    # ... and on no network SeaweedFS is on: it serves the internet in production, and its
-    # own master/volume/filer ports are unauthenticated, so only the gate shares its network.
+    # ... so Temporal shares a network with the gate and its database relay only: not with
+    # Postgres or the migrate job, and not with SeaweedFS, which serves the internet in
+    # production and whose own master/volume/filer ports only the gate may reach.
     networks = {name: set(svc["networks"]) for name, svc in services.items()}
     assert networks == {
         "postgres": {"database"},
+        "postgres-relay": {"temporal-db", "database"},
         "s3": {"bucket"},
-        "temporal": {"control", "database"},
+        "temporal": {"control", "temporal-db"},
         "migrate": {"database"},
         "gate": {"control", "database", "bucket"},
     }
-    assert not networks["s3"] & (networks["temporal"] | networks["postgres"])
-    assert not config["networks"]["control"].get("external")
+    peers = {name for name, nets in networks.items() if nets & networks["temporal"]}
+    assert peers == {"temporal", "gate", "postgres-relay"}
+    assert {name for name, nets in networks.items() if nets & networks["s3"]} == {"s3", "gate"}
+    assert all(not config["networks"][net].get("external") for net in config["networks"])
+    # Temporal's database connections go through the relay, which only connects out.
+    assert temporal["KONTRA_DB_HOST"] == "postgres-relay"
+    relay = services["postgres-relay"]
+    assert relay["entrypoint"] == ["nc"]
+    assert relay["command"] == ["-lk", "-p", "5432", "-e", "nc", "postgres", "5432"]
+    assert (relay["cap_drop"], relay["read_only"], relay["user"]) == (["ALL"], True, "postgres")
+    assert relay["stop_signal"] == "SIGTERM"  # the image's SIGINT does not stop nc
+    # A tmpfs over the image's VOLUME, or every relay container leaves an anonymous volume.
+    assert relay["tmpfs"] == ["/var/lib/postgresql/data"]
+    assert relay["image"] == services["postgres"]["image"]  # the stack trusts no further image
+    # A container inherits the host's ip_forward=1: a service on two networks would route
+    # between them (a peer on `database` routing through the relay reaches Temporal's
+    # temporal-db address one way). Every multi-homed service turns forwarding off.
+    multi_homed = {name for name, nets in networks.items() if len(nets) > 1}
+    assert multi_homed == {"postgres-relay", "temporal", "gate"}
+    for name in multi_homed:
+        assert services[name].get("sysctls") == {"net.ipv4.ip_forward": "0"}, name
     assert (temporal["KONTRA_DB"], temporal["KONTRA_AUTO_SETUP"]) == ("postgres", "1")
     # Production-safe defaults: not a dev gate unless an env file says so.
     assert services["gate"]["environment"]["KONTRA_DEV"] == "0"
     assert services["gate"]["image"] == "ghcr.io/medmahmoudi26/kontra-gate:dev"
     assert services["temporal"]["image"] == "ghcr.io/medmahmoudi26/kontra-temporal:dev"
+
+
+def test_third_party_images_are_pinned_by_digest() -> None:
+    """A tag moves; a digest does not. The tag stays beside it for dependabot and readers.
+    (Kontra's own images are named by KONTRA_*_IMAGE and published from this repository.)"""
+    import yaml
+
+    raw = yaml.safe_load(COMPOSE.read_text())
+    pinned = re.compile(r"[a-z0-9./-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}")
+    for name in ("postgres", "postgres-relay", "s3"):
+        image = raw["services"][name]["image"]
+        assert pinned.fullmatch(image), f"{name}: {image}"
+    for name in ("temporal", "migrate", "gate"):
+        assert raw["services"][name]["image"].startswith("${KONTRA_")
+    # A digest nothing bumps is a frozen image, its security fixes included.
+    bot = yaml.safe_load((REPO / ".github" / "dependabot.yml").read_text())
+    updates = [u for u in bot["updates"] if u["package-ecosystem"] == "docker-compose"]
+    assert [u["directory"] for u in updates] == ["/"]
+
+
+def test_compose_lists_every_host_port_it_reads() -> None:
+    """`kontra dev up` remembers the settings x-kontra-dev-settings lists: every host port
+    the file reads must be there, or `status` would lose it again -- and no bind address,
+    or one `KONTRA_DEV_BIND=0.0.0.0` would publish every later stack to the network."""
+    import yaml
+
+    raw = yaml.safe_load(COMPOSE.read_text())
+    listed = raw.pop("x-kontra-dev-settings")
+    read = set(re.findall(r"\$\{(KONTRA_DEV_[A-Z0-9_]+)", json.dumps(raw)))
+    ports = {name for name in read if name.endswith("_PORT")}
+    assert len(ports) == 4
+    assert read - ports == {"KONTRA_DEV_BIND", "KONTRA_DEV_PG_BIND"}
+    assert set(listed) == ports
+    assert all(value == f"${{{name}:-}}" for name, value in listed.items())
 
 
 @needs_compose
@@ -433,3 +494,170 @@ def test_dev_up_does_not_dev_login_to_a_production_gate(
     assert "not a dev gate" in result.stdout
     bad = Cli(tmp_path / "home")("dev", "up", "--handle", "Not-A-Handle")
     assert bad.exit_code == 1
+
+
+def _env_lines(path: Path) -> dict[str, str]:
+    return dict(ln.split("=", 1) for ln in path.read_text().splitlines() if ln and ln[0] != "#")
+
+
+def test_dev_up_remembers_its_host_settings_in_dev_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What compose resolved for `up` lands in dev.env (which every later command passes
+    to compose); an empty setting is dropped again, and the credentials are kept."""
+    home = tmp_path / "home"
+    rec, _ = _up_world(monkeypatch, {"KONTRA_PUBLIC_URL": "http://localhost:8459"})
+    rec.config["x-kontra-dev-settings"] = {
+        "KONTRA_DEV_PG_PORT": "",
+        "KONTRA_DEV_GATE_PORT": "8459",
+        "KONTRA_DEV_S3_PORT": "9409",
+    }
+    cli = Cli(home)
+    assert cli("dev", "up", "--no-login").exit_code == 0
+    path = home / DEV_ENV_FILE
+    first = _env_lines(path)
+    assert (first["KONTRA_DEV_GATE_PORT"], first["KONTRA_DEV_S3_PORT"]) == ("8459", "9409")
+    assert "KONTRA_DEV_PG_PORT" not in first
+    assert len(first["KONTRA_PG_PASSWORD"]) >= 32
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    rec.config["x-kontra-dev-settings"] = {
+        "KONTRA_DEV_PG_PORT": "5449",
+        "KONTRA_DEV_GATE_PORT": "",  # set empty for this run: back to compose's default
+        "KONTRA_DEV_S3_PORT": "9409",
+    }
+    assert cli("dev", "up", "--no-login").exit_code == 0
+    second = _env_lines(path)
+    assert "KONTRA_DEV_GATE_PORT" not in second
+    assert second["KONTRA_DEV_PG_PORT"] == "5449"
+    assert {k: v for k, v in second.items() if not k.startswith("KONTRA_DEV_")} == {
+        k: v for k, v in first.items() if not k.startswith("KONTRA_DEV_")
+    }
+    assert path.read_text().count("KONTRA_DEV_S3_PORT=") == 1
+    assert [p.name for p in home.iterdir() if p.name.startswith(".")] == []  # no temp file
+
+    # A value dev.env could not hold as written (a second line, a comment, a "$"), or that
+    # is not a port, stops `up` before anything starts, and dev.env is left as it was.
+    for bad in ("8459\nKONTRA_PG_PASSWORD=x", "8459 # c", "${HOME}", "8459'", "0.0.0.0", "\uff18"):
+        rec.calls.clear()
+        rec.config["x-kontra-dev-settings"] = {"KONTRA_DEV_GATE_PORT": bad}
+        result = cli("dev", "up", "--no-login")
+        assert result.exit_code == 1, bad
+        assert "KONTRA_DEV_GATE_PORT" in result.stderr
+        assert [_after_options(c)[0] for c in rec.calls] == ["config"]
+        assert _env_lines(path) == second
+    # A compose file that lists a bind address to remember is refused, not obeyed.
+    rec.calls.clear()
+    rec.config["x-kontra-dev-settings"] = {"KONTRA_DEV_BIND": "0.0.0.0"}
+    result = cli("dev", "up", "--no-login")
+    assert result.exit_code == 1
+    assert "KONTRA_DEV_BIND" in result.stderr
+    assert [_after_options(c)[0] for c in rec.calls] == ["config"]
+    assert _env_lines(path) == second
+
+
+@needs_compose
+def test_dev_status_finds_the_stack_where_up_put_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`KONTRA_DEV_GATE_PORT=8459 kontra dev up`, then `kontra dev status` without it: the
+    real compose file resolves the remembered port (only `up` and `ps` are stood in for)."""
+    for name in list(os.environ):
+        if name.startswith("KONTRA_"):
+            monkeypatch.delenv(name)
+    home = tmp_path / "home"
+    monkeypatch.setenv("KONTRA_HOME", str(home))  # for the direct calls below, as for Cli
+
+    class RealConfig(Recorder):
+        def __call__(self, cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if _after_options(cmd)[0] == "config":
+                self.calls.append(cmd)
+                return _REAL_RUN(cmd, **kwargs)
+            return super().__call__(cmd, **kwargs)
+
+    rec = RealConfig()
+    monkeypatch.setattr(dev_module.subprocess, "run", rec)
+    monkeypatch.setattr(dev_module.shutil, "which", _docker_at)
+    monkeypatch.setattr(dev_module, "_wait_healthy", _healthy_at_once)
+    cli = Cli(home)
+    up = cli("dev", "up", "--no-login", KONTRA_DEV_GATE_PORT="8459", KONTRA_DEV_PG_PORT="5449")
+    assert up.exit_code == 0, up.output
+    assert "gate      http://localhost:8459" in up.stdout
+
+    status = cli("dev", "status", "--json")
+    assert status.exit_code == 0, status.output
+    assert json.loads(status.stdout)["gate"]["url"] == "http://localhost:8459"
+    assert dev_module._published(dev_module._config(()), "postgres") == "localhost:5449"
+    # The environment still wins over what was remembered, as everywhere in compose.
+    monkeypatch.setenv("KONTRA_DEV_GATE_PORT", "8458")
+    assert dev_module._gate_env(dev_module._config(()))["KONTRA_PUBLIC_URL"].endswith(":8458")
+
+
+@needs_compose
+def test_dev_up_never_remembers_a_bind_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`KONTRA_DEV_BIND=0.0.0.0 kontra dev up` publishes that stack on every interface; the
+    next `up` without it is back on loopback (a dev gate's login and play money are not
+    published to the network because of an earlier run), while the port is remembered."""
+    for name in list(os.environ):
+        if name.startswith("KONTRA_"):
+            monkeypatch.delenv(name)
+    home = tmp_path / "home"
+    monkeypatch.setenv("KONTRA_HOME", str(home))
+
+    class RealConfig(Recorder):
+        def __call__(self, cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if _after_options(cmd)[0] == "config":
+                self.calls.append(cmd)
+                return _REAL_RUN(cmd, **kwargs)
+            return super().__call__(cmd, **kwargs)
+
+    monkeypatch.setattr(dev_module.subprocess, "run", RealConfig())
+    monkeypatch.setattr(dev_module.shutil, "which", _docker_at)
+    monkeypatch.setattr(dev_module, "_wait_healthy", _healthy_at_once)
+    cli = Cli(home)
+    up = cli(
+        "dev",
+        "up",
+        "--no-login",
+        KONTRA_DEV_BIND="0.0.0.0",
+        KONTRA_DEV_PG_BIND="0.0.0.0",
+        KONTRA_DEV_GATE_PORT="8459",
+    )
+    assert up.exit_code == 0, up.output
+    remembered = _env_lines(home / DEV_ENV_FILE)
+    assert remembered["KONTRA_DEV_GATE_PORT"] == "8459"
+    assert not {"KONTRA_DEV_BIND", "KONTRA_DEV_PG_BIND"} & set(remembered)
+
+    services = dev_module._config(())["services"]
+    hosts = {
+        (name, port["host_ip"], str(port["published"]))
+        for name, svc in services.items()
+        for port in svc.get("ports") or []
+    }
+    assert hosts == {
+        ("gate", "127.0.0.1", "8459"),
+        ("temporal", "127.0.0.1", "7233"),
+        ("s3", "127.0.0.1", "8333"),
+        ("postgres", "127.0.0.1", "5432"),
+    }
+
+
+def test_dev_up_keeps_the_rest_of_dev_env_as_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Remembering the ports rewrites only its own lines: a value holding a character
+    str.splitlines treats as a line break (form feed, U+2028) comes back unchanged."""
+    home = tmp_path / "home"
+    home.mkdir()
+    path = home / DEV_ENV_FILE
+    odd = "KONTRA_GITHUB_CLIENT_SECRET=a\x0cb\u2028c\n"
+    path.write_text("KONTRA_DEV=1\nKONTRA_PG_PASSWORD=pw\n" + odd, encoding="utf-8")
+    path.chmod(0o600)
+    rec, _ = _up_world(monkeypatch, {"KONTRA_PUBLIC_URL": "http://localhost:8459"})
+    rec.config["x-kontra-dev-settings"] = {"KONTRA_DEV_GATE_PORT": "8459"}
+    assert Cli(home)("dev", "up", "--no-login").exit_code == 0
+    text = path.read_text(encoding="utf-8")
+    assert odd in text
+    assert text.endswith("KONTRA_DEV_GATE_PORT=8459\n")

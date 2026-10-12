@@ -56,6 +56,26 @@ jobs:
           enable-cache: false
       - name: Build the sdist and the wheel
         run: uv build --out-dir dist
+      # pyproject.toml's sdist include list is anchored; this keeps it that way. A bare
+      # pattern matches at any depth (README.md once pulled in .scratch/ and examples/).
+      - name: The sdist carries the package, spec/, compose.yaml and the metadata, nothing else
+        run: |
+          # Listed on its own line: in a pipeline a tar that cannot read the sdist would hand
+          # grep nothing, and the check would pass on an archive it never saw.
+          sdists=(dist/*.tar.gz)
+          if [ "${#sdists[@]}" -ne 1 ] || [ ! -f "${sdists[0]}" ]; then
+            echo "::error::expected exactly one sdist in dist/, found: ${sdists[*]}"
+            exit 1
+          fi
+          listing="$(tar -tzf "${sdists[0]}")"
+          unexpected="$(printf '%s\n' "$listing" | sed 's|^[^/]*/||' \
+            | grep -vE '^$|^(kontra|spec)/|^(compose\.yaml|README\.md|LICENSE|pyproject\.toml|PKG-INFO|\.gitignore)$' \
+            || true)"
+          if [ -n "$unexpected" ]; then
+            echo "::error::the sdist carries files outside its include list"
+            echo "$unexpected"
+            exit 1
+          fi
       - name: The wheel installs, runs, and carries what `kontra dev` and the contract need
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/smoke"
