@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -20,7 +21,10 @@ async def quote(order: Order) -> Quote:
         return Quote.reject("this text is not for sale")
     if order.text == "busy":
         return Quote.busy(30)
-    return Quote(price=Decimal(len(order.text) * order.copies * CENTS_PER_CHAR) / 100)
+    price = Decimal(len(order.text) * order.copies * CENTS_PER_CHAR) / 100
+    if order.text.startswith("quick"):  # a job the seller does in a minute
+        return Quote(price=price, max_duration=timedelta(seconds=60))
+    return Quote(price=price)
 
 
 def bind(path: str | Path) -> BoundOffering:

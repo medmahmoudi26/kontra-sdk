@@ -6,13 +6,16 @@ lookup that produces ``provenance`` is tested against Temporal in ``tests/contro
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from kontra import escrow
 from kontra.escrow import (
+    BUYER_CANCEL_REASON,
     NOT_FROM_BUYER_REASON,
+    OCCUPIED_REASON,
     EffectKind,
     JobRecord,
     Observation,
@@ -195,7 +198,7 @@ def test_no_sequence_of_runs_not_from_the_buyer_ever_pays_the_seller() -> None:
             else:
                 obs = seen(
                     rng.choice(statuses),
-                    rng.choice(NOT_THE_BUYERS),
+                    rng.choice([*NOT_THE_BUYERS, Provenance.OCCUPIED]),
                     run_id=rng.choice([None, "run-x", RUN]),
                     closed_at=now,
                     result_sha256="x",
@@ -208,3 +211,57 @@ def test_no_sequence_of_runs_not_from_the_buyer_ever_pays_the_seller() -> None:
             assert all(e.kind is not EffectKind.RELEASE for e in effects)
             with pytest.raises(escrow.EscrowError):
                 escrow.accept(record, "bob", now)
+
+
+# --------------------------------------------------------------------------- decisions I16
+
+
+@pytest.mark.parametrize(
+    "status",
+    [ObservedStatus.RUNNING, ObservedStatus.TERMINATED, ObservedStatus.TIMED_OUT],
+)
+def test_the_control_planes_placeholder_is_no_run_and_blames_no_seller(
+    status: ObservedStatus,
+) -> None:
+    """``Control.occupy_job``'s placeholder (a cancel took ``job-<id>`` before any run
+    existed) moves nothing and is never pinned; an open job that only ever shows it refunds
+    at the deadline saying so, not "seller workflow terminated"."""
+    obs = seen(status, Provenance.OCCUPIED, run_id="run-placeholder")
+    assert escrow.observe(job(), obs, SOON) == (job(), [])
+    record, effects = escrow.observe(job(), obs, AFTER_DEADLINE)
+    assert (record.state, record.escrow, record.reason, record.run_id) == (
+        JobState.FAILED,
+        Escrow.REFUNDED,
+        OCCUPIED_REASON,
+        None,
+    )
+    assert [e.kind for e in effects] == [EffectKind.REFUND]  # nothing to stop
+
+
+def test_a_run_the_buyer_canceled_through_its_own_call_is_the_buyers_cancel() -> None:
+    """A verified run that ended canceled because the buyer asked (its own call's record
+    says so) refunds as a buyer cancel, which no gate counts against the seller; one the
+    buyer did not ask for stays plain "canceled"."""
+    working, _ = escrow.observe(job(), seen(ObservedStatus.RUNNING), SOON)
+    asked = replace(seen(ObservedStatus.CANCELED), buyer_canceled=True)
+    record, effects = escrow.observe(working, asked, SOON)
+    assert (record.state, record.escrow, record.reason) == (
+        JobState.CANCELED,
+        Escrow.REFUNDED,
+        BUYER_CANCEL_REASON,
+    )
+    assert [(e.kind, e.reason) for e in effects] == [(EffectKind.REFUND, BUYER_CANCEL_REASON)]
+    record, effects = escrow.observe(working, seen(ObservedStatus.CANCELED), SOON)
+    assert (record.state, record.reason) == (JobState.CANCELED, "canceled")
+    assert [(e.kind, e.reason) for e in effects] == [(EffectKind.REFUND, "canceled")]
+    # A cancel through the gate is the same reason, so a gate treats both alike.
+    record, effects = escrow.cancel(job(), "bob", SOON)
+    assert record.reason == BUYER_CANCEL_REASON
+    assert {e.reason for e in effects} == {BUYER_CANCEL_REASON}
+
+
+def test_a_buyer_cancel_flag_on_a_run_not_from_the_buyer_moves_nothing() -> None:
+    """The flag is only ever set on a verified run; on anything else it changes nothing."""
+    for provenance in (*NOT_THE_BUYERS, Provenance.OCCUPIED):
+        obs = replace(seen(ObservedStatus.CANCELED, provenance), buyer_canceled=True)
+        assert escrow.observe(job(), obs, SOON) == (job(), [])

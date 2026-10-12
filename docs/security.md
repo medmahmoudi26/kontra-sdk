@@ -34,8 +34,9 @@ What that means concretely, and what enforces it:
 | One seller forges another seller's Nexus result | the callback guard (below) |
 | A buyer reads, signals or cancels a seller's handler workflow | the Authorizer: a buyer's token has no call in the seller's namespace, including the job it paid for |
 | A buyer forges or alters a hold token (amount, seller, expiry, contract) | ES256 signature checked offline by the seller's handler, with audience, expiry, seller namespace, offering and contract hash |
-| A buyer replays a hold token | the handler workflow id is built from the job id and started with reject-duplicate: one execution per hold |
-| A buyer quotes a small input and executes a large one | the handler validates the input and re-runs the seller's `quote` on it, refusing a price above the hold |
+| A buyer replays a hold token | the handler workflow id is built from the job id and started with reject-duplicate: one execution per hold; a cancel before the job started occupies that id, so the refunded hold cannot start it either |
+| A buyer quotes a small input and executes a large one | the handler refuses, before fetching any of it, an input larger than the one the hold was quoted for (the hold carries its size), then validates the input and re-runs the seller's `quote` on it, refusing a price above the hold; a start too late for the quoted duration is refused, and a run never outlives the gate's refund deadline, which the hold carries |
+| A buyer cancels its own call, or keeps its own namespace too busy to read, to blame the seller or be refunded blind | who canceled is read from the buyer's own records of the call; a failed read of the buyer's namespace is never followed by a blind refund |
 | A seller serves code that differs from the contract the buyer paid for | the hash lock: `kontra serve` refuses to start on a mismatch, and the handler refuses a token for another contract hash |
 | A seller takes the money without delivering | escrow moves only on observed facts: no delivery by the deadline refunds |
 | A buyer takes the delivery without paying | the review window closes on its own and releases the payment |

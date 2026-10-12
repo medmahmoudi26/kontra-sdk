@@ -17,7 +17,7 @@ from temporalio.client import Client, NexusOperationHandle
 from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import NexusSerializationContext
 
-from kontra.codec import KontraCodec
+from kontra.codec import GateBlobStore, KontraCodec
 from kontra.gate_client import models as m
 from kontra.serve import HOLD_HEADER, seller_data_converter
 from kontra.testing import Marketplace, TestParty
@@ -84,12 +84,21 @@ class Buyer:
     """A buyer with nothing but temporalio and the gate client: quote and hire through the
     gate, then start ``execute`` as a standalone Nexus operation in its own namespace."""
 
-    def __init__(self, mp: Marketplace, party: TestParty) -> None:
+    def __init__(
+        self, mp: Marketplace, party: TestParty, *, claim_check_threshold: int | None = None
+    ) -> None:
+        """``claim_check_threshold``: claim-check payloads above that many bytes of
+        ciphertext through the gate's blob store (default: never)."""
         self.mp = mp
         self.party = party
         self.keys = Keys()
         self.codec = KontraCodec(
-            party.identity, party.public_key, role="buyer", seller_keys=self.keys
+            party.identity,
+            party.public_key,
+            role="buyer",
+            seller_keys=self.keys,
+            blobs=GateBlobStore(party.gate) if claim_check_threshold is not None else None,
+            claim_check_threshold=claim_check_threshold or 0,
         )
         config = mp.client(party.namespace).config()
         config["data_converter"] = seller_data_converter(self.codec)

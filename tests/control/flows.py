@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from temporalio import activity, workflow
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, NexusOperationError
 
 
 @dataclass
@@ -83,3 +83,51 @@ class BuyerFlow:
             headers={"x-workflow-id": hire.workflow_id, hire.hold_header: hire.hold},
             schedule_to_close_timeout=timedelta(minutes=5),
         )
+
+
+@workflow.defn
+class CancellingBuyerFlow:
+    """A buyer's workflow that cancels its own ``execute`` call when signalled (the workflow
+    door): its history then records ``NexusOperationCancelRequested`` for the call."""
+
+    def __init__(self) -> None:
+        self._cancel = False
+
+    @workflow.signal
+    def cancel_call(self) -> None:
+        self._cancel = True
+
+    @workflow.run
+    async def run(self, hire: Hire) -> str:
+        nexus = workflow.create_nexus_client(service=hire.service, endpoint=hire.endpoint)
+        handle = await nexus.start_operation(
+            "execute",
+            Plan(hire.text),
+            output_type=str,
+            headers={"x-workflow-id": hire.workflow_id, hire.hold_header: hire.hold},
+            schedule_to_close_timeout=timedelta(minutes=5),
+        )
+        await workflow.wait_condition(lambda: self._cancel)
+        handle.cancel()
+        try:
+            return await handle
+        except NexusOperationError:
+            return "canceled"
+
+
+@workflow.defn
+class StartingBuyerFlow:
+    """A buyer's workflow that starts its ``execute`` call and then ends without waiting
+    for it (the workflow door): its history never records a cancel request for the call."""
+
+    @workflow.run
+    async def run(self, hire: Hire) -> str:
+        nexus = workflow.create_nexus_client(service=hire.service, endpoint=hire.endpoint)
+        await nexus.start_operation(
+            "execute",
+            Plan(hire.text),
+            output_type=str,
+            headers={"x-workflow-id": hire.workflow_id, hire.hold_header: hire.hold},
+            schedule_to_close_timeout=timedelta(minutes=5),
+        )
+        return "started"

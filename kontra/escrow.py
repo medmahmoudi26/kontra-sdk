@@ -28,8 +28,10 @@ from kontra.gate_client.models import Escrow, JobState
 from kontra.ledger import HoldState, Money
 
 __all__ = [
+    "BUYER_CANCEL_REASON",
     "DEFAULT_GRACE",
     "NOT_FROM_BUYER_REASON",
+    "OCCUPIED_REASON",
     "Effect",
     "EffectKind",
     "EscrowError",
@@ -55,6 +57,13 @@ _OPEN = frozenset({JobState.SUBMITTED, JobState.WORKING})
 
 #: Why a job whose only completed run was not started by the buyer's call refunds.
 NOT_FROM_BUYER_REASON = "delivery not started by the buyer's call"
+#: Why a job the buyer canceled refunds: through the gate (:func:`cancel`), or by cancelling
+#: its own Nexus call (:attr:`Observation.buyer_canceled`). A gate counts neither against
+#: the seller.
+BUYER_CANCEL_REASON = "canceled by buyer"
+#: Why an open job whose ``job-<id>`` holds only the control plane's placeholder
+#: (:attr:`Provenance.OCCUPIED`) refunds at its deadline: no call could start it.
+OCCUPIED_REASON = "no run: the job's workflow id was occupied before any call started it"
 
 
 class EscrowError(Exception):
@@ -78,8 +87,8 @@ class ObservedStatus(StrEnum):
 class Provenance(StrEnum):
     """Whether the observed run of ``job-<id>`` is the one the buyer's ``execute`` call
     started, as an authoritative lookup in the buyer's namespace established it. Only
-    ``VERIFIED`` runs count for anything; the other two differ only in what the observer
-    could tell (logs, support), never in what escrow does."""
+    ``VERIFIED`` runs count for anything; the others differ only in what the observer could
+    tell (logs, support, the reason a refund gives), never in whether escrow pays."""
 
     #: The chain's first run was started with the request id of a Nexus ``execute`` call
     #: recorded in the buyer's namespace, on this job's endpoint, carrying this job's hold.
@@ -91,6 +100,15 @@ class Provenance(StrEnum):
     #: namespace, or one whose endpoint, operation, request id or hold differs, or the
     #: buyer's call recorded a different run as the one it started.
     NOT_FROM_BUYER = "not_from_buyer"
+    #: The control plane's placeholder (``kontra._control.Control.occupy_job``): a cancel
+    #: took ``job-<id>`` before any run existed, so that the hold token -- valid until it
+    #: expires, and checked offline -- can no longer start the job. Never a delivery and
+    #: never pinned. It is recognised by the fields it sets, which any start request can
+    #: set too, so a seller can start a look-alike: an open job that shows only it refunds
+    #: at the deadline (:data:`OCCUPIED_REASON`) and counts like any refund at the deadline,
+    #: or the label would excuse a seller that never started the job. (A cancel through the
+    #: gate that occupied the id refunds at once, as the buyer's cancel.)
+    OCCUPIED = "occupied"
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +129,12 @@ class Observation:
     provenance: Provenance = Provenance.UNVERIFIED
     #: The run id of the observed chain's first run: what escrow pins once it is verified.
     run_id: str | None = None
+    #: A verified run that ended ``CANCELED``: the buyer's own call recorded that the buyer
+    #: asked to cancel it (its standalone operation's cancellation, or a
+    #: ``NexusOperationCancelRequested`` event for it in the buyer's workflow), read from the
+    #: buyer's namespace by exact equality. The refund is then the buyer's doing
+    #: (:data:`BUYER_CANCEL_REASON`), not the seller's failure.
+    buyer_canceled: bool = False
 
 
 class EffectKind(StrEnum):
@@ -230,6 +254,8 @@ def observe(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord,
         return tick(job, now)
     if obs.provenance is not Provenance.VERIFIED or not obs.run_id:
         if now >= job.deadline:
+            if obs.provenance is Provenance.OCCUPIED:
+                return _fail(job, OCCUPIED_REASON)
             if obs.status is ObservedStatus.COMPLETED:
                 return _fail(job, NOT_FROM_BUYER_REASON)
             return _fail(job, "seller workflow not started by the buyer's call")
@@ -248,14 +274,17 @@ def observe(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord,
                 job = replace(job, state=JobState.WORKING, started_at=obs.started_at or now)
             return job, []
         case ObservedStatus.CANCELED:
+            # Who asked is in the buyer's records (Observation.buyer_canceled): a buyer that
+            # cancels its own call must not have the refund counted against the seller.
+            why = BUYER_CANCEL_REASON if obs.buyer_canceled else "canceled"
             return (
                 replace(
                     job,
                     state=JobState.CANCELED,
                     escrow=Escrow.REFUNDED,
-                    reason=job.reason or "canceled",
+                    reason=job.reason or why,
                 ),
-                [Effect(EffectKind.REFUND, job.job_id, "canceled")],
+                [Effect(EffectKind.REFUND, job.job_id, why)],
             )
         case ObservedStatus.TIMED_OUT:
             return _fail(job, "seller workflow timed out")
@@ -330,10 +359,10 @@ def cancel(job: JobRecord, party: str, now: datetime) -> tuple[JobRecord, list[E
     if not job.open:
         raise EscrowError("not_open", f"job is {job.state.value}")
     return (
-        replace(job, state=JobState.CANCELED, escrow=Escrow.REFUNDED, reason="canceled by buyer"),
+        replace(job, state=JobState.CANCELED, escrow=Escrow.REFUNDED, reason=BUYER_CANCEL_REASON),
         [
-            Effect(EffectKind.CANCEL_WORKFLOW, job.job_id, "canceled by buyer"),
-            Effect(EffectKind.REFUND, job.job_id, "canceled by buyer"),
+            Effect(EffectKind.CANCEL_WORKFLOW, job.job_id, BUYER_CANCEL_REASON),
+            Effect(EffectKind.REFUND, job.job_id, BUYER_CANCEL_REASON),
         ],
     )
 

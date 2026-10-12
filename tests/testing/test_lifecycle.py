@@ -15,10 +15,15 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 import pytest
-from temporalio.api.workflowservice.v1 import StartNexusOperationExecutionRequest
+from temporalio.api.enums.v1 import NexusOperationExecutionStatus
+from temporalio.api.workflowservice.v1 import (
+    DescribeNexusOperationExecutionRequest,
+    StartNexusOperationExecutionRequest,
+)
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.converter import NexusSerializationContext
 
+from kontra._control import OCCUPY_WORKFLOW_TYPE
 from kontra.codec import ENCODING, KontraCodec, data_converter
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
@@ -275,6 +280,66 @@ async def test_a_respelled_hold_the_handler_accepted_still_pays_the_seller(deal:
     assert (view.escrow, view.delivery is not None) == (m.Escrow.HELD, True)
     result = await deal.buyer.gate.result(job.job_id)
     assert json.loads(unwire(result.payload).data) == {"text": "RESPELLED"}
+
+
+async def test_a_canceled_job_cannot_be_started_with_its_still_valid_hold(deal: Deal) -> None:
+    """Decisions I16, the attack: the buyer cancels through the gate (refunded), then runs
+    ``execute`` from its own client with the hold token it still has -- valid until it
+    expires, and checked offline by the seller's handler. Before the fix the handler started
+    ``job-<id>`` and a short job was delivered for free; now the cancel occupied the id, the
+    handler's start is refused, and nothing is delivered."""
+    async with serving(deal.seller_client(), deal.entry, deal.jwks):
+        job = await deal.hire("free work")
+        view = await deal.buyer.gate.cancel(job.job_id)
+        assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
+        assert (await deal.buyer.balance()).available == "50.00"
+
+        buyer = deal.mp.client(deal.buyer.namespace)
+        op = f"mine-{job.job_id}"
+        req = StartNexusOperationExecutionRequest(
+            namespace=deal.buyer.namespace,
+            identity="the buyer itself",
+            request_id=str(uuid.uuid4()),
+            operation_id=op,
+            endpoint=deal.entry.endpoint,
+            service=deal.entry.service,
+            operation="execute",
+            input=json_payload({"text": "free work"}),
+        )
+        req.schedule_to_close_timeout.FromTimedelta(timedelta(minutes=5))
+        req.nexus_header["kontra-hold"] = job.hold_token
+        await buyer.workflow_service.start_nexus_operation_execution(req)
+        status = None
+        for _ in range(200):
+            d = await buyer.workflow_service.describe_nexus_operation_execution(
+                DescribeNexusOperationExecutionRequest(
+                    namespace=deal.buyer.namespace, operation_id=op
+                )
+            )
+            status = d.info.status
+            if status != NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_RUNNING:
+                break
+            await asyncio.sleep(0.05)
+        assert status == NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_FAILED
+        failure = d.info.last_attempt_failure
+        assert "already ran" in f"{failure.message} {failure.cause.message}", failure
+        desc = await deal.seller_client().get_workflow_handle(job.workflow_id).describe()
+        assert (desc.workflow_type, desc.status) == (
+            OCCUPY_WORKFLOW_TYPE,
+            WorkflowExecutionStatus.TERMINATED,
+        )
+        await asyncio.sleep(1)  # a few sweeps
+    view = await deal.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow, view.delivery) == (
+        m.JobState.CANCELED,
+        m.Escrow.REFUNDED,
+        None,
+    )
+    with pytest.raises(GateError) as e:
+        await deal.buyer.gate.result(job.job_id)
+    assert e.value.code == "not_delivered"
+    assert (await deal.buyer.balance()).available == "50.00"
+    assert (await deal.seller.balance()).available == "100.00"
 
 
 async def test_quote_refusals_from_a_real_handler(deal: Deal) -> None:
