@@ -1836,7 +1836,8 @@ class FakeGate:
             if (job.progress_final and last >= len(job.events)) or self._stopping:
                 return
             try:
-                await asyncio.wait_for(waiter.wait(), timeout=self.keepalive)
+                async with asyncio.timeout(self.keepalive):
+                    await waiter.wait()
             except TimeoutError:
                 yield b": keepalive\n\n"
 

@@ -200,8 +200,9 @@ deadline rule.
 
 - **The internal frontend has no authentication.** Reaching it is full control of every
   namespace; its isolation is the network alone: loopback by default, and in `compose.yaml` the
-  two private networks Temporal shares with the gate and with Postgres (and the gate's migration
-  job), never the bucket's and never a published port.
+  `control` network, shared only with the gate, and `temporal-db`, whose only other member is the
+  Postgres relay. Postgres and the gate's migration job reach the database through that relay and
+  cannot reach Temporal; the bucket's network and the published ports never carry it.
 - **Token lifetime.** A worker token stays valid until its `exp` (15 minutes) after its
   session is revoked.
 - **Kontra is the key directory** (see above).
