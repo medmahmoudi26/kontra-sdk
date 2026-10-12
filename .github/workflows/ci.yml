@@ -1,9 +1,10 @@
 # The gate every change passes (PRD §19.4). Each job runs one `make` target, so
 # `make check` locally is exactly this workflow minus e2e.
 #
-# Required checks (branch protection on `dev` and `main`): lint, typecheck, test, seams,
-# deny-matrix. `deny-matrix` is seam ①, the Authorizer's policy: the Go deny matrix and the
-# same cells over the wire against the real server binary (docs/security.md).
+# Required checks (branch protection on `dev` and `main`): lint, typecheck, test,
+# test (3.11), seams, seams (3.11), deny-matrix. `deny-matrix` is seam ①, the Authorizer's
+# policy: the Go deny matrix and the same cells over the wire against the real server
+# binary (docs/security.md).
 #
 # e2e runs after all of them against `kontra dev` (compose: the Temporal image built here,
 # the published gate image). The gate is private (kontra-cloud): `gate-image` checks that its
@@ -65,12 +66,20 @@ jobs:
       - run: make sync
       - run: make typecheck
 
+  # Every Python the package claims (requires-python >= 3.11). The 3.12 leg keeps the name
+  # `test` that branch protection requires; the others are `test (3.11)`, and so on.
   test:
-    name: test
+    name: ${{ matrix.python == '3.12' && 'test' || format('test ({0})', matrix.python) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    env:
+      PYTHON: ${{ matrix.python }} # make sync: uv sync --python $(PYTHON)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,17 +88,27 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
+          cache-suffix: py${{ matrix.python }}
       - run: make sync
       # Downloads Temporal CLI 1.9.1 (checksum-verified) and sets KONTRA_TEMPORAL_CLI, so a
       # dev server that cannot start fails the run instead of skipping its tests.
       - run: make test
 
+  # The seams on every Python the package claims too: the codec's plaintext rules, the
+  # contract's canonical form and hash and the ledger are what a 3.11 difference must not
+  # change unseen (`test` leaves them out, so nothing runs twice).
   seams:
-    name: seams
+    name: ${{ matrix.python == '3.12' && 'seams' || format('seams ({0})', matrix.python) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    env:
+      PYTHON: ${{ matrix.python }} # make sync: uv sync --python $(PYTHON)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -98,6 +117,7 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
+          cache-suffix: py${{ matrix.python }}
       - run: make sync
       - run: make seams
 

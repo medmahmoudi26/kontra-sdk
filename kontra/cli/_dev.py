@@ -7,11 +7,15 @@ command: ``KONTRA_DEV=1`` and random credentials for the local Postgres and buck
 compose file itself has no default secrets, so production cannot inherit one) and any
 ``--env-file`` given after it. Variables in the environment win over both, as in compose.
 
-``up`` then waits for the gate's ``/healthz``, logs in to it as a dev party (``--handle``,
-else derived from the OS user), writes a dev profile, and waits until Temporal accepts the
-party's worker token: the gate creates namespaces through Temporal's internal frontend, and
-Temporal learns the gate's signing keys by polling its JWKS, so each side comes up without
-the other and the order is settled by retries, not by ``depends_on`` alone.
+``up`` remembers the host ports it ran with (the ``KONTRA_DEV_*_PORT`` settings the compose
+file lists under ``x-kontra-dev-settings``) in that same ``dev.env``, so ``status``, ``logs``
+and ``down`` -- and the next ``up`` -- find the stack where it was put without being told
+again. Never the bind addresses: they decide who on the network reaches a dev gate (dev
+login, play money), so publishing beyond loopback is asked for on each ``up``. It then waits for the gate's ``/healthz``, logs in to it as a dev party
+(``--handle``, else derived from the OS user), writes a dev profile, and waits until Temporal
+accepts the party's worker token: the gate creates namespaces through Temporal's internal
+frontend, and Temporal learns the gate's signing keys by polling its JWKS, so each side comes
+up without the other and the order is settled by retries, not by ``depends_on`` alone.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import secrets
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +47,15 @@ PROJECT = "kontra-dev"
 DEV_ENV_FILE = "dev.env"
 _HEALTH_TIMEOUT = 300.0
 _TEMPORAL_TIMEOUT = 180.0
+#: The compose file's list of the settings ``up`` remembers, resolved by compose itself.
+_SETTINGS_KEY = "x-kontra-dev-settings"
+#: Host ports only: an address (KONTRA_DEV_BIND) remembered would quietly publish every later
+#: stack wherever one ``up`` once did, so a compose file listing one is refused here too.
+_SETTING_NAME = re.compile(r"KONTRA_DEV_[A-Z0-9_]{1,64}_PORT")
+#: A port: nothing a dotenv file would read as quoting, a comment, an interpolation or a
+#: second line.
+_SETTING_VALUE = re.compile(r"[0-9]{1,5}")
+_SETTINGS_HEADER = "# The host ports of the last `kontra dev up`:"
 
 
 def compose_file() -> Path:
@@ -72,6 +86,56 @@ def dev_env(home: Path) -> Path:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
     return path
+
+
+def _settings(config: dict[str, Any]) -> dict[str, str]:
+    """The ``KONTRA_DEV_*`` settings as compose resolved them for this run (environment,
+    then the env files, then ``dev.env``); empty means compose's default."""
+    raw: Any = config.get(_SETTINGS_KEY) or {}
+    if not isinstance(raw, dict):
+        fail(f"compose.yaml's {_SETTINGS_KEY} is not a mapping")
+    settings: dict[str, str] = {}
+    for key, val in raw.items():
+        name, value = str(key), "" if val is None else str(val)
+        if _SETTING_NAME.fullmatch(name) is None:
+            fail(f"compose.yaml's {_SETTINGS_KEY} lists {name!r}, which is not a KONTRA_DEV_*_PORT")
+        if value and _SETTING_VALUE.fullmatch(value) is None:
+            fail(f"{name}={value!r} is not a port")
+        settings[name] = value
+    return settings
+
+
+def _remember(home: Path, settings: Mapping[str, str]) -> None:
+    """Write ``settings`` into ``dev.env`` in place of what an earlier ``up`` wrote there.
+    ``status``, ``logs`` and ``down`` pass ``dev.env`` to compose too, so they resolve the
+    ports ``up`` used; a setting that is empty now (compose's default) is dropped. The
+    credentials in the file are kept as they are."""
+    path = dev_env(home)
+    before = path.read_text(encoding="utf-8")
+    kept: list[str] = []
+    # "\n" only, as compose reads the file: str.splitlines would also split a value at a
+    # form feed or U+2028 and join it back with a newline.
+    for line in before.split("\n"):
+        name, sep, _ = line.partition("=")
+        if line == _SETTINGS_HEADER or (sep and name in settings):
+            continue
+        kept.append(line)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    chosen = [f"{name}={value}" for name, value in settings.items() if value]
+    text = "\n".join([*kept, *([_SETTINGS_HEADER, *chosen] if chosen else [])]) + "\n"
+    if text == before:
+        return
+    # A new file renamed over the old one: never a half-written dev.env, still 0600.
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _docker() -> str:
@@ -266,6 +330,8 @@ def up(
     url = gate_env.get("KONTRA_PUBLIC_URL", "").rstrip("/")
     if not url:
         fail("the compose file sets no KONTRA_PUBLIC_URL for the gate")
+    # Before the stack starts: a failed `up` is exactly when `status` and `logs` are needed.
+    _remember(kontra_home(), _settings(config))
     _compose(env_files, "up", "--detach", "--remove-orphans")
     _wait_healthy(url, timeout)
     click.echo(f"kontra dev is up (compose project {PROJECT})")

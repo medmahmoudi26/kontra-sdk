@@ -175,14 +175,43 @@ from is a workflow state, a timestamp or a buyer's call.
 gate. `kontra dev` runs it on a laptop (it ships in the wheel as `kontra/_dev/compose.yaml`),
 CI's e2e job runs it, and v1 production runs it, with different env files. It carries no
 default secret; `kontra dev` writes random credentials and `KONTRA_DEV=1` (dev login, play
-money) into `$KONTRA_HOME/dev.env`. The internal frontend listens on the compose network only
-and is never published.
+money) into `$KONTRA_HOME/dev.env`, and `kontra dev up` adds the host ports it ran with
+(`KONTRA_DEV_*_PORT`), so `status`, `logs` and `down` find the stack where `up` put it. It never
+remembers a bind address (`KONTRA_DEV_BIND`, `KONTRA_DEV_PG_BIND`): publishing a dev gate (dev
+login, play money) beyond loopback is asked for on each `up`, not inherited from an earlier one.
+
+Temporal's internal frontend has no authentication: reaching it is control of every
+namespace. It is never published, and the networks decide who reaches it. Temporal binds it on
+every interface it has (its own services dial it on loopback, so it cannot be bound to one
+network's address), so Temporal joins only networks whose other members may reach it:
+
+| Network | Members | Carries |
+|---|---|---|
+| `control` | temporal, gate | the internal frontend (gRPC 7236, HTTP 7246); the gate's JWKS |
+| `temporal-db` | temporal, postgres-relay | Temporal's own database connections |
+| `database` | postgres, postgres-relay, gate, migrate | the gate's and the migrations' database connections |
+| `bucket` | s3, gate | SeaweedFS's S3 port and its unauthenticated master, volume and filer ports |
+
+`postgres-relay` is busybox `nc` from the pinned Postgres image itself: it accepts Temporal's
+connections and opens one to Postgres for each, copying bytes, and never connects to Temporal
+(no capabilities, read-only, not root). So Postgres -- large third-party code a SQL injection
+in the gate would reach -- the migrate job and SeaweedFS share no network with Temporal, and
+Docker drops traffic between bridge networks: none of them can reach the internal frontend.
+A container inherits the host's `net.ipv4.ip_forward=1`, which makes a service on two networks
+a router between them (packets from `database` routed through the relay arrive at Temporal's
+`temporal-db` address; only Docker dropping the reply stops the handshake), so every
+multi-homed service -- the relay, Temporal and the gate -- sets it to 0. This rests on Docker's
+own inter-network isolation (its iptables rules): a host that runs Docker with `iptables:
+false` routes between bridge networks and has no such boundary.
+Third-party images are pinned by digest with their tag beside it (Postgres and SeaweedFS in
+`compose.yaml`; the Go builder and the runtime bases in `temporal/authorizer`'s Dockerfiles),
+and the Temporal server is built with the Go toolchain `go.mod` names.
 
 ## CI and releases
 
 | Workflow | When | What |
 |---|---|---|
-| `ci.yml` | every pull request; pushes to `dev` | `lint`, `typecheck`, `test`, `seams`, `deny-matrix` (each one `make` target; `make check` is their union), then `e2e` against `kontra dev` when the gate image is readable (not a fork's pull request while that image is private: decisions I14) |
+| `ci.yml` | every pull request; pushes to `dev` | `lint`, `typecheck`, `test` and `seams` (each on Python 3.11 and 3.12), `deny-matrix` (each one `make` target; `make check` is their union), then `e2e` against `kontra dev` when the gate image is readable (not a fork's pull request while that image is private: decisions I14) |
 | `security.yml` | every push and pull request; weekly | gitleaks, pip-audit, Trivy on the built Temporal image, an SBOM, zizmor |
 | `temporal-image.yml` | a change under `temporal/authorizer/` (which pins the Temporal server version in `go.mod`) | build; on `dev`, push `ghcr.io/medmahmoudi26/kontra-temporal` tagged by commit SHA and `:dev` |
 | `release.yml` | a tag `v*` on `dev` or `main` | build the sdist and wheel, publish `kontra-sdk` to PyPI by trusted publishing (OIDC), attach the SBOM to the GitHub release |
