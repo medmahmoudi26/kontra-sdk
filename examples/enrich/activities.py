@@ -12,13 +12,24 @@ deadline can interrupt it: every step over its bytes is linear, so no page can s
 worker (and every other job on it). Nothing a server sends is held in memory beyond the
 head of the final page: redirects are followed here, without reading their bodies, and the
 page is read as sent, never inflated.
+
+And the URLs are fetched from the seller's machine, inside the seller's network: a buyer
+could name the cloud metadata service (169.254.169.254), the seller's router or a database
+on its LAN, and read the answer in the records. So each URL's host is resolved here, every
+address it resolves to must be public (see `_public`), and the request goes to the address
+that was checked -- httpx never resolves the name again, so a DNS answer that changes
+between the check and the connection (rebinding) cannot swap it. Each redirect is checked
+the same way. A URL that fails the check is that URL's error, `ForbiddenAddress`.
 """
 
 import asyncio
 import codecs
 import html
+import ipaddress
 import json
+import os
 import re
+import socket
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -59,6 +70,78 @@ MAX_REDIRECTS = 10
 #: httpx inflates a whole chunk (through every layer of `Content-Encoding: gzip, gzip`)
 #: before anyone can stop it. A server that compresses anyway yields no title.
 _HEADERS = {"Accept-Encoding": "identity"}
+#: Each URL gets a connection of its own: a pooled one, opened to the same address for
+#: another host name, would carry this request under that host's TLS identity.
+_LIMITS = httpx.Limits(max_keepalive_connections=0)
+#: IPv6 addresses that carry an IPv4 one for a NAT64 gateway to reach.
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _networks(setting: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """The comma-separated networks of `setting` (`127.0.0.1/32,10.1.0.0/16`). A malformed
+    one stops the worker as it starts: a guard must not run unlike what its setting says."""
+    return tuple(
+        ipaddress.ip_network(n.strip(), strict=False) for n in setting.split(",") if n.strip()
+    )
+
+
+#: Non-public networks a URL may reach anyway: none unless `ENRICH_ALLOWED_PRIVATE_NETWORKS`
+#: names some (the README says when to). The tests set it to reach their sites on 127.0.0.1.
+ALLOWED_PRIVATE_NETWORKS = _networks(os.environ.get("ENRICH_ALLOWED_PRIVATE_NETWORKS", ""))
+
+
+class ForbiddenAddress(Exception):
+    """The URL's host is, or resolves to, an address that is not on the public internet."""
+
+
+def _public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Whether `ip` is a public unicast address: not loopback, private (10/8, 172.16/12,
+    192.168/16, fc00::/7), link-local (169.254/16 -- the cloud metadata service -- and
+    fe80::/10), carrier-grade NAT (100.64/10), multicast, unspecified or reserved. An IPv6
+    address that carries an IPv4 one (mapped, NAT64) is judged by that IPv4 address; one
+    that tunnels to one (6to4, Teredo) or is site-local is never public."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return _public(ip.ipv4_mapped)
+        if ip in _NAT64:
+            return _public(ipaddress.IPv4Address(int(ip) & 0xFFFF_FFFF))
+        if ip.sixtofour is not None or ip.teredo is not None or ip.is_site_local:
+            return False
+    return ip.is_global and not ip.is_multicast and not ip.is_reserved
+
+
+async def _checked_address(url: httpx.URL) -> str:
+    """The address to connect to for `url`: its host resolved (an address literal too), and
+    every address it resolves to checked -- one bad answer refuses the URL."""
+    port = _DEFAULT_PORTS.get(url.scheme)
+    if port is None:
+        raise httpx.UnsupportedProtocol(f"only http and https URLs are fetched, not {url.scheme!r}")
+    host = url.raw_host.decode("ascii")  # IDNA-encoded; an IPv6 literal without brackets
+    try:
+        found = await asyncio.get_running_loop().getaddrinfo(
+            host, url.port or port, type=socket.SOCK_STREAM
+        )
+    except socket.gaierror as e:  # a name that does not resolve: httpx's error for it
+        raise httpx.ConnectError(f"{host} does not resolve: {e}") from e
+    addresses = [ipaddress.ip_address(info[4][0]) for info in found]
+    for ip in addresses:
+        if not (_public(ip) or any(ip in net for net in ALLOWED_PRIVATE_NETWORKS)):
+            raise ForbiddenAddress(f"{host} is at {ip}, not a public address")
+    if not addresses:
+        raise ForbiddenAddress(f"{host} resolves to no address")
+    return str(addresses[0])
+
+
+def _pinned(http: httpx.AsyncClient, url: httpx.URL, address: str) -> httpx.Request:
+    """A GET of `url` sent to `address`, the address that was checked. The Host header and
+    TLS (the server name it sends, the certificate it accepts) are still the URL's host."""
+    return http.build_request(
+        "GET",
+        url.copy_with(host=address),
+        headers={"Host": url.netloc.decode("ascii")},
+        extensions={"sni_hostname": url.raw_host.decode("ascii")},
+    )
 
 
 def _domain(url: str) -> str:
@@ -101,17 +184,18 @@ async def _read_head(r: httpx.Response) -> bytes:
 async def _get(http: httpx.AsyncClient, url: str) -> tuple[httpx.Response, bytes]:
     """The final response for `url` and the head of its page. Redirects are followed here
     and not by httpx, which reads each redirect's whole body into memory before it moves
-    on: a redirect with an endless body would fill the worker's memory."""
-    request = http.build_request("GET", url)
+    on (a redirect with an endless body would fill the worker's memory), and each one's
+    destination is checked before it is fetched, like the URL itself."""
+    target = httpx.URL(url)
     for _ in range(MAX_REDIRECTS + 1):
-        r = await http.send(request, stream=True)
+        r = await http.send(_pinned(http, target, await _checked_address(target)), stream=True)
         try:
-            if r.next_request is None:
+            if not r.has_redirect_location:
                 return r, await _read_head(r)
-            request = r.next_request
+            target = target.join(r.headers["Location"])
         finally:
             await r.aclose()  # without reading the rest
-    raise httpx.TooManyRedirects(f"more than {MAX_REDIRECTS} redirects", request=request)
+    raise httpx.TooManyRedirects(f"more than {MAX_REDIRECTS} redirects")
 
 
 async def _fetch(http: httpx.AsyncClient, url: str) -> Record:
@@ -128,7 +212,7 @@ async def _fetch(http: httpx.AsyncClient, url: str) -> Record:
 @activity.defn
 async def fetch_batch(batch: Batch) -> list[Record]:
     records: list[Record] = []
-    async with httpx.AsyncClient(timeout=10, headers=_HEADERS) as http:
+    async with httpx.AsyncClient(timeout=10, headers=_HEADERS, limits=_LIMITS) as http:
         for url in batch.urls:
             records.append(await _fetch(http, url))
             n = batch.done + len(records)

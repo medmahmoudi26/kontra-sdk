@@ -25,7 +25,7 @@ from kontra.testing.devserver import (
 )
 
 from .sites import Sites
-from .support import EXAMPLES, SELLERS, Market, Seller, seller_env
+from .support import ALLOW_LOCAL_SITES, EXAMPLES, SELLERS, Market, Seller, seller_env
 
 # The recon example is a directory of scripts, as a buyer would write it; its workflow
 # module must be importable by name for Temporal's sandbox.
@@ -46,6 +46,17 @@ def dev_server() -> Iterator[DevServer]:
         yield server
     finally:
         release_shared_dev_server()
+
+
+@pytest.fixture(scope="package", autouse=True)
+def allow_local_sites() -> Iterator[None]:
+    """The examples' activities run in subprocesses of this one (and their sellers, which
+    get it from :func:`seller_env` too) may reach the test sites on 127.0.0.1: the
+    examples refuse non-public addresses unless a setting allows them."""
+    with pytest.MonkeyPatch.context() as env:
+        for name, value in ALLOW_LOCAL_SITES.items():
+            env.setenv(name, value)
+        yield
 
 
 @pytest.fixture(scope="package")

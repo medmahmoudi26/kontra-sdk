@@ -14,9 +14,15 @@ import jwt
 import pytest
 from temporalio.api.common.v1 import Payload
 
-from kontra._control import HistorySummary, NexusSyncKind, NexusSyncResult
+from kontra._control import (
+    BuyerCall,
+    HistorySummary,
+    NexusSyncKind,
+    NexusSyncResult,
+    hold_digest,
+)
 from kontra.auth import Session
-from kontra.escrow import ObservedStatus
+from kontra.escrow import NOT_FROM_BUYER_REASON, ObservedStatus, Provenance
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
 from kontra.ledger import PLATFORM_PARTY
@@ -521,6 +527,85 @@ async def test_running_past_the_deadline_is_terminated_and_refunded(shop: Shop) 
     await shop.gate.sweep()
     assert shop.control.terminates == [("acme", f"job-{job.job_id}", "max_duration exceeded")]
     assert shop.gate.jobs[job.job_id].pending_stop is None
+
+
+async def test_the_gate_observes_with_the_buyers_call_then_the_pinned_run(shop: Shop) -> None:
+    """What the gate hands the observer is its own record of the job: the buyer's
+    namespace, the endpoint, the service and a digest of every hold token it issued (the
+    one from hire and the one ``start`` re-signs), then the run escrow pinned."""
+    job = await shop.hire()
+    await shop.gate.sweep()
+    ns, wf, call, pinned = shop.control.observed[-1]
+    buyer_ns = shop.buyer.profile.namespace
+    assert (ns, wf, pinned) == ("acme", f"job-{job.job_id}", None)
+    assert call == BuyerCall(
+        namespace=buyer_ns,
+        endpoint=shop.entry.endpoint,
+        service="acme.enrich",
+        holds=frozenset({hold_digest(job.hold_token)}),
+    )
+    await shop.buyer.gate.start(job.job_id, wire(json_payload({"text": "hi"})))
+    started_with = shop.control.starts[-1].headers["kontra-hold"]
+    assert started_with != job.hold_token  # re-signed
+    shop.observe(job.job_id, ObservedStatus.RUNNING, run_id="run-7")
+    await shop.gate.sweep()
+    assert shop.gate.jobs[job.job_id].record.run_id == "run-7"
+    await shop.gate.sweep()
+    _, _, call, pinned = shop.control.observed[-1]
+    assert pinned == "run-7"
+    # Re-signed over the same claims: the same hold, so the same digest (decisions I15).
+    assert hold_digest(started_with) == hold_digest(job.hold_token)
+    assert call.holds == {hold_digest(job.hold_token)}
+
+
+@pytest.mark.parametrize("provenance", [Provenance.UNVERIFIED, Provenance.NOT_FROM_BUYER])
+async def test_a_delivery_not_from_the_buyers_call_refunds_at_the_deadline(
+    shop: Shop, provenance: Provenance
+) -> None:
+    before = await shop.balances()
+    job = await shop.hire(1000)
+    shop.observe(
+        job.job_id, ObservedStatus.COMPLETED, b"the seller's own run", provenance=provenance
+    )
+    await shop.gate.sweep()
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow, view.delivery) == (m.JobState.SUBMITTED, m.Escrow.HELD, None)
+    with pytest.raises(GateError) as e:
+        await shop.buyer.gate.result(job.job_id)
+    assert (e.value.status, e.value.code) == (404, "not_delivered")
+    shop.gate.advance(timedelta(hours=1, seconds=2))
+    await shop.gate.sweep()
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow, view.reason) == (
+        m.JobState.FAILED,
+        m.Escrow.REFUNDED,
+        NOT_FROM_BUYER_REASON,
+    )
+    assert shop.control.terminates == []  # not the job's run: escrow leaves it alone
+    await shop.gate.sweep()
+    assert await shop.balances() == before  # the buyer has its money back, nobody else any
+    await assert_invariants(shop.gate.ledger)
+
+
+async def test_a_pinned_job_ignores_a_later_run_of_its_id(shop: Shop) -> None:
+    job = await shop.hire(1000)
+    shop.observe(job.job_id, ObservedStatus.RUNNING)
+    await shop.gate.sweep()
+    assert (await shop.buyer.gate.job(job.job_id)).state is m.JobState.WORKING
+    # The seller terminated the buyer's run and completed another (verified or not, it is
+    # not the pinned one): no delivery.
+    shop.observe(job.job_id, ObservedStatus.COMPLETED, b"r", run_id="run-2")
+    await shop.gate.sweep()
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.state, view.delivery) == (m.JobState.WORKING, None)
+    shop.observe(job.job_id, ObservedStatus.TERMINATED)
+    await shop.gate.sweep()
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow, view.reason) == (
+        m.JobState.FAILED,
+        m.Escrow.REFUNDED,
+        "seller workflow terminated",
+    )
 
 
 async def test_a_delivery_after_the_deadline_refunds(shop: Shop) -> None:

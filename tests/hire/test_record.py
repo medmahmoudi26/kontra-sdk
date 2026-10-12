@@ -216,6 +216,7 @@ def test_prices() -> None:
         PriceAboveMax("too much", price="2.00", max_price="1.00", currency="USD"),
         InsufficientFunds("broke"),
         HireRefused("gone", code="offering_not_found", status=404),
+        HireRefused("used", code="quote_used", status=409, detail={"job_id": "e" * 32}),
         InvalidInput("bad", path="input.text"),
         JobFailed("boom", state="canceled", job_id="f" * 32),
         KontraError("plain"),
@@ -239,6 +240,9 @@ async def test_hire_errors_survive_a_temporal_failure(err: KontraError) -> None:
     if isinstance(err, SellerBusy):
         assert isinstance(back, SellerBusy)
         assert back.eta == err.eta
+    if isinstance(err, HireRefused):
+        assert isinstance(back, HireRefused)
+        assert (back.code, back.status, back.detail) == (err.code, err.status, err.detail)
     assert from_failure(ApplicationError("not ours", type="Other")) is None
 
 

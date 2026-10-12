@@ -1,7 +1,9 @@
 """The script door's refusals and the rest of its surface: max_price, rejected and busy
 quotes, contract validation before encryption, a seller that goes offline (acceptance 4),
-a start the handler refuses, progress (acceptance 13), artifacts in and out, re-attaching
-to a job, the profile's own connection, and the gate standing in for Temporal."""
+a start the handler refuses, a run the seller started itself (never a delivery), progress
+(acceptance 13), artifacts in and out, re-attaching to a job, the profile's own connection,
+the gate standing in for Temporal, and every way a start can fail after the hold is locked
+(the job is cancelled at the gate, or named so it can be recovered)."""
 
 from __future__ import annotations
 
@@ -9,6 +11,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from datetime import timedelta
@@ -16,10 +19,15 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import pytest_asyncio
+from temporalio.client import WorkflowExecutionStatus
+from temporalio.service import RPCError, RPCStatusCode
 
 from kontra.codec.age import AgeError, decrypt
+from kontra.contract.names import job_workflow_id
+from kontra.gate_client import GateError
 from kontra.gate_client import models as m
 from kontra.hire import (
     HireRefused,
@@ -39,7 +47,7 @@ from kontra.types import Artifact
 
 from . import sellers
 from .models import TextOut
-from .support import World, open_world
+from .support import Buyer, World, open_world, until
 
 pytestmark = [pytest.mark.temporal, pytest.mark.asyncio(loop_scope="module")]
 
@@ -182,19 +190,89 @@ async def test_a_start_the_handler_refuses_refunds_at_once(world: World) -> None
 # --------------------------------------------------------------------------- the escrow decides
 
 
-async def test_a_refused_start_never_hides_a_delivery_the_gate_recorded(world: World) -> None:
+async def test_a_run_the_seller_started_itself_refunds_the_buyer_and_pays_nobody(
+    world: World,
+) -> None:
     """The seller starts ``job-<id>`` itself and completes it, so the buyer's own start is
-    refused ("already ran"). The gate counts that run as the delivery (it watches the
-    workflow id, I6) and would release the money when the review window closes: the buyer
-    must get that delivery -- and be able to reject it -- not a JobFailed saying it refunds."""
+    refused ("already ran"). That run is no delivery: only the run the buyer's own call
+    started is (decisions I15). The refused start is cancelled at the gate at once: the
+    buyer is refunded, the seller is paid nothing, and there is no delivery to read."""
     buyer = await world.buyer()
+    seller_before = await world.ledger_balance(world.seller.handle)
     world.forge_on_hire(buyer.k, "not what you asked for")
+    with pytest.raises(JobFailed) as refused:
+        await buyer.k.hire(world.key(), text="genuine")
+    err = refused.value
+    assert "the seller refused to start the job" in err.reason
+    assert "already ran" in err.reason
+    assert err.state == "canceled"
+    assert err.job_id is not None
+    view = await buyer.k.gate.job(err.job_id)  # no waiting: refunded by the time we know
+    assert (view.state, view.escrow, view.delivery) == (
+        m.JobState.CANCELED,
+        m.Escrow.REFUNDED,
+        None,
+    )
+    with pytest.raises(GateError) as nothing:
+        await buyer.k.gate.result(err.job_id)
+    assert nothing.value.code == "not_delivered"
+    bal = await buyer.balance()
+    assert (bal.available_minor, bal.held_minor) == (START, 0)
+    assert await world.ledger_balance(world.seller.handle) == seller_before
+
+
+async def test_a_start_whose_answer_was_lost_never_hides_the_delivery_the_gate_recorded(
+    world: World,
+) -> None:
+    """What the escrow-decides rule guards: the buyer's own call starts the job and the
+    seller delivers, but the answer to the start is lost (an error from Temporal that is not
+    "unavailable", so the SDK cannot tell the start was made). The SDK settles the job at
+    the gate rather than leave the hold locked; the gate, which counted the delivery,
+    refuses the cancel, and the job is returned with that delivery -- for the buyer to read,
+    and to reject if it is not what was hired -- not a JobFailed saying it refunds."""
+    buyer = await world.buyer()
+    hired: list[str] = []
+    real_hire = buyer.k.gate.hire
+
+    async def remember(quote_id: str, *, max_price_minor: int | None = None) -> m.HireView:
+        view = await real_hire(quote_id, max_price_minor=max_price_minor)
+        hired.append(view.job_id)
+        return view
+
+    buyer.k.gate.hire = remember  # type: ignore[method-assign]
+    client = await buyer.k.temporal()
+    real_nexus = client.create_nexus_client
+    seller = world.mp.client(world.seller.namespace)
+
+    def losing(*args: Any, **kwargs: Any) -> Any:
+        nexus = real_nexus(*args, **kwargs)
+        real_start = nexus.start_operation
+
+        async def start_then_lose(*a: Any, **kw: Any) -> Any:
+            await real_start(*a, **kw)
+            [job_id] = hired
+            run = seller.get_workflow_handle(job_workflow_id(job_id))
+
+            async def status() -> WorkflowExecutionStatus | None:
+                try:
+                    return (await run.describe()).status
+                except RPCError:  # not started yet
+                    return None
+
+            await until(status, lambda s: s is WorkflowExecutionStatus.COMPLETED)
+            raise RPCError("the answer was lost", RPCStatusCode.INTERNAL, b"")
+
+        nexus.start_operation = start_then_lose
+        return nexus
+
+    client.create_nexus_client = losing  # type: ignore[method-assign]
     job = await buyer.k.hire(world.key(), text="genuine")  # returns: there is a delivery
-    result = await job.result(timeout=60)
-    assert result.text == "NOT WHAT YOU ASKED FOR"
+    assert job.job_id == hired[0]
     view = await buyer.k.gate.job(job.job_id)
     assert (view.state, view.escrow) == (m.JobState.COMPLETED, m.Escrow.HELD)
-    disputed = await job.reject("I never got what I paid for")
+    result = await job.result(timeout=60)
+    assert result.text == "GENUINE"
+    disputed = await job.reject("not what I hired")
     assert disputed.escrow is m.Escrow.DISPUTED
 
 
@@ -371,6 +449,277 @@ async def test_the_gate_stands_in_when_temporal_is_unreachable(world: World) -> 
     assert failed.value.state == "failed"
 
 
+# --------------------------------------------------------------------------- after the lock
+
+
+async def _unreachable() -> object:
+    raise TemporalUnavailable("no route to the frontend")
+
+
+async def _only_job(buyer: Buyer) -> m.JobView:
+    [view] = await buyer.k.jobs()
+    return view
+
+
+async def test_temporal_refusing_the_connection_cancels_the_hold(world: World) -> None:
+    """The hold is locked, then Temporal refuses the connection outright (a permission
+    error, not "unavailable", so the gate cannot stand in): the job is cancelled at the gate
+    at once, and the error names it, with Temporal's as its cause."""
+    buyer = await world.buyer(client=None)  # connects with the profile's own session
+    denied = RPCError("namespace access denied", RPCStatusCode.PERMISSION_DENIED, b"")
+
+    async def refuse(*args: Any, **kwargs: Any) -> object:
+        raise denied
+
+    buyer.k.session.connect_temporal = refuse  # type: ignore[method-assign]
+    with pytest.raises(JobFailed) as failed:
+        await buyer.k.hire(world.key(), text="denied")
+    err = failed.value
+    assert err.__cause__ is denied
+    assert "could not be started" in err.reason
+    assert "PERMISSION_DENIED" in err.reason or "access denied" in err.reason
+    assert err.job_id == (await _only_job(buyer)).job_id
+    view = await buyer.k.gate.job(err.job_id)
+    assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
+    bal = await buyer.balance()
+    assert (bal.available_minor, bal.held_minor) == (START, 0)
+
+
+async def test_a_lost_answer_from_the_gates_start_cancels_the_hold(world: World) -> None:
+    """Temporal is unreachable, so the gate is asked to start the job, and its answer is
+    lost: the start may or may not have happened. The job is cancelled at the gate rather
+    than left holding the buyer's money until its deadline."""
+    buyer = await world.buyer()
+    buyer.k.temporal = _unreachable  # type: ignore[method-assign]
+    lost = httpx.ReadError("the connection dropped before the answer")
+
+    async def start(job_id: str, wire: m.WirePayload) -> m.JobView:
+        raise lost
+
+    buyer.k.gate.start = start  # type: ignore[method-assign]
+    with pytest.raises(JobFailed) as failed:
+        await buyer.k.hire(world.key(), text="lost")
+    err = failed.value
+    assert err.__cause__ is lost
+    assert "ReadError" in err.reason
+    assert err.job_id is not None
+    view = await buyer.k.gate.job(err.job_id)
+    assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
+    assert (await buyer.balance()).held_minor == 0
+
+
+async def test_a_cancel_that_fails_too_names_the_job_and_keeps_the_first_error(
+    world: World,
+) -> None:
+    """The start's answer is lost and the gate cannot be told to cancel either: the error
+    raised is still about the start (its cause), and it names the job, which refunds at its
+    deadline unless the gate saw a delivery -- the caller can look it up, or cancel it."""
+    buyer = await world.buyer()
+    buyer.k.temporal = _unreachable  # type: ignore[method-assign]
+    lost = httpx.ReadError("the connection dropped before the answer")
+
+    async def start(job_id: str, wire: m.WirePayload) -> m.JobView:
+        raise lost
+
+    async def cancel(job_id: str) -> m.JobView:
+        raise httpx.ConnectError("the gate is gone")
+
+    real_cancel = buyer.k.gate.cancel
+    buyer.k.gate.start = start  # type: ignore[method-assign]
+    buyer.k.gate.cancel = cancel  # type: ignore[method-assign]
+    with pytest.raises(JobFailed) as failed:
+        await buyer.k.hire(world.key(), text="stranded")
+    err = failed.value
+    assert err.__cause__ is lost  # not the failed cancel
+    assert "ReadError" in err.reason
+    assert "refunds at the job's deadline" in err.reason
+    assert err.job_id == (await _only_job(buyer)).job_id
+    view = await buyer.k.gate.job(err.job_id)
+    assert (view.state, view.escrow) == (m.JobState.SUBMITTED, m.Escrow.HELD)
+    assert (await real_cancel(err.job_id)).escrow is m.Escrow.REFUNDED  # recoverable
+
+
+async def test_a_hire_cancelled_while_it_starts_cancels_its_job(world: World) -> None:
+    """A hire abandoned after the lock (a timeout around it, Ctrl-C) never returns the job,
+    so nobody would follow it: the job is cancelled at the gate on the way out."""
+    buyer = await world.buyer()
+    buyer.k.temporal = _unreachable  # type: ignore[method-assign]
+    started = asyncio.Event()
+
+    async def start(job_id: str, wire: m.WirePayload) -> m.JobView:
+        started.set()
+        await asyncio.Event().wait()  # never answers
+        raise AssertionError("unreachable")
+
+    buyer.k.gate.start = start  # type: ignore[method-assign]
+    hiring = asyncio.create_task(buyer.k.hire(world.key(), text="abandoned"))
+    await asyncio.wait_for(started.wait(), 30)
+    hiring.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await hiring
+    view = await _only_job(buyer)
+    assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
+    assert (await buyer.balance()).held_minor == 0
+
+
+async def test_a_used_quote_names_the_job_it_made(world: World) -> None:
+    """The gate hires a quote once; hiring it again is refused with the job it became, so a
+    hire retried after a lost answer finds the money it locked (``HireRefused.detail``)."""
+    buyer = await world.buyer()
+    q = await buyer.k.quote(world.key(), text="once")
+    job = await q.hire()
+    with pytest.raises(HireRefused) as used:
+        await q.hire()
+    assert (used.value.code, used.value.status) == ("quote_used", 409)
+    assert used.value.detail == {"job_id": job.job_id}
+    assert used.value.fields["detail"] == {"job_id": job.job_id}  # crosses Temporal too
+    await job.cancel()
+
+
+def _answer_lost(buyer: Buyer, lost: BaseException | None, *, reached: bool = True) -> list[str]:
+    """The gate's answer to this buyer's next ``hire`` goes missing: the call raises
+    ``lost`` (or never returns, when ``lost`` is None) after the gate locked the hold -- or,
+    unless ``reached``, without reaching the gate. Later calls (the SDK asking what the
+    quote became) reach the gate. The jobs the lost call locked."""
+    locked: list[str] = []
+    real = buyer.k.gate.hire
+    calls = 0
+
+    async def hire(quote_id: str, *, max_price_minor: int | None = None) -> m.HireView:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return await real(quote_id, max_price_minor=max_price_minor)
+        if reached:
+            locked.append((await real(quote_id, max_price_minor=max_price_minor)).job_id)
+        if lost is None:
+            await asyncio.Event().wait()
+        raise lost or AssertionError("unreachable")
+
+    buyer.k.gate.hire = hire  # type: ignore[method-assign]
+    return locked
+
+
+@pytest.mark.parametrize(
+    "lost",
+    [
+        httpx.ReadError("the connection dropped before the answer"),
+        GateError(201, "invalid_response", "the gate's answer to hire is not a HireView"),
+        GateError(502, "bad_gateway", "the proxy lost the gate's answer"),
+    ],
+    ids=["transport", "unreadable", "proxy"],
+)
+async def test_a_lost_answer_to_hire_cancels_the_job_it_locked(
+    world: World, lost: Exception
+) -> None:
+    """The gate locks the hold, and its answer to ``hire`` never arrives (or cannot be
+    read). ``Kontra.hire`` quoted internally, so its caller has no quote to retry by and no
+    job id: left alone, the money would stay held until the job's deadline with nobody
+    knowing which job holds it. The SDK asks the gate what the quote became, cancels that
+    job, and names it, with the lost answer as the cause."""
+    buyer = await world.buyer()
+    locked = _answer_lost(buyer, lost)
+    with pytest.raises(JobFailed) as failed:
+        await buyer.k.hire(world.key(), text="lost")
+    err = failed.value
+    assert err.__cause__ is lost
+    assert err.job_id == locked[0]
+    assert "the gate's answer to the hire was lost" in err.reason
+    view = await buyer.k.gate.job(err.job_id)
+    assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
+    bal = await buyer.balance()
+    assert (bal.available_minor, bal.held_minor) == (START, 0)
+
+
+async def test_a_hire_that_never_reached_the_gate_keeps_its_error(world: World) -> None:
+    """The same failure before the gate locked anything: the SDK's question finds no job,
+    nothing is locked by asking, and the original error is raised as it was."""
+    buyer = await world.buyer()
+    lost = httpx.ConnectError("the gate is not there")
+    _answer_lost(buyer, lost, reached=False)
+    with pytest.raises(httpx.ConnectError) as failed:
+        await buyer.k.hire(world.key(), text="never sent")
+    assert failed.value is lost
+    assert await buyer.k.jobs() == []
+    bal = await buyer.balance()
+    assert (bal.available_minor, bal.held_minor) == (START, 0)
+
+
+async def test_a_quote_whose_hire_answer_was_lost_is_hired_again_to_find_its_job(
+    world: World,
+) -> None:
+    """Holding the quote, the caller has a way back (as ``kontra mcp`` does): the lost
+    answer's error is raised as it came, and hiring the same quote again is refused with the
+    job the lost call locked -- never a second lock."""
+    buyer = await world.buyer()
+    q = await buyer.k.quote(world.key(), text="again")
+    lost = httpx.ReadError("the connection dropped before the answer")
+    locked = _answer_lost(buyer, lost)
+    with pytest.raises(httpx.ReadError) as failed:
+        await q.hire()
+    assert failed.value is lost
+    with pytest.raises(HireRefused) as used:
+        await q.hire()
+    assert (used.value.code, used.value.detail) == ("quote_used", {"job_id": locked[0]})
+    assert len(await buyer.k.jobs()) == 1  # locked once
+    assert (await buyer.balance()).held_minor > 0
+    assert (await buyer.k.gate.cancel(locked[0])).escrow is m.Escrow.REFUNDED
+
+
+async def test_a_hire_cancelled_while_the_gate_locks_cancels_the_job(world: World) -> None:
+    """A hire abandoned (a timeout around it, Ctrl-C) while the gate's answer to ``hire``
+    is still on its way: the job the quote became is cancelled on the way out."""
+    buyer = await world.buyer()
+    locked = _answer_lost(buyer, None)
+    hiring = asyncio.create_task(buyer.k.hire(world.key(), text="abandoned"))
+
+    async def jobs() -> list[str]:
+        return list(locked)
+
+    await until(jobs, bool)
+    hiring.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await hiring
+    view = await buyer.k.gate.job(locked[0])
+    assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
+    assert (await buyer.balance()).held_minor == 0
+
+
+async def test_a_job_the_gate_had_closed_is_never_reported_cancelled(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A hire abandoned while its job starts, whose job the gate has closed already (its
+    cancel answers 409: delivered, perhaps). The log must not tell the buyer it was
+    cancelled -- a delivered job is paid at the review window unless the buyer looks."""
+    buyer = await world.buyer()
+    buyer.k.temporal = _unreachable  # type: ignore[method-assign]
+    started = asyncio.Event()
+
+    async def start(job_id: str, wire: m.WirePayload) -> m.JobView:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def closed(job_id: str) -> m.JobView:
+        raise GateError(409, "not_open", "job is completed")
+
+    real_cancel = buyer.k.gate.cancel
+    buyer.k.gate.start = start  # type: ignore[method-assign]
+    buyer.k.gate.cancel = closed  # type: ignore[method-assign]
+    caplog.set_level(logging.WARNING, logger="kontra.hire")
+    hiring = asyncio.create_task(buyer.k.hire(world.key(), text="closed"))
+    await asyncio.wait_for(started.wait(), 30)
+    hiring.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await hiring
+    said = "\n".join(r.getMessage() for r in caplog.records if r.name == "kontra.hire")
+    assert "had already closed it" in said
+    assert "it may have delivered" in said
+    assert "it was cancelled" not in said
+    [view] = await buyer.k.jobs()
+    await real_cancel(view.job_id)
+
+
 # --------------------------------------------------------------------------- trust nothing
 
 
@@ -434,6 +783,7 @@ async def test_a_hold_that_names_another_key_is_cancelled_not_used(world: World)
         await buyer.k.hire(world.key(), text="secret")
     assert refused.value.code == "hold_mismatch"
     [view] = await buyer.k.jobs()
+    assert refused.value.detail == {"job_id": view.job_id}  # the hold it refused, named
     assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
     entry = await buyer.k.offering(world.key())
     assert await buyer.k.seller_keys.seller_key(entry.endpoint) == entry.public_key  # not cached

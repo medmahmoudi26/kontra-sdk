@@ -17,6 +17,11 @@ history *metadata* only (PRD §8.4).
 Errors: a failure of the platform (frontend unreachable, an RPC refused) raises
 :class:`TemporalError`. A seller's own failure is never an exception: :meth:`Control.nexus_sync`
 classifies it into a :class:`NexusSyncResult`.
+
+Provenance (decisions I15): :meth:`Control.observe` reports a run of ``job-<id>`` as the
+buyer's only after looking the buyer's call up in the buyer's namespace and comparing
+structured fields for exact equality; no operation token, callback URL or other encoded
+string is ever decoded.
 """
 
 from __future__ import annotations
@@ -27,19 +32,19 @@ import math
 import re
 import uuid
 from collections import OrderedDict
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, Hashable, Iterable, Mapping, Sequence
+from contextlib import aclosing
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
 from urllib.parse import quote
 
 import httpx
-from google.protobuf.duration_pb2 import Duration
 from google.protobuf.message import DecodeError
 from google.protobuf.timestamp_pb2 import Timestamp
-from temporalio.api.common.v1 import Payload, WorkflowExecution
+from temporalio.api.common.v1 import Link, Payload, WorkflowExecution
 from temporalio.api.enums.v1 import (
     EventType,
     HistoryEventFilterType,
@@ -57,6 +62,9 @@ from temporalio.api.operatorservice.v1 import (
 from temporalio.api.taskqueue.v1 import TaskQueue
 from temporalio.api.workflowservice.v1 import (
     DescribeNamespaceRequest,
+    DescribeNamespaceResponse,
+    DescribeNexusOperationExecutionRequest,
+    DescribeNexusOperationExecutionResponse,
     DescribeTaskQueueRequest,
     DescribeWorkflowExecutionRequest,
     DescribeWorkflowExecutionResponse,
@@ -65,31 +73,50 @@ from temporalio.api.workflowservice.v1 import (
     RequestCancelWorkflowExecutionRequest,
     StartNexusOperationExecutionRequest,
     TerminateWorkflowExecutionRequest,
+    UpdateNamespaceRequest,
 )
 from temporalio.client import Client
 from temporalio.service import RPCError, RPCStatusCode
 
 from kontra.contract.names import is_endpoint_name
-from kontra.escrow import Observation, ObservedStatus
+from kontra.contract.offering import MAX_DURATION_RANGE
+from kontra.escrow import Observation, ObservedStatus, Provenance
 
 __all__ = [
     "CHAIN_READS",
     "DEFAULT_RETENTION",
+    "EXECUTE_OPERATION",
     "FRONTEND_RESERVE",
+    "HOLD_HEADER",
     "IDENTITY",
+    "RETENTION_MARGIN",
+    "BuyerCall",
     "Control",
     "EndpointConflict",
     "EndpointInfo",
     "HistorySummary",
     "NexusSyncKind",
     "NexusSyncResult",
+    "ObservationIncomplete",
     "TemporalControl",
     "TemporalError",
+    "hold_digest",
 ]
 
-#: Party namespaces keep closed workflows this long: long enough for the sweeper to see
-#: every close, short enough that history is not a second archive of ciphertext.
-DEFAULT_RETENTION = timedelta(days=3)
+#: Above the contract's max_duration cap (see :data:`DEFAULT_RETENTION`): the gate's grace
+#: and clock skew are seconds, so days of margin are plenty and cost only history storage.
+RETENTION_MARGIN = timedelta(days=5)
+#: Party namespaces keep closed workflows and standalone operations this long. A hold token
+#: can start ``job-<id>`` until it expires, up to the max_duration cap after the hold was
+#: locked, and the only thing refusing a second start is the first one's record
+#: (``REJECT_DUPLICATE`` on the workflow id and on the operation id): were it dropped before
+#: the token expired, the same token could start the job again. So retention outlasts the
+#: longest token, derived from the cap in one place (FIXUPS #19).
+DEFAULT_RETENTION = MAX_DURATION_RANGE[1] + RETENTION_MARGIN
+#: The Nexus operation that runs a job, and the header its hold token travels in (the
+#: seller's handler reads the same names: ``kontra.serve``).
+EXECUTE_OPERATION = "execute"
+HOLD_HEADER = "kontra-hold"
 #: Who the control plane says it is in histories and on standalone operations.
 IDENTITY = "kontra-control"
 #: The frontend keeps about this much of a Nexus ``Request-Timeout`` for itself: the
@@ -106,8 +133,13 @@ _MESSAGE_MAX = 1000
 #: Prior runs of a continue-as-new chain are immutable once closed, so what they contribute
 #: to a summary is computed once and remembered (bounded).
 _CHAIN_CACHE = 4096
-#: Histories of earlier runs one summary may read (see :meth:`Control._chain_before`).
+#: Histories of earlier runs one summary may read (see :meth:`Control._chain_before`), and
+#: runs one observation may step through along a pinned chain the latest run left.
 CHAIN_READS = 64
+#: Links into the buyer's namespace one run's provenance check resolves. A genuine run has
+#: exactly one (the caller's); each costs a read of a buyer history up to the event it
+#: names, so a seller attaching more only makes the gate read more.
+_LINKS_CHECKED = 2
 _HTTP_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", re.ASCII)
 #: Headers the relay itself sets, or that carry Nexus protocol meaning; a caller's header
 #: may not replace them.
@@ -124,6 +156,22 @@ _WORKFLOW_TASK_EVENTS = frozenset(
         EventType.EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT,
     }
 )
+
+_SCHEDULED = EventType.EVENT_TYPE_NEXUS_OPERATION_SCHEDULED
+_STARTED_EVENT = EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED
+#: Closes that may hand the chain over to a successor run (continue-as-new; a retry or the
+#: next cron run after a completion, failure or timeout). Termination and cancellation end
+#: a chain.
+_MAY_HAND_OVER = frozenset(
+    {
+        WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
+        WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+        WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_FAILED,
+        WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_TIMED_OUT,
+    }
+)
+_K = TypeVar("_K", bound=Hashable)
+_V = TypeVar("_V")
 
 _STATUS: Mapping[int, ObservedStatus] = {
     WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_COMPLETED: ObservedStatus.COMPLETED,
@@ -142,6 +190,14 @@ class TemporalError(Exception):
     """A control-plane call failed: the frontend is unreachable or refused the request."""
 
 
+class ObservationIncomplete(TemporalError):
+    """:meth:`Control.observe` could not reach the end of the pinned chain within one
+    call's budget (:data:`CHAIN_READS` runs); the next call continues where this one
+    stopped. Not a fact about the job: like an unreachable frontend it means "cannot say",
+    so the sweeper retries and a buyer's cancel is refused. Reporting the chain as still
+    running instead would let a buyer cancel, and be refunded, after the job delivered."""
+
+
 class EndpointConflict(TemporalError):
     """:meth:`Control.create_endpoint` for a name that exists with another target."""
 
@@ -155,6 +211,49 @@ class EndpointInfo:
     name: str
     namespace: str
     task_queue: str
+
+
+#: What HTTP drops from both ends of a Nexus header value on its way to the seller's
+#: handler (server 1.32, measured): the buyer's call records ``" <token>\t"`` and the
+#: handler is handed ``"<token>"``. Nothing else is changed; other bytes are refused or kept.
+_HTTP_OWS = " \t"
+
+
+def hold_digest(token: str) -> str:
+    """How a hold is matched: sha256 hex of the bytes its signature covers (the JWS signing
+    input, everything before the last ``.``; all of it when there is none), after dropping
+    the spaces and tabs HTTP drops on the way to the handler.
+
+    The gate digests each token it issues with this, and :meth:`Control.observe` digests
+    the header a buyer's call carried with it. The signature segment is left out because
+    it is not the gate's to fix: ES256 accepts ``(r, n - s)`` for ``(r, s)`` and the
+    verifier's base64url decoder ignores padding, so one issued token has many spellings
+    the seller's handler accepts. Matched byte for byte, a buyer could call with one of
+    them, have the job done, and have escrow refund it as "not the buyer's call". A string
+    with the gate's signed part is the gate's statement whatever signature follows it. The
+    token is never decoded: no claim is read, only bytes compared."""
+    value = token.strip(_HTTP_OWS).encode("utf-8")
+    signed, dot, _signature = value.rpartition(b".")
+    return sha256(signed if dot else value).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class BuyerCall:
+    """The buyer's ``execute`` call of one job as the gate's own records describe it: what
+    a run of ``job-<id>`` must trace back to before its result can be a delivery
+    (decisions I15). Built from the job row, never from anything a history says.
+
+    ``namespace``: the buyer's. ``endpoint``: the offering version's endpoint name (the
+    catalog's). ``service``: the offering's Nexus service name. ``holds``:
+    :func:`hold_digest` of every hold token the gate issued for this job. The call must
+    carry one of them: the token is what the seller's handler checked before it started
+    the job, so it is what ties a call to a job (an operation id is the buyer's choice
+    and binds nothing)."""
+
+    namespace: str
+    endpoint: str
+    service: str
+    holds: frozenset[str]
 
 
 class NexusSyncKind(StrEnum):
@@ -234,10 +333,12 @@ class TemporalControl(Protocol):
     ) -> NexusSyncResult: ...
 
     async def observe(
-        self, namespace: str, workflow_id: str
+        self, namespace: str, workflow_id: str, call: BuyerCall, pinned: str | None
     ) -> tuple[Observation, bytes | None]: ...
 
-    async def history_summary(self, namespace: str, workflow_id: str) -> HistorySummary | None: ...
+    async def history_summary(
+        self, namespace: str, workflow_id: str, pinned: str | None = None
+    ) -> HistorySummary | None: ...
 
     async def cancel_workflow(self, namespace: str, workflow_id: str, reason: str) -> None: ...
 
@@ -354,6 +455,113 @@ def _namespace_missing(e: RPCError) -> bool:
     return e.message.lower().startswith("namespace")
 
 
+class _Gone(Exception):
+    """A history that does not exist (any more): never a platform fault."""
+
+
+class _Unnamed(Exception):
+    """A history named by ids the frontend refuses as malformed (``INVALID_ARGUMENT``):
+    such ids come only from a link someone wrote, never from the server, so they name
+    nothing. Raising instead would make every observation of the run fail, and a gate that
+    cannot observe refuses the buyer's cancel: a seller could make its job uncancelable by
+    starting a run whose callback links carry an invalid run id."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Target:
+    """The seller-side run whose provenance is being established: its chain's first run
+    and the request id that run was started with."""
+
+    namespace: str
+    workflow_id: str
+    root: str
+    request_id: str
+
+
+def _remember(cache: OrderedDict[_K, _V], key: _K, value: _V) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _CHAIN_CACHE:
+        cache.popitem(last=False)
+
+
+def _successor(close: HistoryEvent) -> str:
+    """The run a closed run handed over to, as the server recorded it; "" at a chain's end."""
+    if close.HasField("workflow_execution_continued_as_new_event_attributes"):
+        return close.workflow_execution_continued_as_new_event_attributes.new_execution_run_id
+    if close.HasField("workflow_execution_completed_event_attributes"):
+        return close.workflow_execution_completed_event_attributes.new_execution_run_id
+    if close.HasField("workflow_execution_failed_event_attributes"):
+        return close.workflow_execution_failed_event_attributes.new_execution_run_id
+    if close.HasField("workflow_execution_timed_out_event_attributes"):
+        return close.workflow_execution_timed_out_event_attributes.new_execution_run_id
+    return ""
+
+
+def _namespace_of(link: Link) -> str:
+    """The namespace a caller's link points into, for the two kinds a Nexus caller leaves
+    (a standalone operation; an event of the calling workflow)."""
+    if link.HasField("nexus_operation"):
+        return link.nexus_operation.namespace
+    if link.HasField("workflow_event"):
+        return link.workflow_event.namespace
+    return ""
+
+
+def _carries_hold(header: Mapping[str, str], holds: frozenset[str]) -> bool:
+    """Whether a call's Nexus header carries one of the job's hold tokens. Nexus header
+    names reach the handler lowercased, so every ASCII spelling of the name counts: a buyer
+    cannot send the token under ``Kontra-Hold`` and have escrow refuse a run the handler
+    accepted. Only ASCII folds: ``str.lower`` also maps the Kelvin sign to ``k``, and a
+    name HTTP refuses never reaches a handler. The value is matched by
+    :func:`hold_digest`; it is never decoded."""
+    return any(
+        hold_digest(value) in holds
+        for name, value in header.items()
+        if name.isascii() and name.lower() == HOLD_HEADER
+    )
+
+
+def _is_the_call(
+    endpoint: str,
+    service: str,
+    operation: str,
+    request_id: str,
+    header: Mapping[str, str],
+    target: _Target,
+    call: BuyerCall,
+) -> bool:
+    """A recorded Nexus call (a standalone operation, or a workflow's scheduled one) is
+    this job's ``execute`` call and the one ``target`` was started with: every field equal."""
+    return (
+        endpoint == call.endpoint
+        and service == call.service
+        and operation == EXECUTE_OPERATION
+        and request_id == target.request_id
+        and _carries_hold(header, call.holds)
+    )
+
+
+def _names_only(links: Iterable[Link], target: _Target) -> bool:
+    """False when the caller recorded some other run of the job's workflow as the one its
+    call started (the handler's response link, written once when the start was answered).
+    No such link at all is not evidence either way."""
+    for link in links:
+        if link.HasField("workflow_event"):
+            ns, wf, run = (
+                link.workflow_event.namespace,
+                link.workflow_event.workflow_id,
+                link.workflow_event.run_id,
+            )
+        elif link.HasField("workflow"):
+            ns, wf, run = link.workflow.namespace, link.workflow.workflow_id, link.workflow.run_id
+        else:
+            continue
+        if (ns, wf) == (target.namespace, target.workflow_id) and run != target.root:
+            return False
+    return True
+
+
 class Control:
     """``Control(client, http_base)``: ``client`` is connected to the internal frontend
     (or a dev server); ``http_base`` is that frontend's HTTP API (``http://host:port``),
@@ -384,6 +592,10 @@ class Control:
         self._skips: OrderedDict[str, _Skip] = OrderedDict()
         #: (namespace, workflow id) -> what the last full read of its current run found
         self._runs: OrderedDict[tuple[str, str], _RunScan] = OrderedDict()
+        #: (namespace, workflow id, root, call) -> a definite provenance
+        self._verdicts: OrderedDict[tuple[str, str, str, BuyerCall], Provenance] = OrderedDict()
+        #: (namespace, workflow id, pinned root) -> the latest run of the chain reached so far
+        self._heads: OrderedDict[tuple[str, str, str], str] = OrderedDict()
 
     @property
     def client(self) -> Client:
@@ -428,8 +640,12 @@ class Control:
         self, namespace: str, retention: timedelta = DEFAULT_RETENTION
     ) -> None:
         """Register ``namespace`` if it is missing, then wait until the frontend both
-        describes it and serves requests in it. Idempotent (an existing namespace keeps
-        its retention); concurrent callers converge.
+        describes it and serves requests in it. Idempotent; concurrent callers converge.
+
+        An existing namespace's retention is raised to ``retention`` when it is shorter and
+        never lowered: a namespace registered with a shorter one (an older gate's default)
+        would let a still-valid hold token start ``job-<id>`` again once its first run was
+        dropped (:data:`DEFAULT_RETENTION`), and a longer one is someone's decision.
 
         Registration comes first, without a "does it exist?" read: asking the frontend
         about a namespace that does not exist yet makes it remember the absence for about
@@ -437,15 +653,17 @@ class Control:
         read is refused by workflow calls for that long."""
         if not namespace:
             raise ValueError("namespace must not be empty")
-        req = RegisterNamespaceRequest(
-            namespace=namespace,
-            workflow_execution_retention_period=Duration(seconds=int(retention.total_seconds())),
-        )
+        if retention <= timedelta(0):
+            raise ValueError("retention must be positive")
+        req = RegisterNamespaceRequest(namespace=namespace)
+        req.workflow_execution_retention_period.FromTimedelta(retention)
+        existed = False
         try:
             await self._wf.register_namespace(req, retry=True, timeout=_RPC_TIMEOUT)
         except RPCError as e:
             if e.status != RPCStatusCode.ALREADY_EXISTS:
                 raise TemporalError(f"register namespace {namespace}: {e.message}") from e
+            existed = True
         delay, waited = 0.02, 0.0
         while not await self._usable(namespace):
             if waited >= _NAMESPACE_WAIT:
@@ -453,6 +671,22 @@ class Control:
             await asyncio.sleep(delay)
             waited += delay
             delay = min(delay * 2, 0.5)
+        if existed:
+            await self._keep_at_least(namespace, retention)
+
+    async def _keep_at_least(self, namespace: str, retention: timedelta) -> None:
+        d: DescribeNamespaceResponse = await self._rpc(
+            f"describe namespace {namespace}",
+            self._wf.describe_namespace,
+            DescribeNamespaceRequest(namespace=namespace),
+        )
+        if d.config.workflow_execution_retention_ttl.ToTimedelta() >= retention:
+            return
+        # Only the retention is set: UpdateNamespace leaves every config field it is not
+        # given (archival, bad binaries) as it was.
+        update = UpdateNamespaceRequest(namespace=namespace)
+        update.config.workflow_execution_retention_ttl.FromTimedelta(retention)
+        await self._rpc(f"update namespace {namespace}", self._wf.update_namespace, update)
 
     async def _usable(self, namespace: str) -> bool:
         """Describable, and a workflow call in it is answered for the workflow rather than
@@ -655,12 +889,14 @@ class Control:
     # ------------------------------------------------------------------ observation
 
     async def _describe(
-        self, namespace: str, workflow_id: str
+        self, namespace: str, workflow_id: str, run_id: str = ""
     ) -> DescribeWorkflowExecutionResponse | None:
+        """The run ``run_id`` of ``workflow_id`` (its latest run when ""), or None."""
         try:
             return await self._wf.describe_workflow_execution(
                 DescribeWorkflowExecutionRequest(
-                    namespace=namespace, execution=WorkflowExecution(workflow_id=workflow_id)
+                    namespace=namespace,
+                    execution=WorkflowExecution(workflow_id=workflow_id, run_id=run_id),
                 ),
                 retry=True,
                 timeout=_RPC_TIMEOUT,
@@ -698,47 +934,360 @@ class Control:
             if not token or (close_only and events):
                 return events
 
-    async def observe(self, namespace: str, workflow_id: str) -> tuple[Observation, bytes | None]:
-        """What escrow needs of ``workflow_id`` (the latest run of its chain) in
-        ``namespace``: its status and times and, once completed, the result payload exactly
-        as stored -- a serialized ``Payload``, ciphertext -- with that byte string's sha256
-        and size in the observation."""
+    async def _pages(
+        self, namespace: str, workflow_id: str, run_id: str, *, page_size: int = 1000
+    ) -> AsyncGenerator[Sequence[HistoryEvent], None]:
+        """A run's history page by page, so a reader that finds what it wants early stops
+        reading. Raises :class:`_Gone` when the run does not exist (any more)."""
+        token = b""
+        while True:
+            try:
+                resp = await self._wf.get_workflow_execution_history(
+                    GetWorkflowExecutionHistoryRequest(
+                        namespace=namespace,
+                        execution=WorkflowExecution(workflow_id=workflow_id, run_id=run_id),
+                        maximum_page_size=page_size,
+                        next_page_token=token,
+                        skip_archival=True,
+                    ),
+                    retry=True,
+                    timeout=_RPC_TIMEOUT,
+                )
+            except RPCError as e:
+                if e.status == RPCStatusCode.NOT_FOUND and not _namespace_missing(e):
+                    raise _Gone from e
+                if e.status == RPCStatusCode.INVALID_ARGUMENT:
+                    raise _Unnamed from e
+                raise TemporalError(f"history of {workflow_id} in {namespace}: {e.message}") from e
+            yield resp.history.events
+            token = resp.next_page_token
+            if not token:
+                return
+
+    async def _started_event(
+        self, namespace: str, workflow_id: str, run_id: str
+    ) -> HistoryEvent | None:
+        """The run's ``WorkflowExecutionStarted`` event (one small page), or None when the
+        run is gone."""
+        try:
+            async with aclosing(self._pages(namespace, workflow_id, run_id, page_size=1)) as pages:
+                async for events in pages:
+                    for e in events:
+                        if e.HasField("workflow_execution_started_event_attributes"):
+                            return e
+                        return None
+        except (_Gone, _Unnamed):
+            return None
+        return None
+
+    async def _close_event(self, namespace: str, workflow_id: str, run_id: str) -> HistoryEvent:
+        events = await self._events(namespace, workflow_id, run_id, close_only=True)
+        if not events:
+            raise TemporalError(f"{workflow_id} in {namespace} is closed but has no close event")
+        return events[-1]
+
+    async def observe(
+        self, namespace: str, workflow_id: str, call: BuyerCall, pinned: str | None
+    ) -> tuple[Observation, bytes | None]:
+        """What escrow needs of ``workflow_id`` in ``namespace`` (a seller's): its status and
+        times, whether the buyer's ``call`` started it (``provenance``, decisions I15) and,
+        once a verified run completed, the result payload exactly as stored -- a serialized
+        ``Payload``, ciphertext -- with that byte string's sha256 and size.
+
+        ``pinned``: the chain escrow pinned (``JobRecord.run_id``). With it, only that chain
+        is reported: the latest run of the id when the server says it descends from
+        ``pinned`` (its ``first_run_id``), else the chain's own last run, reached by following
+        each continue-as-new, retry or cron successor the server recorded, each accepted only
+        if its start names the run before it (:class:`ObservationIncomplete` when that takes
+        more than one call). Any other run of the id is never reported. Without it, the latest
+        run of the id is reported with the provenance of its chain's first run, and
+        ``run_id`` is that first run: escrow pins it when it is verified.
+
+        A chain's first run is the server's ``first_run_id``, which only the server sets (on
+        a continue-as-new, retry or cron successor; no start request carries it), read in one
+        call however long the chain: a walk with a budget would leave a long chain's
+        delivery unseen while a buyer cancels."""
         d = await self._describe(namespace, workflow_id)
+        if pinned:
+            return await self._observe_chain(namespace, workflow_id, pinned, d)
         if d is None:
             return Observation(status=ObservedStatus.NOT_FOUND), None
+        root = d.workflow_execution_info.first_run_id
+        if not root:
+            return await self._report(namespace, workflow_id, d, None, Provenance.UNVERIFIED)
+        provenance = await self._provenance(namespace, workflow_id, root, call)
+        return await self._report(namespace, workflow_id, d, root, provenance)
+
+    async def _report(
+        self,
+        namespace: str,
+        workflow_id: str,
+        d: DescribeWorkflowExecutionResponse,
+        root: str | None,
+        provenance: Provenance,
+        close: HistoryEvent | None = None,
+    ) -> tuple[Observation, bytes | None]:
+        """The observation of run ``d``. The result is read only for a verified completion:
+        nothing else can be a delivery."""
         info = d.workflow_execution_info
         status = _STATUS.get(info.status, ObservedStatus.RUNNING)
-        started = _time(info.start_time, info.HasField("start_time"))
-        closed = _time(info.close_time, info.HasField("close_time"))
-        if status is not ObservedStatus.COMPLETED:
-            return Observation(status=status, started_at=started, closed_at=closed), None
-        events = await self._events(namespace, workflow_id, info.execution.run_id, close_only=True)
+        obs = Observation(
+            status=status,
+            started_at=_time(info.start_time, info.HasField("start_time")),
+            closed_at=_time(info.close_time, info.HasField("close_time")),
+            provenance=provenance,
+            run_id=root,
+        )
+        if status is not ObservedStatus.COMPLETED or provenance is not Provenance.VERIFIED:
+            return obs, None
+        if close is None:
+            close = await self._close_event(namespace, workflow_id, info.execution.run_id)
         result = b""
-        for e in events:
-            if e.HasField("workflow_execution_completed_event_attributes"):
-                payloads = e.workflow_execution_completed_event_attributes.result.payloads
-                if payloads:
-                    result = payloads[0].SerializeToString(deterministic=True)
-                break
-        return (
-            Observation(
-                status=status,
-                started_at=started,
-                closed_at=closed,
-                result_sha256=sha256(result).hexdigest(),
-                result_size=len(result),
-            ),
-            result,
+        if close.HasField("workflow_execution_completed_event_attributes"):
+            payloads = close.workflow_execution_completed_event_attributes.result.payloads
+            if payloads:
+                result = payloads[0].SerializeToString(deterministic=True)
+        return replace(
+            obs, result_sha256=sha256(result).hexdigest(), result_size=len(result)
+        ), result
+
+    async def _observe_chain(
+        self,
+        namespace: str,
+        workflow_id: str,
+        root: str,
+        latest: DescribeWorkflowExecutionResponse | None,
+    ) -> tuple[Observation, bytes | None]:
+        """The latest run of the chain that starts at ``root`` (pinned, so verified).
+
+        Usually that is ``latest``, the latest run of the id, which the server says descends
+        from ``root``. Otherwise the chain closed and the seller started another run of the
+        id since: the chain is followed forward from the last run reached before (closed
+        runs never change), at most :data:`CHAIN_READS` runs per call, and a longer stretch
+        raises :class:`ObservationIncomplete` rather than reporting a delivery as unmade."""
+        if latest is not None and latest.workflow_execution_info.first_run_id == root:
+            return await self._report(namespace, workflow_id, latest, root, Provenance.VERIFIED)
+        key = (namespace, workflow_id, root)
+        run = self._heads.get(key, root)
+        for _ in range(CHAIN_READS):
+            d = await self._describe(namespace, workflow_id, run)
+            if d is None:
+                return Observation(status=ObservedStatus.NOT_FOUND, run_id=root), None
+            if d.workflow_execution_info.status not in _MAY_HAND_OVER:
+                return await self._report(namespace, workflow_id, d, root, Provenance.VERIFIED)
+            close = await self._close_event(namespace, workflow_id, run)
+            successor = _successor(close)
+            if not successor:
+                return await self._report(
+                    namespace, workflow_id, d, root, Provenance.VERIFIED, close
+                )
+            started = await self._started_event(namespace, workflow_id, successor)
+            back = (
+                started.workflow_execution_started_event_attributes.continued_execution_run_id
+                if started is not None
+                else None
+            )
+            if back != run:
+                # A hand-over the successor does not confirm: never seen from a real server,
+                # and nothing past it is known to descend from the buyer's call.
+                return await self._report(
+                    namespace, workflow_id, d, root, Provenance.UNVERIFIED, close
+                )
+            run = successor
+            _remember(self._heads, key, run)
+        raise ObservationIncomplete(
+            f"{workflow_id} in {namespace}: the pinned chain is longer than {CHAIN_READS} "
+            "runs past the last one reached; the next observation continues"
         )
 
-    async def history_summary(self, namespace: str, workflow_id: str) -> HistorySummary | None:
+    # ------------------------------------------------------------------ provenance
+
+    async def _provenance(
+        self, namespace: str, workflow_id: str, root: str, call: BuyerCall
+    ) -> Provenance:
+        """Whether the buyer's ``call`` started the chain whose first run is ``root``.
+        A definite answer never changes (every field compared is immutable once
+        written), so it is remembered; ``UNVERIFIED`` is asked again next time."""
+        key = (namespace, workflow_id, root, call)
+        known = self._verdicts.get(key)
+        if known is not None:
+            self._verdicts.move_to_end(key)
+            return known
+        verdict = await self._establish(namespace, workflow_id, root, call)
+        if verdict is not Provenance.UNVERIFIED:
+            _remember(self._verdicts, key, verdict)
+        return verdict
+
+    async def _establish(
+        self, namespace: str, workflow_id: str, root: str, call: BuyerCall
+    ) -> Provenance:
+        """The lookup itself (decisions I15).
+
+        From the seller's side, two facts only the server records: the request id the run
+        was *started* with (``request_id_infos``, the entry pointing at its started event;
+        a request id attached to an already-running run does not count) and the links of
+        its Nexus completion callbacks, which name the caller. Both are the seller's to
+        choose when it starts a workflow itself, so neither proves anything alone: a link
+        into the buyer's namespace must resolve there to a Nexus ``execute`` call on this
+        job's endpoint and service, carrying one of this job's hold tokens, whose request
+        id is the run's start request id. The run is then the one that call started (or a
+        restart with the call's own request id, which the pin and the call's record of the
+        run it started rule out where they can; decisions I15 has the residue)."""
+        d = await self._describe(namespace, workflow_id, root)
+        started = await self._started_event(namespace, workflow_id, root)
+        if d is None or started is None:
+            return Provenance.UNVERIFIED
+        request_ids = [
+            request_id
+            for request_id, info in d.workflow_extended_info.request_id_infos.items()
+            if info.event_type == _STARTED_EVENT and info.event_id == started.event_id
+        ]
+        if len(request_ids) != 1 or not request_ids[0]:
+            return Provenance.UNVERIFIED
+        links = [
+            link
+            for callback in started.workflow_execution_started_event_attributes.completion_callbacks
+            if callback.HasField("nexus")
+            for link in callback.links
+            if _namespace_of(link) == call.namespace
+        ]
+        verdicts: list[Provenance] = []
+        for link in links[:_LINKS_CHECKED]:
+            target = _Target(namespace, workflow_id, root, request_ids[0])
+            verdict = await self._resolve(link, target, call)
+            if verdict is Provenance.VERIFIED:
+                return verdict
+            verdicts.append(verdict)
+        return (
+            Provenance.UNVERIFIED
+            if Provenance.UNVERIFIED in verdicts
+            else Provenance.NOT_FROM_BUYER
+        )
+
+    async def _resolve(self, link: Link, target: _Target, call: BuyerCall) -> Provenance:
+        if link.HasField("nexus_operation"):
+            return await self._resolve_operation(link.nexus_operation, target, call)
+        if link.HasField("workflow_event"):
+            return await self._resolve_scheduled(link.workflow_event, target, call)
+        return Provenance.NOT_FROM_BUYER
+
+    async def _resolve_operation(
+        self, op: Link.NexusOperation, target: _Target, call: BuyerCall
+    ) -> Provenance:
+        """The script door: a standalone operation in the buyer's namespace, by its id and
+        run id (the run id is the server's, so a link written before the operation existed
+        cannot name it)."""
+        if not op.operation_id or not op.run_id:
+            return Provenance.NOT_FROM_BUYER
+        try:
+            resp: DescribeNexusOperationExecutionResponse = (
+                await self._wf.describe_nexus_operation_execution(
+                    DescribeNexusOperationExecutionRequest(
+                        namespace=call.namespace, operation_id=op.operation_id, run_id=op.run_id
+                    ),
+                    retry=True,
+                    timeout=_RPC_TIMEOUT,
+                )
+            )
+        except RPCError as e:
+            if e.status == RPCStatusCode.NOT_FOUND and not _namespace_missing(e):
+                return Provenance.UNVERIFIED
+            if e.status == RPCStatusCode.INVALID_ARGUMENT:
+                return Provenance.NOT_FROM_BUYER  # malformed ids name nothing (_Unnamed)
+            raise TemporalError(
+                f"describe operation {op.operation_id} in {call.namespace}: {e.message}"
+            ) from e
+        info = resp.info
+        if (info.operation_id, info.run_id) != (op.operation_id, op.run_id):
+            return Provenance.NOT_FROM_BUYER
+        if not _is_the_call(
+            info.endpoint,
+            info.service,
+            info.operation,
+            info.request_id,
+            info.nexus_header,
+            target,
+            call,
+        ):
+            return Provenance.NOT_FROM_BUYER
+        if not _names_only(info.links, target):
+            return Provenance.NOT_FROM_BUYER
+        return Provenance.VERIFIED
+
+    async def _resolve_scheduled(
+        self, ref: Link.WorkflowEvent, target: _Target, call: BuyerCall
+    ) -> Provenance:
+        """The workflow door: the ``NexusOperationScheduled`` event in the buyer workflow's
+        history the link points at, by event id, then that operation's
+        ``NexusOperationStarted`` event, whose links say which run the call started.
+
+        Only an event id is followed: it is how the server links a caller's scheduled event
+        (server 1.32, measured). A link by request id would have the gate read a buyer's
+        whole history looking for a string the seller chose."""
+        if not ref.workflow_id or not ref.run_id or not ref.HasField("event_ref"):
+            return Provenance.NOT_FROM_BUYER
+        if ref.event_ref.event_type != _SCHEDULED or ref.event_ref.event_id <= 0:
+            return Provenance.NOT_FROM_BUYER
+        event_id = ref.event_ref.event_id
+        scheduled: HistoryEvent | None = None
+        try:
+            async with aclosing(self._pages(call.namespace, ref.workflow_id, ref.run_id)) as pages:
+                async for events in pages:
+                    for e in events:
+                        if scheduled is None:
+                            if e.event_id < event_id:
+                                continue
+                            if e.event_id != event_id:
+                                return Provenance.NOT_FROM_BUYER
+                            if not e.HasField("nexus_operation_scheduled_event_attributes"):
+                                return Provenance.NOT_FROM_BUYER
+                            a = e.nexus_operation_scheduled_event_attributes
+                            if not _is_the_call(
+                                a.endpoint,
+                                a.service,
+                                a.operation,
+                                a.request_id,
+                                a.nexus_header,
+                                target,
+                                call,
+                            ):
+                                return Provenance.NOT_FROM_BUYER
+                            scheduled = e
+                        elif (
+                            e.HasField("nexus_operation_started_event_attributes")
+                            and e.nexus_operation_started_event_attributes.scheduled_event_id
+                            == scheduled.event_id
+                        ):
+                            if _names_only(e.links, target):
+                                return Provenance.VERIFIED
+                            return Provenance.NOT_FROM_BUYER
+        except _Gone:
+            return Provenance.UNVERIFIED
+        except _Unnamed:
+            return Provenance.NOT_FROM_BUYER
+        # Scheduled with no Started event (yet): nothing contradicts the call.
+        return Provenance.VERIFIED if scheduled is not None else Provenance.NOT_FROM_BUYER
+
+    async def history_summary(
+        self, namespace: str, workflow_id: str, pinned: str | None = None
+    ) -> HistorySummary | None:
         """Progress from history metadata (§8.4), or None when the workflow does not exist.
 
         ``last_event`` skips workflow-task bookkeeping (it would almost always be
         ``WorkflowTaskCompleted``); ``activities_running`` are the pending activities'
         type names; ``activities_completed`` and ``continue_as_new_count`` cover the whole
-        chain (lower bounds while a very long chain is still being counted)."""
+        chain (lower bounds while a very long chain is still being counted).
+
+        ``pinned``: the chain escrow pinned (``JobRecord.run_id``, decisions I15). The
+        summary is then of that chain only, read where :meth:`observe` reads it (the latest
+        run of the id when the server says it descends from ``pinned``, else the chain's own
+        last run), so another run of the id -- one the seller started itself -- never feeds
+        the buyer's progress. Without it, the latest run of the id, whoever started it, so a
+        gate must pass the pin as soon as it has one, and show a job's history progress to
+        its buyer only from a pinned chain."""
         d = await self._describe(namespace, workflow_id)
+        if pinned:
+            d = await self._pinned_run(namespace, workflow_id, pinned, d)
         if d is None:
             return None
         info = d.workflow_execution_info
@@ -760,10 +1309,7 @@ class Control:
                 if e.HasField("workflow_execution_started_event_attributes"):
                     attrs = e.workflow_execution_started_event_attributes
                     seen.previous = attrs.continued_execution_run_id
-            self._runs[key] = seen
-            self._runs.move_to_end(key)
-            while len(self._runs) > _CHAIN_CACHE:
-                self._runs.popitem(last=False)
+            _remember(self._runs, key, seen)
         completed, last, previous = seen.completed, seen.last, seen.previous
         runs, earlier = await self._chain_before(namespace, workflow_id, previous)
         return HistorySummary(
@@ -773,6 +1319,48 @@ class Control:
             activities_running=tuple(p.activity_type.name for p in d.pending_activities),
             continue_as_new_count=runs,
         )
+
+    async def _pinned_run(
+        self,
+        namespace: str,
+        workflow_id: str,
+        root: str,
+        latest: DescribeWorkflowExecutionResponse | None,
+    ) -> DescribeWorkflowExecutionResponse | None:
+        """The latest run reached of the chain that starts at ``root``, or None when that
+        chain is gone (past retention).
+
+        Usually ``latest``, the latest run of the id, whose ``first_run_id`` (set by the
+        server only) is ``root``. Otherwise the chain closed and the seller started another
+        run of the id since: the chain is followed forward as :meth:`observe` follows it,
+        through each successor whose start names the run before it, from the furthest run
+        either of them reached (the walk is shared), at most :data:`CHAIN_READS` runs per
+        call. Progress is not money: past that budget, or at a hand-over the successor does
+        not confirm, the furthest run reached is summarised and the next call goes on."""
+        if latest is not None and latest.workflow_execution_info.first_run_id == root:
+            return latest
+        key = (namespace, workflow_id, root)
+        run = self._heads.get(key, root)
+        d = await self._describe(namespace, workflow_id, run)
+        for _ in range(CHAIN_READS):
+            if d is None or d.workflow_execution_info.status not in _MAY_HAND_OVER:
+                return d
+            successor = _successor(await self._close_event(namespace, workflow_id, run))
+            if not successor:
+                return d
+            started = await self._started_event(namespace, workflow_id, successor)
+            if (
+                started is None
+                or started.workflow_execution_started_event_attributes.continued_execution_run_id
+                != run
+            ):
+                return d
+            ahead = await self._describe(namespace, workflow_id, successor)
+            if ahead is None:
+                return d
+            run, d = successor, ahead
+            _remember(self._heads, key, run)
+        return d
 
     async def _chain_before(self, namespace: str, workflow_id: str, run_id: str) -> tuple[int, int]:
         """(runs, completed activities) of the closed runs from ``run_id`` back to the start
@@ -808,10 +1396,7 @@ class Control:
             runs, completed = runs + 1, completed + count
             run_id = previous
         if start:
-            self._skips[start] = _Skip(run_id, runs, completed)
-            self._skips.move_to_end(start)
-            while len(self._skips) > _CHAIN_CACHE:
-                self._skips.popitem(last=False)
+            _remember(self._skips, start, _Skip(run_id, runs, completed))
         return runs, completed
 
     # ------------------------------------------------------------------ stopping
@@ -864,14 +1449,19 @@ class Control:
         headers (the hold token).
 
         Idempotent: an operation that already exists under ``operation_id`` -- running or
-        closed -- is success. The id may never be reused, so a hold token starts at most
+        closed -- is success. The id may never be reused (while the buyer's namespace
+        retains the operation: :data:`DEFAULT_RETENTION`), so a hold token starts at most
         one execution, and a retried request carries the same request id."""
         if schedule_to_close <= timedelta(0):
             raise ValueError("schedule_to_close must be positive")
         req = StartNexusOperationExecutionRequest(
             namespace=namespace,
             identity=self._identity,
-            request_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"kontra:{namespace}/{operation_id}")),
+            # The idempotency key of this RPC only: the request id the handler is sent, and
+            # that the run proves its call by (decisions I15), is one the server generates
+            # for the operation (server 1.32, measured). A retry of this request reuses it; a
+            # later call that finds the operation started is success whatever its own id.
+            request_id=str(uuid.uuid4()),
             operation_id=operation_id,
             endpoint=endpoint,
             service=service,

@@ -27,10 +27,22 @@ worker's handler checks the model: a target with neither or both gets a rejected
 **The targets are the buyer's.** Each one has an overall deadline, redirects are followed with
 HEAD (no body is ever read), and whatever a target does becomes the `error` of its `Head`. The
 old body's blocking `urllib` could not keep those promises (see `activities.py`), so the port
-uses httpx's async client instead. Targets are probed from your machine, though, and a
-`Head` tells the buyer the status and `Server` header of whatever answered: run the worker
-where they cannot reach anything private (cloud metadata, your LAN), or filter addresses
-before probing.
+uses httpx's async client instead.
+
+Targets are probed from your machine, inside your network, and a `Head` tells the buyer the
+status and `Server` header of whatever answered, so a target may only reach the public
+internet. Its host is resolved first and every address it resolves to must be public: not
+loopback, private (10/8, 172.16/12, 192.168/16, fc00::/7), link-local (169.254.169.254, the cloud
+metadata service, is one), carrier-grade NAT (100.64/10), multicast or unspecified, and an IPv6
+address carrying an IPv4 one (`::ffff:127.0.0.1`) is judged by that IPv4 address. The request
+then goes to the address that was checked, so a DNS answer that changes in between (rebinding)
+cannot redirect it, and each redirect is checked the same way. A target that fails the check
+gets the error `ForbiddenAddress`.
+
+To let buyers probe a private network on purpose, set `PROBE_ALLOWED_PRIVATE_NETWORKS` to it
+before starting the worker, comma-separated: `PROBE_ALLOWED_PRIVATE_NETWORKS=10.20.0.0/16`. It
+is unset by default; the tests set it to `127.0.0.1/32` to reach their own sites. Allow only
+what you mean buyers to reach.
 
 Run it like any offering:
 

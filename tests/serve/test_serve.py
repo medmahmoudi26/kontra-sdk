@@ -17,7 +17,14 @@ import jwt
 import pytest
 import pytest_asyncio
 from cryptography.hazmat.primitives.asymmetric import ec
-from temporalio.client import NexusOperationFailureError
+from temporalio.api.common.v1 import WorkflowExecution, WorkflowType
+from temporalio.api.enums.v1 import EventType, WorkflowIdConflictPolicy, WorkflowIdReusePolicy
+from temporalio.api.taskqueue.v1 import TaskQueue
+from temporalio.api.workflowservice.v1 import (
+    DescribeWorkflowExecutionRequest,
+    StartWorkflowExecutionRequest,
+)
+from temporalio.client import NexusOperationFailureError, WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
 
 from kontra.auth import Session
@@ -299,6 +306,63 @@ async def test_a_job_runs_once_per_hold(world: World) -> None:
     with pytest.raises(NexusOperationFailureError) as failed:
         await again.result()
     assert f"job {hired.job_id} already ran" in failure_text(failed.value)
+
+
+async def test_a_second_execute_while_the_job_runs_is_refused_not_attached(
+    world: World,
+) -> None:
+    """``job-<id>`` is started with conflict policy FAIL: a second ``execute`` with the same
+    hold while the job runs is refused, not attached to the running job (an attached call
+    did not start the run, so escrow would never count what it returns: decisions I15). The
+    first call is unaffected, and a retry of the handler's own start -- the same request
+    id, as Nexus retries it -- still finds its run rather than failing."""
+    value = {"text": "only once", "hold": True}
+    hired = await world.buyer.hire(world.entry, value)
+    first = await world.buyer.start(hired, value, result_type=Shout)
+    seller = world.mp.client(world.seller.namespace)
+    wf = job_workflow_id(hired.job_id)
+    for _ in range(200):
+        try:
+            if (await seller.get_workflow_handle(wf).describe()).status is (
+                WorkflowExecutionStatus.RUNNING
+            ):
+                break
+        except RPCError:
+            pass
+        await asyncio.sleep(0.05)
+    again = await world.buyer.start(hired, value)
+    with pytest.raises(NexusOperationFailureError) as failed:
+        await again.result()
+    assert f"job {hired.job_id} already ran (or is running)" in failure_text(failed.value)
+
+    described = await seller.workflow_service.describe_workflow_execution(
+        DescribeWorkflowExecutionRequest(
+            namespace=seller.namespace, execution=WorkflowExecution(workflow_id=wf)
+        )
+    )
+    run_id = described.workflow_execution_info.execution.run_id
+    infos = described.workflow_extended_info.request_id_infos
+    [started_with] = [
+        rid
+        for rid, info in infos.items()
+        if info.event_type == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED
+    ]
+    assert len(infos) == 1  # nothing was attached to the run
+    retried = await seller.workflow_service.start_workflow_execution(
+        StartWorkflowExecutionRequest(
+            namespace=seller.namespace,
+            workflow_id=wf,
+            workflow_type=WorkflowType(name="UpperFlow"),
+            task_queue=TaskQueue(name=world.bound.offering_id.task_queue),
+            request_id=started_with,
+            workflow_id_reuse_policy=WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+            workflow_id_conflict_policy=WorkflowIdConflictPolicy.WORKFLOW_ID_CONFLICT_POLICY_FAIL,
+        )
+    )
+    assert retried.run_id == run_id  # the first start's own answer: no error, no new run
+
+    await seller.get_workflow_handle(wf).signal("release")
+    assert (await first.result()).text == "ONLY ONCE"
 
 
 # --------------------------------------------------------------------------- progress & history

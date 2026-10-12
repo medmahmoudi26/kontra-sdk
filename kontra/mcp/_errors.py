@@ -128,13 +128,15 @@ def tool_error(err: BaseException) -> tuple[str, str, dict[str, Any]]:
             )
             return "job_failed", message, detail
         case KontraError():
-            fields = {k: v for k, v in err.fields.items() if k != "code"}
-            cause = err.__cause__
-            if isinstance(cause, GateError) and cause.detail:
-                # The gate's own detail, e.g. the job_id of ``quote_used``: a hire retried
-                # after an ambiguous failure learns which job its quote already made.
-                fields = {**cause.detail, **fields}
-            return _kontra_code(err), err.message, fields
+            fields = {k: v for k, v in err.fields.items() if k not in ("code", "detail")}
+            # The gate's own detail. A HireRefused carries it (``quote_used`` names the job
+            # its quote already made: a hire retried after an ambiguous failure finds it);
+            # the money refusals (amounts in minor units) keep it on the GateError they were
+            # raised from.
+            gate = err.detail if isinstance(err, HireRefused) else None
+            if not gate and isinstance(err.__cause__, GateError):
+                gate = err.__cause__.detail
+            return _kontra_code(err), err.message, {**(gate or {}), **fields}
         case GateError():
             message = err.message
             if err.status == 401:

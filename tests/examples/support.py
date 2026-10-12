@@ -37,6 +37,12 @@ SELLERS = ("enrich", "legacy-actor")
 KEY_FILE = EXAMPLES / "example-public-key.txt"
 #: What a buyer is funded with, in cents.
 START = 10_000
+#: The example sellers fetch only public addresses unless told otherwise (their READMEs);
+#: the test sites are on 127.0.0.1, so the tests allow that address, and no other.
+ALLOW_LOCAL_SITES = {
+    "ENRICH_ALLOWED_PRIVATE_NETWORKS": "127.0.0.1/32",
+    "PROBE_ALLOWED_PRIVATE_NETWORKS": "127.0.0.1/32",
+}
 
 
 def example_public_key() -> str:
@@ -179,12 +185,14 @@ class Market:
 
 def seller_env(home: Path, sites: Sites) -> dict[str, str]:
     """The seller processes' environment: the party's profile, every heartbeat forwarded
-    one by one (acceptance 13 counts them), and the test sites' CA trusted for HTTPS."""
+    one by one (acceptance 13 counts them), the test sites' CA trusted for HTTPS, and their
+    address (127.0.0.1) allowed as a destination."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("KONTRA_")}
     env.update(
         KONTRA_HOME=str(home),
         KONTRA_PROGRESS_INTERVAL="0",
         SSL_CERT_FILE=str(sites.ca_file),
         PYTHONUNBUFFERED="1",
+        **ALLOW_LOCAL_SITES,
     )
     return env

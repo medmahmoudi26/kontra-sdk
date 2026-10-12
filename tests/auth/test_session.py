@@ -325,6 +325,50 @@ async def test_connect_temporal_arguments(
     ]
 
 
+def _refreshers() -> list[asyncio.Task[Any]]:
+    """The api_key refreshers alive in this event loop, by asyncio's own bookkeeping."""
+    return [
+        t
+        for t in asyncio.all_tasks()
+        if t.get_name().startswith("kontra-temporal-token-") and not t.done()
+    ]
+
+
+async def test_release_stops_that_clients_refresher_only(
+    home: Path, gate: FakeGate, clock: FakeClock
+) -> None:
+    """FIXUPS #23: whoever is done with a client stops its refresher, while the session
+    (shared with others) lives on; nothing is left running for the released client."""
+    sleep = FakeSleep(clock, budget=0)
+    async with session(home, gate, clock, sleep=sleep) as s:
+        mine, theirs = FakeClient("x"), FakeClient("y")
+        task = s.keep_fresh(mine)
+        other = s.keep_fresh(theirs)
+        await asyncio.sleep(0)
+        assert set(_refreshers()) == {task, other}
+        await s.release(mine)
+        assert task.cancelled()
+        assert _refreshers() == [other]
+        assert list(s._tasks.values()) == [theirs]
+        await s.release(mine)  # idempotent
+        await s.release(FakeClient("never connected"))
+        assert _refreshers() == [other]
+    assert other.cancelled()
+    assert _refreshers() == []
+
+
+async def test_connect_temporal_then_release_leaves_no_task(
+    home: Path, gate: FakeGate, clock: FakeClock
+) -> None:
+    sleep = FakeSleep(clock, budget=0)
+    async with session(home, gate, clock, sleep=sleep) as s:
+        client = await s.connect_temporal(lazy=True)
+        assert len(_refreshers()) == 1
+        await s.release(client)
+        assert _refreshers() == []
+        assert not s._tasks
+
+
 async def test_aclose_cancels_every_refresher(home: Path, gate: FakeGate, clock: FakeClock) -> None:
     sleep = FakeSleep(clock, budget=0)
     s = session(home, gate, clock, sleep=sleep)
@@ -426,3 +470,46 @@ def test_the_refresh_token_is_not_in_the_profile_repr() -> None:
     assert "kr_supersecret" not in repr(p)
     assert "kr_supersecret" not in str(p)
     assert p.model_dump()["refresh_token"] == "kr_supersecret"  # still saved
+
+
+async def test_a_closed_session_starts_no_refresher(
+    home: Path, gate: FakeGate, clock: FakeClock
+) -> None:
+    """A refresher started after :meth:`Session.aclose` would run forever against a closed
+    gate client: nobody would ever cancel it. A client connecting while the session closes
+    (its token was cached), or a ``keep_fresh`` after it, is refused instead."""
+    sleep = FakeSleep(clock, budget=0)
+    s = session(home, gate, clock, sleep=sleep)
+    await s.temporal_token()  # cached: connect_temporal needs no gate call
+    await s.aclose()
+    with pytest.raises(RuntimeError, match="closed"):
+        s.keep_fresh(FakeClient("x"))
+    with pytest.raises(RuntimeError, match="closed"):
+        await s.connect_temporal(lazy=True)
+    assert _refreshers() == []
+    assert not s._tasks  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_a_client_connected_while_the_session_closes_is_not_kept_fresh(
+    home: Path, gate: FakeGate, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from temporalio.client import Client
+
+    sleep = FakeSleep(clock, budget=0)
+    s = session(home, gate, clock, sleep=sleep)
+    connecting, closed = asyncio.Event(), asyncio.Event()
+    real_connect = Client.connect
+
+    async def slow_connect(*args: Any, **kwargs: Any) -> Client:
+        connecting.set()
+        await closed.wait()
+        return await real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(Client, "connect", slow_connect)
+    pending = asyncio.ensure_future(s.connect_temporal(lazy=True))
+    await connecting.wait()
+    await s.aclose()
+    closed.set()
+    with pytest.raises(RuntimeError, match="closed"):
+        await pending
+    assert _refreshers() == []

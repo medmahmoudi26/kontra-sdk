@@ -11,6 +11,7 @@ This module runs inside workflow code: it imports only the standard library and 
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar
@@ -107,13 +108,26 @@ class InsufficientFunds(KontraError):
 
 class HireRefused(KontraError):
     """The gate refused a quote or hire for a reason the buyer must act on (no such
-    offering, the quote expired, the offering was retired...). ``code`` is the gate's."""
+    offering, the quote expired, the offering was retired...), or the SDK refused what the
+    gate answered. ``code``, ``status`` and ``detail`` are the gate's: ``quote_used``'s
+    ``detail["job_id"]`` names the job that quote already made, so a hire retried after an
+    answer was lost finds the money it locked. A hold the SDK refuses to use
+    (``hold_mismatch``) names its job the same way."""
 
     wire_type = _PREFIX + "HireRefused"
 
-    def __init__(self, message: str, *, code: str = "", status: int = 0) -> None:
-        super().__init__(message, code=code, status=status)
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "",
+        status: int = 0,
+        detail: Mapping[str, Any] | None = None,
+    ) -> None:
+        found = dict(detail or {})
+        super().__init__(message, code=code, status=status, detail=found)
         self.code, self.status = code, status
+        self.detail: dict[str, Any] = found
 
 
 class InvalidInput(KontraError):
@@ -128,10 +142,11 @@ class InvalidInput(KontraError):
 
 
 class JobFailed(KontraError):
-    """A hired job ended without a delivery: the seller refused to start it, its workflow
-    failed or timed out, or it was canceled. It is raised once the gate has closed the job
-    without counting a delivery, so its hold is refunded (§8.3); when the gate could not be
-    asked, the gate still refunds by the job's deadline unless it saw a delivery.
+    """A hired job ended without a delivery: the seller refused to start it, it could not
+    be started at all, its workflow failed or timed out, or it was canceled. It is raised
+    once the gate has closed the job without counting a delivery, so its hold is refunded
+    (§8.3); when the gate could not be asked, the gate still refunds by the job's deadline
+    unless it saw a delivery -- ``job_id`` says which job to look at.
 
     ``state`` is the A2A state (``failed`` or ``canceled``); ``reason`` says why, in the
     seller's words when the seller gave any (failure messages are encrypted to the buyer).

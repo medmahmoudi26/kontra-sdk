@@ -4,6 +4,8 @@ contract, encrypts it, and decrypts what comes back."""
 
 from __future__ import annotations
 
+import os
+import secrets
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -205,6 +207,40 @@ def jobs(as_: str, state: str | None, limit: int, as_json: bool) -> None:
         click.echo(_job_line(v))
 
 
+def _private_dirs(directory: Path) -> None:
+    """Create ``directory`` and its missing parents, each exactly 0700 (``mkdir -p`` would
+    make the parents 0755 and filter the leaf's mode through the umask). Directories that
+    already exist are left as they are."""
+    missing: list[Path] = []
+    here = directory
+    while not here.exists() and here != here.parent:
+        missing.append(here)
+        here = here.parent
+    for made in reversed(missing):
+        try:
+            made.mkdir(mode=0o700)
+        except FileExistsError:  # made meanwhile by someone else: not ours to change
+            continue
+        os.chmod(made, 0o700)
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically, as a 0600 file: a new file under a temporary
+    name, renamed over ``path`` (never written through a file or link already there)."""
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.part")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)  # exactly 0600, whatever the umask
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 async def _download_all(value: Any, directory: Path) -> list[Path]:
     """Every artifact in a delivery, into ``directory`` (named by its key: never by a name
     the seller chose)."""
@@ -279,13 +315,14 @@ def job(
             return events
         if result_dir is not None:
             value = await j.result()
-            # What lands here is the decrypted delivery: a directory made for it is the
-            # buyer's alone (0700), whatever the umask; an existing one is left as it is.
-            await asyncio.to_thread(result_dir.mkdir, mode=0o700, parents=True, exist_ok=True)
+            # What lands here is the decrypted delivery: directories made for it are the
+            # buyer's alone (0700) and so is every file (0600), whatever the umask and
+            # whatever the mode of a directory that already exists.
+            await asyncio.to_thread(_private_dirs, result_dir)
             files = await _download_all(value, result_dir)
             target = result_dir / "result.json"
             text = json.dumps(to_jsonable(value), indent=2) + "\n"
-            await asyncio.to_thread(target.write_text, text, encoding="utf-8")
+            await asyncio.to_thread(_write_private, target, text)
             return {"result": str(target), "artifacts": [str(f) for f in files]}
         return await j.status()
 

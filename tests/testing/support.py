@@ -20,6 +20,7 @@ from temporalio.api.common.v1 import Payload
 
 from kontra._control import (
     DEFAULT_RETENTION,
+    BuyerCall,
     EndpointConflict,
     EndpointInfo,
     HistorySummary,
@@ -29,7 +30,7 @@ from kontra._control import (
 )
 from kontra.auth import Session, login
 from kontra.contract import derive_document, parse_offering
-from kontra.escrow import Observation, ObservedStatus
+from kontra.escrow import Observation, ObservedStatus, Provenance
 from kontra.gate_client import models as m
 
 # --------------------------------------------------------------------------- the contract
@@ -146,6 +147,10 @@ class ScriptedControl:
         default_factory=list[tuple[str, str, str, str, Payload, dict[str, str], float]]
     )
     starts: list[Started] = field(default_factory=list[Started])
+    #: every observe call: (namespace, workflow id, the buyer's call, the pinned run)
+    observed: list[tuple[str, str, BuyerCall, str | None]] = field(
+        default_factory=list[tuple[str, str, BuyerCall, str | None]]
+    )
     cancels: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
     terminates: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
     fail_endpoints: Exception | None = None
@@ -160,6 +165,12 @@ class ScriptedControl:
         result: bytes | None = None,
         **kw: Any,
     ) -> None:
+        """Script what the next observations of ``workflow_id`` see. Unless ``provenance`` /
+        ``run_id`` say otherwise, it is the run the buyer's call started (``run-1``), as
+        :class:`~kontra._control.Control` would have verified it."""
+        if status is not ObservedStatus.NOT_FOUND:
+            kw.setdefault("provenance", Provenance.VERIFIED)
+            kw.setdefault("run_id", "run-1")
         self.observations[(namespace, workflow_id)] = (Observation(status=status, **kw), result)
 
     async def ensure_namespace(
@@ -206,7 +217,10 @@ class ScriptedControl:
             return out
         return NexusSyncResult(NexusSyncKind.OK, payload=out)
 
-    async def observe(self, namespace: str, workflow_id: str) -> tuple[Observation, bytes | None]:
+    async def observe(
+        self, namespace: str, workflow_id: str, call: BuyerCall, pinned: str | None
+    ) -> tuple[Observation, bytes | None]:
+        self.observed.append((namespace, workflow_id, call, pinned))
         if self.fail_observe is not None:
             raise self.fail_observe
         return self.observations.get(

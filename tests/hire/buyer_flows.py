@@ -17,6 +17,8 @@ class Order(BaseModel):
     text: str
     mode: str = "ok"
     max_price: str | None = None
+    #: Heartbeats (``beats`` mode) or seconds of work (``quiet`` mode) of the seller's job.
+    beats: int = 0
 
 
 @workflow.defn
@@ -26,7 +28,7 @@ class HireOne:
     @workflow.run
     async def run(self, order: Order) -> dict[str, Any]:
         out = await service(order.offering, max_price=order.max_price).execute(
-            text=order.text, mode=order.mode
+            text=order.text, mode=order.mode, beats=order.beats
         )
         return {
             "record": out.to_dict(),

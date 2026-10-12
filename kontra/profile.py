@@ -23,7 +23,7 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Collection
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -141,6 +141,25 @@ def _write_private(path: Path, data: bytes, *, replace: bool) -> bool:
             os.unlink(tmp)
 
 
+def _problems(err: ValidationError, fields: Collection[str]) -> str:
+    """What is wrong with the profile, field by field, and never a value: pydantic's own
+    rendering quotes the input, and this file holds a refresh token (or whatever was pasted
+    into it -- an age secret key, say), which would then reach a terminal, a log or an agent.
+    A key is named only when it is one of ``fields``, the profile's own: any other key is the
+    file's content too (a token pasted where a name belongs)."""
+    found: list[str] = []
+    for e in err.errors(include_url=False, include_context=False, include_input=False):
+        loc = e["loc"]
+        if not loc:
+            where = "the profile"
+        elif isinstance(loc[0], str) and loc[0] in fields:
+            where = loc[0]  # nothing in a profile is nested: the field says where
+        else:
+            where = "an unknown field"
+        found.append(f"{where}: {e['msg']}")
+    return "; ".join(dict.fromkeys(found)) or "it does not parse"
+
+
 class Profile(BaseModel):
     """What ``kontra login`` writes. ``refresh_token`` is rotated by the gate on use, and
     :class:`kontra.auth.Session` writes the new one back here."""
@@ -167,8 +186,8 @@ class Profile(BaseModel):
     @field_validator("party", "namespace")
     @classmethod
     def _handle(cls, value: str) -> str:
-        if not is_handle(value):
-            raise ValueError(f"{value!r} is not a party handle")
+        if not is_handle(value):  # the value stays out of the message (see _problems)
+            raise ValueError("not a party handle")
         return value
 
     @field_validator("gate_url")
@@ -198,12 +217,16 @@ class Profile(BaseModel):
         try:
             profile = cls.model_validate_json(raw)
         except ValidationError as e:
-            raise ProfileError(
-                f"the profile at {path} is not valid ({e.error_count()} problem(s)): {e}\n"
-                "Run `kontra login` to write a new one."
-            ) from e
-        profile._home = h
-        return profile
+            problems = _problems(e, cls.model_fields)
+        else:
+            profile._home = h
+            return profile
+        # Raised here, outside the handler: the ValidationError (which quotes the input) is
+        # neither this error's cause nor its context, so no traceback prints it.
+        raise ProfileError(
+            f"the profile at {path} is not valid: {problems}. "
+            "Run `kontra login` to write a new one."
+        )
 
     def save(self, home: Path | str | None = None) -> Path:
         """Write the profile (0600) and return its path. Without ``home``, it goes back
