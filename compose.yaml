@@ -29,6 +29,15 @@
 #   KONTRA_PUBLIC_URL, KONTRA_TEMPORAL_PUBLIC, KONTRA_S3_PUBLIC_ENDPOINT
 #                                  what clients are told (default: localhost and the ports)
 #   KONTRA_TEMPORAL_TLS (0)        1 when clients reach Temporal through a TLS proxy
+#   KONTRA_CONTROL_NET (172.16.251)
+#                                  the first three octets of the `control` network: the
+#                                  stack takes .0/28 of it, Temporal is .2, every other
+#                                  address comes from .8/29. Change it only if
+#                                  172.16.251.0/28 collides with a network of yours, or
+#                                  to run a second stack from this file on the same
+#                                  host (Docker refuses overlapping subnets)
+#                                  (`kontra dev up` does not remember it: put it in
+#                                  $KONTRA_HOME/dev.env to keep it)
 #   KONTRA_PG_USER, KONTRA_PG_DB (kontra), KONTRA_S3_BUCKET (kontra), KONTRA_S3_REGION,
 #   KONTRA_LEDGER (postgres), KONTRA_JWKS_REFRESH (15s), and the gate's other KONTRA_*
 #   settings, passed through when set (signing keys, resolvers, fee, GitHub, Stripe).
@@ -41,15 +50,22 @@
 #
 # The internal frontend (7236 gRPC, 7246 HTTP) has no authentication: whoever reaches it
 # controls every namespace. It is never published (only the public frontend, 7233, is), and
-# Temporal shares a network with the gate and with nothing else that could reach it. Each
-# service joins only the networks it needs:
+# it listens on one address only: Temporal's fixed address on `control`, the network it
+# shares with the gate and nothing else. `control` has a pinned subnet (KONTRA_CONTROL_NET)
+# so that address is known before Temporal starts, which it must be: Temporal binds the
+# internal frontend there and dials its own system worker, Nexus dispatch and completions
+# there too. Each service joins only the networks it needs:
 #   control      temporal, gate              the internal frontend; the gate's JWKS
 #   temporal-db  temporal, postgres-relay    Temporal's own database connections
 #   database     postgres, postgres-relay, gate, migrate
 #   bucket       s3, gate                    SeaweedFS's own unauthenticated ports
-# Temporal binds the internal frontend on every interface it has (0.0.0.0, which its own
-# services dial as the local system): it dials the address it binds, but a compose
-# network's address is not known before the container starts. Hence Temporal is not on
+# Temporal's other listeners (the public frontend, authenticated) answer on every network
+# it is on; the internal frontend does not listen on `temporal-db`. The bind alone does not
+# close that network, though: Linux delivers a packet for any of a host's addresses on any
+# of its interfaces, so a peer there that routes Temporal's `control` address through
+# Temporal's `temporal-db` address reaches the internal frontend (measured). Adding that
+# route takes NET_ADMIN, and forging the frame NET_RAW: the relay, Temporal's only peer
+# there, has no capability and is not root, and must stay so. Temporal is not on
 # `database`: Postgres (large third-party code that a SQL injection reaches) and the
 # migrate job share no network with it, and Docker drops traffic between bridge networks,
 # so no address of Temporal is reachable from them. Temporal reaches Postgres through
@@ -61,14 +77,17 @@
 # neither Temporal nor Postgres, and only the gate reaches SeaweedFS's master, volume and
 # filer ports.
 #
-# Every service runs with no capabilities at all (cap_drop ALL, none added back), cannot
-# gain any (no-new-privileges), and has a read-only root filesystem: it writes only to its
-# volume or to a tmpfs that holds nothing across restarts, so code that takes one over
-# cannot replace the service's own binaries or leave anything behind for the next start.
-# Postgres runs as its own user, not root: its entrypoint needs root only to chown a data
-# directory that the named volume already gives postgres. SeaweedFS keeps the image's root
-# user, which owns /data: without capabilities, root is only the owner of root's files, and
-# with a read-only root those are /data and the tmpfs. The gate and Temporal images run as
+# Every service runs with no capabilities at all (cap_drop ALL, none added back; the one
+# exception is s3-owner, below), cannot gain any (no-new-privileges), and has a read-only
+# root filesystem: it writes only to its volume or to a size-capped tmpfs that holds
+# nothing across restarts, so code that takes one over cannot replace the service's own
+# binaries, leave anything behind for the next start, or fill the host's memory. No
+# long-running service runs as root. Postgres runs as its own user: its entrypoint needs
+# root only to chown a data directory that the named volume already gives postgres. The
+# SeaweedFS image has no user but root, and its /data -- so the named volume, which Docker
+# fills from it -- belongs to root: s3-owner, a one-shot with no network and two
+# capabilities (CHOWN, DAC_READ_SEARCH) for one fixed chown, hands the volume to the
+# unprivileged uid SeaweedFS then runs as. The gate and Temporal images run as
 # unprivileged users and write nothing at runtime.
 #
 # Third-party images are pinned by digest, the tag kept beside it; dependabot proposes
@@ -102,7 +121,7 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs:
-      - /var/run/postgresql # the server's socket and its lock file
+      - /var/run/postgresql:size=1m # the server's socket and its lock file
     ports:
       - "${KONTRA_DEV_PG_BIND:-127.0.0.1}:${KONTRA_DEV_PG_PORT:-5432}:5432"
     healthcheck:
@@ -133,12 +152,30 @@ services:
       net.ipv4.ip_forward: 0 # on two networks: never a router between them (see the header)
     tmpfs:
       # The image's VOLUME: a tmpfs here instead of an anonymous volume per container.
-      - /var/lib/postgresql/data
+      - /var/lib/postgresql/data:size=1m
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
     networks: [temporal-db, database]
+
+  s3-owner:
+    # Hands the bucket's volume to the uid SeaweedFS runs as (see the header), then exits:
+    # the image's /data, which Docker copies into a new volume, belongs to root, and so
+    # does everything a SeaweedFS that once ran as root wrote. Root with two capabilities and
+    # nothing else -- no network, a read-only root -- running one fixed command: CHOWN, and
+    # DAC_READ_SEARCH to walk the directories SeaweedFS creates 0700 for itself (on every
+    # start after the first, the walk finds them all its own already).
+    image: chrislusf/seaweedfs:3.80@sha256:1055999e08eed1789b0ae45d235126e4495e23d3fb9d6396293fd42539b1ae6a
+    entrypoint: ["chown", "-R", "10001:10001", "/data"]
+    volumes:
+      - s3:/data
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
 
   s3:
     # The claim-check bucket (ciphertext only). SeaweedFS: MinIO's images can no longer be
@@ -173,12 +210,14 @@ services:
         "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
     volumes:
       - s3:/data
-    # The image's root user, which owns /data (see the header).
+    # Not root: the volume is this uid's (s3-owner). The image has no user of its own, and
+    # SeaweedFS needs none: its ports are all above 1024.
+    user: "10001:10001"
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs:
-      - /tmp # the identities config and SeaweedFS's unix sockets (s3, filer)
+      - /tmp:size=1m # the identities config and SeaweedFS's unix sockets (s3, filer)
     ports:
       - "${KONTRA_DEV_BIND:-127.0.0.1}:${KONTRA_DEV_S3_PORT:-8333}:8333"
     healthcheck:
@@ -187,6 +226,9 @@ services:
       timeout: 5s
       retries: 60
       start_period: 5s
+    depends_on:
+      s3-owner:
+        condition: service_completed_successfully
     restart: unless-stopped
     networks: [bucket]
 
@@ -203,14 +245,15 @@ services:
       KONTRA_DB_PASSWORD: ${KONTRA_PG_PASSWORD:?set KONTRA_PG_PASSWORD}
       KONTRA_AUTO_SETUP: "1"
       KONTRA_FRONTEND_BIND_IP: 0.0.0.0
-      KONTRA_INTERNAL_FRONTEND_BIND_IP: 0.0.0.0 # control + temporal-db only; never in `ports`
+      # Temporal's address on `control` (below), and only that: never in `ports`.
+      KONTRA_INTERNAL_FRONTEND_BIND_IP: ${KONTRA_CONTROL_NET:-172.16.251}.2
       KONTRA_JWKS_URLS: http://gate:8080/.well-known/jwks.json
       KONTRA_JWKS_REFRESH: ${KONTRA_JWKS_REFRESH:-15s}
       KONTRA_LOG_LEVEL: ${KONTRA_TEMPORAL_LOG_LEVEL:-warn}
       # Never a proxy. Compose copies a Docker client's proxy settings into every container,
-      # and Go exempts only loopback from them: Temporal dials its internal frontend at
-      # 0.0.0.0, so its own gRPC (it would not start) and its Nexus tasks and completion
-      # tokens would go to that proxy. Temporal reaches nothing but the gate's JWKS and
+      # and Go exempts only loopback from them: Temporal dials its internal frontend at its
+      # `control` address, so its own gRPC (it would not start) and its Nexus tasks and
+      # completion tokens would go to that proxy. Temporal reaches nothing but the gate's JWKS and
       # postgres-relay, on these networks. An empty value wins over the injected one.
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
@@ -229,7 +272,11 @@ services:
     restart: unless-stopped
     sysctls:
       net.ipv4.ip_forward: 0 # on two networks: never a router between them (see the header)
-    networks: [control, temporal-db]
+    networks:
+      control:
+        # Fixed, outside the range the others draw from: the internal frontend binds it.
+        ipv4_address: ${KONTRA_CONTROL_NET:-172.16.251}.2
+      temporal-db: {}
 
   migrate:
     # The gate's schema (alembic), run to completion before the gate starts: in
@@ -312,6 +359,13 @@ volumes:
 
 networks:
   control:
+    ipam:
+      config:
+        # Outside Docker's default pools (172.17-31.0.0/16, 192.168.0.0/16), so no network
+        # Docker allocates by itself collides with it; KONTRA_CONTROL_NET moves it. Dynamic
+        # addresses come from ip_range only, so nothing else can take Temporal's .2.
+        - subnet: ${KONTRA_CONTROL_NET:-172.16.251}.0/28
+          ip_range: ${KONTRA_CONTROL_NET:-172.16.251}.8/29
   temporal-db:
   database:
   bucket:

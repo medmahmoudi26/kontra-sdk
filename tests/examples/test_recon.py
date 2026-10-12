@@ -142,7 +142,7 @@ async def test_recon_refunds_the_enrichment_when_the_probe_fails(door: Door) -> 
             "canceled by buyer",
         )
         enrich = seller.get_workflow_handle(job_workflow_id(views[ENRICH].job_id))
-        assert (await enrich.describe()).status is WorkflowExecutionStatus.CANCELED
+        assert (await enrich.describe()).status is WorkflowExecutionStatus.TERMINATED
         bal = await door.buyer.balance()
         assert (bal.available_minor, bal.held_minor) == (START, 0)
     finally:

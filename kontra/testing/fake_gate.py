@@ -167,7 +167,9 @@ SEARCH_Q_MAX = 200
 
 _T = TypeVar("_T")
 _OPEN = (m.JobState.SUBMITTED, m.JobState.WORKING)
-_STOPS = frozenset({EffectKind.CANCEL_WORKFLOW, EffectKind.TERMINATE_WORKFLOW})
+_STOPS = frozenset(
+    {EffectKind.CANCEL_WORKFLOW, EffectKind.TERMINATE_WORKFLOW, EffectKind.TERMINATE_RUN}
+)
 _CLOSED_ESCROW = frozenset({m.Escrow.RELEASED, m.Escrow.REFUNDED, m.Escrow.RESOLVED})
 _ESCROW_HOLD = {
     m.Escrow.HELD: HoldState.HELD,
@@ -1639,7 +1641,11 @@ class FakeGate:
         valid until it expires and the seller's handler checks it offline, so the buyer
         could otherwise run ``execute`` with it after the refund and get a short job done
         for free. If a run appeared in the meantime, it is looked at again and stopped as a
-        running job's is. If the id cannot be taken, the cancel is refused."""
+        running job's is. If the id cannot be taken, the cancel is refused.
+
+        A job with an observed run is canceled in the two steps of :func:`escrow.cancel`:
+        its run is terminated, and the refund waits for what Temporal shows of the pinned
+        chain afterwards (:meth:`_complete_cancel`)."""
         job = self.job_for(job_id, who.party)
         if who.party == job.record.buyer and job.record.open and self.control is not None:
             obs = await self._look_before_cancel(job)
@@ -1658,7 +1664,36 @@ class FakeGate:
                 if occupied is Occupation.STARTED:
                     await self._look_before_cancel(job)
         now = self.now()
-        return (await self._transition(job_id, lambda r: escrow.cancel(r, who.party, now))).view()
+        job = await self._transition(job_id, lambda r: escrow.cancel(r, who.party, now))
+        if job.record.open:
+            await self._complete_cancel(job)
+            # Closed now: canceled (refunded, an idempotent repeat), or delivered or failed
+            # before the termination landed (refused, 409, as any cancel of a closed job).
+            now = self.now()
+            job = await self._transition(job_id, lambda r: escrow.cancel(r, who.party, now))
+        return job.view()
+
+    async def _complete_cancel(self, job: _Job) -> None:
+        """Step two of a cancel of a job with an observed run. The cancel's
+        ``TERMINATE_RUN`` has been carried out (or failed, and is still pending); the money
+        now follows what Temporal shows of the pinned chain, never the request alone:
+        terminated is the buyer's cancel, refunded; completed first is a delivery, which
+        stands. A termination that did not land, or a chain that cannot be observed, is a
+        503: the cancel stays requested, the sweeper keeps terminating and observing until
+        the chain closes, and asking again is safe."""
+        if job.pending_stop is EffectKind.TERMINATE_RUN or self.control is None:
+            raise GateHTTPError(
+                503,
+                "temporal_unavailable",
+                "could not stop the job's run yet; the cancel stands, try again shortly",
+            )
+        await self._look_before_cancel(job)
+        if job.record.open:
+            raise GateHTTPError(
+                503,
+                "temporal_unavailable",
+                "the job's run is still being stopped; the cancel stands, try again shortly",
+            )
 
     async def _look_before_cancel(self, job: _Job) -> Observation:
         """Observe ``job-<id>`` and apply what it shows, for a cancel: 503 when Temporal
@@ -1899,14 +1934,28 @@ class FakeGate:
                 if job.split is None:
                     raise RuntimeError(f"job {job.job_id} is resolved but no split is recorded")
                 await self.ledger.resolve(job.job_id, job.split)
-            case EffectKind.CANCEL_WORKFLOW | EffectKind.TERMINATE_WORKFLOW:
+            case (
+                EffectKind.CANCEL_WORKFLOW
+                | EffectKind.TERMINATE_WORKFLOW
+                | EffectKind.TERMINATE_RUN
+            ):
                 await self._stop_workflow(job, effect.kind, effect.reason)
 
     async def _stop_workflow(self, job: _Job, kind: EffectKind, reason: str) -> None:
+        """Carry out a workflow stop. ``TERMINATE_RUN`` (a cancel's) terminates the open run
+        of ``job-<id>``: that is the pinned chain's run whenever the chain is still open (a
+        workflow id has one open run at most), and when it is not, whatever the termination
+        hits is a run nobody may work on; what it achieved for the money is read back from
+        the pinned chain by the caller, never assumed."""
         if self.control is not None:
             ns, wf = job.record.seller_ns, job.workflow_id
             if kind is EffectKind.CANCEL_WORKFLOW:
                 await self.control.cancel_workflow(ns, wf, reason)
+            elif kind is EffectKind.TERMINATE_RUN:
+                # Only the pinned chain: a run outside it is never terminated by a cancel.
+                await self.control.terminate_workflow(
+                    ns, wf, reason, first_run_id=job.record.run_id or ""
+                )
             else:
                 await self.control.terminate_workflow(ns, wf, reason)
         if job.pending_stop is kind:
@@ -2182,11 +2231,17 @@ class FakeGate:
                 {"max_input_bytes": self.max_input_bytes, "requested": req.size},
             )
         key = secrets.token_hex(16)
-        if req.size <= self.part_size:
+        # Like the gate: parts grow (in whole MiB) when the usual size would need more than
+        # MAX_PARTS of them, so any size an offering may allow gets a plan.
+        part_size = self.part_size
+        if -(-req.size // part_size) > m.MAX_PARTS:
+            part_size = -(-req.size // m.MAX_PARTS)
+            part_size = -(-part_size // 2**20) * 2**20
+        if req.size <= part_size:
             plan, upload_id = [req.size], None
         else:
-            full, rest = divmod(req.size, self.part_size)
-            plan = [self.part_size] * full + ([rest] if rest else [])
+            full, rest = divmod(req.size, part_size)
+            plan = [part_size] * full + ([rest] if rest else [])
             upload_id = secrets.token_hex(16)
         self.artifacts[key] = _Artifact(
             key=key,

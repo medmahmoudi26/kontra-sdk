@@ -379,3 +379,26 @@ facts the server or the gate records, compared for equality; nothing is parsed.
 Measured on server 1.32: an operation's `cancellation_info` is set once
 `RequestCancelNexusOperationExecution` is accepted (its `requested_time` stays empty, so
 only its presence is read), and a cancel request on a closed operation is refused.
+
+## I17. A cancel refunds only what Temporal shows was stopped
+
+A buyer's cancel of a job with an observed run used to refund at once and only *ask* the
+seller's workflow to cancel. A run that ignored the request and completed still delivered
+to the buyer's own Nexus call: the buyer kept the work and the refund.
+
+The cancel is now two steps, in the pure rules (`kontra.escrow`) so both gates share it:
+
+1. The cancel records the request and asks the platform to **terminate** the pinned run
+   (`EffectKind.TERMINATE_RUN`), through the control plane, by workflow id and the pinned
+   chain's first run id (`Control.terminate_workflow(..., first_run_id=...)`), so a
+   cancel can never stop a run outside the job's chain. A job with no run yet is occupied
+   instead (I16).
+2. The money then follows what Temporal shows of the pinned chain, never the request:
+   terminated (or canceled, failed, timed out) is the buyer's cancel, refunded; completed
+   first is a delivery, and the cancel is refused as delivered (409). A terminate that did
+   not land, or a chain that cannot be observed, answers 503: the cancel stands, the
+   sweeper keeps terminating and observing, and asking again is safe.
+
+A closed run's status never changes, so two replicas cannot reach different answers. The
+seller's run ends `TERMINATED` (not `CANCELED`) after a buyer's cancel; the reason the job
+records is still "canceled by buyer".

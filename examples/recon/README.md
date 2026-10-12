@@ -3,9 +3,9 @@
 `recon.py` hires `acme/probe` (`../legacy-actor`) and `acme/enrich` (`../enrich`) at the same
 time from a workflow in the buyer's own namespace, for `https://<domain>/` and
 `https://www.<domain>/`. If the probe does not deliver (it fails, its quote is refused, or the
-recon is cancelled), the enrichment is cancelled while it still runs: its hold refunds at once
-and the seller's workflow is cancelled through Nexus (acceptance criterion 11). An enrichment
-that already delivered is a delivery like any other, for the buyer to accept or reject.
+recon is cancelled), the enrichment is cancelled while it still runs: the platform terminates
+the seller's run and then refunds the hold (acceptance criterion 11). An enrichment that already
+delivered is a delivery like any other, for the buyer to accept or reject.
 
 ```sh
 python main.py example.com      # with a profile from `kontra login` or `kontra dev`

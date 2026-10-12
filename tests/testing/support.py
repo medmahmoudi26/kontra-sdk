@@ -9,7 +9,7 @@ import inspect
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -154,12 +154,17 @@ class ScriptedControl:
     )
     cancels: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
     terminates: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
+    terminate_chains: list[str] = field(default_factory=list[str])
     #: every occupy_job call: (namespace, workflow id, reason)
     occupied: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
     #: what the next occupy_job finds (STARTED: a run got there first)
     occupation: Occupation = Occupation.OCCUPIED
     #: called by occupy_job before it answers (a run that appears meanwhile, say)
     on_occupy: Callable[[], None] | None = None
+    #: called by terminate_workflow before it acts (a run that completes first, say)
+    on_terminate: Callable[[], None] | None = None
+    #: False: terminate_workflow answers success but the run stays open
+    terminate_lands: bool = True
     fail_endpoints: Exception | None = None
     fail_observe: Exception | None = None
     fail_occupy: Exception | None = None
@@ -251,11 +256,22 @@ class ScriptedControl:
             raise TemporalError("frontend down")
         self.cancels.append((namespace, workflow_id, reason))
 
-    async def terminate_workflow(self, namespace: str, workflow_id: str, reason: str) -> None:
+    async def terminate_workflow(
+        self, namespace: str, workflow_id: str, reason: str, first_run_id: str = ""
+    ) -> None:
+        """As the server does: the open run of the id ends terminated; a closed one, or none,
+        is left as it is (and is no error). ``first_run_id`` is recorded, not modelled."""
+        self.terminate_chains.append(first_run_id)
         if self.fail_stops:
             self.fail_stops -= 1
             raise TemporalError("frontend down")
+        if self.on_terminate is not None:
+            self.on_terminate()
         self.terminates.append((namespace, workflow_id, reason))
+        seen = self.observations.get((namespace, workflow_id))
+        if self.terminate_lands and seen is not None and seen[0].status is ObservedStatus.RUNNING:
+            closed = replace(seen[0], status=ObservedStatus.TERMINATED)
+            self.observations[(namespace, workflow_id)] = (closed, None)
 
     async def occupy_job(self, namespace: str, workflow_id: str, reason: str) -> Occupation:
         if self.fail_occupy is not None:

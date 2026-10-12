@@ -10,7 +10,7 @@ import asyncio
 import base64
 import json
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -18,13 +18,16 @@ import pytest
 from temporalio.api.enums.v1 import NexusOperationExecutionStatus
 from temporalio.api.workflowservice.v1 import (
     DescribeNexusOperationExecutionRequest,
+    DescribeNexusOperationExecutionResponse,
     StartNexusOperationExecutionRequest,
 )
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.converter import NexusSerializationContext
+from temporalio.service import RPCError, RPCStatusCode
 
 from kontra._control import OCCUPY_WORKFLOW_TYPE
 from kontra.codec import ENCODING, KontraCodec, data_converter
+from kontra.escrow import BUYER_CANCEL_REASON
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
 from kontra.testing import Marketplace, TestParty
@@ -194,20 +197,154 @@ async def test_running_past_max_duration_is_terminated_and_refunded(deal: Deal) 
         assert await _workflow_status(client, job.workflow_id) is WorkflowExecutionStatus.TERMINATED
 
 
-async def test_cancel_refunds_and_cancels_the_sellers_workflow(deal: Deal) -> None:
+async def test_cancel_terminates_the_sellers_workflow_then_refunds(deal: Deal) -> None:
     async with serving(deal.seller_client(), deal.entry, deal.jwks):
         job = await deal.hire("stop me")
         await deal.start(job, "stop me", mode="slow")
         await deal.until(job.job_id, lambda v: v.state is m.JobState.WORKING)
         view = await deal.buyer.gate.cancel(job.job_id)
-        assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
+        assert (view.state, view.escrow, view.reason) == (
+            m.JobState.CANCELED,
+            m.Escrow.REFUNDED,
+            BUYER_CANCEL_REASON,
+        )
+        # Terminated, not asked to cancel, before the refund was answered.
         client = deal.seller_client()
-        for _ in range(100):
-            if await _workflow_status(client, job.workflow_id) is WorkflowExecutionStatus.CANCELED:
-                break
-            await asyncio.sleep(0.1)
-        assert await _workflow_status(client, job.workflow_id) is WorkflowExecutionStatus.CANCELED
+        assert await _workflow_status(client, job.workflow_id) is WorkflowExecutionStatus.TERMINATED
     assert (await deal.buyer.balance()).available == "50.00"
+    assert (await deal.buyer.gate.party(deal.seller.handle)).refunded == 0
+
+
+def _around_terminations(
+    monkeypatch: pytest.MonkeyPatch,
+    deal: Deal,
+    *,
+    before: Callable[[str], Awaitable[None]] | None = None,
+    after: Callable[[str], Awaitable[None]] | None = None,
+) -> list[str]:
+    """Run ``before`` / ``after`` around every termination the gate's control plane makes
+    (on the gate's loop): the moment a race with the seller's run is decided."""
+    control = deal.mp.control
+    real = control.terminate_workflow
+    terminated: list[str] = []
+
+    async def terminate(
+        namespace: str, workflow_id: str, reason: str, first_run_id: str = ""
+    ) -> None:
+        terminated.append(workflow_id)
+        if before is not None:
+            await before(workflow_id)
+        await real(namespace, workflow_id, reason, first_run_id)
+        if after is not None:
+            await after(workflow_id)
+
+    monkeypatch.setattr(control, "terminate_workflow", terminate)
+    return terminated
+
+
+async def _operation_closed(
+    deal: Deal, operation_id: str
+) -> DescribeNexusOperationExecutionResponse:
+    buyer = deal.mp.client(deal.buyer.namespace)
+    for _ in range(300):
+        d = await buyer.workflow_service.describe_nexus_operation_execution(
+            DescribeNexusOperationExecutionRequest(
+                namespace=deal.buyer.namespace, operation_id=operation_id
+            )
+        )
+        if d.info.status != NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_RUNNING:
+            return d
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"the buyer's operation {operation_id} never closed")
+
+
+async def test_a_run_finishing_just_after_the_terminate_delivers_nothing(
+    deal: Deal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hole: a buyer cancels a nearly finished job. Were the run only asked to cancel
+    (and the job refunded at once), a seller whose last step completes regardless would
+    deliver to the buyer's own call: the result for free. The run is terminated first, so
+    its finish -- right after -- is refused, nothing reaches the buyer, and the refund
+    follows the termination Temporal recorded."""
+    refused: list[RPCError] = []
+
+    async def finish_now(workflow_id: str) -> None:
+        try:
+            await deal.seller_client().get_workflow_handle(workflow_id).signal("finish")
+        except RPCError as e:
+            refused.append(e)
+
+    async with serving(deal.seller_client(), deal.entry, deal.jwks):
+        job = await deal.hire("nearly done")
+        await deal.start(job, "nearly done", mode="stubborn")
+        await deal.until(job.job_id, lambda v: v.state is m.JobState.WORKING)
+        terminated = _around_terminations(monkeypatch, deal, after=finish_now)
+        view = await deal.buyer.gate.cancel(job.job_id)
+        assert (view.state, view.escrow, view.reason) == (
+            m.JobState.CANCELED,
+            m.Escrow.REFUNDED,
+            BUYER_CANCEL_REASON,
+        )
+        assert terminated == [job.workflow_id]
+        assert [e.status for e in refused] == [RPCStatusCode.NOT_FOUND]  # the run is closed
+        client = deal.seller_client()
+        assert await _workflow_status(client, job.workflow_id) is WorkflowExecutionStatus.TERMINATED
+        op = await _operation_closed(deal, job.operation_id)
+        assert (
+            op.info.status == NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_FAILED
+        )
+        await asyncio.sleep(1)  # a few sweeps: nothing changes
+    view = await deal.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow, view.delivery) == (
+        m.JobState.CANCELED,
+        m.Escrow.REFUNDED,
+        None,
+    )
+    with pytest.raises(GateError) as e:
+        await deal.buyer.gate.result(job.job_id)
+    assert e.value.code == "not_delivered"
+    assert (await deal.buyer.balance()).available == "50.00"
+    assert (await deal.seller.balance()).available == "100.00"
+    assert (await deal.buyer.gate.party(deal.seller.handle)).refunded == 0
+    await deal.mp.gate.run(lambda: assert_invariants(deal.mp.gate.ledger))
+
+
+async def test_a_run_finishing_just_before_the_terminate_is_delivered_and_paid(
+    deal: Deal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race the other way: the run completes -- and its result reaches the buyer's
+    call -- just before the termination. The termination finds it closed, the delivery
+    stands, and the cancel is refused as for any delivered job: the buyer pays for what it
+    received."""
+
+    async def finish_first(workflow_id: str) -> None:
+        handle = deal.seller_client().get_workflow_handle(workflow_id)
+        await handle.signal("finish")
+        await handle.result()
+
+    async with serving(deal.seller_client(), deal.entry, deal.jwks):
+        job = await deal.hire("just in time")
+        await deal.start(job, "just in time", mode="stubborn")
+        await deal.until(job.job_id, lambda v: v.state is m.JobState.WORKING)
+        terminated = _around_terminations(monkeypatch, deal, before=finish_first)
+        with pytest.raises(GateError) as e:
+            await deal.buyer.gate.cancel(job.job_id)
+        assert (e.value.status, e.value.code) == (409, "not_open")
+        assert terminated == [job.workflow_id]
+        client = deal.seller_client()
+        assert await _workflow_status(client, job.workflow_id) is WorkflowExecutionStatus.COMPLETED
+        op = await _operation_closed(deal, job.operation_id)
+        status = NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_COMPLETED
+        assert op.info.status == status
+    view = await deal.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow) == (m.JobState.COMPLETED, m.Escrow.HELD)
+    assert view.delivery is not None
+    result = await deal.buyer.gate.result(job.job_id)
+    assert json.loads(unwire(result.payload).data) == {"text": "JUST IN TIME"}
+    assert (await deal.buyer.gate.accept(job.job_id)).escrow is m.Escrow.RELEASED
+    price = PRICE_PER_CHAR * len("just in time")
+    assert (await deal.buyer.balance()).available_minor == 5000 - price
+    await deal.mp.gate.run(lambda: assert_invariants(deal.mp.gate.ledger))
 
 
 async def test_an_offline_seller_is_refunded_at_the_deadline(deal: Deal) -> None:

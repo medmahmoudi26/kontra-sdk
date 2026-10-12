@@ -415,7 +415,9 @@ class TemporalControl(Protocol):
 
     async def cancel_workflow(self, namespace: str, workflow_id: str, reason: str) -> None: ...
 
-    async def terminate_workflow(self, namespace: str, workflow_id: str, reason: str) -> None: ...
+    async def terminate_workflow(
+        self, namespace: str, workflow_id: str, reason: str, first_run_id: str = ""
+    ) -> None: ...
 
     async def occupy_job(self, namespace: str, workflow_id: str, reason: str) -> Occupation: ...
 
@@ -891,10 +893,10 @@ class Control:
             return self._given_http, False
         loop = asyncio.get_running_loop()
         if self._own_http is None:
-            self._own_http, self._own_loop = httpx.AsyncClient(), loop
+            self._own_http, self._own_loop = httpx.AsyncClient(trust_env=False), loop
         if self._own_loop is loop:
             return self._own_http, False
-        return httpx.AsyncClient(), True
+        return httpx.AsyncClient(trust_env=False), True
 
     async def nexus_sync(
         self,
@@ -1653,13 +1655,18 @@ class Control:
             if e.status != RPCStatusCode.NOT_FOUND or _namespace_missing(e):
                 raise TemporalError(f"cancel {workflow_id} in {namespace}: {e.message}") from e
 
-    async def terminate_workflow(self, namespace: str, workflow_id: str, reason: str) -> None:
-        """Terminate ``workflow_id``; gone or already closed is not an error."""
+    async def terminate_workflow(
+        self, namespace: str, workflow_id: str, reason: str, first_run_id: str = ""
+    ) -> None:
+        """Terminate ``workflow_id``; gone or already closed is not an error. With
+        ``first_run_id`` (a job's pinned run) only the open run of THAT chain is terminated:
+        Temporal refuses when the open run started a different chain."""
         req = TerminateWorkflowExecutionRequest(
             namespace=namespace,
             workflow_execution=WorkflowExecution(workflow_id=workflow_id),
             identity=self._identity,
             reason=reason,
+            first_execution_run_id=first_run_id,
         )
         try:
             await self._wf.terminate_workflow_execution(req, retry=True, timeout=_RPC_TIMEOUT)

@@ -39,6 +39,8 @@ What that means concretely, and what enforces it:
 | A buyer cancels its own call, or keeps its own namespace too busy to read, to blame the seller or be refunded blind | who canceled is read from the buyer's own records of the call; a failed read of the buyer's namespace is never followed by a blind refund |
 | A seller serves code that differs from the contract the buyer paid for | the hash lock: `kontra serve` refuses to start on a mismatch, and the handler refuses a token for another contract hash |
 | A seller takes the money without delivering | escrow moves only on observed facts: no delivery by the deadline refunds |
+| A buyer cancels a nearly finished job, to be refunded and still receive the result through its own call | a cancel of a job whose run was observed terminates that run first (a cancel request can be ignored) and refunds only once Temporal shows it terminated or closed without completing; a run that completed first is a delivery, and the cancel is refused |
+| An authenticated client sends a body built to make the gate's validation expensive (a megabyte of bad list items, megabytes of stray keys) | every list, dict and string of the wire models has a ceiling; a list is refused at its first item past it, and more than a few unknown keys (or a long one) are one error, so a body is a handful of errors whatever it holds |
 | A buyer takes the delivery without paying | the review window closes on its own and releases the payment |
 | A malicious contract document (SSRF through `$ref`, an unbounded schema) | the catalog's document rules; patterns run on RE2 |
 | A seller's text drives a buyer's terminal or agent | the CLI strips control characters from seller text; `kontra mcp` writes deliveries only where it is safe to (below) |
@@ -199,10 +201,20 @@ deadline rule.
 ## Known limits
 
 - **The internal frontend has no authentication.** Reaching it is full control of every
-  namespace; its isolation is the network alone: loopback by default, and in `compose.yaml` the
-  `control` network, shared only with the gate, and `temporal-db`, whose only other member is the
-  Postgres relay. Postgres and the gate's migration job reach the database through that relay and
-  cannot reach Temporal; the bucket's network and the published ports never carry it.
+  namespace; its isolation is the network alone: loopback by default, and in `compose.yaml`
+  Temporal's fixed address on the `control` network (a pinned subnet, `KONTRA_CONTROL_NET`),
+  shared only with the gate. It does not listen on `temporal-db`, whose only other member is
+  the Postgres relay; Postgres and the gate's migration job reach the database through that
+  relay and cannot reach Temporal at all; the bucket's network and the published ports never
+  carry it. A deployment that adds a container to `control` gives that container the
+  internal frontend. The bind is not the whole wall on `temporal-db`: Linux accepts a packet
+  for any of its addresses on any interface, so a peer there that routes Temporal's `control`
+  address through Temporal's `temporal-db` address reaches it (measured); that takes
+  `NET_ADMIN` (or `NET_RAW`), which the relay -- no capabilities, not root -- lacks. The host
+  itself reaches every container address, the internal frontend's included, and on Docker
+  before 28 a machine on the host's own network that routes the `control` subnet through the
+  host may too, unless the host's `FORWARD` policy drops it; the address is the same on every
+  install (`KONTRA_CONTROL_NET`.2).
 - **Token lifetime.** A worker token stays valid until its `exp` (15 minutes) after its
   session is revoked.
 - **Kontra is the key directory** (see above).

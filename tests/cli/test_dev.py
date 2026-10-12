@@ -10,12 +10,14 @@ invocations they make; ``kontra dev up`` against real images is the e2e suite's.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
 import shutil
 import stat
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -86,7 +88,9 @@ def test_compose_refuses_to_run_without_its_secrets(tmp_path: Path) -> None:
 def test_compose_publishes_only_public_ports_on_loopback(tmp_path: Path) -> None:
     config = _resolved(tmp_path)
     services = config["services"]
-    assert set(services) == {"postgres", "postgres-relay", "s3", "temporal", "migrate", "gate"}
+    assert set(services) == {
+        *("postgres", "postgres-relay", "s3-owner", "s3", "temporal", "migrate", "gate"),
+    }
     published: dict[str, list[tuple[str, str, int]]] = {
         name: [(p["host_ip"], str(p["published"]), int(p["target"])) for p in svc.get("ports", [])]
         for name, svc in services.items()
@@ -94,25 +98,27 @@ def test_compose_publishes_only_public_ports_on_loopback(tmp_path: Path) -> None
     assert published == {
         "postgres": [("127.0.0.1", "5432", 5432)],
         "postgres-relay": [],
+        "s3-owner": [],
         "s3": [("127.0.0.1", "8333", 8333)],
         "temporal": [("127.0.0.1", "7233", 7233)],  # the public frontend only
         "migrate": [],
         "gate": [("127.0.0.1", "8080", 8080)],
     }
     temporal = services["temporal"]["environment"]
-    # The internal frontend (no authentication) listens on every interface Temporal has
-    # (Temporal dials it where it binds it, and a compose network's address is not known
-    # before the container starts), unpublished ...
-    assert temporal["KONTRA_INTERNAL_FRONTEND_BIND_IP"] == "0.0.0.0"
+    # The internal frontend (no authentication) is unpublished, and listens only on
+    # Temporal's fixed address on `control`, the network it shares with the gate alone
+    # (test_the_internal_frontend_listens_on_the_control_network_only) ...
+    assert temporal["KONTRA_INTERNAL_FRONTEND_BIND_IP"] == "172.16.251.2"
     assert all(target not in (7236, 7246) for ports in published.values() for _, _, target in ports)
     assert temporal["KONTRA_JWKS_URLS"] == "http://gate:8080/.well-known/jwks.json"
-    # ... so Temporal shares a network with the gate and its database relay only: not with
+    # ... and Temporal shares a network with the gate and its database relay only: not with
     # Postgres or the migrate job, and not with SeaweedFS, which serves the internet in
     # production and whose own master/volume/filer ports only the gate may reach.
-    networks = {name: set(svc["networks"]) for name, svc in services.items()}
+    networks = {name: set(svc.get("networks", ())) for name, svc in services.items()}
     assert networks == {
         "postgres": {"database"},
         "postgres-relay": {"temporal-db", "database"},
+        "s3-owner": set(),  # network_mode: none
         "s3": {"bucket"},
         "temporal": {"control", "temporal-db"},
         "migrate": {"database"},
@@ -130,7 +136,7 @@ def test_compose_publishes_only_public_ports_on_loopback(tmp_path: Path) -> None
     assert (relay["cap_drop"], relay["read_only"], relay["user"]) == (["ALL"], True, "postgres")
     assert relay["stop_signal"] == "SIGTERM"  # the image's SIGINT does not stop nc
     # A tmpfs over the image's VOLUME, or every relay container leaves an anonymous volume.
-    assert relay["tmpfs"] == ["/var/lib/postgresql/data"]
+    assert relay["tmpfs"] == ["/var/lib/postgresql/data:size=1m"]
     assert relay["image"] == services["postgres"]["image"]  # the stack trusts no further image
     # A container inherits the host's ip_forward=1: a service on two networks would route
     # between them (a peer on `database` routing through the relay reaches Temporal's
@@ -156,31 +162,142 @@ def test_every_service_runs_without_privileges(tmp_path: Path) -> None:
     artifact uploads and downloads, a hire; Temporal's distroless image too) before it was
     written down here."""
     services = _resolved(tmp_path)["services"]
+    owner = services["s3-owner"]
     for name, svc in services.items():
         assert svc.get("cap_drop") == ["ALL"], name
-        assert not svc.get("cap_add"), f"{name} adds back {svc.get('cap_add')}"
+        if name != "s3-owner":
+            assert not svc.get("cap_add"), f"{name} adds back {svc.get('cap_add')}"
         assert svc.get("security_opt") == ["no-new-privileges:true"], name
         assert not svc.get("privileged"), name
         assert svc.get("read_only") is True, name
         # None of it would hold with a host namespace, a device or a host path (the Docker
         # socket is one): named volumes and tmpfs only.
-        for key in ("network_mode", "pid", "ipc", "uts", "userns_mode", "cgroup", "devices"):
+        for key in ("pid", "ipc", "uts", "userns_mode", "cgroup", "devices"):
             assert not svc.get(key), f"{name} sets {key}: {svc.get(key)}"
+        assert svc.get("network_mode") in (None, "none"), name
         assert all(v["type"] == "volume" for v in svc.get("volumes", [])), name
+    # The one exception, and why: s3-owner hands the bucket's volume to SeaweedFS's uid.
+    # Two capabilities, one fixed command, no network, then it exits.
+    assert owner["cap_add"] == ["CHOWN", "DAC_READ_SEARCH"]
+    assert owner["entrypoint"] == ["chown", "-R", "10001:10001", "/data"]
+    assert (owner["network_mode"], owner["restart"], owner.get("command")) == ("none", "no", None)
+    assert [(v["source"], v["target"]) for v in owner["volumes"]] == [("s3", "/data")]
+    assert owner["image"] == services["s3"]["image"]  # the stack trusts no further image
+    s3_deps = services["s3"]["depends_on"]
+    assert set(s3_deps) == {"s3-owner"}
+    assert s3_deps["s3-owner"]["condition"] == "service_completed_successfully"
+    # Every tmpfs is capped: a service taken over cannot fill the host's memory.
     tmpfs = {name: svc["tmpfs"] for name, svc in services.items() if svc.get("tmpfs")}
     assert tmpfs == {
-        "postgres": ["/var/run/postgresql"],  # its socket and lock file
-        "postgres-relay": ["/var/lib/postgresql/data"],  # the image's VOLUME, unused
-        "s3": ["/tmp"],  # the identities config and SeaweedFS's unix sockets
+        "postgres": ["/var/run/postgresql:size=1m"],  # its socket and lock file
+        "postgres-relay": ["/var/lib/postgresql/data:size=1m"],  # the image's VOLUME, unused
+        "s3": ["/tmp:size=1m"],  # the identities config and SeaweedFS's unix sockets
     }
-    # Postgres as its own user: its entrypoint needs root only to chown what the named
-    # volume already gives postgres. SeaweedFS keeps the image's root user, which owns
-    # /data and, without capabilities, nothing more; the gate and Temporal images set a
-    # non-root user of their own.
+    # No long-running service as root. Postgres as its own user: its entrypoint needs root
+    # only to chown what the named volume already gives postgres. SeaweedFS as the uid
+    # s3-owner gave the volume to (the image has no user of its own); the gate and Temporal
+    # images set a non-root user of their own.
     users = {name: svc["user"] for name, svc in services.items() if "user" in svc}
-    assert users == {"postgres": "postgres", "postgres-relay": "postgres"}
+    assert users == {"postgres": "postgres", "postgres-relay": "postgres", "s3": "10001:10001"}
+    assert owner["entrypoint"][2] == services["s3"]["user"]
     assert {v["target"] for v in services["postgres"]["volumes"]} == {"/var/lib/postgresql/data"}
     assert {v["target"] for v in services["s3"]["volumes"]} == {"/data"}
+
+
+@needs_compose
+def test_the_internal_frontend_listens_on_the_control_network_only(tmp_path: Path) -> None:
+    """Temporal binds its internal frontend (no authentication) to its fixed address on
+    `control`, the network it shares with the gate alone, so postgres-relay on
+    `temporal-db` has nothing listening to connect to. The subnet is pinned for that
+    (Temporal must know the address before it starts), lies outside Docker's default pools,
+    and moves as a whole with KONTRA_CONTROL_NET.
+
+    This checks the configuration; the running stack was checked by hand (the review
+    reports): the server listens on 7236/7246 at that address only, the relay, Postgres and
+    SeaweedFS reach neither port at any address while the relay does reach the public
+    frontend, and the gate works end to end. Measured there too: the bind is not the whole
+    wall. Linux delivers a packet for any of its addresses on any interface, so a peer on
+    `temporal-db` with NET_ADMIN that routes the `control` address through Temporal's
+    `temporal-db` address connects to 7236 and 7246. What closes it is that every peer of
+    Temporal off `control` can neither add that route (NET_ADMIN) nor forge the frame
+    (NET_RAW): no capability at all, and not root."""
+    for prefix, extra in (("172.16.251", {}), ("10.213.77", {"KONTRA_CONTROL_NET": "10.213.77"})):
+        config = _resolved(tmp_path, **extra)
+        [ipam] = config["networks"]["control"]["ipam"]["config"]
+        subnet = ipaddress.ip_network(ipam["subnet"])
+        dynamic = ipaddress.ip_network(ipam["ip_range"])
+        assert (str(subnet), str(dynamic)) == (f"{prefix}.0/28", f"{prefix}.8/29")
+        temporal = config["services"]["temporal"]
+        address = ipaddress.ip_address(temporal["networks"]["control"]["ipv4_address"])
+        assert str(address) == temporal["environment"]["KONTRA_INTERNAL_FRONTEND_BIND_IP"]
+        assert address in subnet
+        assert address not in dynamic  # never handed to another container
+        assert temporal["networks"]["temporal-db"] in ({}, None)
+        # The gate dials it by name, which resolves to that address on `control`.
+        gate = config["services"]["gate"]["environment"]
+        assert gate["KONTRA_TEMPORAL_INTERNAL"] == "temporal:7236"
+        # Every other member of a network Temporal is on, but `control`, can reach
+        # Temporal's other addresses: none may route (or forge) its way to the bind.
+        services = config["services"]
+        shared = set(temporal["networks"]) - {"control"}
+        peers = {
+            name
+            for name, svc in services.items()
+            if name != "temporal" and shared & set(svc.get("networks") or ())
+        }
+        assert peers == {"postgres-relay"}
+        for name in peers:
+            svc = services[name]
+            assert (svc.get("cap_drop"), svc.get("cap_add")) == (["ALL"], None), name
+            assert svc.get("user") not in (None, "", "root", "0", "0:0"), name
+            assert svc.get("security_opt") == ["no-new-privileges:true"], name
+            assert not svc.get("privileged"), name
+    default = ipaddress.ip_network("172.16.251.0/28")
+    pools = [ipaddress.ip_network(f"172.{n}.0.0/16") for n in range(17, 32)]
+    assert not any(
+        default.overlaps(pool) for pool in [*pools, ipaddress.ip_network("192.168.0.0/16")]
+    )
+
+
+@needs_compose
+def test_seaweedfs_runs_unprivileged_on_the_volume_s3_owner_hands_it(tmp_path: Path) -> None:
+    """In the pinned image, under the services' own restrictions: a new volume is root's
+    (Docker fills it from the image's /data); s3-owner hands it over, and SeaweedFS's uid
+    can then write it. On every later start the volume holds directories SeaweedFS
+    created 0700, which CHOWN alone cannot walk: hence DAC_READ_SEARCH."""
+    services = _resolved(tmp_path)["services"]
+    owner, s3 = services["s3-owner"], services["s3"]
+    image = s3["image"]
+    if _REAL_RUN(["docker", "image", "inspect", image], capture_output=True).returncode != 0:
+        pytest.skip(f"{image} is not pulled here")
+    volume = f"kontra-test-s3-{uuid.uuid4().hex[:12]}"
+    locked = [*(f"--cap-drop={c}" for c in owner["cap_drop"]), "--read-only", "--network=none"]
+    locked += [f"--security-opt={o}" for o in owner["security_opt"]]
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        return _REAL_RUN(
+            ["docker", "run", "--rm", *locked, f"--volume={volume}:/data", *args],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    def hand_over(caps: list[str]) -> subprocess.CompletedProcess[str]:
+        entry, *args = owner["entrypoint"]
+        return run(*(f"--cap-add={c}" for c in caps), f"--entrypoint={entry}", image, *args)
+
+    as_seaweedfs = (f"--user={s3['user']}", "--entrypoint=/bin/sh", image, "-c")
+    try:
+        fresh = run(*as_seaweedfs, "touch /data/x")
+        assert fresh.returncode != 0  # the image's root-owned /data
+        assert hand_over(owner["cap_add"]).returncode == 0
+        wrote = run(*as_seaweedfs, "mkdir -m 700 /data/own && touch /data/own/f && id -u")
+        assert (wrote.returncode, wrote.stdout.strip()) == (0, s3["user"].split(":")[0])
+        assert hand_over(["CHOWN"]).returncode != 0  # cannot walk /data/own
+        assert hand_over(owner["cap_add"]).returncode == 0  # every later start
+    finally:
+        _REAL_RUN(["docker", "volume", "rm", "-f", volume], capture_output=True, check=False)
 
 
 def _s3_entrypoint(services: dict[str, Any]) -> list[str]:
@@ -223,6 +340,7 @@ def test_s3_credentials_reach_seaweedfs_without_a_writable_root(tmp_path: Path) 
     probe.chmod(0o755)
     flags = [f"--tmpfs={path}" for path in s3["tmpfs"]]
     flags += [f"--cap-drop={cap}" for cap in s3["cap_drop"]]
+    flags += [f"--user={s3['user']}"]
     flags += [f"--security-opt={opt}" for opt in s3["security_opt"]]
     proc = _REAL_RUN(
         [
@@ -249,10 +367,10 @@ _PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
 
 @needs_compose
 def test_temporal_never_sends_its_internal_traffic_to_a_proxy(tmp_path: Path) -> None:
-    """Temporal dials its internal frontend where it binds it, 0.0.0.0 here, and Go exempts
-    only loopback from HTTP(S)_PROXY: a proxy in its environment received the system
-    worker's gRPC (the server then did not start) and would receive history's Nexus tasks
-    and completion tokens. Compose copies a Docker client's proxy settings into every
+    """Temporal dials its internal frontend where it binds it, its `control` address here,
+    and Go exempts only loopback from HTTP(S)_PROXY: a proxy in its environment received the
+    system worker's gRPC (the server then did not start) and would receive history's Nexus
+    tasks and completion tokens. Compose copies a Docker client's proxy settings into every
     container, so the service sets all four variables empty; Go reads the upper and the
     lower case, the first one non-empty.
 

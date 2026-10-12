@@ -148,7 +148,7 @@ KONTRA_DB=postgres ... bin/kontra-temporal setup-schema
 | `KONTRA_FRONTEND_PORT` / `KONTRA_INTERNAL_FRONTEND_PORT` | base+0 / base+3 | override a service's gRPC port |
 | `KONTRA_HISTORY_PORT` / `KONTRA_MATCHING_PORT` / `KONTRA_WORKER_PORT` | base+1 / +2 / +6 | internal service gRPC ports (loopback) |
 | `KONTRA_FRONTEND_BIND_IP` | `127.0.0.1` | bind address (an IP address) of the **public** frontend |
-| `KONTRA_INTERNAL_FRONTEND_BIND_IP` | `127.0.0.1` (images too) | bind address (an IP address) of the **internal** frontend, which has no authentication. Set it only to a private interface the gate shares (a VPC address, or `0.0.0.0` inside a container that is on private networks only, as in compose); never publish its ports. The server dials it at this address too (see below) |
+| `KONTRA_INTERNAL_FRONTEND_BIND_IP` | `127.0.0.1` (images too) | bind address (an IP address) of the **internal** frontend, which has no authentication. Set it only to a private interface the gate shares and nothing else does: a VPC address, or in compose Temporal's fixed address on the `control` network (`KONTRA_CONTROL_NET`.2, on a pinned subnet), so the internal frontend does not answer on Temporal's other networks; never publish its ports. The server dials it at this address too (see below) |
 | `KONTRA_FRONTEND_HTTP_PORT` | `0` (off) | public HTTP API port; left off because the SDKs use gRPC and every HTTP route is denied to tokens |
 | `KONTRA_INTERNAL_FRONTEND_HTTP_PORT` | base+13 | internal HTTP port — required (history delivers Nexus tasks and completions here; the gate relays quotes here) |
 | `KONTRA_DB` | `sqlite` | `sqlite` or `postgres` |
@@ -176,8 +176,10 @@ through the internal frontend, at `KONTRA_INTERNAL_FRONTEND_BIND_IP` exactly as 
 ports. So a private address works as is (the server needs no route to it but its own
 interface), and so does `0.0.0.0`, which Go dials as the local system. Both bind addresses
 must be IP addresses: a host name is refused at start, as Temporal would refuse to bind it.
-Binding `0.0.0.0` on a host, rather than in a container, listens on every interface the host
-has, the public one included: prefer the private address. If the server's environment sets
+`0.0.0.0` listens on every interface the server has: on a host, the public one included; in a
+container, every network it joins, whatever else is on them (compose's Postgres relay was, on
+`temporal-db`). Prefer the one private address the gate uses: compose pins the `control`
+network's subnet so Temporal's address there is known before it starts. If the server's environment sets
 `HTTP_PROXY` or `HTTPS_PROXY` (either case), put that address in `NO_PROXY` too: Go exempts
 only loopback from the proxy, and these connections carry Nexus tasks and completion tokens
 (with `0.0.0.0` and a proxy, the system worker's gRPC goes to the proxy and the server does not
@@ -202,8 +204,9 @@ a Docker client's proxy settings into every container.
 ## Known limits
 
 - The internal frontend has no authentication: reaching it is full control of every
-  namespace. Its isolation is the network alone (loopback by default; a private network
-  shared only with the gate otherwise). Internode mTLS would add a second lock.
+  namespace. Its isolation is the network alone (loopback by default; one address on a
+  private network shared only with the gate otherwise). Internode mTLS would add a second
+  lock.
 - A worker token stays valid until its `exp` (15 minutes): revoking a session at the gate
   does not reach Temporal before that. Temporal's claim mapper also accepts a token with no
   `exp`; the gate never signs one (`KeyRing._sign` refuses), and nothing here checks it.
