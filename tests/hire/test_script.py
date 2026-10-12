@@ -120,7 +120,7 @@ async def test_cancel_refunds_and_stops_the_seller(world: World) -> None:
     async def status() -> WorkflowExecutionStatus | None:
         return (await handle.describe()).status
 
-    await until(status, lambda s: s is WorkflowExecutionStatus.CANCELED)
+    await until(status, lambda s: s is WorkflowExecutionStatus.TERMINATED)
 
 
 async def test_a_silent_buyer_pays_when_the_review_window_closes(world: World) -> None:

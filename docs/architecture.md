@@ -162,7 +162,9 @@ a trailing newline. So every Temporal identifier is built in one place,
    its hash and opens the review window.
 6. **Settlement.** Accept, or silence until the window closes, releases the hold to the seller
    minus the platform fee; reject opens a dispute. A failure, a missed deadline or a cancel
-   refunds. Timers live in Postgres and a sweep loop, not in Temporal; every sweep re-issues the
+   refunds. A cancel of a job whose run the gate has seen terminates that run first and
+   refunds only once Temporal shows it terminated: a run that completed first has already
+   delivered to the buyer's call, so it is a delivery and the cancel is refused. Timers live in Postgres and a sweep loop, not in Temporal; every sweep re-issues the
    ledger calls the job's record says are owed (they are idempotent) until ledger and record
    agree.
 
@@ -181,15 +183,19 @@ remembers a bind address (`KONTRA_DEV_BIND`, `KONTRA_DEV_PG_BIND`): publishing a
 login, play money) beyond loopback is asked for on each `up`, not inherited from an earlier one.
 
 Temporal's internal frontend has no authentication: reaching it is control of every
-namespace. It is never published, and the networks decide who reaches it. Temporal binds it on
-every interface it has (Temporal dials it at the address it binds, and an address on a compose
-network is not known before the container starts), so Temporal joins only networks whose other
-members may reach it:
+namespace. It is never published, and it listens on one address only: Temporal's fixed
+address on `control`, the network it shares with the gate alone. That network's subnet is
+pinned so the address is known before Temporal starts (Temporal binds the internal frontend
+there and dials its own system worker, Nexus dispatch and completions there too):
+`KONTRA_CONTROL_NET` gives its first three octets (default `172.16.251`, outside Docker's
+default address pools); the stack takes `.0/28` of it, Temporal is `.2`, and every other
+address comes from `.8/29`, so no container can take Temporal's. Temporal still joins only
+networks whose other members may reach its other ports:
 
 | Network | Members | Carries |
 |---|---|---|
-| `control` | temporal, gate | the internal frontend (gRPC 7236, HTTP 7246); the gate's JWKS |
-| `temporal-db` | temporal, postgres-relay | Temporal's own database connections |
+| `control` | temporal (`.2`), gate | the internal frontend (gRPC 7236, HTTP 7246); the gate's JWKS |
+| `temporal-db` | temporal, postgres-relay | Temporal's own database connections (the internal frontend does not listen here; a peer that could route Temporal's `control` address through it would still reach it, which takes a capability the relay does not have) |
 | `database` | postgres, postgres-relay, gate, migrate | the gate's and the migrations' database connections |
 | `bucket` | s3, gate | SeaweedFS's S3 port and its unauthenticated master, volume and filer ports |
 
@@ -206,14 +212,21 @@ own inter-network isolation (its iptables rules): a host that runs Docker with `
 false` routes between bridge networks and has no such boundary.
 Temporal's proxy variables are set empty: compose copies a Docker client's proxy settings into
 every container, and Go exempts only loopback from a proxy, so Temporal's connections to its own
-internal frontend (at `0.0.0.0`) would otherwise go to the proxy, and it would not start.
+internal frontend (at its `control` address) would otherwise go to the proxy, and it would not
+start.
 
 Every service runs with no capabilities (`cap_drop: [ALL]`, none added back), with
 `no-new-privileges` and on a read-only root filesystem: code that takes one over cannot open
 raw sockets, change file ownership, gain privileges through a setuid binary or replace the
 service's own binaries, and it writes only to the service's volume or to a tmpfs that a
-restart empties. Postgres runs as its own user rather than root: its entrypoint needs root
-only to chown a data directory the named volume already gives it. SeaweedFS is handed its
+restart empties and that is capped in size (1 MiB each), so it cannot fill the host's memory
+either. No long-running service runs as root. Postgres runs as its own user: its entrypoint
+needs root only to chown a data directory the named volume already gives it. The SeaweedFS
+image has no user but root, and its `/data` -- so the named volume, which Docker fills from it
+-- is root's: `s3-owner`, a one-shot with no network, hands the volume to uid 10001 and exits,
+and SeaweedFS runs as that uid. It is the only container given capabilities, `CHOWN` and
+`DAC_READ_SEARCH` (SeaweedFS creates its directories 0700, which `CHOWN` alone cannot walk on
+a later start), for one fixed `chown -R`. SeaweedFS is handed its
 credentials in its environment and writes them to its tmpfs before it starts: compose's
 `configs` copy their content into the container's root filesystem, which a read-only root
 refuses.

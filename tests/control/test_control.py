@@ -481,6 +481,24 @@ async def test_history_summary_names_running_activities(control: Control, seller
     await control.terminate_workflow(seller.namespace, wf, "done")
 
 
+async def test_terminate_with_a_first_run_id_stays_inside_that_chain(
+    control: Control, seller: Seller
+) -> None:
+    """A cancel terminates only the job's pinned chain: naming another chain's first run
+    leaves the open run alone (and is no error); naming its own ends it."""
+    wf = unique("job")
+    handle = await seller.client.start_workflow(
+        Job.run, Plan("hang"), id=wf, task_queue=seller.task_queue
+    )
+    run_id = handle.result_run_id
+    assert run_id
+    await control.terminate_workflow(seller.namespace, wf, "not this chain", str(uuid.uuid4()))
+    await asyncio.sleep(0.2)
+    assert (await handle.describe()).status is WorkflowExecutionStatus.RUNNING
+    await control.terminate_workflow(seller.namespace, wf, "buyer canceled", run_id)
+    await wait_status(seller.client, wf, [WorkflowExecutionStatus.TERMINATED])
+
+
 # --------------------------------------------------------------------------- standalone operations
 
 

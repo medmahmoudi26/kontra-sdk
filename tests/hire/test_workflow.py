@@ -261,7 +261,7 @@ async def test_cancelling_the_workflow_cancels_a_running_job(door: Door) -> None
     assert (await handle.describe()).status is WorkflowExecutionStatus.CANCELED
     [view] = await door.jobs(1, lambda v: v.escrow is m.Escrow.REFUNDED)
     assert view.state is m.JobState.CANCELED
-    assert await _seller_status(door, view.job_id) is WorkflowExecutionStatus.CANCELED
+    assert await _seller_status(door, view.job_id) is WorkflowExecutionStatus.TERMINATED
     await door.refunded()
 
 
@@ -312,7 +312,7 @@ async def test_recon_refunds_the_second_job_when_the_first_fails(door: Door) -> 
     views = await door.jobs(2, lambda v: v.escrow is m.Escrow.REFUNDED)
     states = {v.offering: v.state for v in views}
     [enrich] = [v for v in views if v.offering == door.world.key("enrich")]
-    assert await _seller_status(door, enrich.job_id) is WorkflowExecutionStatus.CANCELED
+    assert await _seller_status(door, enrich.job_id) is WorkflowExecutionStatus.TERMINATED
     world = door.world
     assert states == {
         world.key("probe"): m.JobState.FAILED,

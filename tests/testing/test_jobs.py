@@ -924,12 +924,19 @@ async def test_a_cancel_before_any_run_occupies_the_job(shop: Shop) -> None:
     assert (await shop.world.anon().party("acme")).refunded == 0
 
 
-async def test_a_running_job_is_not_occupied_but_stopped(shop: Shop) -> None:
+async def test_a_running_job_is_not_occupied_but_terminated(shop: Shop) -> None:
     job = await shop.hire(1000)
     shop.observe(job.job_id, ObservedStatus.RUNNING)
-    await shop.buyer.gate.cancel(job.job_id)
+    view = await shop.buyer.gate.cancel(job.job_id)
+    assert (view.state, view.escrow, view.reason) == (
+        m.JobState.CANCELED,
+        m.Escrow.REFUNDED,
+        BUYER_CANCEL_REASON,
+    )
     assert shop.control.occupied == []
-    assert shop.control.cancels == [("acme", f"job-{job.job_id}", BUYER_CANCEL_REASON)]
+    assert shop.control.terminates == [("acme", f"job-{job.job_id}", BUYER_CANCEL_REASON)]
+    assert shop.control.cancels == []  # a cancel request is not enough: see below
+    assert (await shop.world.anon().party("acme")).refunded == 0
 
 
 async def test_a_cancel_that_cannot_close_the_job_to_starts_is_refused(shop: Shop) -> None:
@@ -954,7 +961,7 @@ async def test_a_run_that_beat_the_cancel_is_looked_at_again(shop: Shop) -> None
     view = await shop.buyer.gate.cancel(job.job_id)
     assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
     assert view.started_at is not None  # it was seen working first
-    assert shop.control.cancels == [("acme", f"job-{job.job_id}", BUYER_CANCEL_REASON)]
+    assert shop.control.terminates == [("acme", f"job-{job.job_id}", BUYER_CANCEL_REASON)]
 
     delivered = await shop.hire(1000)
     shop.control.on_occupy = lambda: shop.observe(
@@ -1049,3 +1056,182 @@ async def test_history_progress_is_only_ever_the_pinned_runs(shop: Shop) -> None
     await shop.gate.sweep()
     assert [e.last_event for e in shop.gate.jobs[mine.job_id].events] == ["ActivityTaskStarted"]
     assert shop.control.summarised == [("acme", f"job-{mine.job_id}", "run-1")]
+
+
+# --------------------------------------------------------------------------- cancel of a running job
+
+
+async def test_a_running_job_is_refunded_only_once_its_run_is_seen_terminated(
+    shop: Shop,
+) -> None:
+    """A run can complete at any moment, and its delivery reaches the buyer's own call
+    whatever escrow says: a refund first, and a cancel request the run ignores, gave the
+    buyer the result for free. The run is terminated, and the money waits for Temporal to
+    show it terminated."""
+    b0 = (await shop.balances())[0]
+    job = await shop.hire(1000)
+    wf = f"job-{job.job_id}"
+    shop.observe(job.job_id, ObservedStatus.RUNNING)
+    await shop.gate.sweep()
+    held: list[tuple[m.JobState, m.Escrow, int]] = []
+
+    def at_terminate() -> None:
+        record = shop.gate.jobs[job.job_id].record
+        held.append((record.state, record.escrow, len(shop.control.observed)))
+
+    shop.control.on_terminate = at_terminate
+    looks = len(shop.control.observed)
+    view = await shop.buyer.gate.cancel(job.job_id)
+    assert (view.state, view.escrow, view.reason) == (
+        m.JobState.CANCELED,
+        m.Escrow.REFUNDED,
+        BUYER_CANCEL_REASON,
+    )
+    # Looked at before, terminated while still held, and looked at again after.
+    assert held == [(m.JobState.WORKING, m.Escrow.HELD, looks + 1)]
+    assert len(shop.control.observed) == looks + 2
+    assert shop.control.terminates == [("acme", wf, BUYER_CANCEL_REASON)]
+    assert (await shop.balances())[0] == b0
+    assert (await shop.buyer.gate.cancel(job.job_id)).state is m.JobState.CANCELED  # idempotent
+    await assert_invariants(shop.gate.ledger)
+
+
+async def test_a_run_that_completes_before_the_terminate_is_delivered(shop: Shop) -> None:
+    """The race the other way: the run completed (and delivered to the buyer's call) just
+    before the termination reached it. The termination changes nothing, the delivery
+    stands, and the cancel is refused as for any delivered job."""
+    b0, s0, k0 = await shop.balances()
+    job = await shop.hire(1000)
+    shop.observe(job.job_id, ObservedStatus.RUNNING)
+    await shop.gate.sweep()
+    shop.control.on_terminate = lambda: shop.observe(
+        job.job_id, ObservedStatus.COMPLETED, b"the delivery"
+    )
+    with pytest.raises(GateError) as e:
+        await shop.buyer.gate.cancel(job.job_id)
+    assert (e.value.status, e.value.code) == (409, "not_open")
+    assert len(shop.control.terminates) == 1
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow) == (m.JobState.COMPLETED, m.Escrow.HELD)
+    assert base64.b64decode((await shop.buyer.gate.result(job.job_id)).payload.b64) == (
+        b"the delivery"
+    )
+    await shop.buyer.gate.accept(job.job_id)
+    assert await shop.balances() == (b0 - 1000, s0 + 950, k0 + 50)
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [
+        (ObservedStatus.FAILED, "seller workflow failed"),
+        (ObservedStatus.TIMED_OUT, "seller workflow timed out"),
+    ],
+)
+async def test_a_run_that_failed_before_the_terminate_refunds_as_its_failure(
+    shop: Shop, status: ObservedStatus, reason: str
+) -> None:
+    """Closed on its own, without completing, before the termination landed: refunded, and
+    the failure is the seller's, as it would have been without the cancel."""
+    job = await shop.hire(1000)
+    shop.observe(job.job_id, ObservedStatus.RUNNING)
+    await shop.gate.sweep()
+    shop.control.on_terminate = lambda: shop.observe(job.job_id, status)
+    with pytest.raises(GateError) as e:
+        await shop.buyer.gate.cancel(job.job_id)
+    assert (e.value.status, e.value.code) == (409, "not_open")
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow, view.reason) == (m.JobState.FAILED, m.Escrow.REFUNDED, reason)
+
+
+async def test_a_terminate_that_does_not_land_refunds_nothing_until_it_does(shop: Shop) -> None:
+    """The cancel is recorded first and stands: a termination that fails is a 503, the job
+    stays held, and the sweeper terminates and looks again until the run is seen closed --
+    then it is the buyer's cancel, never "seller workflow terminated"."""
+    job = await shop.hire(1000)
+    shop.observe(job.job_id, ObservedStatus.RUNNING)
+    await shop.gate.sweep()
+    shop.control.fail_stops = 1
+    with pytest.raises(GateError) as e:
+        await shop.buyer.gate.cancel(job.job_id)
+    assert (e.value.status, e.value.code) == (503, "temporal_unavailable")
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow) == (m.JobState.WORKING, m.Escrow.HELD)
+    assert shop.control.terminates == []
+    await shop.gate.sweep()  # the pending termination lands; the next look sees it
+    assert len(shop.control.terminates) == 1
+    await shop.gate.sweep()
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow, view.reason) == (
+        m.JobState.CANCELED,
+        m.Escrow.REFUNDED,
+        BUYER_CANCEL_REASON,
+    )
+    assert (await shop.buyer.gate.cancel(job.job_id)).state is m.JobState.CANCELED
+    assert (await shop.world.anon().party("acme")).refunded == 0
+
+
+async def test_a_cancel_that_cannot_look_after_the_terminate_is_refused_for_now(
+    shop: Shop,
+) -> None:
+    job = await shop.hire(1000)
+    shop.observe(job.job_id, ObservedStatus.RUNNING)
+    await shop.gate.sweep()
+
+    def frontend_down() -> None:
+        shop.control.fail_observe = TemporalError("frontend down")
+
+    shop.control.on_terminate = frontend_down
+    with pytest.raises(GateError) as e:
+        await shop.buyer.gate.cancel(job.job_id)
+    assert (e.value.status, e.value.code) == (503, "temporal_unavailable")
+    assert (await shop.buyer.gate.job(job.job_id)).escrow is m.Escrow.HELD
+    shop.control.fail_observe = None
+    shop.control.on_terminate = None
+    view = await shop.buyer.gate.cancel(job.job_id)  # asking again completes it
+    assert (view.state, view.escrow, view.reason) == (
+        m.JobState.CANCELED,
+        m.Escrow.REFUNDED,
+        BUYER_CANCEL_REASON,
+    )
+
+
+async def test_a_run_still_running_after_the_terminate_is_a_503_not_a_refund(
+    shop: Shop,
+) -> None:
+    """Whatever the termination call answered, only the pinned chain seen closed moves
+    money: a run still open afterwards is "try again", and the cancel stands."""
+    job = await shop.hire(1000)
+    shop.observe(job.job_id, ObservedStatus.RUNNING)
+    await shop.gate.sweep()
+    shop.control.terminate_lands = False
+    with pytest.raises(GateError) as e:
+        await shop.buyer.gate.cancel(job.job_id)
+    assert (e.value.status, e.value.code) == (503, "temporal_unavailable")
+    assert len(shop.control.terminates) == 2  # once for the cancel, again on seeing it open
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow) == (m.JobState.WORKING, m.Escrow.HELD)
+    shop.control.terminate_lands = True
+    await shop.gate.sweep()  # sees it running: terminates again, and this time it lands
+    await shop.gate.sweep()
+    assert (await shop.buyer.gate.job(job.job_id)).escrow is m.Escrow.REFUNDED
+
+
+async def test_a_pending_cancel_at_the_deadline_is_still_the_buyers(shop: Shop) -> None:
+    """Temporal unreachable for the termination until the deadline: the job refunds then,
+    as any job at its deadline -- the buyer's call and the run both end by it -- and the
+    refund is the buyer's cancel, not the seller's missed deadline."""
+    job = await shop.hire(1000)
+    shop.observe(job.job_id, ObservedStatus.RUNNING)
+    await shop.gate.sweep()
+    shop.control.fail_stops = 1_000
+    with pytest.raises(GateError):
+        await shop.buyer.gate.cancel(job.job_id)
+    shop.gate.advance(timedelta(hours=1, seconds=2))
+    await shop.gate.sweep()
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow, view.reason) == (
+        m.JobState.CANCELED,
+        m.Escrow.REFUNDED,
+        BUYER_CANCEL_REASON,
+    )
+    assert (await shop.world.anon().party("acme")).refunded == 0

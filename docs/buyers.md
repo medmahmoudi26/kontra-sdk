@@ -255,7 +255,7 @@ a pinned Ubuntu image with Docker, without network).
 | Delivered, you reject within the window | disputed; Kontra resolves it on the delivery's hashes and whatever each side decrypts for the resolver |
 | The seller's workflow fails | refunded |
 | No delivery by the deadline (`max_duration`) | refunded |
-| You cancel before delivery | refunded; the seller's workflow is cancelled |
+| You cancel before delivery | the seller's run is terminated, then refunded; a run that delivered first makes the cancel fail (it is a delivery) |
 | The seller refuses to start (bad hold token, a re-quote above your hold) | refunded |
 
 Each row is decided from facts the platform observes (the seller's workflow state in

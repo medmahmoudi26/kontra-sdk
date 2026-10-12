@@ -11,6 +11,14 @@ Every input is a fact the platform can observe without reading a payload (§8.3)
 state of the seller's handler workflow ``job-<id>`` in the seller's namespace, the clock,
 and the buyer's accept / reject / cancel calls.
 
+Effects are carried out in the order given, and no ``REFUND`` is ever returned before the
+fact that justifies it. A buyer's cancel of a job whose run was observed is the one rule
+that needs a fact the call itself cannot have -- whether the run completed first, and its
+delivery already reached the buyer's own Nexus call -- so it takes two steps:
+:func:`cancel` records the request and asks for the pinned run's termination
+(:attr:`EffectKind.TERMINATE_RUN`), and the platform completes it by observing the pinned
+chain afterwards and applying what it shows with :func:`observe`.
+
 Only a run the buyer's own Nexus call started can deliver (decisions I15). A seller can
 start ``job-<id>`` itself, with any input, or stop the run the buyer's call started and
 complete a later one; the observer establishes by lookup in the buyer's namespace which
@@ -143,6 +151,15 @@ class EffectKind(StrEnum):
     DISPUTE = "dispute"
     CANCEL_WORKFLOW = "cancel_workflow"
     TERMINATE_WORKFLOW = "terminate_workflow"
+    #: Step one of a buyer's cancel of a job with an observed run (:func:`cancel`):
+    #: terminate the open run of the pinned chain (:attr:`JobRecord.run_id`), then observe
+    #: that chain and apply the observation (:func:`observe`) -- the refund waits for it.
+    #: A cancel *request* would not do: a run that ignores it, or completes first, delivers
+    #: to the buyer's own call, and the buyer would have both the result and the money.
+    #: Termination ends a chain for good, so once it landed the run can deliver nothing;
+    #: a run that completed before it did is a delivery and the cancel is refused.
+    #: Re-issued by every observation that still finds the run open.
+    TERMINATE_RUN = "terminate_run"
     #: Carry out the resolver's split (``Ledger.resolve``). The split is the resolver's
     #: decision, recorded by the caller with it; the effect only names the job.
     RESOLVE = "resolve"
@@ -178,6 +195,12 @@ class JobRecord:
     #: observation. From then on only that chain counts: a later run of ``job-<id>`` (the
     #: seller's own start after terminating it) is ignored.
     run_id: str | None = None
+    #: When the buyer asked to cancel a job whose run was observed (:func:`cancel`). The
+    #: job stays open until an observation of the pinned chain decides it: terminated (the
+    #: platform's doing, for this cancel) or canceled refunds as the buyer's cancel;
+    #: completed first is a delivery. Recorded *before* the termination is attempted, so
+    #: the termination is never mistaken for the seller's own failure.
+    cancel_requested_at: datetime | None = None
 
     @property
     def open(self) -> bool:
@@ -220,6 +243,31 @@ def _fail(
     return replace(job, state=JobState.FAILED, escrow=Escrow.REFUNDED, reason=reason), effects
 
 
+def _buyer_canceled(
+    job: JobRecord, *, stop: EffectKind | None = None
+) -> tuple[JobRecord, list[Effect]]:
+    """Close a job the buyer canceled: refunded, with the reason no gate counts against
+    the seller. ``stop``: a workflow stop to issue first."""
+    effects = [Effect(EffectKind.REFUND, job.job_id, BUYER_CANCEL_REASON)]
+    if stop is not None:
+        effects.insert(0, Effect(stop, job.job_id, BUYER_CANCEL_REASON))
+    return (
+        replace(job, state=JobState.CANCELED, escrow=Escrow.REFUNDED, reason=BUYER_CANCEL_REASON),
+        effects,
+    )
+
+
+def _past_deadline(job: JobRecord, *, running: bool) -> tuple[JobRecord, list[Effect]]:
+    """An open job at its refund deadline: refunded, a ``running`` run terminated. A job
+    the buyer had asked to cancel stays the buyer's cancel: its run outlived the
+    termination only because the platform could not reach Temporal, which is not the
+    seller's failure. No run delivers after the deadline: the buyer's call and the
+    handler's run both end by it (decisions I16)."""
+    if job.cancel_requested_at is not None:
+        return _buyer_canceled(job, stop=EffectKind.TERMINATE_WORKFLOW if running else None)
+    return _fail(job, "max_duration exceeded", terminate=running)
+
+
 def _deliver(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord, list[Effect]]:
     delivered_at = obs.closed_at or now
     job = replace(
@@ -242,7 +290,13 @@ def observe(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord,
     A run that is not the buyer's call (:class:`Provenance` other than ``VERIFIED``, or
     another run than the pinned one) moves nothing: the job waits for the buyer's call as
     if no run existed, and refunds at the deadline. A completed one is named in the reason,
-    so the refund says what happened."""
+    so the refund says what happened.
+
+    With a cancel requested (:attr:`JobRecord.cancel_requested_at`), this is step two of
+    :func:`cancel`: the pinned chain terminated or canceled refunds as the buyer's cancel,
+    completed is a delivery (it beat the termination), failed or timed out refunds as it
+    would have anyway (it closed on its own first), and still running asks for the
+    termination again."""
     if not job.open:
         return job, []
     if obs.status is ObservedStatus.NOT_FOUND:
@@ -269,14 +323,17 @@ def observe(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord,
             return _deliver(job, obs, now)
         case ObservedStatus.RUNNING:
             if now >= job.deadline:
-                return _fail(job, "max_duration exceeded", terminate=True)
+                return _past_deadline(job, running=True)
             if job.state is JobState.SUBMITTED:
                 job = replace(job, state=JobState.WORKING, started_at=obs.started_at or now)
+            if job.cancel_requested_at is not None:
+                return job, [Effect(EffectKind.TERMINATE_RUN, job.job_id, BUYER_CANCEL_REASON)]
             return job, []
         case ObservedStatus.CANCELED:
             # Who asked is in the buyer's records (Observation.buyer_canceled): a buyer that
             # cancels its own call must not have the refund counted against the seller.
-            why = BUYER_CANCEL_REASON if obs.buyer_canceled else "canceled"
+            asked = obs.buyer_canceled or job.cancel_requested_at is not None
+            why = BUYER_CANCEL_REASON if asked else "canceled"
             return (
                 replace(
                     job,
@@ -289,6 +346,8 @@ def observe(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord,
         case ObservedStatus.TIMED_OUT:
             return _fail(job, "seller workflow timed out")
         case ObservedStatus.TERMINATED:
+            if job.cancel_requested_at is not None:
+                return _buyer_canceled(job)  # the termination step one asked for
             return _fail(job, "seller workflow terminated")
         case ObservedStatus.FAILED:
             return _fail(job, "seller workflow failed")
@@ -304,7 +363,7 @@ def tick(job: JobRecord, now: datetime) -> tuple[JobRecord, list[Effect]]:
                 Effect(EffectKind.RELEASE, job.job_id, "review window closed")
             ]
     elif job.open and now >= job.deadline:
-        return _fail(job, "max_duration exceeded", terminate=job.state is JobState.WORKING)
+        return _past_deadline(job, running=job.state is JobState.WORKING)
     return job, []
 
 
@@ -351,20 +410,31 @@ def reject(
 
 
 def cancel(job: JobRecord, party: str, now: datetime) -> tuple[JobRecord, list[Effect]]:
-    """Buyer cancels before delivery: refund now (no partial payment, §2) and ask the
-    seller's workflow to stop. A delivery that lands afterwards is ignored."""
+    """The buyer cancels before delivery; nothing is paid for a canceled job (§2).
+
+    A job with no observed run (nothing pinned) refunds at once and any run of the id is
+    asked to stop: none is the buyer's call, so none can deliver to it. (The platform
+    first closes ``job-<id>`` to late starts, decisions I16.)
+
+    A job with an observed run takes two steps, because that run can complete at any
+    moment and its delivery reaches the buyer's own Nexus call whatever escrow says: a
+    refund issued first would let a buyer cancel a nearly finished job and keep both the
+    result and the money. Step one, here: the request is recorded
+    (:attr:`JobRecord.cancel_requested_at`), the job stays open, and the only effect is
+    :attr:`EffectKind.TERMINATE_RUN`. Step two is the platform's: once the termination was
+    attempted it observes the pinned chain and applies that with :func:`observe` --
+    terminated refunds as the buyer's cancel; completed first is a delivery, and the
+    cancel is then refused like any cancel of a delivered job. Asking again while step two
+    is pending asks for the termination again."""
     _require_buyer(job, party)
     if job.state is JobState.CANCELED:
         return job, []
     if not job.open:
         raise EscrowError("not_open", f"job is {job.state.value}")
-    return (
-        replace(job, state=JobState.CANCELED, escrow=Escrow.REFUNDED, reason=BUYER_CANCEL_REASON),
-        [
-            Effect(EffectKind.CANCEL_WORKFLOW, job.job_id, BUYER_CANCEL_REASON),
-            Effect(EffectKind.REFUND, job.job_id, BUYER_CANCEL_REASON),
-        ],
-    )
+    if job.run_id is None:
+        return _buyer_canceled(job, stop=EffectKind.CANCEL_WORKFLOW)
+    requested = replace(job, cancel_requested_at=job.cancel_requested_at or now)
+    return requested, [Effect(EffectKind.TERMINATE_RUN, job.job_id, BUYER_CANCEL_REASON)]
 
 
 def resolve(job: JobRecord, now: datetime) -> tuple[JobRecord, list[Effect]]:

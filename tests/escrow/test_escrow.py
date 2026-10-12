@@ -265,3 +265,153 @@ def test_a_buyer_cancel_flag_on_a_run_not_from_the_buyer_moves_nothing() -> None
     for provenance in (*NOT_THE_BUYERS, Provenance.OCCUPIED):
         obs = replace(seen(ObservedStatus.CANCELED, provenance), buyer_canceled=True)
         assert escrow.observe(job(), obs, SOON) == (job(), [])
+
+
+# --------------------------------------------------------------------------- cancel of a running job
+
+
+def working() -> JobRecord:
+    record, _ = escrow.observe(job(), seen(ObservedStatus.RUNNING, started_at=T0), SOON)
+    assert (record.state, record.run_id) == (JobState.WORKING, RUN)
+    return record
+
+
+def test_a_job_with_no_observed_run_is_refunded_at_once() -> None:
+    """Nothing pinned: no run is the buyer's call, so none can deliver to it."""
+    record, effects = escrow.cancel(job(), "bob", SOON)
+    assert (record.state, record.escrow, record.reason) == (
+        JobState.CANCELED,
+        Escrow.REFUNDED,
+        BUYER_CANCEL_REASON,
+    )
+    assert [e.kind for e in effects] == [EffectKind.CANCEL_WORKFLOW, EffectKind.REFUND]
+
+
+def test_cancelling_an_observed_run_refunds_nothing_until_it_is_seen_terminated() -> None:
+    """Step one asks for the termination and moves no money; asking again, or seeing the
+    run still open, asks again; only the pinned chain seen terminated refunds, as the
+    buyer's cancel (never "seller workflow terminated")."""
+    record, effects = escrow.cancel(working(), "bob", SOON)
+    assert (record.state, record.escrow, record.cancel_requested_at) == (
+        JobState.WORKING,
+        Escrow.HELD,
+        SOON,
+    )
+    assert [(e.kind, e.reason) for e in effects] == [
+        (EffectKind.TERMINATE_RUN, BUYER_CANCEL_REASON)
+    ]
+    later = SOON + timedelta(minutes=1)
+    again, effects = escrow.cancel(record, "bob", later)
+    assert again == record  # the first request's time stands
+    assert [e.kind for e in effects] == [EffectKind.TERMINATE_RUN]
+    still, effects = escrow.observe(record, seen(ObservedStatus.RUNNING), later)
+    assert (still, [e.kind for e in effects]) == (record, [EffectKind.TERMINATE_RUN])
+    with pytest.raises(escrow.EscrowError):
+        escrow.cancel(record, "acme", later)  # the seller cannot ask for it
+    done, effects = escrow.observe(record, seen(ObservedStatus.TERMINATED), later)
+    assert (done.state, done.escrow, done.reason) == (
+        JobState.CANCELED,
+        Escrow.REFUNDED,
+        BUYER_CANCEL_REASON,
+    )
+    assert [(e.kind, e.reason) for e in effects] == [(EffectKind.REFUND, BUYER_CANCEL_REASON)]
+    assert escrow.cancel(done, "bob", later) == (done, [])
+
+
+def test_a_run_that_completed_before_the_termination_is_a_delivery() -> None:
+    record, _ = escrow.cancel(working(), "bob", SOON)
+    delivered, effects = escrow.observe(
+        record, seen(ObservedStatus.COMPLETED, closed_at=SOON, result_sha256="x"), SOON
+    )
+    assert (delivered.state, delivered.escrow, delivered.delivery_sha256) == (
+        JobState.COMPLETED,
+        Escrow.HELD,
+        "x",
+    )
+    assert effects == []
+    with pytest.raises(escrow.EscrowError) as refused:
+        escrow.cancel(delivered, "bob", SOON)
+    assert refused.value.code == "not_open"
+    released, effects = escrow.accept(delivered, "bob", SOON)
+    assert (released.escrow, [e.kind for e in effects]) == (Escrow.RELEASED, [EffectKind.RELEASE])
+
+
+@pytest.mark.parametrize(
+    ("status", "state", "reason"),
+    [
+        (ObservedStatus.FAILED, JobState.FAILED, "seller workflow failed"),
+        (ObservedStatus.TIMED_OUT, JobState.FAILED, "seller workflow timed out"),
+        (ObservedStatus.CANCELED, JobState.CANCELED, BUYER_CANCEL_REASON),
+    ],
+)
+def test_a_run_that_closed_on_its_own_first_refunds_as_it_would_have(
+    status: ObservedStatus, state: JobState, reason: str
+) -> None:
+    record, _ = escrow.cancel(working(), "bob", SOON)
+    closed, effects = escrow.observe(record, seen(status, closed_at=SOON), SOON)
+    assert (closed.state, closed.escrow, closed.reason) == (state, Escrow.REFUNDED, reason)
+    assert [e.kind for e in effects] == [EffectKind.REFUND]
+
+
+def test_a_cancel_still_pending_at_the_deadline_is_the_buyers() -> None:
+    """The platform could not terminate the run before the deadline: the job refunds then,
+    as any job does, and it is the buyer's cancel rather than the seller's overrun."""
+    record, _ = escrow.cancel(working(), "bob", SOON)
+    for closed, effects in (
+        escrow.tick(record, AFTER_DEADLINE),
+        escrow.observe(record, seen(ObservedStatus.RUNNING), AFTER_DEADLINE),
+    ):
+        assert (closed.state, closed.escrow, closed.reason) == (
+            JobState.CANCELED,
+            Escrow.REFUNDED,
+            BUYER_CANCEL_REASON,
+        )
+        assert [e.kind for e in effects] == [EffectKind.TERMINATE_WORKFLOW, EffectKind.REFUND]
+    # Without the cancel, the same deadline is the seller's.
+    closed, _ = escrow.tick(working(), AFTER_DEADLINE)
+    assert closed.reason == "max_duration exceeded"
+
+
+def test_no_interleaving_refunds_a_cancel_whose_run_may_still_deliver() -> None:
+    """Whatever the buyer, the pinned run and the clock do, in whatever order: a REFUND
+    after a cancel was requested comes only with a close that is not a completion, or at
+    the deadline; a completion seen at any point is a delivery and never refunded; and
+    every REFUND comes last among the effects that carry it."""
+    rng = random.Random(16)
+    statuses = [s for s in ObservedStatus if s is not ObservedStatus.NOT_FOUND]
+    for _ in range(3000):
+        record, now = working(), SOON
+        for _ in range(rng.randint(1, 10)):
+            now += timedelta(minutes=rng.randint(0, 25))
+            before = record
+            roll = rng.random()
+            obs: Observation | None = None
+            if roll < 0.35:
+                try:
+                    record, effects = escrow.cancel(record, "bob", now)
+                except escrow.EscrowError:
+                    continue
+            elif roll < 0.45:
+                record, effects = escrow.tick(record, now)
+            else:
+                obs = seen(rng.choice(statuses), closed_at=now, result_sha256="x", result_size=1)
+                record, effects = escrow.observe(record, obs, now)
+            kinds = [e.kind for e in effects]
+            if EffectKind.REFUND in kinds:
+                assert kinds[-1] is EffectKind.REFUND
+                if before.cancel_requested_at is not None or record.run_id is not None:
+                    closed_alone = obs is not None and obs.status not in (
+                        ObservedStatus.RUNNING,
+                        ObservedStatus.COMPLETED,
+                    )
+                    assert closed_alone or now >= before.deadline, (before, obs, now)
+            delivered = before.state is JobState.COMPLETED
+            completes_in_time = (
+                before.open
+                and now < before.deadline
+                and obs is not None
+                and obs.status is ObservedStatus.COMPLETED
+            )
+            if delivered or completes_in_time:
+                assert record.state is JobState.COMPLETED
+                assert EffectKind.REFUND not in kinds
