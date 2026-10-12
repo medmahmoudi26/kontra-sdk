@@ -181,8 +181,10 @@ e2e: venv-present ## tests/e2e against `kontra dev` (brings the stack up; `kontr
 	@test -d $(E2E_TESTS) || { echo "$(E2E_TESTS) does not exist: there are no end-to-end tests to run" >&2; exit 1; }
 	@docker image inspect "$$KONTRA_TEMPORAL_IMAGE" >/dev/null 2>&1 || [[ "$$KONTRA_TEMPORAL_IMAGE" == */* ]] || \
 		{ echo "image $$KONTRA_TEMPORAL_IMAGE not found: run \`make temporal\`, or set KONTRA_TEMPORAL_IMAGE" >&2; exit 1; }
-	$(BIN)/kontra dev up
-	$(BIN)/pytest -m e2e $(PYTEST_FLAGS) $(E2E_TESTS)
+	@# Acceptance 1 counts the stack's start (`kontra dev` on a fresh machine starts it):
+	@# KONTRA_E2E_UP_SECONDS hands this `up`'s wall time to the session.
+	start=$$(date +%s); $(BIN)/kontra dev up; \
+	KONTRA_E2E_UP_SECONDS=$$(( $$(date +%s) - start )) $(BIN)/pytest -m e2e $(PYTEST_FLAGS) $(E2E_TESTS)
 
 .PHONY: clean
 clean: ## Remove build outputs (the server binary, dist/); leaves .venv and the CLI cache

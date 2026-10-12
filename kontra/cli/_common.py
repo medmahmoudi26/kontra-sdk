@@ -102,7 +102,7 @@ def describe(exc: BaseException) -> str | None:
         where = ""
         with contextlib.suppress(RuntimeError):  # no request attached
             where = f" {exc.request.url.copy_with(query=None)}"
-        return f"cannot reach{where}: {exc or type(exc).__name__}"
+        return f"cannot reach{where}: {str(exc) or type(exc).__name__}"
     if isinstance(exc, LoginError):
         return exc.message
     known: tuple[type[BaseException], ...] = (

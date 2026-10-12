@@ -69,7 +69,11 @@ kontra dev down        # when you are done (--volumes also drops the data)
 `make e2e` uses `KONTRA_TEMPORAL_IMAGE` (default `kontra-temporal:dev`) and
 `KONTRA_GATE_IMAGE` (default: compose's, `ghcr.io/medmahmoudi26/kontra-gate:dev`). If your
 `KONTRA_HOME` holds a real login, `kontra dev` refuses to replace it: run with
-`KONTRA_HOME=~/.kontra-dev`.
+`KONTRA_HOME=~/.kontra-dev`. The suite ends with `kontra dev down --volumes`, which deletes
+the data of this machine's one dev stack (the compose project is `kontra-dev` whatever the
+home): do not run it next to a dev stack whose data you want to keep.
+[docs/acceptance.md](docs/acceptance.md) maps each PRD §16 criterion to the tests that prove
+it, end to end and below, with the last full run.
 
 ## Rules every change keeps
 
