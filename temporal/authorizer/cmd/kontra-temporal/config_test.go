@@ -73,9 +73,78 @@ func TestOnlyTheFrontendsCanLeaveLoopback(t *testing.T) {
 			t.Errorf("%s binds %q", name, rpc.BindOnIP)
 		}
 	}
-	for name, hosts := range s.hosts() {
-		if !strings.HasPrefix(hosts.Self, "127.0.0.1:") {
-			t.Errorf("%s: services must reach each other over loopback, got %s", name, hosts.Self)
+}
+
+// TestServicesAreDialledWhereTheyBind: this process dials its own internal frontend (the
+// system worker, history's Nexus dispatch and completions, the cluster record). With the
+// address fixed at 127.0.0.1, binding the internal frontend to a private interface, as
+// the README advises, refused every one of those connections and the server never
+// started. The dial address is the bind address exactly, whatever it is.
+func TestServicesAreDialledWhereTheyBind(t *testing.T) {
+	for _, tc := range []struct{ public, internal, wantPublic, wantInternal string }{
+		{"127.0.0.1", "10.20.30.40", "127.0.0.1:7233", "10.20.30.40:7236"},
+		{"0.0.0.0", "127.0.0.2", "0.0.0.0:7233", "127.0.0.2:7236"},
+		{"192.0.2.7", "0.0.0.0", "192.0.2.7:7233", "0.0.0.0:7236"},
+		{"::", "fd00::7", "[::]:7233", "[fd00::7]:7236"},
+	} {
+		clearEnv(t)
+		t.Setenv("KONTRA_FRONTEND_BIND_IP", tc.public)
+		t.Setenv("KONTRA_INTERNAL_FRONTEND_BIND_IP", tc.internal)
+		s, err := loadSettings()
+		if err != nil {
+			t.Fatal(err)
+		}
+		hosts := s.hosts()
+		for name, want := range map[primitives.ServiceName]string{
+			primitives.FrontendService:         tc.wantPublic,
+			primitives.InternalFrontendService: tc.wantInternal,
+			primitives.HistoryService:          "127.0.0.1:7234",
+			primitives.MatchingService:         "127.0.0.1:7235",
+			primitives.WorkerService:           "127.0.0.1:7239",
+		} {
+			if got := hosts[name]; got.Self != want || len(got.All) != 1 || got.All[0] != want {
+				t.Errorf("bind %s/%s: %s static host %+v, want %s", tc.public, tc.internal, name, got, want)
+			}
+		}
+		// The cluster record is how history finds the frontend's HTTP API for Nexus.
+		cluster := s.temporalConfig("/dev/null").ClusterMetadata.ClusterInformation["active"]
+		wantHTTP := strings.TrimSuffix(tc.wantInternal, ":7236") + ":7246"
+		if cluster.RPCAddress != tc.wantInternal || cluster.HTTPAddress != wantHTTP {
+			t.Errorf("bind %s: cluster addresses %s / %s, want %s / %s",
+				tc.internal, cluster.RPCAddress, cluster.HTTPAddress, tc.wantInternal, wantHTTP)
+		}
+	}
+}
+
+// TestBindAddressesAreIPLiterals: the dial address is the bind address verbatim, so the
+// bind address must be what Temporal binds (net.ParseIP), never a name to resolve. A
+// name, a zone, a CIDR or stray whitespace fails with the other settings, at load.
+func TestBindAddressesAreIPLiterals(t *testing.T) {
+	for _, key := range []string{"KONTRA_FRONTEND_BIND_IP", "KONTRA_INTERNAL_FRONTEND_BIND_IP"} {
+		for _, bad := range []string{
+			"localhost", "temporal", "gate.internal", "10.0.0.1 ", " 10.0.0.1", "10.0.0.1\n",
+			"10.0.0.1:7236", "10.0.0.0/8", "fe80::1%eth0", "[::1]", "010.0.0.1", "0x7f.1",
+		} {
+			clearEnv(t)
+			t.Setenv(key, bad)
+			if _, err := loadSettings(); err == nil || !strings.Contains(err.Error(), key) {
+				t.Errorf("%s=%q: %v", key, bad, err)
+			}
+		}
+		for _, good := range []string{"10.20.30.40", "0.0.0.0", "::", "fd00::7", "::ffff:10.0.0.1"} {
+			clearEnv(t)
+			t.Setenv(key, good)
+			s, err := loadSettings()
+			if err != nil {
+				t.Fatalf("%s=%q: %v", key, good, err)
+			}
+			name := primitives.FrontendService
+			if key == "KONTRA_INTERNAL_FRONTEND_BIND_IP" {
+				name = primitives.InternalFrontendService
+			}
+			if got := s.rpc[name].BindOnIP; got != good {
+				t.Errorf("%s=%q is bound as %q: it must be kept as given", key, good, got)
+			}
 		}
 	}
 }

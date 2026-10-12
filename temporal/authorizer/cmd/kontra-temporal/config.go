@@ -101,15 +101,16 @@ func loadSettings() (*settings, error) {
 	// gRPC, and every HTTP route there (HTTP API, Nexus HTTP API, Nexus callbacks) is denied
 	// to tokens anyway.
 	public := s.rpc[primitives.FrontendService]
-	public.BindOnIP = e.str("KONTRA_FRONTEND_BIND_IP", loopback)
+	public.BindOnIP = e.ip("KONTRA_FRONTEND_BIND_IP", loopback)
 	public.HTTPPort = e.integer("KONTRA_FRONTEND_HTTP_PORT", 0)
 	s.rpc[primitives.FrontendService] = public
 	// The internal frontend: no authentication, full control. It must serve HTTP because
 	// history delivers Nexus tasks and completions to it, and the gate relays quotes through
 	// it (decisions I4). Loopback unless the deployment puts the gate on a private network
-	// with it (compose); never publish its ports.
+	// with it (compose, a VPC); never publish its ports. This process dials it there too
+	// (see address).
 	internal := s.rpc[primitives.InternalFrontendService]
-	internal.BindOnIP = e.str("KONTRA_INTERNAL_FRONTEND_BIND_IP", loopback)
+	internal.BindOnIP = e.ip("KONTRA_INTERNAL_FRONTEND_BIND_IP", loopback)
 	internal.HTTPPort = e.integer("KONTRA_INTERNAL_FRONTEND_HTTP_PORT", base+13)
 	if internal.HTTPPort == 0 {
 		e.fail("KONTRA_INTERNAL_FRONTEND_HTTP_PORT must not be 0")
@@ -161,8 +162,8 @@ func postgres(e *env) map[string]*config.SQL {
 	}
 }
 
-// hosts is the static membership of this single process: every service at its loopback
-// gRPC address. No membership protocol runs and no membership port is opened.
+// hosts is the static membership of this single process: every service at the address it
+// binds and its gRPC port. No membership protocol runs and no membership port is opened.
 func (s *settings) hosts() map[primitives.ServiceName]static.Hosts {
 	hosts := make(map[primitives.ServiceName]static.Hosts, len(s.rpc))
 	for name := range s.rpc {
@@ -254,14 +255,20 @@ func (s *settings) persistence() config.Persistence {
 	}
 }
 
-// address is where this process reaches one of its services: loopback and the service's
-// gRPC (or HTTP) port.
+// address is where this process reaches one of its services: exactly the address that
+// service binds, with its gRPC (or HTTP) port. Temporal dials its own internal frontend
+// there (the system worker, history's Nexus dispatch and completions, the cluster record),
+// so a frontend bound to a private interface must be dialled on that interface: a fixed
+// loopback address would refuse every connection and the server would not start. The bind
+// address is used as given, never rewritten: an unspecified one (0.0.0.0, ::) is dialled
+// as is, which Go's dialer defines as the local system.
 func (s *settings) address(name primitives.ServiceName, http bool) string {
-	port := s.rpc[name].GRPCPort
+	rpc := s.rpc[name]
+	port := rpc.GRPCPort
 	if http {
-		port = s.rpc[name].HTTPPort
+		port = rpc.HTTPPort
 	}
-	return net.JoinHostPort(loopback, strconv.Itoa(port))
+	return net.JoinHostPort(rpc.BindOnIP, strconv.Itoa(port))
 }
 
 // env reads variables and collects every malformed one, so a bad configuration fails
@@ -285,6 +292,18 @@ func (e *env) integer(key string, def int) int {
 		e.fail(fmt.Sprintf("%s=%q is not a non-negative integer", key, v))
 	}
 	return n
+}
+
+// ip reads a bind address. It must be an IP literal as Temporal parses one (net.ParseIP),
+// so a host name fails here with the other settings instead of as Temporal's fatal error
+// at start-up; and it is returned exactly as given, because this process dials its
+// services at that very string (see address).
+func (e *env) ip(key, def string) string {
+	v := e.str(key, def)
+	if net.ParseIP(v) == nil {
+		e.fail(fmt.Sprintf("%s=%q is not an IP address", key, v))
+	}
+	return v
 }
 
 func (e *env) duration(key string, def time.Duration) time.Duration {

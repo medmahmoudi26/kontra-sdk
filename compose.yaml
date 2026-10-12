@@ -47,9 +47,10 @@
 #   temporal-db  temporal, postgres-relay    Temporal's own database connections
 #   database     postgres, postgres-relay, gate, migrate
 #   bucket       s3, gate                    SeaweedFS's own unauthenticated ports
-# Temporal binds the internal frontend on every interface it has: its own services dial it
-# on loopback, so it cannot be bound to one network's address alone. Hence Temporal is not
-# on `database`: Postgres (large third-party code that a SQL injection reaches) and the
+# Temporal binds the internal frontend on every interface it has (0.0.0.0, which its own
+# services dial as the local system): it dials the address it binds, but a compose
+# network's address is not known before the container starts. Hence Temporal is not on
+# `database`: Postgres (large third-party code that a SQL injection reaches) and the
 # migrate job share no network with it, and Docker drops traffic between bridge networks,
 # so no address of Temporal is reachable from them. Temporal reaches Postgres through
 # postgres-relay, a byte relay that only ever connects out to Postgres. A container inherits
@@ -59,6 +60,16 @@
 # it to 0. SeaweedFS -- third-party code serving the internet in production -- reaches
 # neither Temporal nor Postgres, and only the gate reaches SeaweedFS's master, volume and
 # filer ports.
+#
+# Every service runs with no capabilities at all (cap_drop ALL, none added back), cannot
+# gain any (no-new-privileges), and has a read-only root filesystem: it writes only to its
+# volume or to a tmpfs that holds nothing across restarts, so code that takes one over
+# cannot replace the service's own binaries or leave anything behind for the next start.
+# Postgres runs as its own user, not root: its entrypoint needs root only to chown a data
+# directory that the named volume already gives postgres. SeaweedFS keeps the image's root
+# user, which owns /data: without capabilities, root is only the owner of root's files, and
+# with a read-only root those are /data and the tmpfs. The gate and Temporal images run as
+# unprivileged users and write nothing at runtime.
 #
 # Third-party images are pinned by digest, the tag kept beside it; dependabot proposes
 # bumps.
@@ -86,6 +97,12 @@ services:
       POSTGRES_DB: ${KONTRA_PG_DB:-kontra}
     volumes:
       - postgres:/var/lib/postgresql/data
+    user: postgres
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /var/run/postgresql # the server's socket and its lock file
     ports:
       - "${KONTRA_DEV_PG_BIND:-127.0.0.1}:${KONTRA_DEV_PG_PORT:-5432}:5432"
     healthcheck:
@@ -125,9 +142,19 @@ services:
 
   s3:
     # The claim-check bucket (ciphertext only). SeaweedFS: MinIO's images can no longer be
-    # pulled anonymously. Credentials come from the identities config below.
+    # pulled anonymously.
     # chrislusf/seaweedfs:3.80
     image: chrislusf/seaweedfs:3.80@sha256:1055999e08eed1789b0ae45d235126e4495e23d3fb9d6396293fd42539b1ae6a
+    # Credentials: the identities config, which this writes to the tmpfs before the image's
+    # own entrypoint starts SeaweedFS. Not compose `configs`: compose copies their content
+    # into the container's root filesystem, which read_only refuses.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        umask 077 && printf '%s' "$$KONTRA_S3_IDENTITIES" > /tmp/s3.json &&
+        unset KONTRA_S3_IDENTITIES && exec /entrypoint.sh "$$@"
+      - s3
     command:
       - server
       - -dir=/data
@@ -137,12 +164,21 @@ services:
       - -volume.max=200
       - -s3
       - -s3.port=8333
-      - -s3.config=/etc/seaweedfs/s3.json
-    configs:
-      - source: s3-identities
-        target: /etc/seaweedfs/s3.json
+      - -s3.config=/tmp/s3.json
+    environment:
+      KONTRA_S3_IDENTITIES: >-
+        {"identities": [{"name": "kontra",
+        "credentials": [{"accessKey": "${KONTRA_S3_ACCESS_KEY:?set KONTRA_S3_ACCESS_KEY}",
+        "secretKey": "${KONTRA_S3_SECRET_KEY:?set KONTRA_S3_SECRET_KEY}"}],
+        "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
     volumes:
       - s3:/data
+    # The image's root user, which owns /data (see the header).
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp # the identities config and SeaweedFS's unix sockets (s3, filer)
     ports:
       - "${KONTRA_DEV_BIND:-127.0.0.1}:${KONTRA_DEV_S3_PORT:-8333}:8333"
     healthcheck:
@@ -171,8 +207,20 @@ services:
       KONTRA_JWKS_URLS: http://gate:8080/.well-known/jwks.json
       KONTRA_JWKS_REFRESH: ${KONTRA_JWKS_REFRESH:-15s}
       KONTRA_LOG_LEVEL: ${KONTRA_TEMPORAL_LOG_LEVEL:-warn}
+      # Never a proxy. Compose copies a Docker client's proxy settings into every container,
+      # and Go exempts only loopback from them: Temporal dials its internal frontend at
+      # 0.0.0.0, so its own gRPC (it would not start) and its Nexus tasks and completion
+      # tokens would go to that proxy. Temporal reaches nothing but the gate's JWKS and
+      # postgres-relay, on these networks. An empty value wins over the injected one.
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
     ports:
       - "${KONTRA_DEV_BIND:-127.0.0.1}:${KONTRA_DEV_TEMPORAL_PORT:-7233}:7233"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -190,6 +238,9 @@ services:
     command: ["alembic", "upgrade", "head"]
     environment:
       KONTRA_DATABASE_URL: *database-url
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -228,6 +279,9 @@ services:
       KONTRA_STRIPE_WEBHOOK_SECRET: ${KONTRA_STRIPE_WEBHOOK_SECRET:-}
     ports:
       - "${KONTRA_DEV_BIND:-127.0.0.1}:${KONTRA_DEV_GATE_PORT:-8080}:8080"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -251,14 +305,6 @@ services:
     sysctls:
       net.ipv4.ip_forward: 0 # on three networks: never a router between them (see the header)
     networks: [control, database, bucket]
-
-configs:
-  s3-identities:
-    content: |
-      {"identities": [{"name": "kontra",
-        "credentials": [{"accessKey": "${KONTRA_S3_ACCESS_KEY:?set KONTRA_S3_ACCESS_KEY}",
-                         "secretKey": "${KONTRA_S3_SECRET_KEY:?set KONTRA_S3_SECRET_KEY}"}],
-        "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
 
 volumes:
   postgres:

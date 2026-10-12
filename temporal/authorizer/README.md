@@ -147,8 +147,8 @@ KONTRA_DB=postgres ... bin/kontra-temporal setup-schema
 | `KONTRA_PORT_BASE` | `7233` | base gRPC port; frontend = base, internal frontend = base+3 |
 | `KONTRA_FRONTEND_PORT` / `KONTRA_INTERNAL_FRONTEND_PORT` | base+0 / base+3 | override a service's gRPC port |
 | `KONTRA_HISTORY_PORT` / `KONTRA_MATCHING_PORT` / `KONTRA_WORKER_PORT` | base+1 / +2 / +6 | internal service gRPC ports (loopback) |
-| `KONTRA_FRONTEND_BIND_IP` | `127.0.0.1` | bind address of the **public** frontend |
-| `KONTRA_INTERNAL_FRONTEND_BIND_IP` | `127.0.0.1` (images too) | bind address of the **internal** frontend, which has no authentication. Set it only to a private interface the gate shares (compose network, VPC); never publish its ports |
+| `KONTRA_FRONTEND_BIND_IP` | `127.0.0.1` | bind address (an IP address) of the **public** frontend |
+| `KONTRA_INTERNAL_FRONTEND_BIND_IP` | `127.0.0.1` (images too) | bind address (an IP address) of the **internal** frontend, which has no authentication. Set it only to a private interface the gate shares (a VPC address, or `0.0.0.0` inside a container that is on private networks only, as in compose); never publish its ports. The server dials it at this address too (see below) |
 | `KONTRA_FRONTEND_HTTP_PORT` | `0` (off) | public HTTP API port; left off because the SDKs use gRPC and every HTTP route is denied to tokens |
 | `KONTRA_INTERNAL_FRONTEND_HTTP_PORT` | base+13 | internal HTTP port — required (history delivers Nexus tasks and completions here; the gate relays quotes here) |
 | `KONTRA_DB` | `sqlite` | `sqlite` or `postgres` |
@@ -170,14 +170,30 @@ Internal services (history, matching, the system worker) always bind loopback an
 variable to change that: they run in this one process and nothing outside it should reach
 them.
 
+The server reaches each of its own services at exactly the address that service binds: the
+system worker, history's Nexus dispatch and completions and `register-namespace` all go
+through the internal frontend, at `KONTRA_INTERNAL_FRONTEND_BIND_IP` exactly as given and its
+ports. So a private address works as is (the server needs no route to it but its own
+interface), and so does `0.0.0.0`, which Go dials as the local system. Both bind addresses
+must be IP addresses: a host name is refused at start, as Temporal would refuse to bind it.
+Binding `0.0.0.0` on a host, rather than in a container, listens on every interface the host
+has, the public one included: prefer the private address. If the server's environment sets
+`HTTP_PROXY` or `HTTPS_PROXY` (either case), put that address in `NO_PROXY` too: Go exempts
+only loopback from the proxy, and these connections carry Nexus tasks and completion tokens
+(with `0.0.0.0` and a proxy, the system worker's gRPC goes to the proxy and the server does not
+start). `compose.yaml` sets all four proxy variables empty for Temporal, because compose copies
+a Docker client's proxy settings into every container.
+
 ## Tests
 
 - `GOFLAGS=-p=1 go test ./...` — the deny matrix (every cell against Kontra's authorizer,
   Temporal's no-op authorizer and Temporal's default authorizer), a full sweep of every
   frontend API against every kind of caller, a check that every listed API is a real unary
-  gRPC method, the callback guard (every carrier, every header spelling, every URL), and the
-  config / dynamic-config checks (including the pins holding at runtime).
-- `KONTRA_TEMPORAL_BIN=$PWD/bin/kontra-temporal .venv/bin/pytest -m temporal ../../tests/temporal`
+  gRPC method, the callback guard (every carrier, every header spelling, every URL), the config /
+  dynamic-config checks (including the pins holding at runtime), and one real server start
+  with the internal frontend bound to `127.0.0.2` (skipped under `-short`, or where that
+  address cannot be bound).
+- `KONTRA_TEMPORAL_BIN=$PWD/bin/kontra-temporal ../../.venv/bin/pytest -m temporal ../../tests/temporal`
   (from this directory) — the policy over the wire against the real binary, plus the
   positive seller/buyer Nexus hiring path, the forged-completion probes and the callback
   and Nexus-header checks. Without `KONTRA_TEMPORAL_BIN` it uses `bin/kontra-temporal`, and
