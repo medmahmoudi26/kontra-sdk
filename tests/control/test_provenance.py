@@ -1,11 +1,15 @@
-"""Delivery provenance (decisions I15) against a real dev server (CLI 1.9.1, server 1.32).
+"""Delivery provenance (decisions I15, I16) against a real dev server (CLI 1.9.1, server
+1.32).
 
 A run of ``job-<id>`` counts for escrow only if the buyer's own ``execute`` call started
 it, which :meth:`Control.observe` establishes by looking the call up in the buyer's
 namespace. Here: the buyer's two doors (a standalone operation, a buyer workflow) verify;
 runs the seller starts itself -- before any call, or dressed in another call's callbacks,
 links and request id -- do not; and once escrow has pinned the buyer's run, terminating it
-and completing a new run of the same id does not move escrow."""
+and completing a new run of the same id does not move escrow. Then decisions I16: a cancel
+occupies ``job-<id>`` so a still-valid hold cannot start it, a buyer cancelling its own call
+is read from the buyer's records, and a failed read of the buyer's namespace is its own
+error."""
 
 from __future__ import annotations
 
@@ -25,16 +29,24 @@ from temporalio.api.common.v1 import (
     WorkflowExecution,
     WorkflowType,
 )
-from temporalio.api.enums.v1 import EventType, WorkflowIdReusePolicy
+from temporalio.api.enums.v1 import (
+    EventType,
+    NexusOperationExecutionStatus,
+    WorkflowIdConflictPolicy,
+    WorkflowIdReusePolicy,
+)
 from temporalio.api.history.v1 import HistoryEvent
 from temporalio.api.taskqueue.v1 import TaskQueue
 from temporalio.api.workflowservice.v1 import (
     DescribeNexusOperationExecutionRequest,
     DescribeWorkflowExecutionRequest,
     GetWorkflowExecutionHistoryRequest,
+    RequestCancelNexusOperationExecutionRequest,
     StartWorkflowExecutionRequest,
+    TerminateNexusOperationExecutionRequest,
 )
 from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker
 
 from kontra import _control as control_module
@@ -42,18 +54,31 @@ from kontra import escrow
 from kontra._control import (
     EXECUTE_OPERATION,
     HOLD_HEADER,
+    OCCUPY_TASK_QUEUE,
+    OCCUPY_WORKFLOW_TYPE,
     BuyerCall,
+    BuyerLookupError,
     Control,
     ObservationIncomplete,
+    Occupation,
+    TemporalError,
     hold_digest,
 )
 from kontra.contract.names import new_endpoint_name
-from kontra.escrow import NOT_FROM_BUYER_REASON, EscrowError, JobRecord, ObservedStatus, Provenance
+from kontra.escrow import (
+    BUYER_CANCEL_REASON,
+    NOT_FROM_BUYER_REASON,
+    OCCUPIED_REASON,
+    EscrowError,
+    JobRecord,
+    ObservedStatus,
+    Provenance,
+)
 from kontra.gate_client.models import Escrow, JobState
 from kontra.ledger import Money
 from kontra.testing.devserver import DevServer
 
-from .flows import BuyerFlow, Hire, Job, hang, step
+from .flows import BuyerFlow, CancellingBuyerFlow, Hire, Job, StartingBuyerFlow, hang, step
 from .handlers import make_handler
 
 pytestmark = pytest.mark.temporal
@@ -97,13 +122,15 @@ class Market:
             holds=frozenset(hold_digest(t) for t in tokens),
         )
 
-    async def script_hire(self, token: str, text: str = "ok") -> str:
+    async def script_hire(
+        self, token: str, text: str = "ok", *, operation_id: str | None = None
+    ) -> str:
         """The script door: a standalone ``execute`` operation in the buyer's namespace (as
         the gate's ``start`` route makes it). Returns the job's workflow id."""
         wf = job_id()
         await self.control.start_operation(
             self.buyer_ns,
-            unique("op"),
+            operation_id or unique("op"),
             self.endpoint,
             self.service,
             EXECUTE_OPERATION,
@@ -214,7 +241,11 @@ async def market(dev_server: DevServer, control: Control) -> AsyncIterator[Marke
             activities=[step, hang],
             nexus_service_handlers=[make_handler(m.service)],
         ),
-        Worker(m.buyer, task_queue=m.buyer_queue, workflows=[BuyerFlow]),
+        Worker(
+            m.buyer,
+            task_queue=m.buyer_queue,
+            workflows=[BuyerFlow, CancellingBuyerFlow, StartingBuyerFlow],
+        ),
     ):
         yield m
 
@@ -720,3 +751,460 @@ def test_hold_header_names_are_matched_in_any_case() -> None:
     # handed a header under a name HTTP refuses.
     assert "\u212aontra-hold".lower() == HOLD_HEADER
     assert not _carries_hold({"\u212aontra-hold": "tok"}, holds)
+
+
+# --------------------------------------------------------------------------- decisions I16
+
+
+async def history_of(client: Client, namespace: str, workflow_id: str) -> list[HistoryEvent]:
+    resp = await client.workflow_service.get_workflow_execution_history(
+        GetWorkflowExecutionHistoryRequest(
+            namespace=namespace, execution=WorkflowExecution(workflow_id=workflow_id)
+        )
+    )
+    return list(resp.history.events)
+
+
+async def handler_start(market: Market, workflow_id: str) -> RPCError:
+    """``job-<id>`` started exactly as ``kontra.serve``'s handler starts it (a fresh request
+    id, ``REJECT_DUPLICATE`` and ``FAIL``); the refusal it must get."""
+    with pytest.raises(RPCError) as refused:
+        await market.seller.workflow_service.start_workflow_execution(
+            StartWorkflowExecutionRequest(
+                namespace=market.seller_ns,
+                workflow_id=workflow_id,
+                workflow_type=WorkflowType(name="Job"),
+                task_queue=TaskQueue(name=market.task_queue),
+                input=Payloads(payloads=[plan_payload("ok")]),
+                request_id=str(uuid.uuid4()),
+                workflow_id_reuse_policy=WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+                workflow_id_conflict_policy=WorkflowIdConflictPolicy.WORKFLOW_ID_CONFLICT_POLICY_FAIL,
+            )
+        )
+    return refused.value
+
+
+async def test_occupy_job_closes_the_id_to_the_handlers_start(market: Market) -> None:
+    """A cancel before any run: ``job-<id>`` is taken by a placeholder that no worker ever
+    runs and that is closed at once, so the handler's own start -- what a buyer's direct
+    ``execute`` with its still-valid hold would trigger -- is refused, and the placeholder
+    is never a delivery nor a run of the seller's."""
+    wf = job_id()
+    assert await market.control.occupy_job(market.seller_ns, wf, BUYER_CANCEL_REASON) is (
+        Occupation.OCCUPIED
+    )
+    desc = await market.seller.get_workflow_handle(wf).describe()
+    assert desc.status is WorkflowExecutionStatus.TERMINATED
+    assert (desc.workflow_type, desc.task_queue) == (OCCUPY_WORKFLOW_TYPE, OCCUPY_TASK_QUEUE)
+    assert await desc.memo() == {"kontra-occupied": BUYER_CANCEL_REASON}
+    events = await history_of(market.seller, market.seller_ns, wf)
+    assert [e.event_type for e in events] == [
+        EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+        EventType.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED,
+    ]  # no workflow task was ever scheduled: no worker ran any of it
+    assert events[1].workflow_execution_terminated_event_attributes.reason == BUYER_CANCEL_REASON
+
+    refused = await handler_start(market, wf)
+    assert refused.status == RPCStatusCode.ALREADY_EXISTS
+
+    call = market.call(unique("hold"))
+    obs, result = await market.control.observe(market.seller_ns, wf, call, None)
+    assert (obs.status, obs.provenance, result) == (
+        ObservedStatus.TERMINATED,
+        Provenance.OCCUPIED,
+        None,
+    )
+    now = datetime.now(UTC)
+    job = a_job(now)
+    assert escrow.observe(job, obs, now) == (job, [])  # not the seller's terminated run
+    late, _ = escrow.observe(job, obs, job.deadline)
+    assert (late.escrow, late.reason, late.run_id) == (Escrow.REFUNDED, OCCUPIED_REASON, None)
+
+    # Idempotent: a retried cancel finds its own placeholder; still one run.
+    assert await market.control.occupy_job(market.seller_ns, wf, BUYER_CANCEL_REASON) is (
+        Occupation.OCCUPIED
+    )
+    assert len(await history_of(market.seller, market.seller_ns, wf)) == 2
+
+
+async def test_occupy_job_reports_a_run_that_got_there_first(market: Market) -> None:
+    """A call (or the seller) that started ``job-<id>`` before the cancel is reported, and
+    left alone: the cancel must stop it as a running job."""
+    token = unique("hold")
+    wf = await market.script_hire(token, "slow")
+    run = await market.wait(wf, WorkflowExecutionStatus.RUNNING)
+    assert await market.control.occupy_job(market.seller_ns, wf, BUYER_CANCEL_REASON) is (
+        Occupation.STARTED
+    )
+    desc = await market.seller.get_workflow_handle(wf).describe()
+    assert (desc.run_id, desc.status) == (run, WorkflowExecutionStatus.RUNNING)
+    obs, _ = await market.control.observe(market.seller_ns, wf, market.call(token), None)
+    assert (obs.status, obs.provenance) == (ObservedStatus.RUNNING, Provenance.VERIFIED)
+
+    closed = await market.script_hire(unique("hold"))
+    await market.wait(closed, WorkflowExecutionStatus.COMPLETED)
+    assert await market.control.occupy_job(market.seller_ns, closed, BUYER_CANCEL_REASON) is (
+        Occupation.STARTED
+    )
+
+
+async def test_a_placeholder_whose_termination_never_landed(
+    market: Market, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate dies between the placeholder's start and its termination: the id is
+    occupied all the same (the handler's ``FAIL`` refuses an open run too), no worker ever
+    gets it (its first task is delayed past its own timeout), a later cancel finishes the
+    job, and left alone it closes by itself."""
+    landed: list[str] = []
+
+    async def lost(self: Control, namespace: str, workflow_id: str, run_id: str, r: str) -> None:
+        landed.append(run_id)
+
+    close = Control._close_placeholder  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(Control, "_close_placeholder", lost)
+    monkeypatch.setattr(control_module, "_OCCUPY_TIMEOUT", timedelta(seconds=2))
+    wf, alone = job_id(), job_id()
+    for w in (wf, alone):
+        assert await market.control.occupy_job(market.seller_ns, w, "x") is Occupation.OCCUPIED
+    assert len(landed) == 2
+    assert (await market.seller.get_workflow_handle(wf).describe()).status is (
+        WorkflowExecutionStatus.RUNNING
+    )
+    assert (await handler_start(market, wf)).status == RPCStatusCode.ALREADY_EXISTS
+    obs, _ = await market.control.observe(market.seller_ns, wf, market.call("t"), None)
+    assert (obs.status, obs.provenance) == (ObservedStatus.RUNNING, Provenance.OCCUPIED)
+
+    monkeypatch.setattr(Control, "_close_placeholder", close)
+    assert await market.control.occupy_job(market.seller_ns, wf, "x") is Occupation.OCCUPIED
+    assert (await market.seller.get_workflow_handle(wf).describe()).status is (
+        WorkflowExecutionStatus.TERMINATED
+    )
+
+    await market.wait(alone, WorkflowExecutionStatus.TIMED_OUT)
+    assert [e.event_type for e in await history_of(market.seller, market.seller_ns, alone)] == [
+        EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+        EventType.EVENT_TYPE_WORKFLOW_EXECUTION_TIMED_OUT,
+    ]
+    assert (await handler_start(market, alone)).status == RPCStatusCode.ALREADY_EXISTS
+
+
+async def test_a_look_alike_the_seller_starts_is_not_the_placeholder(market: Market) -> None:
+    """The placeholder is recognised by every field it sets: a seller's run of the same type
+    and queue but its own identity is just a run the buyer's call did not start."""
+    wf = job_id()
+    req = StartWorkflowExecutionRequest(
+        namespace=market.seller_ns,
+        workflow_id=wf,
+        workflow_type=WorkflowType(name=OCCUPY_WORKFLOW_TYPE),
+        task_queue=TaskQueue(name=OCCUPY_TASK_QUEUE),
+        identity="the seller itself",
+        request_id=str(uuid.uuid4()),
+    )
+    await market.seller.workflow_service.start_workflow_execution(req)
+    obs, _ = await market.control.observe(market.seller_ns, wf, market.call("t"), None)
+    assert obs.provenance is Provenance.NOT_FROM_BUYER
+    assert await market.control.occupy_job(market.seller_ns, wf, "x") is Occupation.STARTED
+    await market.seller.get_workflow_handle(wf).terminate("done")
+
+
+async def test_a_buyer_cancelling_its_own_script_call_is_read_from_its_records(
+    market: Market,
+) -> None:
+    """The buyer cancels its standalone operation: the seller's run ends canceled, and the
+    operation's own record (its cancellation info) says the buyer asked, so the refund is
+    the buyer's cancel. A run the seller cancels itself is not."""
+    token, op = unique("hold"), unique("op")
+    wf = await market.script_hire(token, "slow", operation_id=op)
+    run = await market.wait(wf, WorkflowExecutionStatus.RUNNING)
+    call = market.call(token)
+    obs, _ = await market.control.observe(market.seller_ns, wf, call, None)
+    now = datetime.now(UTC)
+    working, _ = escrow.observe(a_job(now), obs, now)
+    assert working.run_id == run
+    await market.buyer.workflow_service.request_cancel_nexus_operation_execution(
+        RequestCancelNexusOperationExecutionRequest(
+            namespace=market.buyer_ns,
+            operation_id=op,
+            identity="the buyer",
+            request_id=str(uuid.uuid4()),
+            reason="changed my mind",
+        )
+    )
+    await market.wait(wf, WorkflowExecutionStatus.CANCELED)
+    for pinned in (run, None):
+        fresh = Control(market.control.client, market.control.http_base)
+        obs, result = await fresh.observe(market.seller_ns, wf, call, pinned)
+        assert (obs.status, obs.provenance, obs.buyer_canceled, result) == (
+            ObservedStatus.CANCELED,
+            Provenance.VERIFIED,
+            True,
+            None,
+        ), pinned
+    job, effects = escrow.observe(working, obs, datetime.now(UTC))
+    assert (job.state, job.escrow, job.reason) == (
+        JobState.CANCELED,
+        Escrow.REFUNDED,
+        BUYER_CANCEL_REASON,
+    )
+    assert [e.reason for e in effects] == [BUYER_CANCEL_REASON]
+
+    # Another job's hold does not make it this job's call, cancel or no cancel.
+    obs, _ = await market.control.observe(market.seller_ns, wf, market.call("other"), None)
+    assert (obs.provenance, obs.buyer_canceled) == (Provenance.NOT_FROM_BUYER, False)
+
+    # The seller cancels its own run: nothing in the buyer's records asks for it.
+    token = unique("hold")
+    wf = await market.script_hire(token, "slow")
+    run = await market.wait(wf, WorkflowExecutionStatus.RUNNING)
+    await market.seller.get_workflow_handle(wf).cancel()
+    await market.wait(wf, WorkflowExecutionStatus.CANCELED)
+    obs, _ = await market.control.observe(market.seller_ns, wf, market.call(token), run)
+    assert (obs.status, obs.buyer_canceled) == (ObservedStatus.CANCELED, False)
+    job, _ = escrow.observe(working, replace(obs, run_id=working.run_id), datetime.now(UTC))
+    assert job.reason == "canceled"
+
+
+class _Forgetful:
+    """A workflow service whose first ``misses`` descriptions of a standalone operation
+    answer NOT_FOUND, as for a record that cannot be found (everything else works)."""
+
+    def __init__(self, inner: object, misses: int) -> None:
+        self._inner, self.misses = inner, misses
+
+    def __getattr__(self, name: str) -> object:
+        call = getattr(self._inner, name)
+        if name != "describe_nexus_operation_execution":
+            return call
+
+        async def forgetful(req: object, **kw: object) -> object:
+            if self.misses > 0:
+                self.misses -= 1
+                raise RPCError("operation not found", RPCStatusCode.NOT_FOUND, b"")
+            return await call(req, **kw)
+
+        return forgetful
+
+
+class _ForgetfulControl(Control):
+    def __init__(self, control: Control, misses: int) -> None:
+        super().__init__(control.client, control.http_base)
+        self.service = _Forgetful(control.client.workflow_service, misses)
+
+    @property
+    def _wf(self) -> object:  # pyright: ignore[reportIncompatibleVariableOverride]
+        return self.service
+
+
+async def test_a_cancel_lookup_that_cannot_find_the_call_cannot_say(market: Market) -> None:
+    """Who canceled is said only once the buyer's call itself was read. A look that found
+    nothing (the operation's record read as not found) is "cannot say", not "the buyer did
+    not ask": escrow closes the job on the first answer, so that answer would count, for
+    good, against the seller a cancel the buyer asked for. The next look asks again, and a
+    known answer is remembered."""
+    token, op = unique("hold"), unique("op")
+    wf = await market.script_hire(token, "slow", operation_id=op)
+    run = await market.wait(wf, WorkflowExecutionStatus.RUNNING)
+    await market.buyer.workflow_service.request_cancel_nexus_operation_execution(
+        RequestCancelNexusOperationExecutionRequest(
+            namespace=market.buyer_ns, operation_id=op, request_id=str(uuid.uuid4())
+        )
+    )
+    await market.wait(wf, WorkflowExecutionStatus.CANCELED)
+    call = market.call(token)
+    gate = _ForgetfulControl(market.control, misses=1)
+    with pytest.raises(TemporalError) as err:  # pinned: verified already
+        await gate.observe(market.seller_ns, wf, call, run)
+    assert not isinstance(err.value, BuyerLookupError)  # read, and not found: no load
+    obs, _ = await gate.observe(market.seller_ns, wf, call, run)
+    assert (obs.status, obs.provenance, obs.buyer_canceled) == (
+        ObservedStatus.CANCELED,
+        Provenance.VERIFIED,
+        True,
+    )
+    gate.service.misses = 1  # known now: the answer no longer depends on another read
+    obs, _ = await gate.observe(market.seller_ns, wf, call, run)
+    assert (obs.buyer_canceled, gate.service.misses) == (True, 1)
+
+
+async def test_nothing_else_the_buyer_does_to_its_call_cancels_the_sellers_run(
+    market: Market,
+) -> None:
+    """``buyer_canceled`` reads only an explicit cancel request. That is enough only while
+    nothing else a buyer does to its own call cancels the seller's run: terminating the
+    operation or the calling workflow, the workflow ending (or being cancelled) without
+    cancelling the call, the operation timing out. Server 1.32 cancels the run on none of
+    them (measured here); a server that starts to would let a buyer have the seller's run
+    canceled with no request on record, the refund counted against the seller."""
+    terminated_op, timed_out_op = unique("op"), unique("op")
+    runs: dict[str, str] = {}
+    timed_out = job_id()
+    await market.control.start_operation(
+        market.buyer_ns,
+        timed_out_op,
+        market.endpoint,
+        market.service,
+        EXECUTE_OPERATION,
+        plan_payload("slow"),
+        {"x-workflow-id": timed_out, HOLD_HEADER: unique("hold")},
+        timedelta(seconds=8),  # long enough to start under load, then it times out
+    )
+    await market.wait(timed_out, WorkflowExecutionStatus.RUNNING)
+    runs[timed_out] = "timed-out operation"
+    wf = await market.script_hire(unique("hold"), "slow", operation_id=terminated_op)
+    runs[wf] = "terminated operation"
+    flows = []
+    for flow, what in (
+        (CancellingBuyerFlow.run, "terminated workflow"),
+        (CancellingBuyerFlow.run, "cancelled workflow"),
+        (StartingBuyerFlow.run, "workflow that ended"),
+    ):
+        wf = job_id()
+        handle = await market.buyer.start_workflow(
+            flow,
+            Hire(market.endpoint, market.service, wf, unique("hold"), "slow"),
+            id=unique("buyer-flow"),
+            task_queue=market.buyer_queue,
+        )
+        flows.append((handle, what))
+        runs[wf] = what
+    for wf in runs:
+        await market.wait(wf, WorkflowExecutionStatus.RUNNING)
+    await market.buyer.workflow_service.terminate_nexus_operation_execution(
+        TerminateNexusOperationExecutionRequest(
+            namespace=market.buyer_ns, operation_id=terminated_op, request_id=str(uuid.uuid4())
+        )
+    )
+    for handle, what in flows:
+        if what == "terminated workflow":
+            await handle.terminate("the buyer ends its own workflow")
+        elif what == "cancelled workflow":
+            await handle.cancel()
+        else:
+            assert await handle.result() == "started"
+    timed = NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_TIMED_OUT
+    for _ in range(300):
+        op = await market.buyer.workflow_service.describe_nexus_operation_execution(
+            DescribeNexusOperationExecutionRequest(
+                namespace=market.buyer_ns, operation_id=timed_out_op
+            )
+        )
+        if op.info.status == timed:
+            break
+        await asyncio.sleep(0.1)
+    assert op.info.status == timed
+    await asyncio.sleep(3)  # any cancel these caused would have reached the seller by now
+    for wf, what in runs.items():
+        desc = await market.seller.get_workflow_handle(wf).describe()
+        assert desc.status is WorkflowExecutionStatus.RUNNING, what
+        await market.seller.get_workflow_handle(wf).terminate("done")
+
+
+async def test_a_buyer_cancelling_its_own_workflow_call_is_read_from_its_history(
+    market: Market,
+) -> None:
+    """The workflow door: the buyer's workflow cancels the call, which its history records
+    as ``NexusOperationCancelRequested`` for the scheduled event the run's link names."""
+    token = unique("hold")
+    wf = job_id()
+    buyer = await market.buyer.start_workflow(
+        CancellingBuyerFlow.run,
+        Hire(market.endpoint, market.service, wf, token, "slow"),
+        id=unique("buyer-flow"),
+        task_queue=market.buyer_queue,
+    )
+    run = await market.wait(wf, WorkflowExecutionStatus.RUNNING)
+    call = market.call(token)
+    obs, _ = await market.control.observe(market.seller_ns, wf, call, None)
+    assert (obs.provenance, obs.buyer_canceled) == (Provenance.VERIFIED, False)
+    await buyer.signal(CancellingBuyerFlow.cancel_call)
+    assert await buyer.result() == "canceled"
+    await market.wait(wf, WorkflowExecutionStatus.CANCELED)
+    fresh = Control(market.control.client, market.control.http_base)
+    obs, _ = await fresh.observe(market.seller_ns, wf, call, run)
+    assert (obs.status, obs.provenance, obs.buyer_canceled) == (
+        ObservedStatus.CANCELED,
+        Provenance.VERIFIED,
+        True,
+    )
+
+    # A workflow call the buyer never cancelled, ended by the seller: not the buyer's doing.
+    token = unique("hold")
+    wf = job_id()
+    other = await market.buyer.start_workflow(
+        CancellingBuyerFlow.run,
+        Hire(market.endpoint, market.service, wf, token, "slow"),
+        id=unique("buyer-flow"),
+        task_queue=market.buyer_queue,
+    )
+    run = await market.wait(wf, WorkflowExecutionStatus.RUNNING)
+    await market.seller.get_workflow_handle(wf).cancel()
+    await market.wait(wf, WorkflowExecutionStatus.CANCELED)
+    obs, _ = await fresh.observe(market.seller_ns, wf, market.call(token), run)
+    assert (obs.status, obs.buyer_canceled) == (ObservedStatus.CANCELED, False)
+    await other.signal(CancellingBuyerFlow.cancel_call)  # lets the buyer's flow end
+    assert await other.result() == "canceled"
+
+
+class _Busy:
+    """A workflow service whose calls in one namespace fail as an overloaded namespace's do."""
+
+    def __init__(self, inner: object, namespace: str) -> None:
+        self._inner, self._namespace = inner, namespace
+
+    def __getattr__(self, name: str) -> object:
+        call = getattr(self._inner, name)
+
+        async def busy(req: object, **kw: object) -> object:
+            if getattr(req, "namespace", None) == self._namespace:
+                raise RPCError(
+                    "namespace rate limit exceeded", RPCStatusCode.RESOURCE_EXHAUSTED, b""
+                )
+            return await call(req, **kw)
+
+        return busy
+
+
+class _BusyControl(Control):
+    """A control plane that cannot read ``namespace`` (everything else works)."""
+
+    def __init__(self, control: Control, namespace: str) -> None:
+        super().__init__(control.client, control.http_base)
+        self._busy = _Busy(control.client.workflow_service, namespace)
+
+    @property
+    def _wf(self) -> object:  # pyright: ignore[reportIncompatibleVariableOverride]
+        return self._busy
+
+
+async def test_a_buyers_unreadable_namespace_is_its_own_error(market: Market) -> None:
+    """A buyer can keep its own namespace too busy to read. That must surface as
+    :class:`BuyerLookupError` -- a gate never gives up into a blind refund on it -- for
+    both doors and for the cancellation lookup; the seller's side failing is a plain
+    :class:`TemporalError`."""
+    token = unique("hold")
+    script = await market.script_hire(token)
+    await market.wait(script, WorkflowExecutionStatus.COMPLETED)
+    door_token = unique("hold")
+    door = await market.workflow_hire(door_token)
+    busy_buyer = _BusyControl(market.control, market.buyer_ns)
+    with pytest.raises(BuyerLookupError):
+        await busy_buyer.observe(market.seller_ns, script, market.call(token), None)
+    with pytest.raises(BuyerLookupError):
+        await busy_buyer.observe(market.seller_ns, door, market.call(door_token), None)
+
+    op, token = unique("op"), unique("hold")
+    wf = await market.script_hire(token, "slow", operation_id=op)
+    run = await market.wait(wf, WorkflowExecutionStatus.RUNNING)
+    await market.buyer.workflow_service.request_cancel_nexus_operation_execution(
+        RequestCancelNexusOperationExecutionRequest(
+            namespace=market.buyer_ns, operation_id=op, request_id=str(uuid.uuid4())
+        )
+    )
+    await market.wait(wf, WorkflowExecutionStatus.CANCELED)
+    with pytest.raises(BuyerLookupError):  # pinned: only who canceled is asked of the buyer
+        await busy_buyer.observe(market.seller_ns, wf, market.call(token), run)
+
+    busy_seller = _BusyControl(market.control, market.seller_ns)
+    with pytest.raises(TemporalError) as err:
+        await busy_seller.observe(market.seller_ns, script, market.call(token), None)
+    assert not isinstance(err.value, BuyerLookupError)

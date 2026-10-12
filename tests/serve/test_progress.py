@@ -182,6 +182,22 @@ async def test_close_sends_what_is_queued() -> None:
     assert all(isinstance(p.at, datetime) for _, p in gate.posts)
 
 
+async def test_close_is_not_lost_to_a_heartbeat_in_the_same_pass() -> None:
+    """A heartbeat's poke and aclose() in one loop pass, while the sender waits out the
+    interval. On Python 3.11 asyncio.wait_for dropped that cancel: the sender then waited for
+    a heartbeat forever, and aclose() -- a worker's shutdown -- with it."""
+    gate = Gate()
+    fw = ProgressForwarder(gate, Keys(), interval=60, clock=lambda: 0.0)
+    fw.start()
+    fw.offer(new_job_id(), "x", (1,))
+    await _until(lambda: len(gate.posts) == 1)
+    await asyncio.sleep(0.05)  # the sender is back to waiting, with the interval as timeout
+    fw._poke()
+    async with asyncio.timeout(5.0):
+        await fw.aclose()
+    assert gate.details() == [1]
+
+
 async def test_a_slow_gate_does_not_break_the_pace() -> None:
     """Heartbeats that arrive while an event is in flight wait for the interval: one event
     per interval per job (PRD §8.4), however slow the gate is."""

@@ -17,6 +17,7 @@ from nexusrpc.handler import StartOperationContext
 from temporalio import nexus
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
+from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.nexus import WorkflowRunOperationContext
 from temporalio.worker import Worker
 
@@ -69,13 +70,20 @@ def seller_handler(
             claims = verify(ctx.headers["kontra-hold"])
             if buyer_keys is not None:
                 buyer_keys[claims.job_id] = claims.buyer_key
-            return await ctx.start_workflow(
-                EnrichJob.run,
-                order,
-                id=job_workflow_id(claims.job_id),
-                execution_timeout=timedelta(seconds=claims.max_duration_seconds),
-                id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
-            )
+            try:
+                return await ctx.start_workflow(
+                    EnrichJob.run,
+                    order,
+                    id=job_workflow_id(claims.job_id),
+                    execution_timeout=timedelta(seconds=claims.max_duration_seconds),
+                    id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                )
+            except WorkflowAlreadyStartedError:  # one execution per hold, as kontra.serve
+                raise nexusrpc.HandlerError(
+                    f"job {claims.job_id} already ran",
+                    type=nexusrpc.HandlerErrorType.BAD_REQUEST,
+                    retryable_override=False,
+                ) from None
 
     return nexusrpc.handler.service_handler(name=entry.service)(Handler)()
 

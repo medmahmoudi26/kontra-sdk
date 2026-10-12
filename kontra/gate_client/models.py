@@ -19,7 +19,14 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
 __all__ = [
     "API_VERSION",
@@ -512,3 +519,28 @@ class HoldClaims(_M):
     currency: str
     contract_hash: str
     max_duration_seconds: int
+    #: The size, in bytes, of the input the quote priced, as the seller's handler receives
+    #: it (``kontra._control.input_size``: a claim-check's stored ciphertext, else the
+    #: payload). The handler refuses an ``execute`` input above it before fetching anything,
+    #: so one Nexus attempt is always enough to answer (decisions I16). Absent from tokens
+    #: of a gate that does not set it (then the handler's only bound is its codec's), and
+    #: then left out of the claims entirely, so re-signing such a token gives the same bytes.
+    input_size: int | None = Field(default=None, ge=0)
+    #: The gate's refund deadline for the job, in Unix seconds rounded down: the hold's
+    #: lock time plus ``max_duration`` plus the gate's own grace (``kontra.escrow``). The
+    #: handler ends the job's run by it, so a late start never delivers after the gate
+    #: refunded the job, whatever grace this gate is configured with (decisions I16).
+    #: Absent from tokens of a gate that does not set it (the handler then assumes
+    #: ``exp`` plus ``kontra.escrow.DEFAULT_GRACE``), and then left out of the claims, as
+    #: ``input_size`` is.
+    deadline: int | None = Field(default=None, ge=0)
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_bound(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        for optional in ("input_size", "deadline"):
+            if data.get(optional) is None:
+                data.pop(optional, None)
+        return data

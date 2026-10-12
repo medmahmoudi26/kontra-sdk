@@ -305,3 +305,77 @@ Retention (`DEFAULT_RETENTION`) is the contract's max_duration cap plus 5 days, 
 hold token can start `job-<id>` until it expires, and only the first run's record refuses a
 second start. `ensure_namespace` raises a shorter retention of an existing namespace to it and
 never lowers one.
+
+## I16. A job's start and end, closed to the parties' tricks
+
+Five ways money or blame still moved wrongly with I10 and I15 in place. Each is closed with
+facts the server or the gate records, compared for equality; nothing is parsed.
+
+1. **Cancel, then start.** A hold token stays valid until it expires and the handler checks
+   it offline (I10), so a buyer that canceled through the gate (refunded) could still run
+   `execute` with it, and a job that finished before the gate's next look was delivered for
+   free. A cancel of a job with no run now first *occupies* `job-<id>`
+   (`Control.occupy_job`): through the internal frontend it starts a placeholder under that
+   id (type and task queue `kontra.occupied`, the reason in its memo) with
+   `REJECT_DUPLICATE` and `FAIL`, and terminates it at once, by run id. The handler starts
+   the job with the same policies, so its start is refused for as long as the namespace
+   retains the placeholder (`DEFAULT_RETENTION`, longer than any hold). The placeholder's
+   first workflow task is delayed past its own one-minute execution timeout, so no worker
+   ever runs it and it closes by itself if the termination never lands (server 1.32,
+   measured: the execution timeout runs from the start, delay included). A run found
+   instead (`Occupation.STARTED`: a call got there first) is observed again and stopped as
+   a running job; an id that cannot be taken refuses the cancel (503), as an unobservable
+   job does. The placeholder is recognised by every field it sets and reported as
+   `Provenance.OCCUPIED`: never a delivery, never pinned, never "the seller's run
+   terminated"; an open job that shows only it refunds at the deadline with its own reason.
+   A seller can start a look-alike, which only refuses its own job (it could anyway), so
+   the label moves no money; for the same reason that refund counts against the seller
+   like any refund at the deadline, or a look-alike would excuse a seller that never
+   started the job. The late-start watch stays, for runs that began before the cancel.
+2. **Late start.** The hold's `max_duration` counts from the hire, but the run's timeout
+   was a full `max_duration` from the handler's start. The handler now ends the run by the
+   gate's refund deadline, which the hold carries (`deadline`, Unix seconds rounded down:
+   the gate's grace is its own setting, and `kontra.testing`'s is one second; a token
+   without it is taken to mean the expiry plus `DEFAULT_GRACE`), and refuses a start when
+   the re-quoted duration is longer than the time left before the expiry plus
+   `DEFAULT_GRACE` (or the deadline, if later): the seller is not blamed for a deadline it
+   never had, and no run delivers after the buyer was refunded. The refusal keeps
+   `DEFAULT_GRACE` even under a shorter gate grace because a job quoted for its whole
+   `max_duration` always starts a moment after the hire; such a run is cut to the deadline.
+   The cut uses the seller's clock against the server's, so a seller whose clock is behind
+   gives its run that much more (its own loss). Like `input_size`, the claim is left out
+   when unset, so tokens re-sign to the same bytes.
+3. **A slow handler looks absent.** A handler that has not answered within one Nexus
+   attempt (about 10 s) is recorded as `UPSTREAM_TIMEOUT`, exactly like a seller with no
+   worker. The hold now carries `input_size`, the quoted input's size as the seller
+   receives it (`kontra._control.input_size`: a claim-check reference's `size`, else the
+   serialized payload), which the gate records only after the seller's own quote fetched
+   and checked that input. The handler refuses an `execute` input larger than that (plus
+   4 KiB for encodings) before fetching any of it, non-retryable and naming the bound, so
+   what it fetches and validates is what the seller already did within the gate's quote
+   timeout; a fetch still running 2 s before the request's deadline (6 s at most: the
+   deadline is the server's clock, read on the seller's) is abandoned with a refusal. The claim is optional, and omitted from the claims when unset, so a token from
+   a gate that does not set it re-signs to the same bytes (I15's digests). The offline
+   checks of acceptance criteria 7 and 18 are unchanged.
+4. **A buyer cancelling its own call** ended the job "canceled", counted against the seller.
+   For a verified run that ended canceled, `Observation.buyer_canceled` now says whether
+   the buyer's own call recorded a cancel request: the standalone operation's
+   `cancellation_info` (described by operation id and run id, as for provenance), or a
+   `NexusOperationCancelRequested` event naming the linked scheduled event in the buyer's
+   workflow. Only the buyer and the server write either. Escrow then gives the reason a
+   cancel through the gate gives (`BUYER_CANCEL_REASON`). The answer is remembered once
+   known -- read from the call itself -- because a cancel request that caused the cancel
+   is recorded before the handler is asked, so a later request cannot move the blame. A
+   look that cannot find the call is "cannot say" (`TemporalError`, asked again), never
+   "the buyer did not ask": escrow closes the job on the first answer it gets. Measured on server 1.32: nothing else the buyer does to its call (terminating
+   the operation or its workflow, the workflow ending or being cancelled without
+   cancelling the call, the operation timing out) cancels the seller's run.
+5. **Blind refund.** A failed read of the buyer's namespace (provenance, cancellation)
+   raises `BuyerLookupError`, a `TemporalError`. The buyer controls that namespace's load,
+   so a gate must not give up into its deadline refund on it: the fake gate keeps asking,
+   and the buyer's cancel stays refused meanwhile. A failure on the seller's side, or of
+   the frontend, is still a plain `TemporalError`.
+
+Measured on server 1.32: an operation's `cancellation_info` is set once
+`RequestCancelNexusOperationExecution` is accepted (its `requested_time` stays empty, so
+only its presence is read), and a cancel request on a closed operation is refused.

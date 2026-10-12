@@ -26,6 +26,7 @@ from kontra._control import (
     HistorySummary,
     NexusSyncKind,
     NexusSyncResult,
+    Occupation,
     TemporalError,
 )
 from kontra.auth import Session, login
@@ -153,8 +154,19 @@ class ScriptedControl:
     )
     cancels: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
     terminates: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
+    #: every occupy_job call: (namespace, workflow id, reason)
+    occupied: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
+    #: what the next occupy_job finds (STARTED: a run got there first)
+    occupation: Occupation = Occupation.OCCUPIED
+    #: called by occupy_job before it answers (a run that appears meanwhile, say)
+    on_occupy: Callable[[], None] | None = None
     fail_endpoints: Exception | None = None
     fail_observe: Exception | None = None
+    fail_occupy: Exception | None = None
+    #: every history_summary call: (namespace, workflow id, pinned)
+    summarised: list[tuple[str, str, str | None]] = field(
+        default_factory=list[tuple[str, str, str | None]]
+    )
     fail_stops: int = 0
 
     def observe_as(
@@ -227,7 +239,10 @@ class ScriptedControl:
             (namespace, workflow_id), (Observation(status=ObservedStatus.NOT_FOUND), None)
         )
 
-    async def history_summary(self, namespace: str, workflow_id: str) -> HistorySummary | None:
+    async def history_summary(
+        self, namespace: str, workflow_id: str, pinned: str | None = None
+    ) -> HistorySummary | None:
+        self.summarised.append((namespace, workflow_id, pinned))
         return self.summaries.get((namespace, workflow_id))
 
     async def cancel_workflow(self, namespace: str, workflow_id: str, reason: str) -> None:
@@ -241,6 +256,14 @@ class ScriptedControl:
             self.fail_stops -= 1
             raise TemporalError("frontend down")
         self.terminates.append((namespace, workflow_id, reason))
+
+    async def occupy_job(self, namespace: str, workflow_id: str, reason: str) -> Occupation:
+        if self.fail_occupy is not None:
+            raise self.fail_occupy
+        self.occupied.append((namespace, workflow_id, reason))
+        if self.on_occupy is not None:
+            self.on_occupy()
+        return self.occupation
 
     async def start_operation(
         self,

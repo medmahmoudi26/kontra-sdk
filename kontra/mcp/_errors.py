@@ -109,6 +109,26 @@ def _kontra_code(err: KontraError) -> str:
             return "kontra_error"
 
 
+def _job_failed_message(err: JobFailed) -> str:
+    """What became of a failed job's money, said only as far as it is known.
+
+    ``JobFailed`` carries no escrow state. It is raised once the gate closed the job
+    without a delivery (refunded), but also when the gate could not be asked or had not
+    closed the job yet -- and then the gate may still record a delivery (a run that
+    completed after the call timed out) and pay for it when the review window closes. Its
+    ``reason`` cannot tell the cases apart either: it ends in the seller's own words
+    whenever the seller gave any, so a check of its text is one the seller can satisfy.
+    So the message states the rule, not an outcome, and points at ``status``, which
+    reads the escrow; the seller's text comes last, labelled, where clipping cuts only it.
+    """
+    return (
+        f"the job ended without a delivery ({err.state}). The gate refunds its escrow when "
+        "it closes the job without one, by the job's refund deadline at the latest; call "
+        "status with this job_id to see whether it is refunded yet (and if the gate recorded "
+        f"a delivery after all, review it). Reason given: {err.reason}"
+    )
+
+
 def tool_error(err: BaseException) -> tuple[str, str, dict[str, Any]]:
     """``(code, message, detail)`` for a failure in :data:`HANDLED`."""
     match err:
@@ -122,11 +142,7 @@ def tool_error(err: BaseException) -> tuple[str, str, dict[str, Any]]:
             return "invalid_delivery", err.message, {"job_id": err.job_id}
         case JobFailed():
             detail = {"job_id": err.job_id, "state": err.state, "reason": err.reason}
-            message = (
-                f"the job ended without a delivery ({err.state}): {err.reason}; "
-                "its escrow is refunded"
-            )
-            return "job_failed", message, detail
+            return "job_failed", _job_failed_message(err), detail
         case KontraError():
             fields = {k: v for k, v in err.fields.items() if k not in ("code", "detail")}
             # The gate's own detail. A HireRefused carries it (``quote_used`` names the job

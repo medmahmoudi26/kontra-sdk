@@ -16,13 +16,24 @@ from temporalio.api.common.v1 import Payload
 
 from kontra._control import (
     BuyerCall,
+    BuyerLookupError,
     HistorySummary,
     NexusSyncKind,
     NexusSyncResult,
+    Occupation,
+    TemporalError,
     hold_digest,
+    input_size,
 )
 from kontra.auth import Session
-from kontra.escrow import NOT_FROM_BUYER_REASON, ObservedStatus, Provenance
+from kontra.codec import CLAIM_CHECK_ENCODING
+from kontra.escrow import (
+    BUYER_CANCEL_REASON,
+    NOT_FROM_BUYER_REASON,
+    OCCUPIED_REASON,
+    ObservedStatus,
+    Provenance,
+)
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
 from kontra.ledger import PLATFORM_PARTY
@@ -264,6 +275,39 @@ async def test_hire_locks_the_price_and_signs_a_hold_token(shop: Shop) -> None:
     assert claims.exp - claims.iat == 3600  # lock time + max_duration (I10)
     assert view.expires_at == datetime.fromtimestamp(claims.exp, UTC)
     assert claims.iss == shop.gate.issuer
+    # The bound on what execute may bring: the quoted payload's size (decisions I16).
+    assert claims.input_size == json_payload({"text": "hi"}).ByteSize()
+    # The refund deadline with this gate's own grace, which a late run must end by (I16).
+    job = await shop.buyer.gate.job(view.job_id)
+    assert claims.deadline == int(job.deadline.timestamp())
+    assert claims.deadline - claims.exp == shop.gate.grace.total_seconds()  # whole seconds
+
+
+def _claims_of(shop: Shop, token: str) -> m.HoldClaims:
+    jwks = jwt.PyJWKSet.from_dict(shop.gate.keys.jwks())
+    return m.HoldClaims.model_validate(
+        jwt.decode(token, jwks.keys[0].key, algorithms=["ES256"], audience="kontra:hold")
+    )
+
+
+async def test_the_hold_bounds_execute_by_the_claim_checked_input_the_seller_priced(
+    shop: Shop,
+) -> None:
+    """A claim-checked quote input is bounded by the size its reference names -- what the
+    seller's quote fetched and checked -- not by the few bytes of the reference itself."""
+    ref = Payload(
+        metadata={"encoding": CLAIM_CHECK_ENCODING, "kontra-v": b"1"},
+        data=b'{"sha256":"' + b"a" * 64 + b'","size":700000}',
+    )
+    assert input_size(ref) == 700_000
+    shop.control.responder = lambda p, h: ok_quote(100)
+    q = await shop.buyer.gate.quote(shop.entry.name, wire(ref))
+    view = await shop.buyer.gate.hire(q.quote_id or "")
+    assert _claims_of(shop, view.hold_token).input_size == 700_000
+    # Re-issued for start, the token is the same statement (and the same digest).
+    await shop.buyer.gate.start(view.job_id, wire(json_payload({"text": "hi"})))
+    [started] = shop.control.starts
+    assert _claims_of(shop, started.headers["kontra-hold"]).input_size == 700_000
 
 
 async def test_hire_refusals(shop: Shop) -> None:
@@ -854,3 +898,154 @@ async def test_the_last_history_event_carries_the_final_state(shop: Shop) -> Non
     assert shop.gate.jobs[job.job_id].progress_final
     await shop.gate.sweep()
     assert len(shop.gate.jobs[job.job_id].events) == 2
+
+
+# --------------------------------------------------------------------------- decisions I16
+
+
+async def test_a_cancel_before_any_run_occupies_the_job(shop: Shop) -> None:
+    """The hold token outlives the cancel and is checked offline, so a job with no run is
+    closed to starts before it is refunded: a direct execute with the old token can then
+    never start it (the dev-server version of this attack is in test_lifecycle)."""
+    job = await shop.hire(1000)
+    wf = f"job-{job.job_id}"
+    view = await shop.buyer.gate.cancel(job.job_id)
+    assert (view.state, view.escrow, view.reason) == (
+        m.JobState.CANCELED,
+        m.Escrow.REFUNDED,
+        BUYER_CANCEL_REASON,
+    )
+    assert shop.control.occupied == [("acme", wf, BUYER_CANCEL_REASON)]
+    # The placeholder, seen afterwards, is no late start to stop and no delivery.
+    shop.observe(job.job_id, ObservedStatus.RUNNING, provenance=Provenance.OCCUPIED)
+    await shop.gate.sweep()
+    assert len(shop.control.cancels) == 1  # only the cancel's own request
+    assert (await shop.buyer.gate.job(job.job_id)).state is m.JobState.CANCELED
+    assert (await shop.world.anon().party("acme")).refunded == 0
+
+
+async def test_a_running_job_is_not_occupied_but_stopped(shop: Shop) -> None:
+    job = await shop.hire(1000)
+    shop.observe(job.job_id, ObservedStatus.RUNNING)
+    await shop.buyer.gate.cancel(job.job_id)
+    assert shop.control.occupied == []
+    assert shop.control.cancels == [("acme", f"job-{job.job_id}", BUYER_CANCEL_REASON)]
+
+
+async def test_a_cancel_that_cannot_close_the_job_to_starts_is_refused(shop: Shop) -> None:
+    job = await shop.hire(1000)
+    shop.control.fail_occupy = TemporalError("frontend down")
+    with pytest.raises(GateError) as e:
+        await shop.buyer.gate.cancel(job.job_id)
+    assert (e.value.status, e.value.code) == (503, "temporal_unavailable")
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.state, view.escrow) == (m.JobState.SUBMITTED, m.Escrow.HELD)
+    shop.control.fail_occupy = None
+    assert (await shop.buyer.gate.cancel(job.job_id)).escrow is m.Escrow.REFUNDED
+
+
+async def test_a_run_that_beat_the_cancel_is_looked_at_again(shop: Shop) -> None:
+    """The buyer's call started ``job-<id>`` between the gate's look and its occupation:
+    the run is observed again and the cancel goes through the running-job path -- or is
+    refused, when that run already delivered."""
+    job = await shop.hire(1000)
+    shop.control.occupation = Occupation.STARTED
+    shop.control.on_occupy = lambda: shop.observe(job.job_id, ObservedStatus.RUNNING)
+    view = await shop.buyer.gate.cancel(job.job_id)
+    assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
+    assert view.started_at is not None  # it was seen working first
+    assert shop.control.cancels == [("acme", f"job-{job.job_id}", BUYER_CANCEL_REASON)]
+
+    delivered = await shop.hire(1000)
+    shop.control.on_occupy = lambda: shop.observe(
+        delivered.job_id, ObservedStatus.COMPLETED, b"the delivery"
+    )
+    with pytest.raises(GateError) as e:
+        await shop.buyer.gate.cancel(delivered.job_id)
+    assert (e.value.status, e.value.code) == (409, "not_open")
+    assert (await shop.buyer.gate.job(delivered.job_id)).state is m.JobState.COMPLETED
+
+
+async def test_an_open_job_holding_only_the_placeholder_refunds_saying_so(shop: Shop) -> None:
+    """A cancel occupied the id but was never saved (a crash): the job waits for its
+    deadline like any job no call started, then refunds naming the placeholder."""
+    job = await shop.hire(1000)
+    shop.observe(
+        job.job_id, ObservedStatus.TERMINATED, provenance=Provenance.OCCUPIED, run_id="run-p"
+    )
+    await shop.gate.sweep()
+    assert (await shop.buyer.gate.job(job.job_id)).state is m.JobState.SUBMITTED
+    shop.gate.advance(timedelta(hours=1, seconds=2))
+    await shop.gate.sweep()
+    view = await shop.buyer.gate.job(job.job_id)
+    assert (view.escrow, view.reason) == (m.Escrow.REFUNDED, OCCUPIED_REASON)
+
+
+async def test_a_buyer_that_cancels_its_own_call_is_not_counted_against_the_seller(
+    shop: Shop,
+) -> None:
+    mine = await shop.hire(1000)
+    shop.observe(mine.job_id, ObservedStatus.CANCELED, buyer_canceled=True)
+    await shop.gate.sweep()
+    view = await shop.buyer.gate.job(mine.job_id)
+    assert (view.state, view.escrow, view.reason) == (
+        m.JobState.CANCELED,
+        m.Escrow.REFUNDED,
+        BUYER_CANCEL_REASON,
+    )
+    assert (await shop.world.anon().party("acme")).refunded == 0
+    theirs = await shop.hire(1000)
+    shop.observe(theirs.job_id, ObservedStatus.CANCELED)  # the seller stopped its own run
+    await shop.gate.sweep()
+    assert (await shop.buyer.gate.job(theirs.job_id)).reason == "canceled"
+    assert (await shop.world.anon().party("acme")).refunded == 1
+
+
+async def test_an_unreadable_buyer_namespace_never_refunds_blind(shop: Shop) -> None:
+    """Past the deadline and the give-up period, a job the gate cannot observe refunds --
+    unless what fails is the read of the buyer's own namespace, whose load the buyer
+    controls: a buyer could otherwise keep it failing and be refunded for a delivery."""
+    job = await shop.hire(1000)
+    shop.control.fail_observe = BuyerLookupError("namespace rate limit exceeded")
+    shop.gate.advance(timedelta(hours=2))  # past the deadline and the 15 minutes' give-up
+    await shop.gate.sweep()
+    assert (await shop.buyer.gate.job(job.job_id)).escrow is m.Escrow.HELD
+    with pytest.raises(GateError) as e:  # nor can the buyer cancel meanwhile
+        await shop.buyer.gate.cancel(job.job_id)
+    assert e.value.status == 503
+    shop.control.fail_observe = TemporalError("frontend down")  # the platform's own failure
+    await shop.gate.sweep()
+    assert (await shop.buyer.gate.job(job.job_id)).escrow is m.Escrow.REFUNDED
+
+
+async def test_history_progress_is_only_ever_the_pinned_runs(shop: Shop) -> None:
+    """The buyer's progress comes from the run its call started, as the gate reads it
+    (FIXUPS #34): neither a run the seller started itself nor the placeholder a cancel
+    left in ``job-<id>`` (decisions I16) is anyone's progress, and once a run is pinned
+    the summary is asked of that chain only."""
+    wf_summary = HistorySummary(state=ObservedStatus.RUNNING, last_event="ActivityTaskStarted")
+    theirs = await shop.hire(1000)
+    shop.control.summaries[("acme", f"job-{theirs.job_id}")] = wf_summary
+    shop.observe(theirs.job_id, ObservedStatus.RUNNING, provenance=Provenance.NOT_FROM_BUYER)
+    await shop.gate.sweep()
+    assert shop.gate.jobs[theirs.job_id].events == []
+
+    occupied = await shop.hire(1000)  # a cancel that occupied the id but was not saved
+    shop.control.summaries[("acme", f"job-{occupied.job_id}")] = HistorySummary(
+        state=ObservedStatus.TERMINATED, last_event="WorkflowExecutionTerminated"
+    )
+    shop.observe(
+        occupied.job_id, ObservedStatus.TERMINATED, provenance=Provenance.OCCUPIED, run_id="p"
+    )
+    await shop.gate.sweep()
+    assert shop.gate.jobs[occupied.job_id].events == []
+    for job in (theirs, occupied):  # free the offering's two slots
+        await shop.buyer.gate.cancel(job.job_id)
+    assert shop.control.summarised == []
+
+    mine = await shop.hire(1000)
+    shop.control.summaries[("acme", f"job-{mine.job_id}")] = wf_summary
+    shop.observe(mine.job_id, ObservedStatus.RUNNING)
+    await shop.gate.sweep()
+    assert [e.last_event for e in shop.gate.jobs[mine.job_id].events] == ["ActivityTaskStarted"]
+    assert shop.control.summarised == [("acme", f"job-{mine.job_id}", "run-1")]

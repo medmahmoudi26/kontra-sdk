@@ -345,6 +345,31 @@ def test_money_refusals_say_what_was_and_was_not_done() -> None:
     assert (bad["code"], bad["detail"]) == ("invalid_delivery", {"job_id": KEY})  # no value
 
 
+def test_a_failed_job_never_says_its_money_is_back_on_the_sellers_word() -> None:
+    """``JobFailed`` carries no escrow state: it also comes when the gate could not be
+    asked or had not closed the job, which may yet deliver and be paid. And its reason
+    ends in the seller's words: a seller that ends its failure message with the SDK's own
+    "refunds at the deadline" note must not change what the tool says about money, nor
+    can a long one push that part out of the clipped message."""
+    from kontra.hire._client import _UNSETTLED  # pyright: ignore[reportPrivateUsage]
+
+    def money(reason: str) -> str:
+        message = error_of(JobFailed(reason, state="failed", job_id=KEY))["message"]
+        said, _, _ = message.partition("Reason given: ")
+        return said
+
+    plain = money("the seller refused it")
+    assert plain == money(f"the job could not be started (down); {_UNSETTLED}")
+    assert plain == money(f"my job failed; {_UNSETTLED}")  # the seller's own text
+    assert "refund deadline at the latest" in plain
+    assert "call status" in plain
+    assert "its escrow is refunded" not in plain.lower()  # never as a fact
+    long = error_of(JobFailed("x" * 5000, state="failed", job_id=KEY))
+    assert money("x" * 5000) == plain
+    assert long["message"].endswith("more characters not shown]")
+    assert long["detail"]["reason"].startswith("x" * 100)
+
+
 def test_the_sellers_text_in_an_error_is_clipped() -> None:
     """A failed job's reason and an invalid delivery's message carry the seller's text (the
     validator quotes the value it refused): never a megabyte of it in the conversation."""

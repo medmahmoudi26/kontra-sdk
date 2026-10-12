@@ -6,10 +6,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +23,14 @@ from temporalio.api.common.v1 import WorkflowExecution, WorkflowType
 from temporalio.api.enums.v1 import EventType, WorkflowIdConflictPolicy, WorkflowIdReusePolicy
 from temporalio.api.taskqueue.v1 import TaskQueue
 from temporalio.api.workflowservice.v1 import (
+    DescribeNexusOperationExecutionRequest,
     DescribeWorkflowExecutionRequest,
     StartWorkflowExecutionRequest,
 )
 from temporalio.client import NexusOperationFailureError, WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
 
+from kontra._control import OCCUPY_WORKFLOW_TYPE
 from kontra.auth import Session
 from kontra.codec import ENCODING
 from kontra.codec.age import decrypt
@@ -363,6 +367,107 @@ async def test_a_second_execute_while_the_job_runs_is_refused_not_attached(
 
     await seller.get_workflow_handle(wf).signal("release")
     assert (await first.result()).text == "ONLY ONCE"
+
+
+# --------------------------------------------------------------------------- decisions I16
+
+
+async def test_a_canceled_job_cannot_be_started_with_its_still_valid_hold(world: World) -> None:
+    """The buyer cancels through the gate before starting (refunded), then runs execute
+    with the hold it still has. The cancel occupied ``job-<id>``, so kontra.serve's handler
+    refuses the start and no work is done for free."""
+    value = {"text": "free work"}
+    hired = await world.buyer.hire(world.entry, value)
+    view = await world.buyer.party.gate.cancel(hired.job_id)
+    assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
+    handle = await world.buyer.start(hired, value)
+    with pytest.raises(NexusOperationFailureError) as failed:
+        await handle.result()
+    assert f"job {hired.job_id} already ran" in failure_text(failed.value)
+    desc = (
+        await world.mp.client("acme").get_workflow_handle(job_workflow_id(hired.job_id)).describe()
+    )
+    assert (desc.workflow_type, desc.status) == (
+        OCCUPY_WORKFLOW_TYPE,
+        WorkflowExecutionStatus.TERMINATED,
+    )
+    view = await world.buyer.party.gate.job(hired.job_id)
+    assert (view.state, view.delivery) == (m.JobState.CANCELED, None)
+
+
+def _minted(world: World, hired: m.HireView, **changes: Any) -> tuple[str, str]:
+    """A token the gate signed for a new job, ``changes`` applied to the hire's claims."""
+    job = new_job_id()
+    claims = {**_claims(hired.hold_token), "job_id": job, "sub": job, **changes}
+    return world.mp.gate.keys.sign(claims), job
+
+
+async def test_a_late_start_ends_by_the_holds_expiry(world: World) -> None:
+    """A start late in the hold's life runs until the gate's refund deadline, which the
+    hold carries (this gate's grace is one second), not for a full max_duration from the
+    start nor for an escrow grace this gate does not give; a token without the claim gets
+    the expiry plus the default grace; a start too late for what the input needs is
+    refused before anything runs."""
+    value = {"text": "quick one"}  # the seller quotes a minute for it
+    hired = await world.buyer.hire(world.entry, value)
+    view = await world.buyer.party.gate.job(hired.job_id)
+    assert _claims(hired.hold_token)["deadline"] == int(view.deadline.timestamp())
+
+    async def timeout_of(**changes: Any) -> timedelta:
+        token, job = _minted(world, hired, max_duration_seconds=600, **changes)
+        started = await world.buyer.start(hired, value, token=token, result_type=Shout)
+        assert (await started.result()).text == "QUICK ONE"
+        desc = await world.mp.client("acme").get_workflow_handle(job_workflow_id(job)).describe()
+        return desc.raw_description.execution_config.workflow_execution_timeout.ToTimedelta()
+
+    # A 10-minute hold with two minutes left: the job runs for those (and the gate's grace).
+    exp = int(time.time()) + 120
+    cut = await timeout_of(exp=exp, deadline=exp + 1)
+    assert timedelta(seconds=110) <= cut <= timedelta(seconds=121)
+    no_claim = await timeout_of(exp=exp, deadline=None)  # 120 s + the default 30 s grace
+    assert timedelta(seconds=140) <= no_claim <= timedelta(seconds=150)
+
+    exp = int(time.time()) + 20  # + 30 s tolerance < the 60 s the seller quotes
+    token, job = _minted(world, hired, exp=exp, deadline=exp + 1)
+    text = await _refused(world, hired, value, token, job)
+    assert "sooner than this input needs" in text
+
+
+async def test_execute_is_bounded_by_the_input_the_hold_was_quoted_for(world: World) -> None:
+    """Quote a small input, execute a huge one: refused at once, naming the bound, before
+    the seller fetches a byte of it -- the answer comes within one Nexus attempt, so the
+    seller is never recorded as absent. The quoted input itself, claim-checked, runs."""
+    buyer = Buyer(world.mp, world.buyer.party, claim_check_threshold=1024)
+    big = {"text": "q" * 1500}
+    before = len(world.transport.requests)
+    hired = await buyer.hire(world.entry, big)  # the quote's input is claim-checked too
+    assert [p for p in world.transport.paths(before) if p.startswith("GET /v1/blobs/")]
+    assert (await (await buyer.start(hired, big, result_type=Shout)).result()).text == ("Q" * 1500)
+
+    small = {"text": "ab"}
+    hired = await buyer.hire(world.entry, small)
+    before = len(world.transport.requests)
+    huge = {"text": "h" * 40_000}
+    began = time.monotonic()
+    handle = await buyer.start(hired, huge)
+    with pytest.raises(NexusOperationFailureError) as failed:
+        await handle.result()
+    assert time.monotonic() - began < 5
+    text = failure_text(failed.value)
+    assert "larger than the input this hold was quoted for" in text
+    assert [p for p in world.transport.paths(before) if p.startswith("GET /v1/blobs/")] == []
+    desc = await buyer.client.workflow_service.describe_nexus_operation_execution(
+        DescribeNexusOperationExecutionRequest(
+            namespace=buyer.party.namespace, operation_id=handle.operation_id
+        )
+    )
+    assert desc.info.last_attempt_failure.nexus_handler_failure_info.type == "BAD_REQUEST"
+    history = await world.mp.gate.run(lambda: _blob_count(world))
+    assert history >= 2  # the huge input was uploaded (claim-checked) but never fetched
+
+
+async def _blob_count(world: World) -> int:
+    return len(world.mp.gate.blobs)
 
 
 # --------------------------------------------------------------------------- progress & history

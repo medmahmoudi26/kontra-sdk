@@ -219,8 +219,12 @@ class ProgressForwarder:
         while True:
             wake.clear()
             delay = await self._send_due()
+            # asyncio.timeout, never wait_for, in this module: on Python 3.11 wait_for drops
+            # a cancel that lands as its wait completes (aclose while a heartbeat pokes), and
+            # this loop would then wait for a heartbeat forever, and aclose with it.
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(wake.wait(), timeout=delay)
+                async with asyncio.timeout(delay):
+                    await wake.wait()
 
     async def _send_due(self) -> float | None:
         """Send every job that is due; the delay until the next one is (None: nothing queued)."""
@@ -272,7 +276,8 @@ class ProgressForwarder:
                 activity=event.activity,
                 ciphertext_b64=base64.b64encode(ciphertext).decode("ascii"),
             )
-            await asyncio.wait_for(self._gate.post_progress(job_id, post), _SEND_TIMEOUT)
+            async with asyncio.timeout(_SEND_TIMEOUT):
+                await self._gate.post_progress(job_id, post)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -304,7 +309,8 @@ class ProgressForwarder:
         self._settling.add(drain)
         drain.add_done_callback(self._settling.discard)
         try:
-            await asyncio.wait_for(asyncio.shield(drain), self.settle_timeout)
+            async with asyncio.timeout(self.settle_timeout):
+                await asyncio.shield(drain)
         except TimeoutError:
             self._quiet_until = self._clock() + _QUIET_FOR
             log.info(

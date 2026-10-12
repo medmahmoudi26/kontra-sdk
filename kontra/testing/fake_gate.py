@@ -75,13 +75,17 @@ from temporalio.api.common.v1 import Payload
 from kontra import escrow
 from kontra._control import (
     BuyerCall,
+    BuyerLookupError,
     EndpointConflict,
     HistorySummary,
     NexusSyncKind,
+    Occupation,
     TemporalControl,
     TemporalError,
     hold_digest,
+    input_size,
 )
+from kontra.codec import InvalidPayload
 from kontra.contract import ContractError, ContractInfo, KontraQuote, agent_card, validate_document
 from kontra.contract.facts import check_public_key
 from kontra.contract.names import (
@@ -97,7 +101,15 @@ from kontra.contract.names import (
     validate_handle,
 )
 from kontra.contract.quote import MAX_ETA_SECONDS
-from kontra.escrow import Effect, EffectKind, EscrowError, JobRecord, Observation, ObservedStatus
+from kontra.escrow import (
+    Effect,
+    EffectKind,
+    EscrowError,
+    JobRecord,
+    Observation,
+    ObservedStatus,
+    Provenance,
+)
 from kontra.gate_client import models as m
 from kontra.gate_client.routes import BY_NAME
 from kontra.ledger import (
@@ -390,6 +402,8 @@ class _Quote:
     created_at: datetime
     expires_at: datetime
     job_id: str | None = None
+    #: :func:`~kontra._control.input_size` of the input the seller priced: the hold's bound.
+    input_size: int | None = None
 
 
 @dataclass
@@ -423,6 +437,8 @@ class _Job:
     #: :func:`~kontra._control.hold_digest` of every hold token issued for the job: a run
     #: of ``job-<id>`` counts only if the buyer's call carried one of them (decisions I15).
     holds: set[str] = field(default_factory=set[str])
+    #: The quoted input's size, carried in the hold (decisions I16).
+    input_size: int | None = None
 
     @property
     def job_id(self) -> str:
@@ -1024,7 +1040,10 @@ class FakeGate:
 
     def reputation(self, party: str) -> tuple[int, int, int]:
         """(released, refunded, disputed) of the seller's jobs: §17's raw counts. Self-hires
-        and jobs the buyer canceled do not count; a hold never locked does not either."""
+        and jobs the buyer canceled -- through the gate, or by cancelling its own call
+        (``Observation.buyer_canceled``) -- do not count; a hold never locked does not
+        either. A canceled job counts only when the buyer's own run of it ended canceled
+        without the buyer asking: the seller stopped it."""
         released = refunded = disputed = 0
         for job in self.jobs.values():
             r = job.record
@@ -1033,7 +1052,11 @@ class FakeGate:
             if r.escrow is m.Escrow.RELEASED:
                 released += 1
             elif r.escrow is m.Escrow.REFUNDED:
-                if r.state is not m.JobState.CANCELED and job.hold_ref is not None:
+                if job.hold_ref is None:
+                    continue
+                if r.state is not m.JobState.CANCELED or (
+                    r.run_id is not None and r.reason != escrow.BUYER_CANCEL_REASON
+                ):
                     refunded += 1
             elif r.escrow in (m.Escrow.DISPUTED, m.Escrow.RESOLVED):
                 disputed += 1
@@ -1310,6 +1333,12 @@ class FakeGate:
             raise GateHTTPError(
                 502, "invalid_quote", "the seller quoted a max_duration above the offering's"
             )
+        try:
+            # Read once the seller's quote fetched what a reference names and checked it
+            # against its size: the bound is the seller's verified figure (decisions I16).
+            size = input_size(payload)
+        except InvalidPayload:
+            size = payload.ByteSize()  # the seller took it as it is: a plain payload
         stored = _Quote(
             quote_id=new_job_id(),
             buyer=who.party,
@@ -1319,6 +1348,7 @@ class FakeGate:
             max_duration=timedelta(seconds=seconds),
             created_at=now,
             expires_at=now + self.quote_ttl,
+            input_size=size,
         )
         self.quotes[stored.quote_id] = stored
         return view(
@@ -1358,6 +1388,10 @@ class FakeGate:
             currency=r.amount.currency,
             contract_hash=job.contract_hash,
             max_duration_seconds=int(job.max_duration.total_seconds()),
+            input_size=job.input_size,
+            # The refund deadline with this gate's own grace (one second by default), so a
+            # seller's handler ends a late-started run by it (decisions I16).
+            deadline=int(r.deadline.timestamp()),
         )
         token = self.keys.sign(claims.model_dump())
         job.holds.add(hold_digest(token))
@@ -1428,6 +1462,7 @@ class FakeGate:
             service=oid.service_name,
             max_duration=q.max_duration,
             quote_id=q.quote_id,
+            input_size=q.input_size,
         )
         self.jobs[job_id] = job
         try:
@@ -1597,23 +1632,51 @@ class FakeGate:
         """The buyer cancels before delivery (refund). The seller's workflow is looked at
         first: a buyer whose operation already returned the result could otherwise cancel
         in the gap before the sweeper sees the completion, and keep both the delivery and
-        the money. When Temporal cannot say, the cancel is refused rather than guessed."""
+        the money. When Temporal cannot say, the cancel is refused rather than guessed.
+
+        A job with no run yet is closed to starts before it is refunded
+        (:meth:`~kontra._control.Control.occupy_job`, decisions I16): the hold token stays
+        valid until it expires and the seller's handler checks it offline, so the buyer
+        could otherwise run ``execute`` with it after the refund and get a short job done
+        for free. If a run appeared in the meantime, it is looked at again and stopped as a
+        running job's is. If the id cannot be taken, the cancel is refused."""
         job = self.job_for(job_id, who.party)
         if who.party == job.record.buyer and job.record.open and self.control is not None:
-            try:
-                obs, result = await self.control.observe(
-                    job.record.seller_ns, job.workflow_id, job.call, job.record.run_id
-                )
-            except Exception:
-                log.warning("cannot observe %s before a cancel", job.workflow_id, exc_info=True)
-                raise GateHTTPError(
-                    503,
-                    "temporal_unavailable",
-                    "could not check whether the job has delivered; try again shortly",
-                ) from None
-            await self._apply_observation(job_id, obs, result)
+            obs = await self._look_before_cancel(job)
+            if obs.status is ObservedStatus.NOT_FOUND and job.record.open:
+                try:
+                    occupied = await self.control.occupy_job(
+                        job.record.seller_ns, job.workflow_id, escrow.BUYER_CANCEL_REASON
+                    )
+                except Exception:
+                    log.warning("cannot occupy %s for a cancel", job.workflow_id, exc_info=True)
+                    raise GateHTTPError(
+                        503,
+                        "temporal_unavailable",
+                        "could not close the job to late starts; try again shortly",
+                    ) from None
+                if occupied is Occupation.STARTED:
+                    await self._look_before_cancel(job)
         now = self.now()
         return (await self._transition(job_id, lambda r: escrow.cancel(r, who.party, now))).view()
+
+    async def _look_before_cancel(self, job: _Job) -> Observation:
+        """Observe ``job-<id>`` and apply what it shows, for a cancel: 503 when Temporal
+        cannot say."""
+        assert self.control is not None
+        try:
+            obs, result = await self.control.observe(
+                job.record.seller_ns, job.workflow_id, job.call, job.record.run_id
+            )
+        except Exception:
+            log.warning("cannot observe %s before a cancel", job.workflow_id, exc_info=True)
+            raise GateHTTPError(
+                503,
+                "temporal_unavailable",
+                "could not check whether the job has delivered; try again shortly",
+            ) from None
+        await self._apply_observation(job.job_id, obs, result)
+        return obs
 
     # ------------------------------------------------------------------ disputes
 
@@ -1936,7 +1999,11 @@ class FakeGate:
         refunded job, whoever started the run."""
         assert self.control is not None
         obs, _ = await self.control.observe(job.record.seller_ns, job.workflow_id, job.call, None)
-        if obs.status is ObservedStatus.RUNNING and job.pending_stop is None:
+        if (
+            obs.status is ObservedStatus.RUNNING
+            and obs.provenance is not Provenance.OCCUPIED  # the cancel's own placeholder
+            and job.pending_stop is None
+        ):
             job.pending_stop = EffectKind.CANCEL_WORKFLOW
             job.pending_stop_reason = job.record.reason or "canceled by buyer"
 
@@ -1963,6 +2030,12 @@ class FakeGate:
             obs, result = await self.control.observe(
                 job.record.seller_ns, job.workflow_id, job.call, job.record.run_id
             )
+        except BuyerLookupError:
+            # The buyer's own namespace could not be read. The buyer controls its load, so
+            # this never gives up into a blind refund: the buyer could otherwise keep it
+            # failing past the deadline and be refunded for a delivered job.
+            log.warning("cannot read %s's records of %s; retrying", job.buyer_ns, job.job_id)
+            return
         except Exception:
             now = self.now()
             if now < job.record.deadline + self.observe_give_up:
@@ -1991,11 +2064,16 @@ class FakeGate:
             job.notify()
 
     async def _history_progress(self, job: _Job) -> None:
-        """Progress from history metadata (§8.4), recorded when it changed."""
-        if self.control is None:
+        """Progress from history metadata (§8.4), recorded when it changed -- of the pinned
+        chain only, as the gate does (FIXUPS #34). Before a pin, whatever runs as
+        ``job-<id>`` is no one's job: a run the seller started itself, or the placeholder a
+        cancel left (decisions I16), is not the buyer's progress."""
+        if self.control is None or job.record.run_id is None:
             return
         try:
-            summary = await self.control.history_summary(job.record.seller_ns, job.workflow_id)
+            summary = await self.control.history_summary(
+                job.record.seller_ns, job.workflow_id, job.record.run_id
+            )
         except Exception:
             log.warning("history of %s unavailable", job.workflow_id, exc_info=True)
             return
