@@ -252,6 +252,20 @@ def test_describe_known_failures() -> None:
     assert describe(RuntimeError("a bug")) is None  # unexpected: the traceback is shown
 
 
+def test_describe_names_a_transport_failure_that_has_no_message() -> None:
+    """httpx's timeouts often carry no text: the line names the failure instead of ending
+    in an empty "cannot reach <url>: " (seen when the gate stalled behind a slow Temporal)."""
+    import httpx
+
+    request = httpx.Request("POST", "http://127.0.0.1:8080/v1/catalog?x=1")
+    assert describe(httpx.ReadTimeout("", request=request)) == (
+        "cannot reach http://127.0.0.1:8080/v1/catalog: ReadTimeout"
+    )
+    assert describe(httpx.ConnectError("refused", request=request)) == (
+        "cannot reach http://127.0.0.1:8080/v1/catalog: refused"
+    )
+
+
 def test_describe_temporal_refusing_or_absent() -> None:
     """temporalio's failures reach `kontra serve` raw: one line each, not a traceback."""
     from temporalio.service import RPCError, RPCStatusCode
