@@ -101,7 +101,8 @@ def test_compose_publishes_only_public_ports_on_loopback(tmp_path: Path) -> None
     }
     temporal = services["temporal"]["environment"]
     # The internal frontend (no authentication) listens on every interface Temporal has
-    # (its own services dial it on loopback), unpublished ...
+    # (Temporal dials it where it binds it, and a compose network's address is not known
+    # before the container starts), unpublished ...
     assert temporal["KONTRA_INTERNAL_FRONTEND_BIND_IP"] == "0.0.0.0"
     assert all(target not in (7236, 7246) for ports in published.values() for _, _, target in ports)
     assert temporal["KONTRA_JWKS_URLS"] == "http://gate:8080/.well-known/jwks.json"
@@ -143,6 +144,176 @@ def test_compose_publishes_only_public_ports_on_loopback(tmp_path: Path) -> None
     assert services["gate"]["environment"]["KONTRA_DEV"] == "0"
     assert services["gate"]["image"] == "ghcr.io/medmahmoudi26/kontra-gate:dev"
     assert services["temporal"]["image"] == "ghcr.io/medmahmoudi26/kontra-temporal:dev"
+
+
+@needs_compose
+def test_every_service_runs_without_privileges(tmp_path: Path) -> None:
+    """No capabilities and no way to gain any, in every service: code that takes one over
+    cannot open raw sockets (ARP or DNS spoofing on the shared networks), change file
+    ownership or use a setuid binary. A read-only root filesystem everywhere, with a tmpfs
+    only where a service must write outside its volume, so nothing it writes outlives a
+    restart. Proven on a running stack (dev login, a worker token accepted by Temporal,
+    artifact uploads and downloads, a hire; Temporal's distroless image too) before it was
+    written down here."""
+    services = _resolved(tmp_path)["services"]
+    for name, svc in services.items():
+        assert svc.get("cap_drop") == ["ALL"], name
+        assert not svc.get("cap_add"), f"{name} adds back {svc.get('cap_add')}"
+        assert svc.get("security_opt") == ["no-new-privileges:true"], name
+        assert not svc.get("privileged"), name
+        assert svc.get("read_only") is True, name
+        # None of it would hold with a host namespace, a device or a host path (the Docker
+        # socket is one): named volumes and tmpfs only.
+        for key in ("network_mode", "pid", "ipc", "uts", "userns_mode", "cgroup", "devices"):
+            assert not svc.get(key), f"{name} sets {key}: {svc.get(key)}"
+        assert all(v["type"] == "volume" for v in svc.get("volumes", [])), name
+    tmpfs = {name: svc["tmpfs"] for name, svc in services.items() if svc.get("tmpfs")}
+    assert tmpfs == {
+        "postgres": ["/var/run/postgresql"],  # its socket and lock file
+        "postgres-relay": ["/var/lib/postgresql/data"],  # the image's VOLUME, unused
+        "s3": ["/tmp"],  # the identities config and SeaweedFS's unix sockets
+    }
+    # Postgres as its own user: its entrypoint needs root only to chown what the named
+    # volume already gives postgres. SeaweedFS keeps the image's root user, which owns
+    # /data and, without capabilities, nothing more; the gate and Temporal images set a
+    # non-root user of their own.
+    users = {name: svc["user"] for name, svc in services.items() if "user" in svc}
+    assert users == {"postgres": "postgres", "postgres-relay": "postgres"}
+    assert {v["target"] for v in services["postgres"]["volumes"]} == {"/var/lib/postgresql/data"}
+    assert {v["target"] for v in services["s3"]["volumes"]} == {"/data"}
+
+
+def _s3_entrypoint(services: dict[str, Any]) -> list[str]:
+    """The s3 service's entrypoint as the container receives it: ``docker compose config``
+    prints a literal ``$`` escaped as ``$$``."""
+    return [arg.replace("$$", "$") for arg in services["s3"]["entrypoint"]]
+
+
+@needs_compose
+def test_s3_credentials_reach_seaweedfs_without_a_writable_root(tmp_path: Path) -> None:
+    """Compose's ``configs`` copy their content into the container's root filesystem, which
+    read_only refuses; so the s3 service hands the identities config over in its
+    environment, and its entrypoint writes it to the tmpfs (0600) and drops the variable
+    before the image's own entrypoint starts SeaweedFS with that file."""
+    config = _resolved(tmp_path)
+    assert "configs" not in config
+    s3 = config["services"]["s3"]
+    identities = json.loads(s3["environment"]["KONTRA_S3_IDENTITIES"])
+    assert identities["identities"][0]["credentials"] == [
+        {"accessKey": "ak-test", "secretKey": "sk-test"}
+    ]
+    assert "-s3.config=/tmp/s3.json" in s3["command"]
+    entrypoint = _s3_entrypoint(config["services"])
+    assert entrypoint[:2] == ["/bin/sh", "-c"]
+    assert entrypoint[2].endswith('exec /entrypoint.sh "$@"')
+
+    # The snippet itself, in the pinned image under the service's own restrictions, with a
+    # stand-in for the image's entrypoint that reports what SeaweedFS would be started with.
+    image = s3["image"]
+    if _REAL_RUN(["docker", "image", "inspect", image], capture_output=True).returncode != 0:
+        pytest.skip(f"{image} is not pulled here")
+    probe = tmp_path / "entrypoint.sh"
+    probe.write_text(
+        "#!/bin/sh\n"
+        'echo "args: $*"\n'
+        'echo "env: ${KONTRA_S3_IDENTITIES-unset}"\n'
+        "stat -c 'mode: %a' /tmp/s3.json\n"
+        "cat /tmp/s3.json\n"
+    )
+    probe.chmod(0o755)
+    flags = [f"--tmpfs={path}" for path in s3["tmpfs"]]
+    flags += [f"--cap-drop={cap}" for cap in s3["cap_drop"]]
+    flags += [f"--security-opt={opt}" for opt in s3["security_opt"]]
+    proc = _REAL_RUN(
+        [
+            *("docker", "run", "--rm", "--read-only", "--network=none", *flags),
+            "--tmpfs=/data",  # in place of the named volume: nothing left behind
+            f"--volume={probe}:/entrypoint.sh:ro",
+            f"--env=KONTRA_S3_IDENTITIES={s3['environment']['KONTRA_S3_IDENTITIES']}",
+            f"--entrypoint={entrypoint[0]}",
+            *(image, *entrypoint[1:], *s3["command"]),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    assert lines[:3] == ["args: " + " ".join(s3["command"]), "env: unset", "mode: 600"]
+    assert json.loads("\n".join(lines[3:])) == identities
+
+
+_PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+
+
+@needs_compose
+def test_temporal_never_sends_its_internal_traffic_to_a_proxy(tmp_path: Path) -> None:
+    """Temporal dials its internal frontend where it binds it, 0.0.0.0 here, and Go exempts
+    only loopback from HTTP(S)_PROXY: a proxy in its environment received the system
+    worker's gRPC (the server then did not start) and would receive history's Nexus tasks
+    and completion tokens. Compose copies a Docker client's proxy settings into every
+    container, so the service sets all four variables empty; Go reads the upper and the
+    lower case, the first one non-empty.
+
+    The second half proves on this compose that an empty value wins over the injected one,
+    with the service's own entries, a client configured with a proxy, and the pinned
+    Postgres image (it has ``env``) standing in for Temporal's."""
+    services = _resolved(tmp_path)["services"]
+    env = services["temporal"]["environment"]
+    assert {var: env.get(var) for var in _PROXY_VARS} == dict.fromkeys(_PROXY_VARS, "")
+
+    image = services["postgres"]["image"]
+    if _REAL_RUN(["docker", "image", "inspect", image], capture_output=True).returncode != 0:
+        pytest.skip(f"{image} is not pulled here")
+    client = tmp_path / "docker-config"
+    client.mkdir()
+    proxy = "http://proxy.invalid:3128"
+    (client / "config.json").write_text(
+        json.dumps({"proxies": {"default": {"httpProxy": proxy, "httpsProxy": proxy}}})
+    )
+    # The compose plugin is found through the client's config directory.
+    real = Path(os.environ.get("DOCKER_CONFIG") or Path.home() / ".docker") / "cli-plugins"
+    if real.is_dir():
+        (client / "cli-plugins").symlink_to(real)
+    probe = tmp_path / "probe.yaml"
+    probe.write_text(
+        json.dumps(
+            {
+                "services": {
+                    "probe": {
+                        "image": image,
+                        "entrypoint": ["env"],
+                        "network_mode": "none",
+                        "environment": {var: env[var] for var in _PROXY_VARS},
+                    }
+                }
+            }
+        )
+    )
+
+    def run(config: Path) -> dict[str, str]:
+        clean = {k: v for k, v in os.environ.items() if k.upper() not in _PROXY_VARS}
+        proc = _REAL_RUN(
+            [
+                *("docker", "compose", "-p", "kontra-proxy-test", "-f", str(config)),
+                *("run", "--rm", "--no-deps", "-T", "probe"),
+            ],
+            capture_output=True,
+            text=True,
+            env={**clean, "DOCKER_CONFIG": str(client)},
+            timeout=120,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        seen = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+        return {var: seen.get(var, "<unset>") for var in _PROXY_VARS}
+
+    assert run(probe) == dict.fromkeys(_PROXY_VARS, "")
+    # Control: without those entries the client's proxy does reach the container.
+    bare = tmp_path / "bare.yaml"
+    bare.write_text(probe.read_text().replace('"environment"', '"labels"'))
+    assert run(bare) == dict.fromkeys(_PROXY_VARS, proxy)
 
 
 def test_third_party_images_are_pinned_by_digest() -> None:
@@ -218,7 +389,7 @@ def test_compose_wires_the_gate_settings(tmp_path: Path) -> None:
     assert deps["migrate"]["condition"] == "service_completed_successfully"
     assert deps["postgres"]["condition"] == deps["s3"]["condition"] == "service_healthy"
     assert services["gate"]["restart"] == "unless-stopped"  # retries until Temporal is up
-    identities = json.loads(config["configs"]["s3-identities"]["content"])
+    identities = json.loads(services["s3"]["environment"]["KONTRA_S3_IDENTITIES"])
     creds = identities["identities"][0]["credentials"][0]
     assert creds == {"accessKey": "ak-test", "secretKey": "sk-test"}
 

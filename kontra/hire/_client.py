@@ -445,10 +445,12 @@ class Job:
         When ``execute`` ends without a result, the gate's record decides, not the
         operation (see :meth:`Kontra._verdict`): a delivery the gate counted is returned,
         because the gate releases it to the seller when the review window closes."""
-        if timeout is None:
+        # asyncio.timeout, never wait_for, in this module: on Python 3.11 wait_for returns
+        # the result when a cancellation lands as the wait completes, so a cancelled caller
+        # (a task group, an agent's aborted tool call) would carry on as if it had not been
+        # cancelled -- here, open and validate a delivery nobody is waiting for.
+        async with asyncio.timeout(timeout):  # None: no deadline
             value = await self._outcome()
-        else:
-            value = await asyncio.wait_for(self._outcome(), timeout)
         self._delivered = True
         return await self._kontra._deliver(self, value, output_type)
 
@@ -1045,16 +1047,19 @@ class Kontra:
     async def _abandon_cancelled(self, job_id: str, reason: str | None = None) -> None:
         """The hire was cancelled while its job started: cancel the job at the gate (so its
         hold refunds now), shielded from the cancellation and bounded in time."""
-        reason = reason or "the hire was cancelled before it returned the job"
+        why = reason or "the hire was cancelled before it returned the job"
+
+        async def bounded() -> _Abandoned:  # asyncio.timeout, never wait_for: see Job.result
+            async with asyncio.timeout(_ABANDON_WAIT):
+                return await self._abandon(job_id, why)
+
         try:
-            done = await asyncio.shield(
-                asyncio.wait_for(self._abandon(job_id, reason), _ABANDON_WAIT)
-            )
+            done = await asyncio.shield(bounded())
         except (asyncio.CancelledError, TimeoutError):  # _abandon did not get to say so
-            log.warning("job %s: %s; %s", job_id, reason, _UNSETTLED)
+            log.warning("job %s: %s; %s", job_id, why, _UNSETTLED)
             return
         if done != "unreached":  # _abandon has said so
-            log.warning("job %s: %s; %s", job_id, reason, _ABANDONED[done])
+            log.warning("job %s: %s; %s", job_id, why, _ABANDONED[done])
 
     async def _quote_job(self, q: QuoteResult) -> str | None:
         """The job the gate made of ``q`` when no hire of it here got the gate's answer, or
@@ -1109,13 +1114,14 @@ class Kontra:
         cancellation and bounded in time."""
         reason = "the hire was cancelled before the gate's answer to it arrived"
 
-        async def settle() -> None:
-            job_id = await self._quote_job(q)
-            if job_id is not None:
-                await self._abandon_cancelled(job_id, reason)
+        async def settle() -> None:  # asyncio.timeout, never wait_for: see Job.result
+            async with asyncio.timeout(_ABANDON_WAIT):
+                job_id = await self._quote_job(q)
+                if job_id is not None:
+                    await self._abandon_cancelled(job_id, reason)
 
         try:
-            await asyncio.shield(asyncio.wait_for(settle(), _ABANDON_WAIT))
+            await asyncio.shield(settle())
         except (asyncio.CancelledError, TimeoutError):
             log.warning(
                 "%s: %s; if quote %s locked a hold, it refunds at the job's deadline",

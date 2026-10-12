@@ -18,7 +18,9 @@ import sys
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TypeVar
 
 import httpx
@@ -42,7 +44,8 @@ from mcp_seller import (
 from kontra.gate_client import models as m
 from kontra.hire import Kontra
 from kontra.ledger import PLATFORM_PARTY
-from kontra.mcp import server
+from kontra.mcp import KontraTools, server
+from kontra.mcp import _server as mcp_server
 from kontra.serve.progress import INTERVAL_ENV
 from kontra.testing import Marketplace, TestParty
 from kontra.testing.devserver import DevServer
@@ -552,6 +555,137 @@ async def test_a_large_output_goes_to_a_file(world: World, tmp_path: Path) -> No
         output = json.loads(await asyncio.to_thread(Path(saved["output_file"]).read_text))
         assert output["upper"] == EXAMPLE["text"].upper()
         assert len(json.dumps(output, separators=(",", ":"))) == saved["output_bytes"]
+
+
+# --------------------------------------------------------------------------- cancel safety
+#
+# No Temporal and no gate: stand-ins for the stream and the job make a cancellation land in
+# the loop iteration where the awaited thing arrives. On Python 3.11 ``asyncio.wait_for``
+# returns the result then and drops the cancellation, so an aborted tool call would go on
+# (reading progress, asking the gate); ``asyncio.timeout`` keeps it. Red on 3.11 with
+# ``wait_for``. CI runs them on 3.11 and 3.12; locally, without touching ``.venv``:
+# ``uv run --isolated --python 3.11 pytest tests/mcp/test_mcp_server.py -k cancel``.
+
+_JOB = "0" * 32
+
+
+class _Stream:
+    """A progress stream whose first event arrives when the test resolves ``arrival``, and
+    that ends after it."""
+
+    def __init__(self) -> None:
+        self.arrival: asyncio.Future[m.ProgressEvent] = asyncio.get_running_loop().create_future()
+        self.waiting = asyncio.Event()
+        self.reads = 0
+        self.cancelled = False
+        self.closed = False
+
+    def __aiter__(self) -> _Stream:
+        return self
+
+    async def __anext__(self) -> m.ProgressEvent:
+        self.reads += 1
+        if self.reads > 1:
+            raise StopAsyncIteration
+        self.waiting.set()
+        try:
+            return await self.arrival
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _StreamKontra:
+    """The two calls ``status`` makes on its client to read progress."""
+
+    def __init__(self, stream: _Stream) -> None:
+        def progress(job_id: str, *, after: int) -> _Stream:
+            return stream
+
+        self.gate = SimpleNamespace(progress=progress)
+        self.read: list[m.ProgressEvent] = []
+
+    def _progress(self, event: m.ProgressEvent) -> SimpleNamespace:
+        self.read.append(event)
+        return SimpleNamespace(source=event.source)
+
+
+class _DeliveredJob:
+    """A job whose gate records the delivery when the test resolves ``arrival``."""
+
+    job_id = _JOB
+
+    def __init__(self) -> None:
+        self.arrival: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.waiting = asyncio.Event()
+        self.status_calls = 0
+
+    async def _gate_saw_delivery(self) -> None:
+        self.waiting.set()
+        await self.arrival
+
+    async def status(self) -> str:
+        self.status_calls += 1
+        return "view"
+
+
+def _event() -> m.ProgressEvent:
+    return m.ProgressEvent(seq=1, at=datetime.now(UTC), source=m.ProgressSource.HISTORY)
+
+
+async def test_cancel_of_status_that_lands_as_progress_arrives_is_kept() -> None:
+    stream = _Stream()
+    k = _StreamKontra(stream)
+    task = asyncio.create_task(KontraTools(k)._progress(_JOB))  # type: ignore[arg-type]
+    await stream.waiting.wait()
+    stream.arrival.set_result(_event())  # in the same loop iteration as the cancel
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert k.read == []  # the event that arrived with the cancel was not taken
+    assert stream.closed  # and the stream is closed on the way out
+
+
+async def test_cancel_of_result_that_lands_as_the_gate_catches_up_is_kept() -> None:
+    job = _DeliveredJob()
+    tools = KontraTools(_StreamKontra(_Stream()))  # type: ignore[arg-type]
+    task = asyncio.create_task(tools._delivered_view(job))  # type: ignore[arg-type]
+    await job.waiting.wait()
+    job.arrival.set_result(None)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert job.status_calls == 0  # it did not go on to ask the gate
+
+
+async def test_cancel_safe_waits_still_time_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mcp_server, "_PROGRESS_FIRST", 0.05)
+    monkeypatch.setattr(mcp_server, "_GATE_CATCH_UP", 0.05)
+    stream = _Stream()  # never yields
+    tools = KontraTools(_StreamKontra(stream))  # type: ignore[arg-type]
+    seen = await tools._progress(_JOB)
+    assert (seen.seq, seen.latest) == (0, None)
+    assert stream.cancelled  # the read was stopped at the deadline
+    assert stream.closed
+    job = _DeliveredJob()  # the gate never catches up: the view is read anyway
+    assert await tools._delivered_view(job) == "view"  # type: ignore[arg-type]
+    assert job.status_calls == 1
+    assert asyncio.current_task().cancelling() == 0  # type: ignore[union-attr]
+
+
+async def test_progress_still_reads_every_event_it_is_given() -> None:
+    stream = _Stream()
+    k = _StreamKontra(stream)
+    task = asyncio.create_task(KontraTools(k)._progress(_JOB))  # type: ignore[arg-type]
+    await stream.waiting.wait()
+    event = _event()
+    stream.arrival.set_result(event)
+    seen = await task
+    assert (seen.seq, k.read) == (1, [event])
+    assert stream.closed
 
 
 # --------------------------------------------------------------------------- kontra mcp

@@ -439,7 +439,11 @@ class KontraTools:
         """Read the progress published since the last call, without following the stream:
         the gate replays what it has at once, so a pause means we are caught up (and a
         closed job's stream simply ends). Progress is best effort: a gate that cannot
-        stream it leaves the last known event in place."""
+        stream it leaves the last known event in place.
+
+        Every wait here is ``asyncio.timeout``, never ``wait_for``: on Python 3.11
+        ``wait_for`` drops a cancellation that lands as its wait completes, so an aborted
+        tool call would go on reading (and the server's shutdown would wait for it)."""
         k = self.kontra()
         seen = self._seen.setdefault(job_id, _Seen())
         events = k.gate.progress(job_id, after=seen.seq)
@@ -449,7 +453,8 @@ class KontraTools:
         try:
             while (left := end - loop.time()) > 0:
                 try:
-                    event = await asyncio.wait_for(anext(events), min(wait, left))
+                    async with asyncio.timeout(min(wait, left)):
+                        event = await anext(events)
                 except (StopAsyncIteration, TimeoutError):
                     break
                 progress = k._progress(event)  # decrypted with our key
@@ -545,10 +550,12 @@ class KontraTools:
     async def _delivered_view(self, job: Job) -> m.JobView | None:
         """The gate's view once it has recorded the delivery we just read (it observes the
         seller's workflow a moment later), so the review deadline is known. Bounded and best
-        effort: the output is already ours."""
+        effort: the output is already ours. (``asyncio.timeout``, not ``wait_for``: see
+        :meth:`_progress`.)"""
         try:
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(job._gate_saw_delivery(), _GATE_CATCH_UP)
+                async with asyncio.timeout(_GATE_CATCH_UP):
+                    await job._gate_saw_delivery()
             return await job.status()
         except (GateError, httpx.TransportError) as err:
             log.info("job %s: delivered, but its state could not be read: %s", job.job_id, err)

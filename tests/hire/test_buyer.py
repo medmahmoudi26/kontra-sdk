@@ -573,7 +573,17 @@ async def test_a_used_quote_names_the_job_it_made(world: World) -> None:
     assert (used.value.code, used.value.status) == ("quote_used", 409)
     assert used.value.detail == {"job_id": job.job_id}
     assert used.value.fields["detail"] == {"job_id": job.job_id}  # crosses Temporal too
-    await job.cancel()
+    # Cleanup. "once" is quick: its run may have started, and delivered, before the cancel
+    # looks (decisions I16: a run found then is stopped or, delivered, refuses the cancel).
+    try:
+        await job.cancel()
+    except GateError as e:
+        refused = (e.status, e.code)
+    else:
+        refused = None
+    if refused is not None:
+        assert refused == (409, "not_open")
+        assert (await job.status()).state is m.JobState.COMPLETED
 
 
 def _answer_lost(buyer: Buyer, lost: BaseException | None, *, reached: bool = True) -> list[str]:

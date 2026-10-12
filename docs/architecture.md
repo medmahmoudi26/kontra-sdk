@@ -182,8 +182,9 @@ login, play money) beyond loopback is asked for on each `up`, not inherited from
 
 Temporal's internal frontend has no authentication: reaching it is control of every
 namespace. It is never published, and the networks decide who reaches it. Temporal binds it on
-every interface it has (its own services dial it on loopback, so it cannot be bound to one
-network's address), so Temporal joins only networks whose other members may reach it:
+every interface it has (Temporal dials it at the address it binds, and an address on a compose
+network is not known before the container starts), so Temporal joins only networks whose other
+members may reach it:
 
 | Network | Members | Carries |
 |---|---|---|
@@ -203,6 +204,19 @@ a router between them (packets from `database` routed through the relay arrive a
 multi-homed service -- the relay, Temporal and the gate -- sets it to 0. This rests on Docker's
 own inter-network isolation (its iptables rules): a host that runs Docker with `iptables:
 false` routes between bridge networks and has no such boundary.
+Temporal's proxy variables are set empty: compose copies a Docker client's proxy settings into
+every container, and Go exempts only loopback from a proxy, so Temporal's connections to its own
+internal frontend (at `0.0.0.0`) would otherwise go to the proxy, and it would not start.
+
+Every service runs with no capabilities (`cap_drop: [ALL]`, none added back), with
+`no-new-privileges` and on a read-only root filesystem: code that takes one over cannot open
+raw sockets, change file ownership, gain privileges through a setuid binary or replace the
+service's own binaries, and it writes only to the service's volume or to a tmpfs that a
+restart empties. Postgres runs as its own user rather than root: its entrypoint needs root
+only to chown a data directory the named volume already gives it. SeaweedFS is handed its
+credentials in its environment and writes them to its tmpfs before it starts: compose's
+`configs` copy their content into the container's root filesystem, which a read-only root
+refuses.
 Third-party images are pinned by digest with their tag beside it (Postgres and SeaweedFS in
 `compose.yaml`; the Go builder and the runtime bases in `temporal/authorizer`'s Dockerfiles),
 and the Temporal server is built with the Go toolchain `go.mod` names.
