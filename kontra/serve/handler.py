@@ -16,8 +16,12 @@ Service ``acme.enrich`` (:attr:`OfferingId.service_name`), two operations:
   (refusals travel in plaintext; the codec deliberately leaves this operation's replies
   unencrypted so a buyer can read them).
 
-The input arrives as raw JSON (the operations are typed ``Any``): validating the raw value
-is what refuses an extra field that a lenient pydantic model would silently drop (§11.3).
+The input is validated as raw JSON: validating the raw value is what refuses an extra field
+that a lenient pydantic model would silently drop (§11.3). ``quote`` takes it as ``Any``.
+``execute`` takes the payload itself (``RawValue``) and converts it only after the hold
+check: the codec leaves a claim-checked input unfetched there
+(:meth:`kontra.codec.KontraCodec.open_deferred`), so a forged ``execute`` naming a huge blob
+makes this worker download nothing.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar
 
@@ -35,11 +39,14 @@ import nexusrpc.handler
 from nexusrpc.handler import StartOperationContext
 from pydantic import BaseModel, ValidationError
 from temporalio import nexus
-from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.api.common.v1 import Payload
+from temporalio.common import RawValue, WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.contrib.pydantic import PydanticPayloadConverter
+from temporalio.converter import PayloadConverter
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.nexus import WorkflowRunOperationContext
 
-from kontra.codec import age
+from kontra.codec import InvalidPayload, age
 from kontra.contract import ContractError, InputValidator, KontraQuote, Quote, QuoteError
 from kontra.contract.names import is_job_id, job_workflow_id
 from kontra.gate_client import models as m
@@ -116,6 +123,13 @@ class OfferingService:
     verifier: HoldVerifier
     jobs: JobDirectory
     clock: Callable[[], float] = time.time
+    #: Opens the claim-check the codec left in an ``execute`` input until the hold token was
+    #: verified (:meth:`kontra.codec.KontraCodec.open_deferred`). None: no codec, so a
+    #: claim-checked input cannot be read and is refused.
+    open_deferred: Callable[[Payload], Awaitable[Payload]] | None = None
+    #: Turns the opened ``execute`` input into its JSON value, as temporalio would have for
+    #: an ``Any`` input (the worker passes its data converter's).
+    payload_converter: PayloadConverter = field(default_factory=PydanticPayloadConverter)
 
     @property
     def key(self) -> str:
@@ -242,6 +256,37 @@ class OfferingService:
                 f"{claims.max_duration_seconds}s; quote this input and hire again"
             )
 
+    async def _read_input(self, raw: Any) -> Any:
+        """The ``execute`` input's JSON value, now that the hold is verified: a deferred
+        claim-check is fetched only here. A value that is not a ``RawValue`` (a direct call)
+        is already one."""
+        if not isinstance(raw, RawValue):
+            return raw
+        payload = raw.payload
+        if self.open_deferred is not None:
+            try:
+                payload = await self.open_deferred(payload)
+            except InvalidPayload as exc:
+                # Malformed, above the limit, altered, not encrypted to us: the same input
+                # fails the same way on every retry, each one downloading it again. Refused
+                # now; what exactly stays in the seller's log (it may quote a library).
+                log.warning("%s execute: the input cannot be opened (%s)", self.key, exc)
+                raise _refuse(
+                    f"the input of {self.key} cannot be opened by its seller (a claim-check "
+                    "that is malformed, too large or altered, or a payload not encrypted to "
+                    "the seller); the job was not started"
+                ) from None
+            # Anything else (the bucket or the gate did not answer) goes to _guarded: a
+            # generic, retryable error.
+        try:
+            [value] = self.payload_converter.from_payloads([payload], None)
+        except Exception as exc:
+            log.warning("%s execute: the input is not a JSON value (%s)", self.key, exc)
+            raise _refuse(
+                f"the input of {self.key} could not be read as JSON; the job was not started"
+            ) from None
+        return value
+
     async def execute(
         self, ctx: WorkflowRunOperationContext, raw: Any
     ) -> nexus.WorkflowHandle[Any]:
@@ -251,8 +296,9 @@ class OfferingService:
         except HoldRefused as exc:
             log.info("%s execute: %s", self.key, exc)
             raise _refuse(str(exc)) from None
+        value = await self._read_input(raw)
         try:
-            inp = self._parse(raw)
+            inp = self._parse(value)
         except ContractError as exc:
             self._log_invalid("execute", exc)
             raise _refuse(
@@ -267,12 +313,19 @@ class OfferingService:
                 inp,
                 id=job_workflow_id(claims.job_id),
                 execution_timeout=timedelta(seconds=claims.max_duration_seconds),
+                # One start per job, closed or running: a call attached to a running
+                # job-<id> (USE_EXISTING) is not the call that started it, so escrow would
+                # never count what it returns (decisions I15); it is refused instead, like a
+                # second start after the run closed. A retry of this very start (the same
+                # Nexus request id) still gets its run: the server matches the request id
+                # before it applies the policy.
                 id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
-                id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+                id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
             )
         except WorkflowAlreadyStartedError:
             raise _refuse(
-                f"job {claims.job_id} already ran; a hold starts at most one execution"
+                f"job {claims.job_id} already ran (or is running); a hold starts at most one "
+                "execution"
             ) from None
 
 
@@ -285,9 +338,10 @@ def service_handler(service: OfferingService) -> Any:
         async def quote(self, ctx: StartOperationContext, input: Any) -> KontraQuote:
             return await _guarded(service.key, "quote", service.quote(input))
 
+        # RawValue: the payload as the codec left it, read only after the hold check.
         @nexus.workflow_run_operation
         async def execute(
-            self, ctx: WorkflowRunOperationContext, input: Any
+            self, ctx: WorkflowRunOperationContext, input: RawValue
         ) -> nexus.WorkflowHandle[Any]:
             return await _guarded(service.key, "execute", service.execute(ctx, input))
 

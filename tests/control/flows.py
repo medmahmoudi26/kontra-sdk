@@ -20,6 +20,19 @@ class Plan:
     text: str
 
 
+@dataclass
+class Hire:
+    """What :class:`BuyerFlow` calls: ``execute`` on ``endpoint`` / ``service`` with the
+    hold token in ``hold_header`` (the name a buyer's workflow happens to spell it with)."""
+
+    endpoint: str
+    service: str
+    workflow_id: str
+    hold: str
+    text: str = "ok"
+    hold_header: str = "kontra-hold"
+
+
 @activity.defn
 async def step(n: int) -> int:
     activity.heartbeat({"percent": 50 * n})
@@ -53,3 +66,20 @@ class Job:
         if text.startswith("can") and int(text[3:]) > 0:
             workflow.continue_as_new(Plan(f"can{int(text[3:]) - 1}"))
         return text.upper()
+
+
+@workflow.defn
+class BuyerFlow:
+    """A buyer's workflow hiring through Nexus (the workflow door): the caller is this
+    workflow, so its own history records the call."""
+
+    @workflow.run
+    async def run(self, hire: Hire) -> str:
+        nexus = workflow.create_nexus_client(service=hire.service, endpoint=hire.endpoint)
+        return await nexus.execute_operation(
+            "execute",
+            Plan(hire.text),
+            output_type=str,
+            headers={"x-workflow-id": hire.workflow_id, hire.hold_header: hire.hold},
+            schedule_to_close_timeout=timedelta(minutes=5),
+        )

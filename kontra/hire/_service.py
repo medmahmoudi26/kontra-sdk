@@ -10,9 +10,10 @@ seller. Then the workflow itself is the Nexus caller: ``execute`` with the hold 
 When ``execute`` ends without a result (refused, failed, timed out), the gate's record
 decides what the workflow sees, as in a script (decisions I6): the activity
 ``kontra.hire.settle`` waits for the gate to close the job and hands back the delivery if
-the gate counted one -- a seller can complete ``job-<id>`` outside the operation, or after
-the operation timed out but before the gate's deadline, and the gate releases such a
-delivery to the seller when the review window closes. Otherwise the workflow gets
+the gate counted one -- the run the workflow's own call started can complete after the
+operation timed out but before the gate's deadline, and the gate releases such a delivery to
+the seller when the review window closes (a run the seller started itself is never a
+delivery: decisions I15). Otherwise the workflow gets
 :class:`~kontra.hire.JobFailed` (a non-retryable ``ApplicationError``) with the seller's
 reason when it gave one. A start the seller's handler refused, and a cancellation that lands
 before the seller started, run ``kontra.hire.cancel`` first so the hold refunds at once

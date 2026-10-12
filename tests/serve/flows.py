@@ -102,3 +102,20 @@ class UpperFlowV2:
     @workflow.run
     async def run(self, order: OrderV2) -> Shout:
         return Shout(text=order.text.upper(), length=len(order.text))
+
+
+@workflow.defn
+class Chain:
+    """``steps`` activities, then ``hops`` continue-as-new more of the same, then waits for
+    ever (``wait``) or returns: one workflow id with a chain of runs, as a seller's job may
+    be (the history-summary tests)."""
+
+    @workflow.run
+    async def run(self, hops: int, steps: int, wait: bool) -> int:
+        for _ in range(steps):
+            await workflow.execute_activity(shout, "x", start_to_close_timeout=_T)
+        if hops:
+            workflow.continue_as_new(args=[hops - 1, steps, wait])
+        if wait:
+            await workflow.wait_condition(lambda: False)
+        return steps

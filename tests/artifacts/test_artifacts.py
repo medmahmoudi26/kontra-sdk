@@ -4,6 +4,7 @@ size announced up front, retries, resume, and every way a download must refuse t
 from __future__ import annotations
 
 import os
+import stat
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -320,6 +321,46 @@ async def test_directory_destination_uses_the_opaque_key(
     out = await download(gate, art, seller[0], out_dir)
     assert out == out_dir / art.key
     assert out.read_bytes() == b"hello"
+
+
+@pytest.mark.parametrize("umask", [0o022, 0o000])
+async def test_a_download_is_readable_by_us_alone(
+    gate: Any, tmp_path: Path, seller: Any, umask: int
+) -> None:
+    """A download is decrypted plaintext: it is created 0600 whatever the process umask
+    (the usual 022 would make it 0644, readable by every user of the machine), into a file
+    path or an existing directory. A file already at the name is replaced by a private one,
+    and a link planted there is replaced too, never written through."""
+    src = tmp_path / "in.bin"
+    src.write_bytes(b"the buyer's secret")
+    art = await upload(gate, src, recipients=[seller[1]])
+    out_dir = tmp_path / "shared"
+    out_dir.mkdir(mode=0o755)
+    existing = tmp_path / "existing.bin"
+    existing.write_bytes(b"old")
+    existing.chmod(0o644)
+    target = tmp_path / "target"
+    target.write_bytes(b"not to be touched")
+    link = tmp_path / "link.bin"
+    link.symlink_to(target)
+    old = os.umask(umask)
+    try:
+        written = [
+            await download(gate, art, seller[0], tmp_path / "out.bin"),
+            await download(gate, art, seller[0], out_dir),
+            await download(gate, art, seller[0], existing),
+            await download(gate, art, seller[0], link),
+        ]
+    finally:
+        os.umask(old)
+    for path in written:
+        mode = os.lstat(path).st_mode
+        assert stat.S_ISREG(mode), path
+        assert stat.S_IMODE(mode) == 0o600, (path, oct(mode))
+        assert path.read_bytes() == b"the buyer's secret"
+    assert target.read_bytes() == b"not to be touched"
+    assert stat.S_IMODE(out_dir.stat().st_mode) == 0o755  # an existing directory is left alone
+    assert [name for name in os.listdir(tmp_path) if name.endswith(".part")] == []
 
 
 async def test_bad_arguments_fail_before_the_gate(

@@ -42,7 +42,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 from types import TracebackType
-from typing import Any, TypeVar, cast, overload
+from typing import Any, Literal, TypeVar, cast, overload
 
 import httpx
 import temporalio.api.enums.v1 as temporal_enums
@@ -62,7 +62,7 @@ from kontra.auth import Session
 from kontra.codec import CodecError, GateBlobStore, KontraCodec, data_converter
 from kontra.codec import age as age_crypto
 from kontra.contract import ContractError, ContractInfo, InputValidator
-from kontra.contract.names import NameError_
+from kontra.contract.names import NameError_, is_job_id
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
 from kontra.hire._errors import (
@@ -114,6 +114,22 @@ _GATE_CATCH_UP = 60.0
 #: grace away (acceptance 4: a minute), unless the gate is not observing at all.
 _VERDICT_MARGIN = 60.0
 _VERDICT_MAX_WAIT = 300.0
+#: How long a cancelled hire spends cancelling its job at the gate before it gives up.
+_ABANDON_WAIT = 10.0
+#: What a job the gate could not be told about becomes.
+_UNSETTLED = (
+    "its hold could not be cancelled at the gate, so it refunds at the job's deadline "
+    "unless the gate saw a delivery"
+)
+#: What :meth:`Kontra._abandon` did with a job it will not use: cancelled it, found it
+#: closed already (it may have delivered: never report that as a refund), or could not tell
+#: the gate.
+_Abandoned = Literal["cancelled", "closed", "unreached"]
+_ABANDONED: dict[_Abandoned, str] = {
+    "cancelled": "it was cancelled",
+    "closed": "the gate had already closed it (look at its state: it may have delivered)",
+    "unreached": "it could not be cancelled, so it refunds at its deadline",
+}
 _OPEN = frozenset({m.JobState.SUBMITTED, m.JobState.WORKING})
 #: One long poll for the start of ``execute`` never waits longer than this.
 _START_POLL_CHUNK = 10.0
@@ -231,7 +247,9 @@ def _refusal(err: GateError, offering: str, currency: str | None = None) -> Kont
     if err.code == "insufficient_funds":
         return InsufficientFunds(err.message, offering=offering)
     if 400 <= err.status < 500 and err.status not in _NOT_REFUSALS:
-        return HireRefused(f"{offering}: {err.message}", code=err.code, status=err.status)
+        return HireRefused(
+            f"{offering}: {err.message}", code=err.code, status=err.status, detail=detail
+        )
     return None
 
 
@@ -336,6 +354,9 @@ class QuoteResult:
     seller_public_key: str
     _kontra: Kontra = field(repr=False)
     _input: dict[str, Any] = field(repr=False)
+    #: The job a hire of this quote got the gate's answer for (a quote makes one job at
+    #: most): a hire whose own answer was lost never takes it for its own.
+    _job_id: str | None = field(default=None, repr=False, compare=False)
 
     @property
     def ok(self) -> bool:
@@ -344,8 +365,17 @@ class QuoteResult:
     async def hire(self, max_price: Decimal | int | float | str | None = None) -> Job:
         """Lock the price and start the job. Refuses to lock above ``max_price`` (in the
         quote's currency): :class:`PriceAboveMax`. A rejected or busy quote raises
-        :class:`QuoteRejected` / :class:`SellerBusy`."""
-        hired = await self._kontra._lock(self, max_price)
+        :class:`QuoteRejected` / :class:`SellerBusy`.
+
+        A start that fails once the hold is locked cancels the job and names it
+        (``JobFailed.job_id``). If the gate's answer to the hire itself is lost, its error
+        is raised as it came: hire this quote again -- the gate never hires a quote twice,
+        and answers :class:`HireRefused` ``quote_used`` with ``detail["job_id"]`` when the
+        lost call did lock (``kontra mcp`` retries the same way)."""
+        return await self._hire(max_price, recover=False)
+
+    async def _hire(self, max_price: Decimal | int | float | str | None, *, recover: bool) -> Job:
+        hired = await self._kontra._lock(self, max_price, recover=recover)
         return await self._kontra._start(hired, self._input)
 
 
@@ -801,14 +831,30 @@ class Kontra:
         max_price: Decimal | int | float | str | None = None,
         **kwargs: Any,
     ) -> Job:
-        """Quote, then hire: ``await k.hire("acme/enrich", urls=urls, max_price=20)``."""
+        """Quote, then hire: ``await k.hire("acme/enrich", urls=urls, max_price=20)``.
+
+        The quote never reaches the caller, so no retry by its id could find the job a lost
+        answer to the hire locked: that job is found and cancelled here, and named
+        (:meth:`_lost_hire`)."""
         q = await self.quote(offering, input, **kwargs)
-        return await q.hire(max_price)
+        return await q._hire(max_price, recover=True)
 
     async def _lock(
-        self, q: QuoteResult, max_price: Decimal | int | float | str | None
+        self,
+        q: QuoteResult,
+        max_price: Decimal | int | float | str | None,
+        *,
+        recover: bool = False,
     ) -> m.HireView:
-        """Check the quote and the cap, then lock the hold (no Temporal involved)."""
+        """Check the quote and the cap, then lock the hold (no Temporal involved).
+
+        ``recover``: when the gate's answer to ``hire`` is lost or unreadable, or the hire
+        is cancelled while it waits for it, find the job the quote became and settle it
+        (:meth:`_lost_hire`) rather than leave the money held with nobody knowing which
+        job holds it -- for :meth:`hire`, whose caller has no quote to retry by. A
+        :class:`QuoteResult`'s caller retries by the quote (the gate names the job), and
+        the workflow door's activity is retried, releasing what the lost attempt locked
+        (``kontra.hire.prepare``)."""
         if q.status is m.QuoteStatus.REJECTED:
             raise QuoteRejected(
                 f"{q.offering} rejected this input: {q.reason}",
@@ -843,9 +889,20 @@ class Kontra:
             hired = await self.gate.hire(q.quote_id, max_price_minor=cap)
         except GateError as err:
             mapped = _refusal(err, q.offering, q.currency)
-            if mapped is None:
-                raise
-            raise mapped from err
+            if mapped is not None:
+                raise mapped from err
+            if recover:  # a 5xx, or a 2xx we could not read: the lock may have happened
+                await self._lost_hire(q, err)
+            raise
+        except httpx.TransportError as err:
+            if recover:
+                await self._lost_hire(q, err)
+            raise
+        except asyncio.CancelledError:
+            if recover:
+                await self._lost_hire_cancelled(q)
+            raise
+        q._job_id = hired.job_id
         # The seller key here is what the job input is encrypted to: it must be the one the
         # quoted contract seals, never a key the hire answer merely names.
         if (
@@ -867,21 +924,30 @@ class Kontra:
             q.service,
             q.seller_public_key,
         ):
-            await self._abandon(hired.job_id, "the hold does not match the quote")
+            abandoned = await self._abandon(hired.job_id, "the hold does not match the quote")
             raise HireRefused(
                 f"the gate locked a hold that differs from the quote for {q.offering}; "
-                "it was cancelled",
+                + _ABANDONED[abandoned],
                 code="hold_mismatch",
+                detail={"job_id": hired.job_id},
             )
         self._keys.remember(hired.endpoint, hired.seller_public_key)
         return hired
 
     async def _start(self, hired: m.HireView, value: dict[str, Any]) -> Job:
         """Start ``execute`` as a standalone Nexus operation in our namespace (the gate does
-        it for us when Temporal is unreachable). A start that is refused, or cannot be made,
-        is settled at the gate (:meth:`_verdict`): cancelled so the hold refunds now, unless
-        the gate already holds a delivery for the job -- then the job is returned and
-        ``result()`` reads that delivery."""
+        it for us when Temporal is unreachable).
+
+        The hold is locked by now, so nothing may leave here with the money held and the
+        caller unaware of it. A start that is refused, or fails in any way (Temporal refusing
+        the connection, the gate's answer to ``start`` lost...), is settled at the gate
+        (:meth:`_verdict`): cancelled so the hold refunds now, and :class:`JobFailed` raised
+        with the job id and the failure as its cause -- unless the gate recorded a delivery
+        for the job, which is then returned for ``result()`` to read. A cancel that fails
+        too never hides the first error: the hold then refunds at the job's deadline, and
+        ``JobFailed.job_id`` says which job to look at. A hire that is itself cancelled
+        meanwhile (a timeout, Ctrl-C) cancels its job: the caller never got it, so nobody
+        would follow it."""
         job = Job(
             self,
             job_id=hired.job_id,
@@ -891,45 +957,172 @@ class Kontra:
             operation_id=hired.operation_id,
         )
         try:
-            client = await self.temporal()
             try:
-                job._handle = await client.create_nexus_client(
-                    service=hired.service, endpoint=hired.endpoint
-                ).start_operation(
-                    EXECUTE_OPERATION,
-                    value,
-                    id=hired.operation_id,
-                    headers={HOLD_HEADER: hired.hold_token},
-                    schedule_to_close_timeout=timedelta(seconds=hired.max_duration_seconds),
-                )
-            except NexusOperationAlreadyStartedError:
-                job._handle = client.get_nexus_operation_handle(hired.operation_id)
-            except RPCError as err:
-                if _unavailable(err):
-                    raise TemporalUnavailable(str(err)) from err
-                # Refused outright (no such endpoint, not allowed): nothing will ever run.
-                await self._verdict(
-                    hired.job_id,
-                    Outcome("refused", f"Temporal refused to start the job: {err}"),
-                    cause=err,
-                )
-                return job
-        except TemporalUnavailable as err:
-            log.info("job %s: %s; the gate starts it", hired.job_id, err)
-            wire = await self._wire(hired.endpoint, hired.service, value, EXECUTE_OPERATION)
-            try:
-                await self.gate.start(hired.job_id, wire)
-            except GateError as gate_err:
-                await self._verdict(
-                    hired.job_id,
-                    Outcome("refused", f"the job could not be started: {gate_err.message}"),
-                    cause=gate_err,
-                )
-            return job
-        refused = await self._start_refused(client, hired)
-        if refused is not None:
-            await self._verdict(hired.job_id, refused)
+                client = await self._start_execute(job, hired, value)
+                if client is not None:
+                    refused = await self._start_refused(client, hired)
+                    if refused is not None:
+                        await self._verdict(hired.job_id, refused)
+            except JobFailed:
+                raise  # settled at the gate already, and it names the job
+            except Exception as err:  # anything else (a HireRefused from the codec too)
+                await self._unstarted(hired.job_id, err)
+        except asyncio.CancelledError:  # while starting, or while settling a failure
+            await self._abandon_cancelled(hired.job_id)
+            raise
         return job
+
+    async def _start_execute(
+        self, job: Job, hired: m.HireView, value: dict[str, Any]
+    ) -> Client | None:
+        """Start ``execute`` (or have the gate start it). The client it was started with,
+        to watch whether the handler takes it; None when the gate started it or the start
+        was refused and settled. Any other failure is raised for :meth:`_start` to settle."""
+        try:
+            client = await self.temporal()
+        except TemporalUnavailable as err:
+            await self._start_through_gate(hired, value, err)
+            return None
+        try:
+            job._handle = await client.create_nexus_client(
+                service=hired.service, endpoint=hired.endpoint
+            ).start_operation(
+                EXECUTE_OPERATION,
+                value,
+                id=hired.operation_id,
+                headers={HOLD_HEADER: hired.hold_token},
+                schedule_to_close_timeout=timedelta(seconds=hired.max_duration_seconds),
+            )
+        except NexusOperationAlreadyStartedError:
+            job._handle = client.get_nexus_operation_handle(hired.operation_id)
+        except RPCError as err:
+            if _unavailable(err):
+                await self._start_through_gate(hired, value, TemporalUnavailable(str(err)))
+                return None
+            # Refused outright (no such endpoint, not allowed): nothing will ever run.
+            await self._verdict(
+                hired.job_id,
+                Outcome("refused", f"Temporal refused to start the job: {err}"),
+                cause=err,
+            )
+            return None
+        return client
+
+    async def _start_through_gate(
+        self, hired: m.HireView, value: dict[str, Any], why: TemporalUnavailable
+    ) -> None:
+        """``POST /v1/jobs/{id}/start``: the gate starts ``execute`` in our namespace. A
+        refusal is settled here; a lost answer is raised (the start may or may not have
+        happened, and :meth:`_start` cancels the job rather than guess: the gate refuses the
+        cancel of a job that has delivered, and the delivery is then returned)."""
+        log.info("job %s: %s; the gate starts it", hired.job_id, why)
+        wire = await self._wire(hired.endpoint, hired.service, value, EXECUTE_OPERATION)
+        try:
+            await self.gate.start(hired.job_id, wire)
+        except GateError as gate_err:
+            await self._verdict(
+                hired.job_id,
+                Outcome("refused", f"the job could not be started: {gate_err.message}"),
+                cause=gate_err,
+            )
+
+    async def _unstarted(self, job_id: str, err: Exception, reason: str | None = None) -> m.JobView:
+        """Settle a job whose start failed with ``err`` after its hold was locked: cancel
+        it at the gate and raise :class:`JobFailed` from ``err`` -- or return the gate's
+        view when it recorded a delivery for the job. Whatever the settling itself runs
+        into, the error raised is a ``JobFailed`` naming the job, caused by ``err``."""
+        what = f"{type(err).__name__}: {err}" if str(err) else type(err).__name__
+        reason = f"{reason or 'the job could not be started'} ({what})"
+        log.warning("job %s: %s; cancelling it at the gate", job_id, reason)
+        try:
+            return await self._verdict(job_id, Outcome("refused", reason), cause=err)
+        except JobFailed:
+            raise
+        except Exception as settling:  # not the gate being down (_verdict handles that)
+            log.warning("job %s: could not be settled at the gate (%r)", job_id, settling)
+            raise JobFailed(f"{reason}; {_UNSETTLED}", state="failed", job_id=job_id) from err
+
+    async def _abandon_cancelled(self, job_id: str, reason: str | None = None) -> None:
+        """The hire was cancelled while its job started: cancel the job at the gate (so its
+        hold refunds now), shielded from the cancellation and bounded in time."""
+        reason = reason or "the hire was cancelled before it returned the job"
+        try:
+            done = await asyncio.shield(
+                asyncio.wait_for(self._abandon(job_id, reason), _ABANDON_WAIT)
+            )
+        except (asyncio.CancelledError, TimeoutError):  # _abandon did not get to say so
+            log.warning("job %s: %s; %s", job_id, reason, _UNSETTLED)
+            return
+        if done != "unreached":  # _abandon has said so
+            log.warning("job %s: %s; %s", job_id, reason, _ABANDONED[done])
+
+    async def _quote_job(self, q: QuoteResult) -> str | None:
+        """The job the gate made of ``q`` when no hire of it here got the gate's answer, or
+        None (no job, or the gate cannot say). Hiring the quote again under a cap below any
+        price never locks anything: the gate answers ``quote_used`` naming the job the quote
+        became, or refuses on price because nothing was locked (as ``kontra.hire.prepare``
+        asks after a lost attempt)."""
+        if q.quote_id is None:
+            return None
+        try:
+            again = await self.gate.hire(q.quote_id, max_price_minor=-1)
+        except GateError as answer:
+            found = (answer.detail or {}).get("job_id") if answer.code == "quote_used" else None
+            job_id = found if is_job_id(found) else None
+        except Exception as err:  # the gate is still out of reach: nothing more to learn
+            log.warning(
+                "%s: cannot ask the gate what quote %s became (%r)", q.offering, q.quote_id, err
+            )
+            return None
+        else:  # a gate that ignored the cap locked it just now: nothing will use that job
+            job_id = again.job_id
+        if job_id is None or job_id == q._job_id:  # none, or one a hire here has in hand
+            return None
+        return cast("str", job_id)
+
+    async def _lost_hire(self, q: QuoteResult, err: Exception) -> None:
+        """The gate's answer to ``hire`` was lost or unreadable (``err``), so the hold may be
+        locked although nothing here has its job to start or follow, and the caller of
+        :meth:`hire` has no quote to retry by. If the quote did become a job, it is settled
+        as a start that failed: cancelled, and :class:`JobFailed` raised naming it, caused
+        by ``err`` (a job the gate says delivered is refused as ``quote_used``, named, to be
+        followed with :meth:`job`). Returns when the quote made no job, or the gate cannot
+        say: ``err`` then stands."""
+        try:
+            job_id = await self._quote_job(q)
+            if job_id is None:
+                return
+            view = await self._unstarted(job_id, err, "the gate's answer to the hire was lost")
+        except asyncio.CancelledError:
+            await self._lost_hire_cancelled(q)
+            raise
+        raise HireRefused(
+            f"the gate's answer to the hire of {q.offering} was lost, and the job it made, "
+            f"{view.job_id}, has delivered: follow it with Kontra.job({view.job_id!r})",
+            code="quote_used",
+            detail={"job_id": view.job_id},
+        ) from err
+
+    async def _lost_hire_cancelled(self, q: QuoteResult) -> None:
+        """The hire was cancelled while it waited for the gate's answer to ``hire``: cancel
+        the job the quote became, if it became one (:meth:`_quote_job`), shielded from the
+        cancellation and bounded in time."""
+        reason = "the hire was cancelled before the gate's answer to it arrived"
+
+        async def settle() -> None:
+            job_id = await self._quote_job(q)
+            if job_id is not None:
+                await self._abandon_cancelled(job_id, reason)
+
+        try:
+            await asyncio.shield(asyncio.wait_for(settle(), _ABANDON_WAIT))
+        except (asyncio.CancelledError, TimeoutError):
+            log.warning(
+                "%s: %s; if quote %s locked a hold, it refunds at the job's deadline",
+                q.offering,
+                reason,
+                q.quote_id,
+            )
 
     async def _start_refused(self, client: Client, hired: m.HireView) -> Outcome | None:
         """Wait up to ``start_timeout`` for the handler to take the start. The refusal if it
@@ -976,24 +1169,30 @@ class Kontra:
         job once it is settled, if the gate counted a delivery; otherwise raise
         :class:`JobFailed` with ``outcome``'s reason and the state the gate closed the job in.
 
-        The escrow decides, not the operation (decisions I6). The gate counts a delivery by
-        watching the seller's ``job-<id>``, which can complete although the buyer's
-        operation did not return it: a seller that starts ``job-<id>`` itself (the buyer's
-        own start is then refused as "already ran"), or one that delivers after the buyer's
-        operation timed out (``max_duration`` from the buyer's start) but before the gate's
-        deadline (lock + ``max_duration`` + grace). The gate releases such a delivery to the
-        seller when the review window closes; telling the buyer "failed, refunded" would
-        have it pay without looking. A refused start is cancelled first, so its hold refunds
-        now. If the gate cannot be reached, the operation's outcome is all there is."""
+        The escrow decides, not the operation (decisions I6, I15). The gate counts a
+        delivery only from the run of ``job-<id>`` that the buyer's own call started (a run
+        the seller started itself is never one), and that run can complete although the
+        operation did not return it: after the buyer's operation timed out (``max_duration``
+        from the buyer's start) but before the gate's deadline (lock + ``max_duration`` +
+        grace), or when the answer to the start was lost although the start was made. The
+        gate releases such a delivery to the seller when the review window closes; telling
+        the buyer "failed, refunded" would have it pay without looking. A refused start is
+        cancelled first, so its hold refunds now (the gate refuses the cancel of a job it
+        has seen deliver). If the gate cannot be reached, the operation's outcome is all
+        there is."""
         if outcome.kind == "canceled":
             raise JobFailed(outcome.reason, state=outcome.state, job_id=job_id) from cause
+        cancelled: m.JobView | None = None
         try:
             if outcome.kind == "refused":
-                await self._cancel_at_gate(job_id)
-            view = await self._closed_view(job_id)
+                cancelled = await self._cancel_at_gate(job_id)
+            view = cancelled if cancelled is not None else await self._closed_view(job_id)
         except (GateError, httpx.TransportError) as err:
             log.warning("job %s: the gate's verdict is unavailable (%s)", job_id, err)
-            raise JobFailed(outcome.reason, state=outcome.state, job_id=job_id) from cause
+            reason = outcome.reason
+            if outcome.kind == "refused" and cancelled is None:  # the cancel itself failed
+                reason = f"{reason}; {_UNSETTLED}"
+            raise JobFailed(reason, state=outcome.state, job_id=job_id) from cause
         if view.state is m.JobState.COMPLETED:
             log.warning(  # %r: the reason is the seller's text
                 "job %s: %r, yet the gate recorded a delivery; returning it (reject it if it "
@@ -1005,14 +1204,16 @@ class Kontra:
         state = outcome.state if view.state in _OPEN else view.state.value
         raise JobFailed(outcome.reason, state=state, job_id=job_id) from cause
 
-    async def _cancel_at_gate(self, job_id: str) -> None:
-        """Cancel a job that will not run here, so its hold refunds now. A 409 means the gate
-        has closed it already (delivered, failed, canceled): its verdict stands."""
+    async def _cancel_at_gate(self, job_id: str) -> m.JobView | None:
+        """Cancel a job that will not run here, so its hold refunds now: the gate's view of
+        the cancelled job. None when the gate has closed it already (a 409: delivered,
+        failed, canceled), whose verdict stands."""
         try:
-            await self.gate.cancel(job_id)
+            return await self.gate.cancel(job_id)
         except GateError as err:
             if err.status != 409:
                 raise
+        return None
 
     async def _closed_view(
         self, job_id: str, *, beat: Callable[[], None] | None = None
@@ -1034,18 +1235,22 @@ class Kontra:
             view = await self.gate.job(job_id)
         return view
 
-    async def _abandon(self, job_id: str, reason: str) -> None:
-        """Cancel a hold this client refuses to use (best effort: if the gate cannot, the
-        hold refunds at its deadline)."""
+    async def _abandon(self, job_id: str, reason: str) -> _Abandoned:
+        """Cancel a hold this client refuses to use. Best effort, and never raises, so the
+        error that made us abandon the job is the one the caller sees: ``unreached`` when
+        the gate could not be told (the hold then refunds at its deadline), ``closed`` when
+        it had closed the job already -- delivered perhaps, so never called a refund."""
         try:
-            await self.gate.cancel(job_id)
-        except (GateError, httpx.TransportError) as err:
+            view = await self._cancel_at_gate(job_id)
+        except Exception as err:
             log.warning(
                 "job %s: %s; could not cancel it (%s); it refunds at its deadline",
                 job_id,
                 reason,
                 err,
             )
+            return "unreached"
+        return "cancelled" if view is not None else "closed"
 
     # ------------------------------------------------------------------ delivery & progress
 

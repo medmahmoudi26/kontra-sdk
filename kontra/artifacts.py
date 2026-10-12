@@ -377,11 +377,29 @@ async def iter_plaintext(
         yield last
 
 
+def _create_private(path: Path) -> BinaryIO:
+    """A new file at ``path``, open for writing and readable by us alone: it receives
+    decrypted plaintext, which the process umask (typically 0644) would leave readable by
+    every user of the machine. 0600 from creation, not chmod-ed afterwards (no window), and
+    exactly 0600 whatever the umask. ``O_EXCL``/``O_NOFOLLOW``: never an existing file or a
+    link planted at the name."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 async def download(
     gate: ArtifactGate, artifact: Artifact, identity: str | Sequence[str], dest: str | Path
 ) -> Path:
     """Fetch, decrypt and verify into ``dest`` (a file path, or an existing directory to
-    put the key's last segment in). Nothing appears at ``dest`` unless it verified."""
+    put the key's last segment in). Nothing appears at ``dest`` unless it verified, and
+    what appears is readable by us alone (0600): it is the decrypted plaintext."""
     dest = Path(dest)
     if dest.is_dir():
         # The key comes from the counterparty's result: never let it pick "..", or a
@@ -394,7 +412,7 @@ async def download(
         dest = dest / name
     tmp = dest.with_name(f".{dest.name}.{secrets.token_hex(4)}.part")
     try:
-        f = await asyncio.to_thread(tmp.open, "wb")
+        f = await asyncio.to_thread(_create_private, tmp)
         try:
             async for piece in iter_plaintext(gate, artifact, identity):
                 await asyncio.to_thread(f.write, piece)

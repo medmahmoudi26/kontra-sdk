@@ -1,5 +1,5 @@
 """``kontra.serve.Worker``: argument checks, the kwargs passthrough (acceptance 10), the hash
-lock's decisions, and graceful shutdown on SIGTERM."""
+lock's decisions, graceful shutdown on SIGTERM, and request URLs kept out of the log."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import nexusrpc
 import nexusrpc.handler
 import pytest
@@ -37,10 +38,11 @@ from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 from kontra.codec.age import generate_identity
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
-from kontra.profile import Profile
+from kontra.profile import NotLoggedIn, Profile
 from kontra.serve import KontraInterceptor, ServeError, Worker
 from kontra.testing import Marketplace
 from kontra.testing.devserver import DevServer
+from kontra.types import Artifact
 
 from . import seller
 from .flows import SentinelFlow, count, shout
@@ -432,3 +434,50 @@ async def test_one_worker_serves_several_offerings(dev_server: DevServer, tmp_pa
                 entry = await acme.gate.get_offering(bound.key)
                 assert entry.contract_hash == bound.contract_hash(acme.public_key)
                 assert entry.task_queue == bound.key
+
+
+# --------------------------------------------------------------------------- logging
+
+
+@pytest.mark.temporal
+async def test_python_worker_py_keeps_signed_and_buyer_urls_out_of_the_log(
+    dev_server: DevServer,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``python worker.py`` is ``Worker.run()`` with nothing around it. httpx logs the full
+    URL of every request at INFO: an artifact's presigned upload URL (its signature
+    included: whoever reads the log could write that object) and every URL an activity
+    fetches for a buyer (the buyer's input, which travels encrypted). The worker turns that
+    logger down, as ``kontra serve`` does, unless the seller chose its level."""
+    monkeypatch.setattr(logging.getLogger("httpx"), "level", logging.NOTSET)
+    caplog.set_level(logging.INFO)
+    async with Marketplace(dev_server=dev_server) as mp:
+        acme = await mp.party("acme")
+        worker = Worker(offerings=[seller.bind(write_offering(tmp_path))], activities=[shout])
+        async with mp.serve(worker, acme):
+            data = tmp_path / "records.jsonl"
+            data.write_text('{"url": "https://buyer.example/private"}\n')
+            artifact = await Artifact.from_path(data)  # as an activity would: a presigned PUT
+            async with httpx.AsyncClient() as http:  # a buyer's URL, fetched by an activity
+                await http.get(f"{mp.gate.base_url}/buyer-supplied/secret-path?token=abc")
+    assert artifact.size > 0
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "serving acme/upper" in logged  # the worker's own INFO lines are there
+    for leak in ("sig=", "/_blob/", "buyer-supplied", "token=abc"):
+        assert leak not in logged
+
+
+async def test_a_level_the_seller_chose_for_httpx_is_kept(
+    bound: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    httpx_log = logging.getLogger("httpx")
+    monkeypatch.setattr(httpx_log, "level", logging.DEBUG)
+    with pytest.raises(NotLoggedIn):  # no profile here: the start fails after the logging
+        await Worker(offerings=[bound]).run_async(home=tmp_path, handle_signals=False)
+    assert httpx_log.level == logging.DEBUG
+    monkeypatch.setattr(httpx_log, "level", logging.NOTSET)
+    with pytest.raises(NotLoggedIn):
+        await Worker(offerings=[bound]).run_async(home=tmp_path, handle_signals=False)
+    assert httpx_log.level == logging.WARNING

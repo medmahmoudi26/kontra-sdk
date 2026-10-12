@@ -14,7 +14,9 @@ Three servers share one set of pages:
 Pages: ``/`` ("Home"), ``/page/<n>`` ("Page <n>"), ``/moved`` (301 to ``/page/moved``),
 ``/missing`` (404, "Not found"), ``/garbage`` (not HTTP at all) and ``/endless`` (a title,
 then bytes until the client hangs up -- or ``ENDLESS_CAP``, which only a client that reads
-everything reaches; :attr:`Sites.endless_capped` says whether one did).
+everything reaches; :attr:`Sites.endless_capped` says whether one did). ``/host`` is titled
+with the ``Host`` header it was sent, and ``/to?<location>`` redirects (302) to the
+percent-encoded location after the ``?``, wherever that is (:meth:`Sites.redirect`).
 
 Hostile ones: ``/redirect-endless`` (to a GET, a 301 to ``/page/landed`` whose body is
 endless like ``/endless``'s; to a HEAD, the bare 301), ``/redirect-twice`` (301 to
@@ -38,6 +40,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -98,6 +101,10 @@ def _handler(state: _State, *, stall: bool) -> type[BaseHTTPRequestHandler]:
             page = _PAGE.fullmatch(path)
             if path == "/":
                 return self._page(200, "Home", body)
+            if path == "/host":
+                return self._page(200, f"Host {self.headers.get('Host', '')}", body)
+            if path == "/to":
+                return self._moved(unquote(self.path.partition("?")[2]), status=302)
             if page is not None:
                 return self._page(200, f"Page {page.group(1)}", body)
             if path == "/moved":
@@ -143,8 +150,8 @@ def _handler(state: _State, *, stall: bool) -> type[BaseHTTPRequestHandler]:
             if body:
                 self.wfile.write(data)
 
-        def _moved(self, location: str) -> None:
-            self.send_response(301)
+        def _moved(self, location: str, status: int = 301) -> None:
+            self.send_response(status)
             self.send_header("Location", location)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -320,6 +327,13 @@ class Sites:
 
     def stall(self, path: str = "/") -> str:
         return f"https://{self.host('stall')}{path}"
+
+    def redirect(self, location: str, name: str = "plain") -> str:
+        """A URL of server ``name`` that redirects to ``location``, wherever that is."""
+        return {"plain": self.plain, "secure": self.secure}[name]("/to?" + quote(location, safe=""))
+
+    def port(self, name: str = "plain") -> int:
+        return self._port(name)
 
     @staticmethod
     def refused() -> str:

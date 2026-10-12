@@ -9,7 +9,6 @@ import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from hashlib import sha256
 
 import pytest
 from temporalio.api.common.v1 import Payload
@@ -18,6 +17,9 @@ from temporalio.converter import DataConverter, PayloadCodec
 from temporalio.worker import Worker
 
 from kontra._control import (
+    DEFAULT_RETENTION,
+    RETENTION_MARGIN,
+    BuyerCall,
     Control,
     EndpointConflict,
     HistorySummary,
@@ -25,7 +27,8 @@ from kontra._control import (
     TemporalError,
 )
 from kontra.contract.names import new_endpoint_name
-from kontra.escrow import ObservedStatus
+from kontra.contract.offering import MAX_DURATION_RANGE
+from kontra.escrow import DEFAULT_GRACE, ObservedStatus, Provenance
 from kontra.testing.devserver import DevServer, free_port
 
 from .flows import Job, Plan, hang, step
@@ -40,6 +43,10 @@ def unique(prefix: str) -> str:
 
 def json_payload(value: object) -> Payload:
     return Payload(metadata={"encoding": b"json/plain"}, data=json.dumps(value).encode())
+
+
+#: A buyer's call no workflow here was started by (provenance has its own tests).
+NO_CALL = BuyerCall("nobody", new_endpoint_name(), "x.y", frozenset())
 
 
 @dataclass
@@ -95,6 +102,46 @@ async def test_ensure_namespace_registers_once_and_is_usable_at_once(
     handle = await client.start_workflow(Job.run, Plan("slow"), id="probe", task_queue="nobody")
     assert (await handle.describe()).status is WorkflowExecutionStatus.RUNNING
     await handle.terminate("done")
+
+
+def test_default_retention_outlasts_the_longest_hold() -> None:
+    """A hold token can start ``job-<id>`` until max_duration after the hold; only the
+    first run's record refuses a second start, so it must outlive every token (FIXUPS
+    #19). Tied to the contract's cap, so raising the cap raises retention with it."""
+    longest_token, retention = MAX_DURATION_RANGE[1], DEFAULT_RETENTION
+    assert retention == longest_token + RETENTION_MARGIN
+    assert retention >= longest_token + DEFAULT_GRACE + timedelta(days=1)
+
+
+async def _retention(control: Control, namespace: str) -> timedelta:
+    from temporalio.api.workflowservice.v1 import DescribeNamespaceRequest
+
+    d = await control.client.workflow_service.describe_namespace(
+        DescribeNamespaceRequest(namespace=namespace)
+    )
+    return d.config.workflow_execution_retention_ttl.ToTimedelta()
+
+
+async def test_ensure_namespace_raises_a_short_retention_and_never_lowers_it(
+    control: Control,
+) -> None:
+    ns = unique("party")
+    await control.ensure_namespace(ns, timedelta(days=1))  # as an older gate registered it
+    assert await _retention(control, ns) == timedelta(days=1)
+    await control.ensure_namespace(ns)
+    assert await _retention(control, ns) == DEFAULT_RETENTION
+    await control.ensure_namespace(ns, timedelta(days=2))
+    assert await _retention(control, ns) == DEFAULT_RETENTION  # never shortened
+    longer = DEFAULT_RETENTION + timedelta(days=10)
+    await control.ensure_namespace(ns, longer)
+    assert await _retention(control, ns) == longer
+    await control.ensure_namespace(ns)
+    assert await _retention(control, ns) == longer
+    fresh = unique("party")
+    await control.ensure_namespace(fresh)
+    assert await _retention(control, fresh) == DEFAULT_RETENTION
+    with pytest.raises(ValueError, match="retention"):
+        await control.ensure_namespace(fresh, timedelta(0))
 
 
 async def test_ensure_namespace_refuses_an_empty_name(control: Control) -> None:
@@ -314,38 +361,27 @@ async def test_sync_refuses_a_nonsense_timeout(control: Control) -> None:
 # --------------------------------------------------------------------------- observation
 
 
-async def test_observe_lifecycle(control: Control, seller: Seller) -> None:
-    obs, result = await control.observe(seller.namespace, "job-missing")
+async def test_observe_reports_any_run_but_only_as_the_buyers_once_verified(
+    control: Control, seller: Seller
+) -> None:
+    """A run nobody's Nexus call started is reported with its status and times, as not the
+    buyer's, and its result is not even read: it can never be a delivery. (A run a buyer's
+    call started: ``test_provenance``.)"""
+    obs, result = await control.observe(seller.namespace, "job-missing", NO_CALL, None)
     assert (obs.status, result) == (ObservedStatus.NOT_FOUND, None)
 
     handle = await seller.client.start_workflow(
         Job.run, Plan("ok"), id=unique("job"), task_queue=seller.task_queue
     )
     await handle.result()
-    obs, result = await control.observe(seller.namespace, handle.id)
+    obs, result = await control.observe(seller.namespace, handle.id, NO_CALL, None)
     assert obs.status is ObservedStatus.COMPLETED
+    assert obs.provenance is Provenance.NOT_FROM_BUYER
+    assert obs.run_id == handle.result_run_id
     assert obs.started_at is not None
     assert obs.closed_at is not None
     assert obs.started_at <= obs.closed_at
-    assert result is not None
-    assert obs.result_sha256 == sha256(result).hexdigest()
-    assert obs.result_size == len(result)
-    stored = Payload()
-    stored.ParseFromString(result)
-    assert json.loads(stored.data) == "OK"
-
-
-async def test_observe_follows_the_latest_run(control: Control, seller: Seller) -> None:
-    handle = await seller.client.start_workflow(
-        Job.run, Plan("can2"), id=unique("job"), task_queue=seller.task_queue
-    )
-    await seller.client.get_workflow_handle(handle.id).result()
-    obs, result = await control.observe(seller.namespace, handle.id)
-    assert obs.status is ObservedStatus.COMPLETED
-    assert result is not None
-    stored = Payload()
-    stored.ParseFromString(result)
-    assert json.loads(stored.data) == "CAN0"
+    assert (result, obs.result_sha256, obs.result_size) == (None, None, None)
 
 
 @pytest.mark.parametrize(
@@ -368,7 +404,7 @@ async def test_observe_unsuccessful_closes(
     )
     if how != "fail":
         await wait_status(seller.client, wf, [WorkflowExecutionStatus.RUNNING])
-        obs, _ = await control.observe(seller.namespace, wf)
+        obs, _ = await control.observe(seller.namespace, wf, NO_CALL, None)
         assert obs.status is ObservedStatus.RUNNING
         assert obs.started_at is not None
         assert obs.closed_at is None
@@ -383,8 +419,9 @@ async def test_observe_unsuccessful_closes(
         WorkflowExecutionStatus.TIMED_OUT,
     }
     await wait_status(seller.client, wf, list(closed))
-    obs, result = await control.observe(seller.namespace, wf)
+    obs, result = await control.observe(seller.namespace, wf, NO_CALL, None)
     assert obs.status is want
+    assert obs.provenance is Provenance.NOT_FROM_BUYER
     assert result is None
     assert obs.closed_at is not None
     # stopping what is already closed, or gone, is not an error
@@ -401,7 +438,7 @@ async def test_a_missing_namespace_is_a_platform_fault_not_a_job_fact(control: C
     with pytest.raises(TemporalError):
         await control.cancel_workflow(ghost, "wf", "x")
     with pytest.raises(TemporalError):
-        await control.observe(ghost, "wf")
+        await control.observe(ghost, "wf", NO_CALL, None)
     with pytest.raises(TemporalError):
         await control.history_summary(ghost, "wf")
 

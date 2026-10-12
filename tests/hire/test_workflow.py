@@ -10,6 +10,8 @@ import dataclasses
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -160,16 +162,60 @@ async def test_a_refused_start_refunds_at_once(door: Door) -> None:
     await _replays(door, handle)
 
 
-async def test_a_refused_start_returns_the_delivery_the_gate_recorded(door: Door) -> None:
+async def test_a_run_the_seller_started_itself_refunds_the_workflow(door: Door) -> None:
     """The seller completes ``job-<id>`` itself, so the workflow's own start is refused
-    ("already ran"); the gate counts that run as the delivery and would release the money at
-    the review window. The workflow gets that delivery, as a script would, not JobFailed."""
-    door.world.forge_on_hire(door.buyer.k, "forged by the seller")
-    handle = await door.start(HireCatching.run, Order(offering=door.world.key(), text="genuine"))
+    ("already ran"). That run is no delivery: only the run the buyer's own call started is
+    (decisions I15). The hold refunds at once, the seller is paid nothing, and the workflow
+    gets JobFailed, as a script would."""
+    world = door.world
+    seller_before = await world.ledger_balance(world.seller.handle)
+    world.forge_on_hire(door.buyer.k, "forged by the seller")
+    handle = await door.start(HireCatching.run, Order(offering=world.key(), text="genuine"))
     out = await handle.result()
-    assert out["record"]["text"] == "FORGED BY THE SELLER"
+    assert out["error"] == "JobFailed"
+    assert "already ran" in out["message"]
+    assert out["fields"]["state"] == "canceled"
+    [view] = await door.jobs(1)
+    assert (view.state, view.escrow, view.delivery) == (
+        m.JobState.CANCELED,
+        m.Escrow.REFUNDED,
+        None,
+    )
+    await door.refunded()
+    assert await world.ledger_balance(world.seller.handle) == seller_before
+    await _replays(door, handle)
+
+
+async def test_a_delivery_after_the_operation_timed_out_reaches_the_workflow(
+    door: Door, tmp_path: Path
+) -> None:
+    """What the escrow-decides rule guards, in a workflow: the run the workflow's own call
+    started delivers after the operation timed out (``max_duration`` from the call) but
+    before the gate's deadline (lock + max_duration + grace). The gate counts that delivery
+    and pays it at the review window, so the workflow gets it, not JobFailed."""
+    world = door.world
+    bound = sellers.text_offering(tmp_path, max_duration="8s")
+    grace = await world.gate(lambda g: g.grace)
+    await world.gate(lambda g: setattr(g, "grace", timedelta(seconds=4)))
+    try:
+        async with world.mp.serve(sellers.text_worker(bound), world.seller):
+            # The handler takes 3 s to start the job (the operation's 8 s run from before
+            # that); the job then works 6 s: done ~9 s after the call, before 8 + 4.
+            text = f"late-{uuid.uuid4().hex[:6]}"
+            handle = await door.start(
+                HireOne.run, Order(offering=bound.key, text=text, mode="quiet", beats=6)
+            )
+            out = await handle.result()
+    finally:
+        await world.gate(lambda g: setattr(g, "grace", grace))
+    assert out["text"] == text.upper()
     [view] = await door.jobs(1)
     assert (view.state, view.escrow) == (m.JobState.COMPLETED, m.Escrow.HELD)
+    history = await handle.fetch_history()
+    timed_out = [
+        e for e in history.events if e.HasField("nexus_operation_timed_out_event_attributes")
+    ]
+    assert len(timed_out) == 1  # the operation itself returned nothing
     await _replays(door, handle)
 
 

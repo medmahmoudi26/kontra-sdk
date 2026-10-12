@@ -25,9 +25,21 @@ Change `acme` to your own handle before publishing.
 200 kB of the final page is read: redirects are followed without reading their bodies, and the
 page is asked for and read uncompressed (a few kB of gzip can inflate to gigabytes). Whatever a
 URL does (refuse, hang, stream forever, redirect in circles, answer garbage, fail to parse)
-becomes the `error` of its record instead of failing the job. They are fetched from your
-machine, though: run the worker where they cannot reach anything private (cloud metadata, your
-LAN), or filter addresses before fetching.
+becomes the `error` of its record instead of failing the job.
+
+They are fetched from your machine, inside your network, so a URL may only reach the public
+internet. Its host is resolved first and every address it resolves to must be public: not
+loopback, private (10/8, 172.16/12, 192.168/16, fc00::/7), link-local (169.254.169.254, the cloud
+metadata service, is one), carrier-grade NAT (100.64/10), multicast or unspecified, and an IPv6
+address carrying an IPv4 one (`::ffff:127.0.0.1`) is judged by that IPv4 address. The request
+then goes to the address that was checked, so a DNS answer that changes in between (rebinding)
+cannot redirect it, and each redirect is checked the same way. A URL that fails the check gets
+the error `ForbiddenAddress` in its record.
+
+To let buyers reach a private network on purpose (an intranet you sell access to), set
+`ENRICH_ALLOWED_PRIVATE_NETWORKS` to it before starting the worker, comma-separated:
+`ENRICH_ALLOWED_PRIVATE_NETWORKS=10.20.0.0/16`. It is unset by default; the tests set it to
+`127.0.0.1/32` to reach their own sites. Allow only what you mean buyers to reach.
 
 `contract.yaml` is sealed with the example key in `../example-public-key.txt`, so that
 `tests/examples/test_golden.py` reproduces it byte for byte; `kontra publish` seals your key,

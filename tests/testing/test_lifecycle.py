@@ -9,11 +9,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
 import pytest
+from temporalio.api.workflowservice.v1 import StartNexusOperationExecutionRequest
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.converter import NexusSerializationContext
 
@@ -218,6 +220,63 @@ async def test_an_offline_seller_is_refunded_at_the_deadline(deal: Deal) -> None
     assert view.reason == "seller never started the job"
 
 
+#: The order of the P-256 group: (r, s) and (r, N - s) are both valid ECDSA signatures.
+_P256_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+
+
+def _respelled(token: str) -> str:
+    """The same hold, spelled so that no byte of it but the signed part is the gate's: the
+    other valid ES256 signature ``(r, N - s)``, base64url padding the verifier's decoder
+    ignores, and spaces and a tab around it, which HTTP drops before the seller's handler
+    sees the header (server 1.32, measured)."""
+    signed, _, sig = token.rpartition(".")
+    raw = base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))
+    s = int.from_bytes(raw[32:], "big")
+    other = raw[:32] + (_P256_N - s).to_bytes(32, "big")
+    return f" \t{signed}.{base64.urlsafe_b64encode(other).decode()} "
+
+
+async def test_a_respelled_hold_the_handler_accepted_still_pays_the_seller(deal: Deal) -> None:
+    """The buyer calls ``execute`` itself with its hold spelled differently from what the
+    gate issued. The seller's handler verifies it (it is the gate's signature over the
+    gate's claims) and does the job, so escrow must count the run as the buyer's: matching
+    the header against the issued token byte for byte let a buyer take the delivery and
+    have the job refund at the deadline."""
+    async with serving(deal.seller_client(), deal.entry, deal.jwks):
+        job = await deal.hire("respelled")
+        token = _respelled(job.hold_token)
+        assert token.strip() != job.hold_token
+        req = StartNexusOperationExecutionRequest(
+            namespace=deal.buyer.namespace,
+            identity="the buyer itself",
+            request_id=str(uuid.uuid4()),
+            operation_id=f"mine-{job.job_id}",
+            endpoint=deal.entry.endpoint,
+            service=deal.entry.service,
+            operation="execute",
+            input=json_payload({"text": "respelled"}),
+        )
+        req.schedule_to_close_timeout.FromTimedelta(timedelta(minutes=5))
+        req.nexus_header["kontra-hold"] = token
+        await deal.mp.client(deal.buyer.namespace).workflow_service.start_nexus_operation_execution(
+            req
+        )
+        client = deal.seller_client()
+        for _ in range(200):  # the handler accepted the token and the job ran
+            try:
+                status = await _workflow_status(client, job.workflow_id)
+            except Exception:
+                status = None
+            if status is WorkflowExecutionStatus.COMPLETED:
+                break
+            await asyncio.sleep(0.1)
+        assert status is WorkflowExecutionStatus.COMPLETED
+        view = await deal.until(job.job_id, lambda v: v.state is m.JobState.COMPLETED)
+    assert (view.escrow, view.delivery is not None) == (m.Escrow.HELD, True)
+    result = await deal.buyer.gate.result(job.job_id)
+    assert json.loads(unwire(result.payload).data) == {"text": "RESPELLED"}
+
+
 async def test_quote_refusals_from_a_real_handler(deal: Deal) -> None:
     async with serving(deal.seller_client(), deal.entry, deal.jwks):
         q = await deal.buyer.gate.quote(
@@ -236,7 +295,11 @@ async def test_payloads_stay_ciphertext_end_to_end(deal: Deal) -> None:
     only ciphertext, and the buyer decrypts the delivery it fetched from the gate."""
     buyer_keys: dict[str, str] = {}
     seller_codec = KontraCodec(
-        deal.seller.identity, deal.seller.public_key, role="seller", buyer_keys=_Keys(buyer_keys)
+        deal.seller.identity,
+        deal.seller.public_key,
+        role="seller",
+        buyer_keys=_Keys(buyer_keys),
+        services=[deal.entry.service],  # the replies it may send in plaintext (quote's price)
     )
     buyer_codec = KontraCodec(
         deal.buyer.identity, deal.buyer.public_key, role="buyer", seller_keys=_Seller(deal.entry)

@@ -7,7 +7,9 @@ SDK needs:
   :attr:`Session.gate`;
 * Temporal worker JWTs (:meth:`Session.temporal_token`), cached the same way;
 * a ``temporalio`` client whose ``api_key`` is replaced in the background before the JWT
-  expires (:meth:`Session.connect_temporal`), so a worker runs for days on 15-minute tokens.
+  expires (:meth:`Session.connect_temporal`), so a worker runs for days on 15-minute tokens;
+  :meth:`Session.release` stops that when the client is done with, :meth:`Session.aclose`
+  stops all of them.
 
 The gate rotates the refresh token on every use and revokes the whole session if an old
 one is presented again, so refreshing is serialised: within a process by a lock, between
@@ -177,7 +179,10 @@ class Session:
         self._disk_token = profile.refresh_token
         self._temporal: dict[str, tuple[m.TemporalToken, datetime]] = {}
         self._temporal_lock = asyncio.Lock()
-        self._tasks: set[asyncio.Task[None]] = set()
+        #: Background api_key refreshers and the client each one keeps fresh.
+        self._tasks: dict[asyncio.Task[None], _ApiKeyHolder] = {}
+        #: Set by aclose(): no refresher may start after it, as nothing would ever stop it.
+        self._closed = False
         self._gate = GateClient(profile.gate_url, token=_AccessTokens(self), transport=transport)
 
     @classmethod
@@ -195,6 +200,7 @@ class Session:
         return Profile.identity(self._home or kontra_home())
 
     async def aclose(self) -> None:
+        self._closed = True
         tasks = list(self._tasks)
         for task in tasks:
             task.cancel()
@@ -331,14 +337,19 @@ class Session:
         """``temporalio.client.Client.connect`` to the profile's frontend as ``role``.
 
         The JWT is the client's ``api_key`` and is replaced in the background before it
-        expires, until :meth:`aclose` (§10.3: "swapped into the Temporal client at
-        runtime"). ``tls`` defaults to the profile's (temporalio would otherwise turn TLS
-        on by itself because an api key is set); other kwargs go to ``Client.connect``.
+        expires (§10.3: "swapped into the Temporal client at runtime"), until
+        :meth:`release` of this client or :meth:`aclose`. Release a client you are done
+        with while the session lives on (a worker shutting down on a shared session):
+        otherwise its refresher keeps fetching tokens for nobody. ``tls`` defaults to the
+        profile's (temporalio would otherwise turn TLS on by itself because an api key is
+        set); other kwargs go to ``Client.connect``.
         """
         from temporalio.client import Client
 
         if "api_key" in kwargs:
             raise TypeError("connect_temporal manages api_key itself")
+        if self._closed:
+            raise RuntimeError("this Session is closed: it keeps no client's api_key fresh")
         tok = await self.temporal_token(role)
         kwargs.setdefault("tls", self.profile.tls)
         if data_converter is not None:
@@ -349,17 +360,34 @@ class Session:
             api_key=tok.token,
             **kwargs,
         )
-        self.keep_fresh(client, role)
+        self.keep_fresh(client, role)  # refused if the session closed while connecting
         return client
 
     def keep_fresh(self, client: _ApiKeyHolder, role: str = "worker") -> asyncio.Task[None]:
-        """Keep ``client.api_key`` a valid ``role`` JWT until :meth:`aclose`."""
+        """Keep ``client.api_key`` a valid ``role`` JWT until :meth:`release` of ``client``
+        or :meth:`aclose`. Returns the background task. Raises ``RuntimeError`` once the
+        session is closed: that refresher would retry against a closed gate client forever,
+        with nobody left to cancel it."""
+        if self._closed:
+            raise RuntimeError("this Session is closed: it keeps no client's api_key fresh")
         task = asyncio.get_running_loop().create_task(
             self._keep_fresh(client, role), name=f"kontra-temporal-token-{role}"
         )
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._tasks[task] = client
+        task.add_done_callback(self._forget)
         return task
+
+    def _forget(self, task: asyncio.Task[None]) -> None:
+        self._tasks.pop(task, None)
+
+    async def release(self, client: object) -> None:
+        """Stop keeping ``client``'s api_key fresh and wait until its refresher has stopped.
+        Other clients of this session keep theirs. Idempotent; a client this session never
+        connected is a no-op."""
+        tasks = [task for task, held in self._tasks.items() if held is client]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _keep_fresh(self, client: _ApiKeyHolder, role: str) -> None:
         failures = 0

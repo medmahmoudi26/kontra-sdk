@@ -212,3 +212,96 @@ with a warning that says so, as an unreadable gate image is (I13). Once the imag
 which `kontra dev` needs anyway, there is nothing to protect and forks run `e2e` too. The job
 logs out of the registry as soon as the image is pulled, so no later step can read the
 credential.
+
+## I15. Only the buyer's own call delivers
+
+I6 watched the *latest* run of `job-<id>` and paid for a completed one. A seller can start
+`job-<id>` itself (it learns the id from the quote and the hold), with any input, or stop the
+run the buyer's call started and complete a later one; either way it was paid unless the buyer
+noticed and disputed in time. Now a run counts only if the buyer's own `execute` call started
+its chain, and `Control.observe` establishes that by lookup and exact equality on structured
+fields, never by decoding an operation token, a callback URL or any other string:
+
+1. In the seller's namespace, from what only the server writes: the chain's first run (the
+   run's `first_run_id`, which the server sets on a continue-as-new, retry or cron successor
+   and no start request can carry, read in one call however long the chain), the request id
+   that run was *started* with (`request_id_infos`, the entry for its
+   `WorkflowExecutionStarted`; a request id attached to a running run does not count), and the
+   links of its Nexus completion callbacks (at most two are followed; a genuine run has one).
+   A seller chooses all three when it starts a workflow itself, so they only say where to look.
+2. In the buyer's namespace (the job row's, never the link's), each such link is resolved: a
+   standalone operation by operation id *and* run id (`DescribeNexusOperationExecution`), a
+   buyer workflow's `NexusOperationScheduled` event by workflow, run and event id (a link "by
+   request id" is refused: no caller makes one, and following it meant scanning a buyer's
+   history for a string the seller chose; a link whose ids the frontend refuses as malformed
+   names nothing, since a lookup that failed on it would fail every observation and a gate
+   that cannot observe refuses the buyer's cancel). The call must be on the job's endpoint and
+   service, operation `execute`, with the run's start request id, and carry a `kontra-hold`
+   header (any ASCII spelling: the handler sees names lowercased) holding one of the hold
+   tokens the gate issued for *this* job. The hold binds a call to a job because it is what
+   the seller's handler checked; the operation id is the buyer's choice, so a buyer could call
+   under any id and have escrow refuse a run the handler accepted.
+3. The call's own record of the run it started (the handler's response link: the operation's
+   `links`, the `NexusOperationStarted` event's) must not name another run of `job-<id>`.
+
+How a hold matches (`hold_digest`). Escrow must count every call the handler accepted, and
+the handler accepts more strings than the gate issued: ES256 verifies `(r, n - s)` as well as
+`(r, s)`, the verifier's base64url decoder ignores padding, and HTTP drops spaces and tabs
+around a header value before the handler sees it (server 1.32, measured: the call records
+`" <token>\t"`, the handler is handed `"<token>"`). Matched byte for byte, a buyer could call
+with such a spelling, have the job done, and see it refunded at the deadline as "not the
+buyer's call". So a hold is matched by the sha256 of the bytes its signature covers -- the
+JWS signing input, everything before the last `.` -- after dropping those spaces and tabs.
+That part is the gate's own signed statement; nothing is decoded and no claim is read. The
+gate digests each token it issues with the same function (the one in `start` re-signs the same
+claims, so it has the same digest).
+
+The first verified observation pins the run (`JobRecord.run_id`). From then on `observe`
+reports that chain only: the latest run of the id when its `first_run_id` is the pinned run,
+else (the chain closed and the seller started another run of the id) the chain's own last run,
+walked forward through each successor whose start names the run before it. That walk reads at
+most `CHAIN_READS` runs per call and then raises `ObservationIncomplete`, which a gate treats
+as "cannot say" (the sweeper retries, a buyer's cancel is refused): reporting a long chain as
+still running would let a buyer that already had the result cancel and be refunded. Escrow
+ignores any other run of the id. A run that is not verified moves nothing (the job neither
+starts working nor closes); at the deadline the job fails and refunds, "delivery not started
+by the buyer's call" when that run completed. An `Observation` is `unverified` unless the
+observer says otherwise, so an observer that does not check pays nobody.
+
+A gate applies each observation to the job row as it is *when it saves* (the fake gate's
+`_transition`; a compare-and-set in a database): an observation made before another replica
+pinned the job then names another run and is ignored, instead of moving the pin.
+
+What server 1.32.0 records (measured): the handler run's started event has no `links` of its
+own; the caller's link is inside `completion_callbacks[].links` (`Link.NexusOperation` with a
+run id for a standalone operation, `Link.WorkflowEvent` with an `event_ref` to the
+`NexusOperationScheduled` event for a workflow). The operation, and the scheduled event,
+record `request_id`, endpoint, service, operation and the Nexus header; the operation's
+`links` and the `NexusOperationStarted` event hold the response link to the handler run. A
+standalone operation's `request_id` is generated by the server, not taken from the starter's
+request, and the `links` a starter puts on `StartNexusOperationExecution` are neither stored
+on the operation nor sent to the handler, so a buyer can neither choose the request id nor
+plant a response link that disowns the run.
+
+Residual risk. The handler is the seller's code, so it decides which run a call starts: it can
+start one, stop it and start another with the call's request id, callbacks and links (the
+server de-duplicates a request id only while its run is the latest, so one run in between is
+needed), answering the call with no response link or a false one. If the gate's first look
+sees only that later run, it verifies. That is no more than a handler that started the later
+run in the first place could do, the review window and dispute stand, and once the gate has
+seen a run the choice is final. Checking the buyer operation's *outcome* would narrow it, but
+the buyer can change that (it may terminate its own operation), which would let a buyer take a
+delivery and a refund, so the rule reads only fields that are immutable once written. Each
+run the seller starts makes the gate resolve its (at most two) links once, reading a buyer
+workflow's history up to the event a link names: bounded by Temporal's history limit, and paid
+again for every new run of the id a seller starts between sweeps. Finally, the lookup now reads
+the buyer's namespace, which the buyer can load: if per-namespace rate limits a buyer can
+exhaust also apply to the gate's internal frontend, a buyer could keep the lookup failing past
+the deadline, and a gate that refunds when it has not been able to observe for a while (the
+fake gate's `observe_give_up`) would refund a delivered job. The internal frontend must not
+share those limits with party tokens.
+
+Retention (`DEFAULT_RETENTION`) is the contract's max_duration cap plus 5 days, 35 days: a
+hold token can start `job-<id>` until it expires, and only the first run's record refuses a
+second start. `ensure_namespace` raises a shorter retention of an existing namespace to it and
+never lowers one.

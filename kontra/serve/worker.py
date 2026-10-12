@@ -30,6 +30,7 @@ import dataclasses
 import inspect
 import logging
 import signal
+import sys
 import threading
 from collections.abc import Generator, Sequence
 from pathlib import Path
@@ -67,6 +68,11 @@ TEMPORAL_KWARGS: frozenset[str] = frozenset(
 )
 _OPEN_STATES = (m.JobState.SUBMITTED, m.JobState.WORKING)
 _JOB_PAGES = 20
+#: Loggers that write the full URL of every request at INFO: the bucket's presigned URLs
+#: (their signatures included) and every URL a seller's activities fetch for a buyer.
+_URL_LOGGERS = ("httpx",)
+#: The longest a stopping worker waits for temporalio's own threads to leave Python code.
+_SETTLE_TIMEOUT = 5.0
 
 
 class ServeError(RuntimeError):
@@ -96,6 +102,51 @@ def _restore_runtime(ours: _runtime.Runtime, previous: _runtime.Runtime | None) 
         _runtime.uninstall(ours)
         if previous is not None:
             _runtime.install(previous)
+
+
+def _quiet_url_logs() -> None:
+    """Turn the loggers that print request URLs at INFO (:data:`_URL_LOGGERS`) down to
+    WARNING, unless the seller chose their level. A worker's log must not carry a presigned
+    upload URL (whoever reads the log could write that object until it expires) or the URLs
+    a buyer sent (they are the buyer's input, which travels encrypted); ``kontra serve``
+    has always done this, and ``python worker.py`` must be as safe."""
+    for name in _URL_LOGGERS:
+        logger = logging.getLogger(name)
+        if logger.level == logging.NOTSET:
+            logger.setLevel(logging.WARNING)
+
+
+def _core_threads_in_python() -> bool:
+    """Whether a thread Python did not start -- one of temporalio's Rust core threads -- is
+    executing Python code right now."""
+    ours = {t.ident for t in threading.enumerate() if not isinstance(t, threading._DummyThread)}
+    return any(ident not in ours for ident in sys._current_frames())
+
+
+async def _settle_core_threads() -> None:
+    """Return once no temporalio core thread is running Python code (or after
+    :data:`_SETTLE_TIMEOUT`).
+
+    temporalio's Rust core hands each result to the event loop from one of its own threads,
+    holding the GIL to call ``loop.call_soon_threadsafe``. That call writes to the loop's
+    socket, which lets go of the GIL: the loop can see the result -- here, the inner
+    workers' final ``finalize_shutdown`` -- and the process run on to interpreter shutdown
+    before that thread is scheduled again to take the GIL back. Python 3.12 ends a thread
+    that asks for the GIL during finalization where it waits, and the unwinding runs the
+    Rust destructors of what the call held (pyo3's task locals: the event loop and a
+    ``contextvars.Context``), which free Python objects in the middle of the interpreter's
+    last garbage collection: SIGSEGV (exit status 139) after a clean stop -- measured in
+    one ``python worker.py`` in 15 to 80 on a busy machine, more often on a single CPU
+    (``tests/serve/test_exit.py``). Waiting here, with the GIL free, lets the thread finish
+    the call and drop its references under the GIL; after a graceful shutdown nothing of
+    ours awaits the core any more, so no core thread enters Python again. Nothing is
+    released early instead: the worker's client and runtime are gone with ``aclose``, and
+    it is the core thread still running that must finish."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + _SETTLE_TIMEOUT
+    # Polled: the state is another thread's, and nothing signals when it changes.
+    while _core_threads_in_python() and loop.time() < end:  # noqa: ASYNC110
+        await asyncio.sleep(0.001)
 
 
 def _home_dir(profile: Profile, home: str | Path | None) -> Path:
@@ -249,6 +300,7 @@ class Worker:
         _runtime.install(runtime)
         stack.callback(_restore_runtime, runtime, previous)
 
+        # Plaintext replies only for the services generated here, by their exact names.
         codec = KontraCodec(
             identity,
             public_key,
@@ -256,6 +308,7 @@ class Worker:
             buyer_keys=jobs,
             seller_keys=SellerKeyCache(gate),
             blobs=GateBlobStore(gate),
+            services=[b.offering_id.service_name for b in self._offerings],
         )
         converter = seller_data_converter(codec)
         # Headers stay out of the codec: the kontra-job header must be readable before any
@@ -266,6 +319,8 @@ class Worker:
                 data_converter=converter,
                 header_codec_behavior=HeaderCodecBehavior.NO_CODEC,
             )
+            # The token refresher dies with the worker, not with a session it may share.
+            stack.push_async_callback(session.release, client)
         else:
             config = client.config()
             config["data_converter"] = converter
@@ -297,6 +352,8 @@ class Worker:
                 validator=b.validator(public_key),
                 verifier=verifier,
                 jobs=jobs,
+                open_deferred=codec.open_deferred,
+                payload_converter=converter.payload_converter,
             )
             kwargs = dict(self._kwargs)
             kwargs["workflows"] = _dedupe([b.workflow, *self._kwargs.get("workflows", ())])
@@ -439,11 +496,16 @@ class Worker:
     ) -> None:
         """Start (see :meth:`prepare`) and serve until :meth:`shutdown`, SIGINT or SIGTERM
         (``handle_signals``, main thread only), then shut down gracefully (temporalio's
-        ``graceful_shutdown_timeout``) and send the progress still queued."""
+        ``graceful_shutdown_timeout``) and send the progress still queued.
+
+        Request URLs stay out of the log at INFO (:func:`_quiet_url_logs`), and it returns
+        only once temporalio's core threads are out of Python code, so the interpreter can
+        exit right after (:func:`_settle_core_threads`)."""
         if self._running or self._stack is not None:
             raise RuntimeError("this Worker is already started")
         self._running = True
         self._loop = asyncio.get_running_loop()
+        _quiet_url_logs()
         try:
             await self.prepare(session=session, client=client, gate=gate, home=home)
             with self._signals(handle_signals):
@@ -454,6 +516,7 @@ class Worker:
             self._ready.set()
             try:
                 await self.aclose()
+                await _settle_core_threads()
             finally:
                 self._running = False
 

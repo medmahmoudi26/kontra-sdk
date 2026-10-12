@@ -6,6 +6,7 @@ Temporal dev server, no containers), as a seller and buyers would use it: ``logi
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import stat
@@ -386,8 +387,37 @@ async def test_job_result_downloads_the_artifacts(shop: Shop) -> None:
         "http://127.0.0.1:9/b",
     ]
     assert (out / artifact["key"]).stat().st_size == artifact["size"]
-    # The decrypted delivery is the buyer's alone: the directory made for it is 0700.
+    # The decrypted delivery is the buyer's alone: the directory made for it is 0700, and
+    # every file in it 0600.
     assert stat.S_IMODE(out.stat().st_mode) == 0o700
+    for written_file in (out / "result.json", out / artifact["key"]):
+        assert stat.S_IMODE(written_file.stat().st_mode) == 0o600, written_file
+
+
+async def test_job_result_into_an_existing_directory_is_the_buyers_alone(shop: Shop) -> None:
+    """`job --result DIR` into a directory that exists (0755, as most do): what it writes
+    there is decrypted plaintext, so result.json is 0600 whatever the umask, and the
+    directories it creates below are 0700 each, parents included (``mkdir -p`` would make
+    them 0755). The existing directory itself is left as it is."""
+    buyer = await shop.buyer()
+    hired = await buyer.json("hire", shop.key, "-f", str(shop.input_file))
+    shared = shop.root / f"shared-{hired['job_id']}"
+    shared.mkdir(mode=0o755)
+    shared.chmod(0o755)
+    old = os.umask(0o022)
+    try:
+        await buyer.ok("job", hired["job_id"], "--result", str(shared))
+        nested = shared / "new" / "deeper"
+        await buyer.ok("job", hired["job_id"], "--result", str(nested))
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o755
+    for made in (shared / "new", nested):
+        assert stat.S_IMODE(made.stat().st_mode) == 0o700, made
+    for result in (shared / "result.json", nested / "result.json"):
+        assert stat.S_IMODE(result.stat().st_mode) == 0o600, result
+        assert json.loads(result.read_text())["words"] == 11
+    assert [p.name for p in shared.iterdir() if p.name.endswith(".part")] == []
 
 
 async def test_serve_says_in_one_line_that_temporal_is_unreachable(shop: Shop) -> None:

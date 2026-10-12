@@ -74,11 +74,13 @@ from temporalio.api.common.v1 import Payload
 
 from kontra import escrow
 from kontra._control import (
+    BuyerCall,
     EndpointConflict,
     HistorySummary,
     NexusSyncKind,
     TemporalControl,
     TemporalError,
+    hold_digest,
 )
 from kontra.contract import ContractError, ContractInfo, KontraQuote, agent_card, validate_document
 from kontra.contract.facts import check_public_key
@@ -418,6 +420,9 @@ class _Job:
     heartbeats: deque[float] = field(default_factory=deque[float])
     heartbeat_bytes: int = 0
     changed: asyncio.Event = field(default_factory=asyncio.Event)
+    #: :func:`~kontra._control.hold_digest` of every hold token issued for the job: a run
+    #: of ``job-<id>`` counts only if the buyer's call carried one of them (decisions I15).
+    holds: set[str] = field(default_factory=set[str])
 
     @property
     def job_id(self) -> str:
@@ -431,6 +436,17 @@ class _Job:
     def operation_id(self) -> str:
         """The standalone Nexus operation id in the buyer's namespace."""
         return f"job-{self.record.job_id}"
+
+    @property
+    def call(self) -> BuyerCall:
+        """The buyer's ``execute`` call as this gate recorded it: what an observed run must
+        trace back to before it can deliver."""
+        return BuyerCall(
+            namespace=self.buyer_ns,
+            endpoint=self.endpoint,
+            service=self.service,
+            holds=frozenset(self.holds),
+        )
 
     @property
     def hold_expires_at(self) -> datetime:
@@ -1319,7 +1335,11 @@ class FakeGate:
 
     def hold_token(self, job: _Job) -> str:
         """The hold token (D10, decisions I10), from the job alone: re-issued for ``start``
-        it carries the same claims as at hire."""
+        it carries the same claims as at hire. Every token issued is remembered by
+        :func:`~kontra._control.hold_digest`, the digest of the bytes its signature covers,
+        so the buyer's call is matched to the job by exact equality whichever of the
+        spellings the seller's handler accepts it carried (decisions I15). Re-signing the
+        same claims gives the same digest."""
         r = job.record
         claims = m.HoldClaims(
             iss=self.issuer,
@@ -1339,7 +1359,9 @@ class FakeGate:
             contract_hash=job.contract_hash,
             max_duration_seconds=int(job.max_duration.total_seconds()),
         )
-        return self.keys.sign(claims.model_dump())
+        token = self.keys.sign(claims.model_dump())
+        job.holds.add(hold_digest(token))
+        return token
 
     async def hire(self, who: Principal, req: m.HireRequest) -> m.HireView:
         now = self.now()
@@ -1579,7 +1601,9 @@ class FakeGate:
         job = self.job_for(job_id, who.party)
         if who.party == job.record.buyer and job.record.open and self.control is not None:
             try:
-                obs, result = await self.control.observe(job.record.seller_ns, job.workflow_id)
+                obs, result = await self.control.observe(
+                    job.record.seller_ns, job.workflow_id, job.call, job.record.run_id
+                )
             except Exception:
                 log.warning("cannot observe %s before a cancel", job.workflow_id, exc_info=True)
                 raise GateHTTPError(
@@ -1908,8 +1932,10 @@ class FakeGate:
         )
 
     async def _stop_late_start(self, job: _Job) -> None:
+        """Any run of ``job-<id>`` is stopped, not only the pinned one: nobody works on a
+        refunded job, whoever started the run."""
         assert self.control is not None
-        obs, _ = await self.control.observe(job.record.seller_ns, job.workflow_id)
+        obs, _ = await self.control.observe(job.record.seller_ns, job.workflow_id, job.call, None)
         if obs.status is ObservedStatus.RUNNING and job.pending_stop is None:
             job.pending_stop = EffectKind.CANCEL_WORKFLOW
             job.pending_stop_reason = job.record.reason or "canceled by buyer"
@@ -1934,7 +1960,9 @@ class FakeGate:
             await self._transition(job_id, lambda r: escrow.tick(r, now))
             return
         try:
-            obs, result = await self.control.observe(job.record.seller_ns, job.workflow_id)
+            obs, result = await self.control.observe(
+                job.record.seller_ns, job.workflow_id, job.call, job.record.run_id
+            )
         except Exception:
             now = self.now()
             if now < job.record.deadline + self.observe_give_up:

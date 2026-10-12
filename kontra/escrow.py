@@ -10,6 +10,12 @@ sweep.
 Every input is a fact the platform can observe without reading a payload (§8.3): the
 state of the seller's handler workflow ``job-<id>`` in the seller's namespace, the clock,
 and the buyer's accept / reject / cancel calls.
+
+Only a run the buyer's own Nexus call started can deliver (decisions I15). A seller can
+start ``job-<id>`` itself, with any input, or stop the run the buyer's call started and
+complete a later one; the observer establishes by lookup in the buyer's namespace which
+run (if any) the buyer's call started (:class:`Provenance`), escrow pins that run's chain
+(:attr:`JobRecord.run_id`) and ignores every other run of the id.
 """
 
 from __future__ import annotations
@@ -23,12 +29,14 @@ from kontra.ledger import HoldState, Money
 
 __all__ = [
     "DEFAULT_GRACE",
+    "NOT_FROM_BUYER_REASON",
     "Effect",
     "EffectKind",
     "EscrowError",
     "JobRecord",
     "Observation",
     "ObservedStatus",
+    "Provenance",
     "accept",
     "cancel",
     "new_job",
@@ -44,6 +52,9 @@ __all__ = [
 DEFAULT_GRACE = timedelta(seconds=30)
 
 _OPEN = frozenset({JobState.SUBMITTED, JobState.WORKING})
+
+#: Why a job whose only completed run was not started by the buyer's call refunds.
+NOT_FROM_BUYER_REASON = "delivery not started by the buyer's call"
 
 
 class EscrowError(Exception):
@@ -64,10 +75,32 @@ class ObservedStatus(StrEnum):
     TIMED_OUT = "timed_out"
 
 
+class Provenance(StrEnum):
+    """Whether the observed run of ``job-<id>`` is the one the buyer's ``execute`` call
+    started, as an authoritative lookup in the buyer's namespace established it. Only
+    ``VERIFIED`` runs count for anything; the other two differ only in what the observer
+    could tell (logs, support), never in what escrow does."""
+
+    #: The chain's first run was started with the request id of a Nexus ``execute`` call
+    #: recorded in the buyer's namespace, on this job's endpoint, carrying this job's hold.
+    VERIFIED = "verified"
+    #: Not established: a record the lookup needs does not exist (any more). Never a
+    #: delivery.
+    UNVERIFIED = "unverified"
+    #: Established to be some other run: it names no call of this job in the buyer's
+    #: namespace, or one whose endpoint, operation, request id or hold differs, or the
+    #: buyer's call recorded a different run as the one it started.
+    NOT_FROM_BUYER = "not_from_buyer"
+
+
 @dataclass(frozen=True, slots=True)
 class Observation:
-    """What the platform saw of ``job-<id>`` in the seller's namespace (latest run of the
-    continue-as-new chain)."""
+    """What the platform saw of ``job-<id>`` in the seller's namespace: the latest run of
+    the continue-as-new chain the buyer's call started once escrow has pinned it, else the
+    latest run of the id.
+
+    The default ``provenance`` is ``UNVERIFIED`` on purpose: an observer that does not
+    establish provenance gets no delivery, never an unchecked one."""
 
     status: ObservedStatus
     started_at: datetime | None = None
@@ -75,6 +108,9 @@ class Observation:
     #: sha256 / size of the completion's result payload as stored (ciphertext).
     result_sha256: str | None = None
     result_size: int | None = None
+    provenance: Provenance = Provenance.UNVERIFIED
+    #: The run id of the observed chain's first run: what escrow pins once it is verified.
+    run_id: str | None = None
 
 
 class EffectKind(StrEnum):
@@ -114,6 +150,10 @@ class JobRecord:
     delivery_sha256: str | None = None
     delivery_size: int | None = None
     reason: str | None = None
+    #: The first run of the chain the buyer's call started, pinned by the first verified
+    #: observation. From then on only that chain counts: a later run of ``job-<id>`` (the
+    #: seller's own start after terminating it) is ignored.
+    run_id: str | None = None
 
     @property
     def open(self) -> bool:
@@ -173,9 +213,29 @@ def _deliver(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord
 
 
 def observe(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord, list[Effect]]:
-    """Apply one observation of the seller's handler workflow."""
+    """Apply one observation of the seller's handler workflow.
+
+    A run that is not the buyer's call (:class:`Provenance` other than ``VERIFIED``, or
+    another run than the pinned one) moves nothing: the job waits for the buyer's call as
+    if no run existed, and refunds at the deadline. A completed one is named in the reason,
+    so the refund says what happened."""
     if not job.open:
         return job, []
+    if obs.status is ObservedStatus.NOT_FOUND:
+        if now >= job.deadline:
+            gone = "the job's workflow is gone" if job.run_id else "seller never started the job"
+            return _fail(job, gone)
+        return job, []
+    if job.run_id is not None and obs.run_id != job.run_id:
+        return tick(job, now)
+    if obs.provenance is not Provenance.VERIFIED or not obs.run_id:
+        if now >= job.deadline:
+            if obs.status is ObservedStatus.COMPLETED:
+                return _fail(job, NOT_FROM_BUYER_REASON)
+            return _fail(job, "seller workflow not started by the buyer's call")
+        return job, []
+    if job.run_id is None:
+        job = replace(job, run_id=obs.run_id)
     match obs.status:
         case ObservedStatus.COMPLETED:
             if obs.closed_at is not None and obs.closed_at > job.deadline:
@@ -186,10 +246,6 @@ def observe(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord,
                 return _fail(job, "max_duration exceeded", terminate=True)
             if job.state is JobState.SUBMITTED:
                 job = replace(job, state=JobState.WORKING, started_at=obs.started_at or now)
-            return job, []
-        case ObservedStatus.NOT_FOUND:
-            if now >= job.deadline:
-                return _fail(job, "seller never started the job")
             return job, []
         case ObservedStatus.CANCELED:
             return (

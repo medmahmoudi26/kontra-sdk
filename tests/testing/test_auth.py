@@ -11,6 +11,7 @@ import httpx
 import jwt
 import pytest
 
+from kontra._control import DEFAULT_RETENTION
 from kontra.auth import Session, login_device
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
@@ -35,7 +36,7 @@ def _verify(world: World, token: str, audience: str) -> dict[str, object]:
 async def test_dev_login_creates_the_party_namespace_and_grant(world: World) -> None:
     tok = await world.anon().dev_login("carol")
     assert tok.party == "carol"
-    assert world.control.namespaces["carol"] == timedelta(days=3)
+    assert world.control.namespaces["carol"] == DEFAULT_RETENTION
     claims = _verify(world, tok.access_token, AUD_API)
     assert claims["sub"] == "carol"
     assert claims["exp"] - claims["iat"] == 900  # type: ignore[operator]
