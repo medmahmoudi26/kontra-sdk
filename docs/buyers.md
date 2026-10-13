@@ -28,9 +28,11 @@ kontra balance
 The command prints a code; the link's page asks for it, so a link you did not ask for logs
 nobody in, and a mail scanner that opens the link uses nothing. Sign-ups are by invitation:
 an address that is not invited gets no mail, and the command says so when the code runs out.
-Plain `kontra login` offers the same sign-in in your browser instead (its page can mail you
-the link too). Both talk to `https://api.kontra.run` unless `--gate` or `KONTRA_GATE` names
-another gate.
+Plain `kontra login` approves the code in your browser instead, where the gate's page offers
+a way to (GitHub, or a handle on a `kontra dev` gate); that page never mails links, so email
+sign-in always starts from the command, and against a gate that signs in by email only plain
+`kontra login` says so. Both talk to `https://api.kontra.run` unless `--gate` or
+`KONTRA_GATE` names another gate.
 
 `kontra login` writes `~/.kontra/profile` and `~/.kontra/key` (both mode 0600). The key is
 your private age identity: deliveries are encrypted to it and nobody else, Kontra included,
@@ -57,7 +59,8 @@ A key quotes, hires, follows, accepts and disputes jobs, and runs `kontra serve`
 publishes, sets your encryption key or manages keys -- those answer 403
 `fresh_login_required` however new the key is -- so a leaked key cannot change what you sell
 or who can read your deliveries. Making, listing and revoking keys need a recent login of
-yours; a party holds at most 25 live keys. A revoked key stops working on its next request.
+yours; a party holds at most 25 live keys. A revoked key stops working on its next request to
+the gate, and its workers on Temporal within seconds.
 
 Any party can buy and sell: a buyer is a party with a namespace like a seller.
 

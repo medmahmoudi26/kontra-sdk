@@ -92,6 +92,27 @@ async def test_pending_slow_down_then_success(
     assert no_browser == [gate.device.verification_uri_complete]
 
 
+async def test_a_gate_that_signs_in_by_email_only_is_told_at_once(
+    gate: FakeGate, mono: Mono, no_browser: list[str]
+) -> None:
+    """A production gate's device page approves nothing (no GitHub, no dev login, and it
+    mails no links: the review's F1). Plain `kontra login` says what works instead of
+    opening that page and polling for ten minutes."""
+    gate.github, gate.dev = False, False
+    with pytest.raises(LoginError) as ei:
+        await device(gate, mono)
+    assert ei.value.code == "email_sign_in"
+    assert "kontra login --email" in ei.value.message
+    assert gate.calls("/v1/auth/device") == 0
+    assert no_browser == []
+
+
+async def test_a_gate_without_the_info_route_is_tried_as_before(gate: FakeGate, mono: Mono) -> None:
+    gate.github = None
+    tok = await device(gate, mono, open_browser=False)
+    assert tok.access_token == "acc1"
+
+
 async def test_slow_down_honours_a_larger_interval_from_the_gate(
     gate: FakeGate, mono: Mono
 ) -> None:
