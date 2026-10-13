@@ -413,6 +413,18 @@ class _MagicLink:
     attempts: int = 0
 
 
+@dataclass(slots=True)
+class _Handoff:
+    """A sign-in the link's page just approved, waiting for that browser's console to trade
+    it for its own session (the ``handoff`` grant): once, within ``HANDOFF_TTL_SECONDS``."""
+
+    party: str
+    auth_time: datetime
+    via: str
+    expires_at: datetime
+    consumed: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class SentMail:
     """A mail the gate would have sent (:attr:`FakeGate.outbox`). A sign-in mail carries the
@@ -722,6 +734,10 @@ class FakeGate:
         #: Every mail the gate sent, oldest first.
         self.outbox: list[SentMail] = []
         self._magic: dict[str, _MagicLink] = {}  # by the link token's sha256
+        self._handoffs: dict[str, _Handoff] = {}  # by the handoff's sha256
+        #: Every handoff the link's page issued, oldest first (what the platform's page puts
+        #: in the console URL's fragment).
+        self.handoffs: list[str] = []
         self._magic_rate: dict[str, deque[datetime]] = {}
         self.api_keys: dict[str, _ApiKey] = {}  # by id
         self._api_key_ids: dict[str, str] = {}  # the key's sha256 -> id
@@ -1053,6 +1069,8 @@ class FakeGate:
             return await self._exchange_device(req.device_code, req.handle)
         if req.api_key is not None:
             return self._exchange_api_key(req.api_key)
+        if req.handoff is not None:
+            return self._exchange_handoff(req.handoff)
         assert req.refresh_token is not None
         return self._rotate(req.refresh_token)
 
@@ -1390,7 +1408,23 @@ class FakeGate:
             party = wanted
         rec.consumed_at = now
         approved = await self.approve_device(device.user_code, party, via="device:email")
+        if approved:
+            self._new_handoff(party, now, "device:email")
         return "approved" if approved else "gone"
+
+    def _new_handoff(self, party: str, auth_time: datetime, via: str) -> str:
+        handoff = secrets.token_urlsafe(32)
+        expires = self.now() + timedelta(seconds=m.HANDOFF_TTL_SECONDS)
+        self._handoffs[_digest(handoff)] = _Handoff(party, auth_time, via, expires)
+        self.handoffs.append(handoff)
+        return handoff
+
+    def _exchange_handoff(self, handoff: str) -> m.TokenResponse:
+        rec = self._handoffs.get(_digest(handoff)) if _SECRET.fullmatch(handoff) else None
+        if rec is None or rec.consumed or self.now() >= rec.expires_at:
+            raise GateHTTPError(400, "invalid_grant", "the sign-in handoff is not valid")
+        rec.consumed = True
+        return self._open_session(rec.party, rec.auth_time, rec.via)
 
     def temporal_token(self, who: Principal) -> m.TemporalToken:
         """The party's Temporal *worker* JWT: the only Temporal token there is (decisions

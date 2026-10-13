@@ -42,6 +42,8 @@ __all__ = [
     "API_VERSION",
     "DEVICE_GRANT",
     "EMAIL_MAX",
+    "HANDOFF_PATTERN",
+    "HANDOFF_TTL_SECONDS",
     "MAX_API_KEYS",
     "MAX_PARTS",
     "REVOCATION_WINDOW_MAX",
@@ -194,6 +196,12 @@ API_KEY_ID_PATTERN = r"^key_[0-9a-f]{16}$"
 API_KEY_LABEL_PATTERN = r"^[\x20-\x7e]{1,64}$"
 #: The live keys a party may hold at once (the 26th is ``409 too_many_keys``).
 MAX_API_KEYS = 25
+#: A sign-in handoff: base64url(32 random bytes), unpadded. A gate whose link page has just
+#: approved a sign-in sends the browser on to its console with one, in the URL fragment; the
+#: console trades it once, within minutes, for that browser's own session (``handoff`` grant).
+HANDOFF_PATTERN = r"^[A-Za-z0-9_-]{43}$"
+#: How long a handoff may wait to be traded.
+HANDOFF_TTL_SECONDS = 120
 #: RFC 5321's path limit, and its local part's.
 EMAIL_MAX = 254
 _EMAIL_LOCAL_MAX = 64
@@ -219,6 +227,7 @@ _ApiKey = Annotated[
 ]
 _ApiKeyId = Annotated[str, StringConstraints(max_length=20, pattern=API_KEY_ID_PATTERN)]
 _KeyLabel = Annotated[str, StringConstraints(max_length=64, pattern=API_KEY_LABEL_PATTERN)]
+_Handoff = Annotated[str, StringConstraints(max_length=43, pattern=HANDOFF_PATTERN)]
 
 
 def is_email(text: str) -> bool:
@@ -295,9 +304,12 @@ DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 class TokenRequest(_M):
     """``POST /v1/auth/token``. Each grant takes exactly its own fields
     (:meth:`grant_error`): ``device_code`` (and, on a first login, ``handle``) for the device
-    grant, ``refresh_token`` for ``refresh_token``, ``api_key`` for ``api_key``."""
+    grant, ``refresh_token`` for ``refresh_token``, ``api_key`` for ``api_key``, ``handoff``
+    for ``handoff``."""
 
-    grant_type: Literal["urn:ietf:params:oauth:grant-type:device_code", "refresh_token", "api_key"]
+    grant_type: Literal[
+        "urn:ietf:params:oauth:grant-type:device_code", "refresh_token", "api_key", "handoff"
+    ]
     # The credentials stay out of ``repr``: a request in a log line or a traceback with
     # locals must not carry them.
     device_code: _Long | None = Field(default=None, repr=False)
@@ -306,6 +318,8 @@ class TokenRequest(_M):
     handle: _Name | None = None
     #: The ``api_key`` grant's key (``kontra_sk_`` + 43 characters, :func:`is_api_key`).
     api_key: _ApiKey | None = Field(default=None, repr=False)
+    #: The ``handoff`` grant's one-time code (:data:`HANDOFF_PATTERN`).
+    handoff: _Handoff | None = Field(default=None, repr=False)
 
     def grant_error(self) -> str | None:
         """Why the fields present do not fit ``grant_type``, or None when they do. A gate
@@ -313,7 +327,7 @@ class TokenRequest(_M):
         that is not a TokenRequest at all is the usual 422."""
         present = {
             name
-            for name in ("device_code", "refresh_token", "handle", "api_key")
+            for name in ("device_code", "refresh_token", "handle", "api_key", "handoff")
             if getattr(self, name) is not None
         }
         if self.grant_type == DEVICE_GRANT:
@@ -322,6 +336,9 @@ class TokenRequest(_M):
         elif self.grant_type == "refresh_token":
             if present != {"refresh_token"}:
                 return "the refresh_token grant takes refresh_token only"
+        elif self.grant_type == "handoff":
+            if present != {"handoff"}:
+                return "the handoff grant takes handoff only"
         elif present != {"api_key"}:
             return "the api_key grant takes api_key only"
         return None

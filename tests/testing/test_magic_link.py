@@ -317,3 +317,49 @@ async def test_a_dev_gate_mails_anyone(scripted: ScriptedControl) -> None:
     start = await anon.device_start()
     await anon.magic_link("anyone@example.com", start.user_code)
     assert [mail.to for mail in gate.outbox] == ["anyone@example.com"]
+
+
+async def test_the_link_page_signs_in_its_own_browser_too(invite: Invite) -> None:
+    """After the code is typed, the browser that holds the link lands signed in: the page
+    sends it to the console with a one-time handoff, traded for that browser's own session
+    (seen in production: people typed the code and were left on a page that sent them
+    nowhere). The device that asked still gets its session; the handoff works once."""
+    gate = invite.gate
+    gate.allow_email("ann@example.com")
+    start, req = await invite.device("ann")
+    await invite.anon.magic_link("ann@example.com", start.user_code)
+    link = gate.outbox[0].link
+    assert gate.handoffs == []
+    assert await gate.use_magic_link(link, "BCDF-GHJK") == "wrong_code"
+    assert gate.handoffs == []  # a wrong code hands nothing over
+    assert await gate.use_magic_link(link, start.user_code, handle="ann") == "approved"
+    [handoff] = gate.handoffs
+    trade = m.TokenRequest(grant_type="handoff", handoff=handoff)
+    browser = await invite.anon.token(trade)
+    assert browser.party == "ann"
+    assert browser.refresh_token is not None
+    assert gate.now() - browser.auth_time < timedelta(minutes=1)  # fresh: a key can be set
+    with pytest.raises(GateError) as e:
+        await invite.anon.token(trade)
+    assert e.value.code == "invalid_grant"  # once
+    device = await invite.poll(req)
+    assert isinstance(device, m.TokenResponse)
+    assert device.party == "ann"
+    assert sorted(s.via for s in gate.sessions.values()) == ["device:email", "device:email"]
+
+
+async def test_a_handoff_waits_two_minutes_at_most(invite: Invite) -> None:
+    gate = invite.gate
+    gate.allow_email("ann@example.com")
+    start, _ = await invite.device("ann")
+    await invite.anon.magic_link("ann@example.com", start.user_code)
+    assert (
+        await gate.use_magic_link(gate.outbox[0].link, start.user_code, handle="ann") == "approved"
+    )
+    gate.advance(timedelta(seconds=m.HANDOFF_TTL_SECONDS))
+    with pytest.raises(GateError) as e:
+        await invite.anon.token(m.TokenRequest(grant_type="handoff", handoff=gate.handoffs[0]))
+    assert e.value.code == "invalid_grant"
+    with pytest.raises(GateError) as e:  # never issued
+        await invite.anon.token(m.TokenRequest(grant_type="handoff", handoff="A" * 43))
+    assert e.value.code == "invalid_grant"
