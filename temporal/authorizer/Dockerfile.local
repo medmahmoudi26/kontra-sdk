@@ -1,0 +1,32 @@
+# A fast local image: it copies a binary built on the host by build.sh, instead of
+# compiling inside Docker. build.sh reuses the host's warm Go build cache, so this image is
+# ready in seconds; the trade-off is that the binary links the host's glibc, so the base
+# here must be at least as new (Ubuntu 24.04 = glibc 2.39 >= the 23.10 build host's 2.38).
+# Use the multi-stage Dockerfile for anything shipped; this one is for `kontra dev` and the
+# tests/temporal fixture only.
+#
+#   temporal/authorizer/build.sh
+#   docker build -f temporal/authorizer/Dockerfile.local -t kontra-temporal:dev temporal/authorizer
+#
+# Pinned by digest like the Dockerfile's bases (dependabot proposes bumps).
+# ubuntu:24.04
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 kontra
+
+COPY bin/kontra-temporal /usr/local/bin/kontra-temporal
+COPY dynamicconfig/kontra.yaml /etc/kontra/dynamicconfig.yaml
+
+# Only the public frontend leaves the container's loopback; the internal frontend (no
+# authentication) stays there unless KONTRA_INTERNAL_FRONTEND_BIND_IP is set (see Dockerfile).
+ENV KONTRA_TEMPORAL_DYNAMIC_CONFIG=/etc/kontra/dynamicconfig.yaml \
+    KONTRA_FRONTEND_BIND_IP=0.0.0.0
+
+EXPOSE 7233
+
+USER kontra
+ENTRYPOINT ["kontra-temporal"]
+CMD ["serve"]

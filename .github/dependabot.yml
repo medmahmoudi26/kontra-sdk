@@ -1,0 +1,86 @@
+# Dependency updates, as pull requests into dev (the default branch).
+#
+# Every ecosystem waits a week after a release before proposing it (`cooldown`): a
+# compromised release is usually caught and yanked within days, and nothing here needs a
+# version on its first day. Security updates are not delayed.
+#
+# Held back on purpose, to be upgraded by hand with the tests that guard them:
+# - temporalio (Python) beyond its pinned minor: standalone Nexus operations and the
+#   serialization context are experimental there (pyproject.toml).
+# - go.temporal.io/server and go.temporal.io/api beyond a patch: an upgrade must re-run the
+#   callback guard's carrier sweep (TestCallbackCarriers) and the wire suite, and be read
+#   against the upstream Nexus completion fix (docs/security.md).
+
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: uv
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: temporalio
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+    groups:
+      python:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: gomod
+    directory: /temporal/authorizer
+    target-branch: dev
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: go.temporal.io/server
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: go.temporal.io/api
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+    groups:
+      go:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps(authorizer)
+
+  - package-ecosystem: docker
+    directory: /temporal/authorizer
+    target-branch: dev
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: deps(image)
+
+  # compose.yaml pins Postgres (twice: postgres and postgres-relay) and SeaweedFS by digest;
+  # without this entry those digests would never move, security fixes included.
+  - package-ecosystem: docker-compose
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: deps(compose)

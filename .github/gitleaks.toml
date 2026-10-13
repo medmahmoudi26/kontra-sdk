@@ -1,0 +1,28 @@
+# gitleaks configuration for this repository: the default rules, plus two narrow allowances.
+#
+# The tests use the artifact key 0123456789abcdef0123456789abcdef (and its first half) as an
+# obviously fake fixture; gitleaks' generic-api-key rule reads it as a 32-character key. Only
+# that exact value is allowed: anything else shaped like a key is still a finding.
+#
+# A KONTRA_* variable *name* is not a secret either: compose.yaml's header lists
+# "KONTRA_PG_PASSWORD, KONTRA_S3_ACCESS_KEY, KONTRA_S3_SECRET_KEY", which the same rule reads
+# as a password. Only a finding whose whole secret is such a name is allowed; a value
+# assigned to one (KONTRA_S3_SECRET_KEY=...) is still a finding.
+#
+# Used by .github/workflows/security.yml (GITLEAKS_CONFIG). Locally:
+#   gitleaks git --config .github/gitleaks.toml --redact .
+
+title = "kontra-sdk"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "the fixed fake artifact key used by the tests"
+regexTarget = "secret"
+regexes = ['''^0123456789abcdef(?:0123456789abcdef)?$''']
+
+[[allowlists]]
+description = "a KONTRA_* variable name is not a secret (compose.yaml lists them in prose)"
+regexTarget = "secret"
+regexes = ['''^KONTRA_[A-Z0-9_]+[.,;:]?$''']

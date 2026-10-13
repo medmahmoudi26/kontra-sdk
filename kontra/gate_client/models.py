@@ -1,0 +1,657 @@
+"""Wire models of the gate HTTP API (seam ②).
+
+One set of pydantic models serves the SDK, the gate and the MCP server (PRD §19.2). The
+gate imports these; it never defines a twin. A change here is a change to the gate's
+OpenAPI document, whose snapshot test must be updated in the same PR.
+
+Conventions:
+* Amounts are ``amount_minor: int`` + ``currency``; ``price`` is a display string.
+* Times are timezone-aware UTC datetimes.
+* Opaque Temporal payloads travel as :class:`WirePayload` -- the serialized
+  ``temporal.api.common.v1.Payload`` proto, base64. The gate relays them byte for byte
+  and never decodes them; they are ciphertext.
+* Every model forbids unknown fields, so a client and gate that drift fail loudly.
+* Every list, dict and free string has a ceiling (see "Bounds" below).
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Sequence
+from datetime import datetime
+from enum import StrEnum
+from typing import Annotated, Any, Literal, cast
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    StringConstraints,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
+
+__all__ = [
+    "API_VERSION",
+    "MAX_PARTS",
+    "AcceptRequest",
+    "AccessToken",
+    "ArtifactComplete",
+    "ArtifactCreate",
+    "ArtifactUpload",
+    "Balance",
+    "BlobCreate",
+    "BlobUrl",
+    "CatalogEntry",
+    "CatalogList",
+    "CatalogSummary",
+    "DeliveryView",
+    "DevLogin",
+    "DeviceStart",
+    "DownloadUrl",
+    "ErrorBody",
+    "Escrow",
+    "HireRequest",
+    "HireView",
+    "HoldClaims",
+    "JobList",
+    "JobState",
+    "JobView",
+    "Me",
+    "PartyView",
+    "ProgressEvent",
+    "ProgressPost",
+    "ProgressSource",
+    "PublishRequest",
+    "QuoteRequest",
+    "QuoteStatus",
+    "QuoteView",
+    "RejectRequest",
+    "ResolveRequest",
+    "ResultView",
+    "SellerJobView",
+    "SetKey",
+    "StartRequest",
+    "TemporalToken",
+    "TemporalTokenRequest",
+    "TokenRequest",
+    "TokenResponse",
+    "Topup",
+    "TopupResult",
+    "UploadPart",
+    "WirePayload",
+]
+
+API_VERSION = "v1"
+
+# --------------------------------------------------------------------------- bounds
+#
+# A gate parses a request body into these models before anything else looks at it, and a
+# validation error costs far more memory than the bytes that caused it (a 1 MiB body of
+# bad ETags was ~540 MiB of errors). So every list, dict and free string has a ceiling,
+# and nothing can make one request produce more than a handful of errors: a list stops at
+# its first item past ``max_length`` with a single error, the one list a request carries
+# (``ArtifactComplete.etags``) is refused whole at its first bad item, and unknown keys
+# are a few errors at most (:class:`_M`). The ceilings are not the rules: each is at or above
+# the largest legitimate value, with room, so a gate's own checks (a handle's shape, a
+# note's 2000 characters, the 2 MiB payload) still answer with their own error codes.
+# Response models carry the same ceilings, above anything a gate produces.
+
+#: Identifiers and short strings: handles and namespaces (32 characters; Temporal's own
+#: ID limit is 255 in Kontra's server), offering references (95), endpoint names, job and
+#: quote ids, hashes, currencies, prices, age public keys (62), content types (255).
+_NAME_MAX = 255
+#: Opaque third-party tokens and URLs: JWTs (ES256, under 2 KiB), refresh and device
+#: secrets (43), presigned bucket URLs (with a session token, past 2 KiB), S3 upload ids.
+_LONG_MAX = 16 * 1024
+#: Human text a gate stores on a job: a dispute reason (2000, :class:`RejectRequest`), a
+#: seller's quote reason (1000, ``kontra.contract.quote``), escrow's own reasons.
+_TEXT_MAX = 2000
+#: A resolver's note: room above the gate's own 2000-character rule (``invalid_note``).
+_NOTE_MAX = 8 * 1024
+#: A contract's description and pricing hint (``kontra.contract.offering``).
+_DESCRIPTION_MAX = 2000
+_PRICING_HINT_MAX = 200
+#: An error message. A contract error names the JSON path of the offence, which can be as
+#: long as the 256 KiB canonical document allows (``kontra.contract.validate``).
+_ERROR_MESSAGE_MAX = 512 * 1024
+#: Top-level members of a JSON object carried whole: a contract document has five, an
+#: A2A card about a dozen, an error's detail one or two.
+_MEMBERS_MAX = 64
+#: Parts of a multipart upload: the S3 limit, which the gate plans within
+#: (``gate.artifacts.service.MAX_PARTS``).
+MAX_PARTS = 10_000
+#: An ETag as a bucket returns it (S3's: a quoted MD5, 34 characters), printable ASCII.
+_ETAG_MAX = 256
+#: A page of a list route (the gates serve at most 200 items).
+_PAGE_MAX = 1000
+#: A serialized Temporal payload: twice the 2 MiB blob limit of Temporal's default and of
+#: Kontra's server (``limit.blobSize.error``), base64. A gate's own limit is lower.
+_PAYLOAD_B64_MAX = 4 * -(-(4 * 1024 * 1024) // 3)
+#: A progress event's ciphertext: twice the gates' 64 KiB heartbeat limit, base64.
+_PROGRESS_B64_MAX = 4 * -(-(128 * 1024) // 3)
+#: Pending activities of a run and their type names, at Temporal's default limits (2000
+#: and 1000 characters; Kontra's server sets 1000 and 255).
+_PENDING_ACTIVITIES_MAX = 2000
+_ACTIVITY_MAX = 1000
+
+_Name = Annotated[str, StringConstraints(max_length=_NAME_MAX)]
+_Long = Annotated[str, StringConstraints(max_length=_LONG_MAX)]
+_Text = Annotated[str, StringConstraints(max_length=_TEXT_MAX)]
+_Activity = Annotated[str, StringConstraints(max_length=_ACTIVITY_MAX)]
+_ETag = Annotated[str, StringConstraints(max_length=_ETAG_MAX, pattern=r"^[\x20-\x7e]*$")]
+#: What ``_ETag`` accepts, for the whole-list check (:meth:`ArtifactComplete._one_error`).
+_ETAG_TEXT = re.compile(rf"[\x20-\x7e]{{0,{_ETAG_MAX}}}", re.ASCII)
+#: Unknown keys pydantic reports one by one (``extra_forbidden``, each at its own location):
+#: a few, each short. More, or a longer one, are one error naming the first few.
+_UNKNOWN_REPORTED = 8
+_UNKNOWN_KEY_REPORTED = 64
+_UNKNOWN_NAMED = 3
+
+
+class _M(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unknown_keys_are_few_errors(cls, data: Any) -> Any:
+        """``extra="forbid"`` reports every unknown key as an error of its own, located by
+        the key: 4 MiB of stray keys cost a gate ~300 MiB, and a megabyte-long key ends up
+        in the error's location and in the gate's message. A few short ones are left to
+        pydantic's own report; anything more is refused here, before any field is
+        validated, as one error that names the first few by their first characters."""
+        if isinstance(data, dict):
+            unknown = [key for key in data if key not in cls.model_fields]
+            if len(unknown) > _UNKNOWN_REPORTED or any(
+                not isinstance(key, str) or len(key) > _UNKNOWN_KEY_REPORTED for key in unknown
+            ):
+                named = ", ".join(repr(str(key)[:40]) for key in unknown[:_UNKNOWN_NAMED])
+                more = len(unknown) - _UNKNOWN_NAMED
+                rest = f" and {more} more" if more > 0 else ""
+                raise ValueError(f"unknown field(s): {named}{rest}")
+        return data
+
+
+class ErrorBody(_M):
+    """Every non-2xx response. ``code`` is stable and machine-readable."""
+
+    code: _Name
+    message: Annotated[str, StringConstraints(max_length=_ERROR_MESSAGE_MAX)]
+    detail: dict[str, Any] | None = Field(default=None, max_length=_MEMBERS_MAX)
+
+
+# --------------------------------------------------------------------------- auth
+
+
+class DeviceStart(_M):
+    """RFC 8628 device authorization response (``POST /v1/auth/device``)."""
+
+    device_code: _Long
+    user_code: _Name
+    verification_uri: _Long
+    verification_uri_complete: _Long
+    interval: int
+    expires_in: int
+
+
+class TokenRequest(_M):
+    """``POST /v1/auth/token``."""
+
+    grant_type: Literal["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"]
+    device_code: _Long | None = None
+    refresh_token: _Long | None = None
+    #: First login only: the handle to claim (the party id and Temporal namespace).
+    handle: _Name | None = None
+
+
+class DevLogin(_M):
+    """``POST /v1/auth/dev-login`` -- only when the gate runs with ``KONTRA_DEV=1``. Creates
+    the party if missing and returns tokens at once, with play money (§7.4)."""
+
+    handle: _Name
+
+
+class TokenResponse(_M):
+    access_token: _Long  # gate API JWT, aud "kontra:api"
+    token_type: Literal["Bearer"] = "Bearer"  # noqa: S105
+    expires_in: int
+    refresh_token: _Long
+    party: _Name
+    #: The ``auth_time`` of the human session this refresh token descends from.
+    auth_time: datetime
+
+
+class AccessToken(_M):
+    access_token: _Long
+    expires_in: int
+
+
+class TemporalTokenRequest(_M):
+    """``POST /v1/auth/temporal-token``. There is one Temporal role, ``worker`` (a buyer is a
+    worker of its own namespace too). No token can reach Temporal's Operator API: endpoints
+    are created by the platform when a fresh human session publishes (decisions I3)."""
+
+    role: Literal["worker"] = "worker"
+
+
+class TemporalToken(_M):
+    token: _Long  # JWT for the Temporal frontend; default claim mapper format
+    expires_at: datetime
+    namespace: _Name
+    temporal_address: _Long
+    role: Literal["worker"] = "worker"
+
+
+class Me(_M):
+    party: _Name
+    namespace: _Name
+    public_key: _Name | None
+    temporal_address: _Long
+    created_at: datetime
+    dev: bool = False
+
+
+class SetKey(_M):
+    """``PUT /v1/me/key``: the party's age X25519 recipient (``age1...``). Needs a fresh
+    human session: the key decides who can read future deliveries."""
+
+    public_key: _Name
+
+
+class PartyView(_M):
+    party: _Name
+    public_key: _Name | None
+    released: int = 0
+    refunded: int = 0
+    disputed: int = 0
+
+
+# --------------------------------------------------------------------------- catalog
+
+
+class PublishRequest(_M):
+    """``POST /v1/catalog``: the full contract document (with ``x-kontra``), as JSON. Needs a
+    human session younger than the gate's freshness window (§10.4); the gate then creates
+    the Nexus endpoint itself, targeting the caller's namespace and the offering's task
+    queue, under a fresh random name (decisions I1)."""
+
+    document: dict[str, Any] = Field(max_length=_MEMBERS_MAX)
+
+
+class CatalogEntry(_M):
+    offering: _Name  # acme/enrich@1.2.0
+    party: _Name
+    name: _Name  # acme/enrich
+    version: _Name
+    description: Annotated[str, StringConstraints(max_length=_DESCRIPTION_MAX)]
+    pricing_hint: Annotated[str, StringConstraints(max_length=_PRICING_HINT_MAX)] | None = None
+    contract_hash: _Name
+    document: dict[str, Any] = Field(max_length=_MEMBERS_MAX)
+    card: dict[str, Any] = Field(max_length=_MEMBERS_MAX)
+    endpoint: _Name  # opaque, assigned by the catalog; never derived from the offering
+    service: _Name
+    task_queue: _Name
+    public_key: _Name
+    published_at: datetime
+    retired: bool = False
+
+
+class CatalogSummary(_M):
+    offering: _Name
+    name: _Name
+    version: _Name
+    description: Annotated[str, StringConstraints(max_length=_DESCRIPTION_MAX)]
+    pricing_hint: Annotated[str, StringConstraints(max_length=_PRICING_HINT_MAX)] | None = None
+    contract_hash: _Name
+    seller: PartyView
+
+
+class CatalogList(_M):
+    items: list[CatalogSummary] = Field(max_length=_PAGE_MAX)
+    next_cursor: _Long | None = None
+
+
+# --------------------------------------------------------------------------- quotes & jobs
+
+
+class WirePayload(_M):
+    """A ``temporal.api.common.v1.Payload``, serialized and base64-encoded (standard alphabet)."""
+
+    b64: Annotated[str, StringConstraints(max_length=_PAYLOAD_B64_MAX)]
+
+
+class QuoteRequest(_M):
+    """``POST /v1/quotes``. ``offering`` is a reference (``acme/enrich``, ``@1``, exact)."""
+
+    offering: _Name
+    input: WirePayload
+
+
+class QuoteStatus(StrEnum):
+    OK = "ok"
+    REJECTED = "rejected"
+    BUSY = "busy"
+
+
+class QuoteView(_M):
+    quote_id: _Name | None  # None unless status == ok
+    offering: _Name  # resolved, exact
+    status: QuoteStatus
+    amount_minor: int | None = None
+    currency: _Name | None = None
+    price: _Name | None = None  # "12.40"
+    max_duration_seconds: int | None = None
+    reason: _Text | None = None
+    eta_seconds: int | None = None
+    expires_at: datetime | None = None
+    contract_hash: _Name
+    endpoint: _Name
+    service: _Name
+    seller_public_key: _Name
+
+
+class HireRequest(_M):
+    """``POST /v1/jobs``. Refused with ``price_above_max`` when the quote exceeds
+    ``max_price_minor``; refused with ``insufficient_funds`` when the lock fails."""
+
+    quote_id: _Name
+    max_price_minor: int | None = None
+
+
+class JobState(StrEnum):
+    """A2A task states (D12). ``input-required`` is the quote step."""
+
+    INPUT_REQUIRED = "input-required"
+    SUBMITTED = "submitted"
+    WORKING = "working"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
+class Escrow(StrEnum):
+    HELD = "held"
+    RELEASED = "released"
+    REFUNDED = "refunded"
+    DISPUTED = "disputed"
+    RESOLVED = "resolved"
+
+
+class HireView(_M):
+    job_id: _Name
+    hold_token: _Long
+    offering: _Name
+    endpoint: _Name
+    service: _Name
+    workflow_id: _Name  # job-<job_id>, in the seller's namespace
+    operation_id: _Name  # the standalone Nexus operation id to use in the buyer's namespace
+    contract_hash: _Name
+    amount_minor: int
+    currency: _Name
+    max_duration_seconds: int
+    seller_public_key: _Name
+    expires_at: datetime  # the hold token's expiry: start before this
+
+
+class DeliveryView(_M):
+    sha256: _Name  # of the result payload as stored in history (ciphertext)
+    size: int
+    delivered_at: datetime
+
+
+class JobView(_M):
+    job_id: _Name
+    offering: _Name
+    buyer: _Name
+    seller: _Name
+    state: JobState
+    escrow: Escrow
+    amount_minor: int
+    currency: _Name
+    price: _Name
+    created_at: datetime
+    started_at: datetime | None = None
+    deadline: datetime  # refund if not delivered by then (max_duration + grace)
+    delivery: DeliveryView | None = None
+    review_deadline: datetime | None = None
+    reason: _Text | None = None  # failure / cancel / dispute reason, platform-observable only
+    operation_id: _Name
+    workflow_id: _Name
+
+
+class StartRequest(_M):
+    """``POST /v1/jobs/{id}/start``: the buyer's input, already encrypted to the seller.
+    The gate starts the standalone Nexus operation in the BUYER's namespace on its behalf,
+    with the hold token -- for clients without a Temporal connection (the console)."""
+
+    input: WirePayload
+
+
+class ResultView(_M):
+    """``GET /v1/jobs/{id}/result``: the delivery as stored (ciphertext to the buyer)."""
+
+    job_id: _Name
+    payload: WirePayload
+    sha256: _Name
+    size: int
+    delivered_at: datetime
+
+
+class SellerJobView(_M):
+    """``GET /v1/jobs/{id}/seller`` -- what a seller's worker needs on a cache miss."""
+
+    job_id: _Name
+    offering: _Name
+    buyer_public_key: _Name
+    contract_hash: _Name
+    max_duration_seconds: int
+
+
+class JobList(_M):
+    items: list[JobView] = Field(max_length=_PAGE_MAX)
+    next_cursor: _Long | None = None
+
+
+class AcceptRequest(_M):
+    pass
+
+
+class RejectRequest(_M):
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class ResolveRequest(_M):
+    """Resolver only (``POST /v1/admin/jobs/{id}/resolve``)."""
+
+    buyer_minor: int
+    seller_minor: int
+    note: Annotated[str, StringConstraints(max_length=_NOTE_MAX)] = ""
+
+
+# --------------------------------------------------------------------------- progress
+
+
+class ProgressSource(StrEnum):
+    HEARTBEAT = "heartbeat"
+    HISTORY = "history"
+
+
+class ProgressEvent(_M):
+    """One event of ``GET /v1/jobs/{id}/progress`` (SSE, ``data:`` is this JSON).
+
+    ``heartbeat`` events carry the seller's heartbeat details encrypted to the buyer
+    (``ciphertext_b64``, age). ``history`` events carry platform-observable metadata."""
+
+    seq: int
+    at: datetime
+    source: ProgressSource
+    activity: _Activity | None = None
+    ciphertext_b64: Annotated[str, StringConstraints(max_length=_PROGRESS_B64_MAX)] | None = None
+    state: JobState | None = None
+    last_event: _Name | None = None
+    activities_completed: int | None = None
+    activities_running: list[_Activity] | None = Field(
+        default=None, max_length=_PENDING_ACTIVITIES_MAX
+    )
+    continue_as_new_count: int | None = None
+
+
+class ProgressPost(_M):
+    """``POST /v1/jobs/{id}/progress`` from the seller's worker."""
+
+    at: datetime
+    activity: _Activity
+    ciphertext_b64: Annotated[str, StringConstraints(max_length=_PROGRESS_B64_MAX)]
+
+
+# --------------------------------------------------------------------------- artifacts & blobs
+
+
+class ArtifactCreate(_M):
+    """``POST /v1/artifacts``. ``job_id`` is set for a seller's output (the gate refuses
+    ``size`` above the offering's ``max_output_bytes`` before anything is stored) and
+    unset for a buyer's input. ``size`` is the ciphertext size."""
+
+    size: int = Field(ge=0)
+    content_type: _Name = "application/octet-stream"
+    job_id: _Name | None = None
+
+
+class UploadPart(_M):
+    number: int
+    url: _Long
+    size: int
+
+
+class ArtifactUpload(_M):
+    key: str = Field(pattern=r"^[0-9a-f]{32}$")  # opaque, gate-assigned (see kontra.types.Artifact)
+    upload_id: _Long | None  # None: single PUT to parts[0]
+    part_size: int
+    parts: list[UploadPart] = Field(max_length=MAX_PARTS)
+    expires_at: datetime
+
+
+class ArtifactComplete(_M):
+    """``POST /v1/artifacts/{key}/complete``. One ETag per planned part, in order (a
+    single PUT: one, possibly empty)."""
+
+    upload_id: _Long | None
+    etags: list[_ETag] = Field(max_length=MAX_PARTS)
+    ciphertext_sha256: _Name
+
+    @field_validator("etags", mode="before")
+    @classmethod
+    def _one_error(cls, value: Any) -> Any:
+        """Refuse a list with a bad item as one error naming the first, before pydantic
+        reports every item on its own: under the cap, 10 000 bad items were 10 000 errors
+        (~25 MiB at a gate for a 1 MiB body). A list past the cap is left to pydantic's own
+        single ``too_long``; the item type still states the rule (and the schema)."""
+        items: Sequence[object] = (
+            cast("Sequence[object]", value) if isinstance(value, list | tuple) else ()
+        )
+        if len(items) <= MAX_PARTS:
+            for i, item in enumerate(items):
+                if not isinstance(item, str) or _ETAG_TEXT.fullmatch(item) is None:
+                    raise ValueError(
+                        f"etags[{i}]: an ETag is at most {_ETAG_MAX} printable ASCII characters"
+                    )
+        return value
+
+
+class DownloadUrl(_M):
+    url: _Long
+    size: int
+    expires_at: datetime
+
+
+class BlobCreate(_M):
+    """Claim-check (``POST /v1/blobs``): content-addressed by the ciphertext's sha256."""
+
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size: int = Field(ge=0)
+
+
+class BlobUrl(_M):
+    sha256: _Name
+    url: _Long  # presigned PUT (create) or GET (read)
+    exists: bool = False
+    expires_at: datetime
+
+
+# --------------------------------------------------------------------------- money
+
+
+class Balance(_M):
+    party: _Name
+    currency: _Name
+    available_minor: int
+    held_minor: int
+    available: _Name
+    held: _Name
+
+
+class Topup(_M):
+    amount_minor: int = Field(gt=0)
+    currency: _Name = "USD"
+
+
+class TopupResult(_M):
+    """Dev: credited at once. Production: a checkout URL to complete (Phase 7)."""
+
+    credited: bool
+    balance: Balance | None = None
+    checkout_url: _Long | None = None
+
+
+# --------------------------------------------------------------------------- hold token
+
+
+class HoldClaims(_M):
+    """Claims of the hold token (D10, §10.5): a JWT signed by the gate (ES256, ``kid`` in
+    the JWKS at ``/.well-known/jwks.json``), carried in the Nexus header ``kontra-hold``
+    and verified offline by the seller's handler."""
+
+    iss: _Long
+    aud: Literal["kontra:hold"]
+    sub: _Name  # job_id
+    iat: int
+    exp: int
+    job_id: _Name
+    offering: _Name  # acme/enrich@1.2.0
+    seller: _Name
+    seller_ns: _Name
+    buyer: _Name
+    buyer_ns: _Name
+    buyer_key: _Name  # age1... -- the job's output recipient (§7.4: travels with the job)
+    amount_minor: int
+    currency: _Name
+    contract_hash: _Name
+    max_duration_seconds: int
+    #: The size, in bytes, of the input the quote priced, as the seller's handler receives
+    #: it (``kontra._control.input_size``: a claim-check's stored ciphertext, else the
+    #: payload). The handler refuses an ``execute`` input above it before fetching anything,
+    #: so one Nexus attempt is always enough to answer (decisions I16). Absent from tokens
+    #: of a gate that does not set it (then the handler's only bound is its codec's), and
+    #: then left out of the claims entirely, so re-signing such a token gives the same bytes.
+    input_size: int | None = Field(default=None, ge=0)
+    #: The gate's refund deadline for the job, in Unix seconds rounded down: the hold's
+    #: lock time plus ``max_duration`` plus the gate's own grace (``kontra.escrow``). The
+    #: handler ends the job's run by it, so a late start never delivers after the gate
+    #: refunded the job, whatever grace this gate is configured with (decisions I16).
+    #: Absent from tokens of a gate that does not set it (the handler then assumes
+    #: ``exp`` plus ``kontra.escrow.DEFAULT_GRACE``), and then left out of the claims, as
+    #: ``input_size`` is.
+    deadline: int | None = Field(default=None, ge=0)
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_bound(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        for optional in ("input_size", "deadline"):
+            if data.get(optional) is None:
+                data.pop(optional, None)
+        return data

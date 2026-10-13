@@ -1,0 +1,41 @@
+# {{party}}/{{name}}
+
+A Kontra offering: a durable, quoted job that buyers hire through Kontra and that runs on
+your own machine as a plain Temporal worker. Made by `kontra init`.
+
+| File | Owner of |
+|---|---|
+| `offering.yaml` | name, version, limits, display text: declarative, no code names |
+| `models.py` | the input and output types; the published contract is derived from them |
+| `workflows.py`, `activities.py` | the job itself, in plain Temporal; nothing from kontra |
+| `quote.py` | the price, from the input |
+| `worker.py` | the binding of workflow and quote to the offering, and all worker tuning |
+| `tests/test_offering.py` | the whole lifecycle (quote, hire, deliver, accept; a refund) with no containers |
+
+## Try it locally
+
+```sh
+kontra dev                                    # a local Kontra in Docker, with play money
+kontra serve                                  # serve this offering (a dev profile publishes it)
+kontra quote {{party}}/{{name}} -f input.json
+kontra hire {{party}}/{{name}} -f input.json --max-price 1 --wait --accept
+```
+
+## Test it
+
+```sh
+pip install "kontra-sdk[testing]" pytest
+pytest
+```
+
+## Sell it
+
+```sh
+kontra login
+kontra publish        # needs a recent login; prints the contract hash and the endpoint
+kontra serve          # on the machine that does the work
+```
+
+A published version is fixed. Change the types in `models.py` or anything in
+`offering.yaml`, and bump `version` before publishing again: `kontra serve` refuses to serve
+code whose contract differs from the catalog's.

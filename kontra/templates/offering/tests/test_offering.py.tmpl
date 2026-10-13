@@ -1,0 +1,118 @@
+"""The offering's whole lifecycle in a unit test, with no containers (PRD §19.3).
+
+A Temporal dev server (downloaded once) plays the frontend, `kontra.testing`'s fake gate
+plays Kontra (catalog, quote relay, escrow with play money), and the worker serves as the
+seller, exactly as `kontra serve` would:
+
+    pip install "kontra-sdk[testing]" pytest
+    pytest
+"""
+
+import asyncio
+import re
+from collections.abc import Awaitable, Callable, Iterator
+from decimal import Decimal
+from pathlib import Path
+from typing import TypeVar
+
+import pytest
+from kontra.contract import load_offering
+from kontra.hire import JobFailed
+from kontra.serve import Worker, offering
+from kontra.testing import Marketplace
+from kontra.testing.devserver import (
+    DevServer,
+    acquire_shared_dev_server,
+    release_shared_dev_server,
+)
+
+from activities import count_words
+from quote import quote
+from workflows import {{Class}}Flow
+
+ROOT = Path(__file__).resolve().parents[1]
+TEXT = "the quick brown fox jumps over the lazy dog\nthe end\n"
+PRICE = Decimal("0.01")  # what quote() asks for TEXT
+T = TypeVar("T")
+
+
+@pytest.fixture(scope="module")
+def dev_server() -> Iterator[DevServer]:
+    server = acquire_shared_dev_server()
+    try:
+        yield server
+    finally:
+        release_shared_dev_server()
+
+
+def buyer_handle(seller: str, wanted: str) -> str:
+    return wanted if wanted != seller else f"{wanted}-2"
+
+
+async def eventually(probe: Callable[[], Awaitable[T]], ok: Callable[[T], bool]) -> T:
+    """The gate settles money on its own clock (a sweep): wait for it, briefly."""
+    value = await probe()
+    for _ in range(300):
+        if ok(value):
+            return value
+        await asyncio.sleep(0.1)
+        value = await probe()
+    raise AssertionError(f"never settled: {value!r}")
+
+
+def test_quote_hire_deliver_accept(dev_server: DevServer) -> None:
+    asyncio.run(lifecycle(dev_server))
+
+
+async def lifecycle(dev_server: DevServer) -> None:
+    from worker import worker  # the module-level worker: what `kontra serve` runs
+
+    spec = load_offering(ROOT / "offering.yaml")
+    party = spec.offering_id.party
+    async with Marketplace(dev_server=dev_server) as mp:
+        seller = await mp.party(party, balance=0)
+        buyer = await mp.party(buyer_handle(party, "buyer"), balance="10.00")
+        async with mp.serve(worker, seller):
+            k = buyer.kontra()
+            q = await k.quote(spec.offering_id.key, text=TEXT)
+            assert q.ok, q.reason
+            assert (q.price, q.currency) == (PRICE, "USD")
+
+            job = await q.hire(max_price="1.00")
+            result = await job.result(timeout=60)
+            assert (result.words, result.lines) == (11, 2)
+            assert result.top["the"] == 3
+
+            await job.accept()
+        paid = await eventually(buyer.balance, lambda b: b.held_minor == 0)
+        assert paid.available == "9.99"
+        earned = await eventually(seller.balance, lambda b: b.available_minor > 0)
+        assert Decimal(earned.available) <= PRICE  # the platform fee is taken at release
+
+
+def test_a_seller_that_never_delivers_refunds_the_buyer(
+    dev_server: DevServer, tmp_path: Path
+) -> None:
+    asyncio.run(never_delivered(dev_server, tmp_path))
+
+
+async def never_delivered(dev_server: DevServer, tmp_path: Path) -> None:
+    # The same offering with a 3 second max_duration: the seller quotes, then goes offline.
+    short = tmp_path / "offering.yaml"
+    yaml = (ROOT / "offering.yaml").read_text()
+    short.write_text(re.sub(r"(?m)^max_duration:.*$", "max_duration: 3s", yaml))
+    bound = offering(short, workflow={{Class}}Flow, quote=quote)
+    seller_worker = Worker(offerings=[bound], activities=[count_words])
+    party = bound.offering_id.party
+    async with Marketplace(dev_server=dev_server) as mp:
+        seller = await mp.party(party, balance=0)
+        buyer = await mp.party(buyer_handle(party, "patient"), balance="10.00")
+        k = buyer.kontra(start_timeout=0.5)
+        async with mp.serve(seller_worker, seller):
+            q = await k.quote(bound.key, text=TEXT)
+        job = await q.hire()  # nobody is serving any more
+
+        with pytest.raises(JobFailed):
+            await job.result(timeout=60)
+        refunded = await eventually(buyer.balance, lambda b: b.held_minor == 0)
+        assert refunded.available == "10.00"

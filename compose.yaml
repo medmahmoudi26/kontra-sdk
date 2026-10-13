@@ -1,0 +1,386 @@
+# The Kontra stack: Postgres, a bucket, Kontra's Temporal server and the gate.
+#
+# This is the single environment definition (PRD §19.3): `kontra dev` runs it on a laptop,
+# CI runs it, and v1 production runs it -- the same file with different env files, never a
+# second way to bring the stack up. So it carries no default secret and no dev-only
+# behaviour except the one switch, KONTRA_DEV (the gate's dev login and play money).
+# `kontra dev up` writes $KONTRA_HOME/dev.env (KONTRA_DEV=1 and random credentials) and
+# passes it as --env-file; production passes its own. It ships in the wheel as
+# kontra/_dev/compose.yaml.
+#
+# Required: KONTRA_PG_PASSWORD, KONTRA_S3_ACCESS_KEY, KONTRA_S3_SECRET_KEY. All three are
+# pasted verbatim into a URL or a JSON file below, so use letters, digits and hyphens only:
+# a password with '@' or '/' would make the gate's database URL name another host.
+# Production (KONTRA_DEV=0) also needs KONTRA_SIGNING_KEYS: the gate refuses to start without.
+# Optional (default):
+#   KONTRA_DEV (0)                 1: dev login, play money, instant top-ups
+#   KONTRA_GATE_IMAGE              (ghcr.io/medmahmoudi26/kontra-gate:dev)
+#   KONTRA_TEMPORAL_IMAGE          (ghcr.io/medmahmoudi26/kontra-temporal:dev)
+#   KONTRA_DEV_BIND (127.0.0.1)    host address the gate, Temporal and the bucket publish on
+#   KONTRA_DEV_PG_BIND (127.0.0.1) host address Postgres publishes on
+#   KONTRA_DEV_GATE_PORT (8080), KONTRA_DEV_TEMPORAL_PORT (7233), KONTRA_DEV_S3_PORT (8333),
+#   KONTRA_DEV_PG_PORT (5432)      host ports
+#                                  `kontra dev up` remembers the four ports in its dev.env
+#                                  (x-kontra-dev-settings below), so `status`, `logs` and
+#                                  `down` find the stack where `up` put it. Never the two
+#                                  addresses: one `KONTRA_DEV_BIND=0.0.0.0 kontra dev up`
+#                                  must not publish every later stack (dev login, play
+#                                  money) to the network without being asked again
+#   KONTRA_PUBLIC_URL, KONTRA_TEMPORAL_PUBLIC, KONTRA_S3_PUBLIC_ENDPOINT
+#                                  what clients are told (default: localhost and the ports)
+#   KONTRA_TEMPORAL_TLS (0)        1 when clients reach Temporal through a TLS proxy
+#   KONTRA_CONTROL_NET (172.16.251)
+#                                  the first three octets of the `control` network: the
+#                                  stack takes .0/28 of it, Temporal is .2, every other
+#                                  address comes from .8/29. Change it only if
+#                                  172.16.251.0/28 collides with a network of yours, or
+#                                  to run a second stack from this file on the same
+#                                  host (Docker refuses overlapping subnets)
+#                                  (`kontra dev up` does not remember it: put it in
+#                                  $KONTRA_HOME/dev.env to keep it)
+#   KONTRA_PG_USER, KONTRA_PG_DB (kontra), KONTRA_S3_BUCKET (kontra), KONTRA_S3_REGION,
+#   KONTRA_LEDGER (postgres), KONTRA_JWKS_REFRESH (15s), and the gate's other KONTRA_*
+#   settings, passed through when set (signing keys, resolvers, fee, GitHub, Stripe).
+#
+# Start-up has a cycle that ordering alone cannot break: the gate creates each party's
+# namespace through Temporal's internal frontend, and Temporal verifies tokens with the
+# gate's JWKS. Temporal starts first and polls the JWKS (KONTRA_JWKS_REFRESH) until the
+# gate answers; the gate is restarted until Temporal's internal frontend takes its
+# connection; `kontra dev up` waits until a worker token is accepted end to end.
+#
+# The internal frontend (7236 gRPC, 7246 HTTP) has no authentication: whoever reaches it
+# controls every namespace. It is never published (only the public frontend, 7233, is), and
+# it listens on one address only: Temporal's fixed address on `control`, the network it
+# shares with the gate and nothing else. `control` has a pinned subnet (KONTRA_CONTROL_NET)
+# so that address is known before Temporal starts, which it must be: Temporal binds the
+# internal frontend there and dials its own system worker, Nexus dispatch and completions
+# there too. Each service joins only the networks it needs:
+#   control      temporal, gate              the internal frontend; the gate's JWKS
+#   temporal-db  temporal, postgres-relay    Temporal's own database connections
+#   database     postgres, postgres-relay, gate, migrate
+#   bucket       s3, gate                    SeaweedFS's own unauthenticated ports
+# Temporal's other listeners (the public frontend, authenticated) answer on every network
+# it is on; the internal frontend does not listen on `temporal-db`. The bind alone does not
+# close that network, though: Linux delivers a packet for any of a host's addresses on any
+# of its interfaces, so a peer there that routes Temporal's `control` address through
+# Temporal's `temporal-db` address reaches the internal frontend (measured). Adding that
+# route takes NET_ADMIN, and forging the frame NET_RAW: the relay, Temporal's only peer
+# there, has no capability and is not root, and must stay so. Temporal is not on
+# `database`: Postgres (large third-party code that a SQL injection reaches) and the
+# migrate job share no network with it, and Docker drops traffic between bridge networks,
+# so no address of Temporal is reachable from them. Temporal reaches Postgres through
+# postgres-relay, a byte relay that only ever connects out to Postgres. A container inherits
+# the host's net.ipv4.ip_forward=1, which would make every service on two networks a router
+# between them (a peer that routes through the relay reaches Temporal's temporal-db address;
+# only the reply's path back, which Docker drops, stops the handshake), so each of them sets
+# it to 0. SeaweedFS -- third-party code serving the internet in production -- reaches
+# neither Temporal nor Postgres, and only the gate reaches SeaweedFS's master, volume and
+# filer ports.
+#
+# Every service runs with no capabilities at all (cap_drop ALL, none added back; the one
+# exception is s3-owner, below), cannot gain any (no-new-privileges), and has a read-only
+# root filesystem: it writes only to its volume or to a size-capped tmpfs that holds
+# nothing across restarts, so code that takes one over cannot replace the service's own
+# binaries, leave anything behind for the next start, or fill the host's memory. No
+# long-running service runs as root. Postgres runs as its own user: its entrypoint needs
+# root only to chown a data directory that the named volume already gives postgres. The
+# SeaweedFS image has no user but root, and its /data -- so the named volume, which Docker
+# fills from it -- belongs to root: s3-owner, a one-shot with no network and two
+# capabilities (CHOWN, DAC_READ_SEARCH) for one fixed chown, hands the volume to the
+# unprivileged uid SeaweedFS then runs as. The gate and Temporal images run as
+# unprivileged users and write nothing at runtime.
+#
+# Third-party images are pinned by digest, the tag kept beside it; dependabot proposes
+# bumps.
+
+name: kontra-dev
+
+# The host ports `kontra dev up` writes into $KONTRA_HOME/dev.env, as compose resolved them
+# for that run (environment, then env files, then dev.env); inert for everyone else. The
+# bind addresses are deliberately not here (see the header).
+x-kontra-dev-settings:
+  KONTRA_DEV_GATE_PORT: ${KONTRA_DEV_GATE_PORT:-}
+  KONTRA_DEV_TEMPORAL_PORT: ${KONTRA_DEV_TEMPORAL_PORT:-}
+  KONTRA_DEV_S3_PORT: ${KONTRA_DEV_S3_PORT:-}
+  KONTRA_DEV_PG_PORT: ${KONTRA_DEV_PG_PORT:-}
+
+x-database-url: &database-url postgresql+asyncpg://${KONTRA_PG_USER:-kontra}:${KONTRA_PG_PASSWORD:?set KONTRA_PG_PASSWORD (`kontra dev` writes one into its dev.env)}@postgres:5432/${KONTRA_PG_DB:-kontra}
+
+services:
+  postgres:
+    # postgres:16-alpine (postgres-relay runs the same image: keep the two in step)
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    environment:
+      POSTGRES_USER: ${KONTRA_PG_USER:-kontra}
+      POSTGRES_PASSWORD: ${KONTRA_PG_PASSWORD:?set KONTRA_PG_PASSWORD}
+      POSTGRES_DB: ${KONTRA_PG_DB:-kontra}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    user: postgres
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /var/run/postgresql:size=1m # the server's socket and its lock file
+    ports:
+      - "${KONTRA_DEV_PG_BIND:-127.0.0.1}:${KONTRA_DEV_PG_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+    restart: unless-stopped
+    networks: [database]
+
+  postgres-relay:
+    # Temporal's only way to Postgres (see the header): for each connection it accepts, it
+    # opens one to postgres:5432 and copies bytes; it never connects to Temporal. (A peer on
+    # `database` that connects to it reaches Postgres, which it reaches anyway.) It is
+    # busybox nc from the Postgres image itself, so the stack trusts no further image.
+    # No capabilities, read-only, not root.
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    entrypoint: ["nc"]
+    command: ["-lk", "-p", "5432", "-e", "nc", "postgres", "5432"]
+    # The image's stop signal is SIGINT (Postgres' smart shutdown); nc stops on SIGTERM.
+    stop_signal: SIGTERM
+    user: postgres
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    sysctls:
+      net.ipv4.ip_forward: 0 # on two networks: never a router between them (see the header)
+    tmpfs:
+      # The image's VOLUME: a tmpfs here instead of an anonymous volume per container.
+      - /var/lib/postgresql/data:size=1m
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [temporal-db, database]
+
+  s3-owner:
+    # Hands the bucket's volume to the uid SeaweedFS runs as (see the header), then exits:
+    # the image's /data, which Docker copies into a new volume, belongs to root, and so
+    # does everything a SeaweedFS that once ran as root wrote. Root with two capabilities and
+    # nothing else -- no network, a read-only root -- running one fixed command: CHOWN, and
+    # DAC_READ_SEARCH to walk the directories SeaweedFS creates 0700 for itself (on every
+    # start after the first, the walk finds them all its own already).
+    image: chrislusf/seaweedfs:3.80@sha256:1055999e08eed1789b0ae45d235126e4495e23d3fb9d6396293fd42539b1ae6a
+    entrypoint: ["chown", "-R", "10001:10001", "/data"]
+    volumes:
+      - s3:/data
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  s3:
+    # The claim-check bucket (ciphertext only). SeaweedFS: MinIO's images can no longer be
+    # pulled anonymously.
+    # chrislusf/seaweedfs:3.80
+    image: chrislusf/seaweedfs:3.80@sha256:1055999e08eed1789b0ae45d235126e4495e23d3fb9d6396293fd42539b1ae6a
+    # Credentials: the identities config, which this writes to the tmpfs before the image's
+    # own entrypoint starts SeaweedFS. Not compose `configs`: compose copies their content
+    # into the container's root filesystem, which read_only refuses.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        umask 077 && printf '%s' "$$KONTRA_S3_IDENTITIES" > /tmp/s3.json &&
+        unset KONTRA_S3_IDENTITIES && exec /entrypoint.sh "$$@"
+      - s3
+    command:
+      - server
+      - -dir=/data
+      - -ip.bind=0.0.0.0
+      - -master.volumePreallocate=false
+      - -master.volumeSizeLimitMB=1024
+      - -volume.max=200
+      - -s3
+      - -s3.port=8333
+      - -s3.config=/tmp/s3.json
+    environment:
+      KONTRA_S3_IDENTITIES: >-
+        {"identities": [{"name": "kontra",
+        "credentials": [{"accessKey": "${KONTRA_S3_ACCESS_KEY:?set KONTRA_S3_ACCESS_KEY}",
+        "secretKey": "${KONTRA_S3_SECRET_KEY:?set KONTRA_S3_SECRET_KEY}"}],
+        "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
+      # Never a proxy. Compose copies a Docker client's proxy settings into every container,
+      # and Go exempts only loopback from them: SeaweedFS's master, volume server, filer and
+      # S3 gateway dial one another over gRPC at the container's own address, so with a
+      # client proxy they reached nothing and the bucket never started (measured). SeaweedFS
+      # connects to nothing outside this container. An empty value wins over the injected one.
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    volumes:
+      - s3:/data
+    # Not root: the volume is this uid's (s3-owner). The image has no user of its own, and
+    # SeaweedFS needs none: its ports are all above 1024.
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=1m # the identities config and SeaweedFS's unix sockets (s3, filer)
+    ports:
+      - "${KONTRA_DEV_BIND:-127.0.0.1}:${KONTRA_DEV_S3_PORT:-8333}:8333"
+    healthcheck:
+      # Never through a proxy (-Y off), whatever the environment holds: compose copies a
+      # Docker client's proxy settings into the container, and wget would send even
+      # 127.0.0.1 there.
+      test: ["CMD", "wget", "-Y", "off", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+    depends_on:
+      s3-owner:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [bucket]
+
+  temporal:
+    # Kontra's Temporal server: every service in one process, the Authorizer on the public
+    # frontend (temporal/authorizer). Distroless: no shell for a healthcheck; readiness is
+    # proven end to end by `kontra dev up`.
+    image: ${KONTRA_TEMPORAL_IMAGE:-ghcr.io/medmahmoudi26/kontra-temporal:dev}
+    environment:
+      KONTRA_DB: postgres
+      KONTRA_DB_HOST: postgres-relay
+      KONTRA_DB_PORT: "5432"
+      KONTRA_DB_USER: ${KONTRA_PG_USER:-kontra}
+      KONTRA_DB_PASSWORD: ${KONTRA_PG_PASSWORD:?set KONTRA_PG_PASSWORD}
+      KONTRA_AUTO_SETUP: "1"
+      KONTRA_FRONTEND_BIND_IP: 0.0.0.0
+      # Temporal's address on `control` (below), and only that: never in `ports`.
+      KONTRA_INTERNAL_FRONTEND_BIND_IP: ${KONTRA_CONTROL_NET:-172.16.251}.2
+      KONTRA_JWKS_URLS: http://gate:8080/.well-known/jwks.json
+      KONTRA_JWKS_REFRESH: ${KONTRA_JWKS_REFRESH:-15s}
+      KONTRA_LOG_LEVEL: ${KONTRA_TEMPORAL_LOG_LEVEL:-warn}
+      # Never a proxy. Compose copies a Docker client's proxy settings into every container,
+      # and Go exempts only loopback from them: Temporal dials its internal frontend at its
+      # `control` address, so its own gRPC (it would not start) and its Nexus tasks and
+      # completion tokens would go to that proxy. Temporal reaches nothing but the gate's JWKS and
+      # postgres-relay, on these networks. An empty value wins over the injected one.
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    ports:
+      - "${KONTRA_DEV_BIND:-127.0.0.1}:${KONTRA_DEV_TEMPORAL_PORT:-7233}:7233"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-relay:
+        condition: service_started
+    restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: 0 # on two networks: never a router between them (see the header)
+    networks:
+      control:
+        # Fixed, outside the range the others draw from: the internal frontend binds it.
+        ipv4_address: ${KONTRA_CONTROL_NET:-172.16.251}.2
+      temporal-db: {}
+
+  migrate:
+    # The gate's schema (alembic), run to completion before the gate starts: in
+    # production too, migrations run as a job before the gate rolls (§19.4).
+    image: ${KONTRA_GATE_IMAGE:-ghcr.io/medmahmoudi26/kontra-gate:dev}
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      KONTRA_DATABASE_URL: *database-url
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [database]
+
+  gate:
+    image: ${KONTRA_GATE_IMAGE:-ghcr.io/medmahmoudi26/kontra-gate:dev}
+    environment:
+      KONTRA_DEV: ${KONTRA_DEV:-0}
+      KONTRA_DATABASE_URL: *database-url
+      KONTRA_BIND: 0.0.0.0:8080
+      KONTRA_PUBLIC_URL: ${KONTRA_PUBLIC_URL:-http://localhost:${KONTRA_DEV_GATE_PORT:-8080}}
+      KONTRA_TEMPORAL_INTERNAL: temporal:7236
+      KONTRA_TEMPORAL_INTERNAL_HTTP: http://temporal:7246
+      KONTRA_TEMPORAL_PUBLIC: ${KONTRA_TEMPORAL_PUBLIC:-localhost:${KONTRA_DEV_TEMPORAL_PORT:-7233}}
+      KONTRA_TEMPORAL_TLS: ${KONTRA_TEMPORAL_TLS:-0}
+      KONTRA_S3_ENDPOINT: http://s3:8333
+      KONTRA_S3_PUBLIC_ENDPOINT: ${KONTRA_S3_PUBLIC_ENDPOINT:-http://localhost:${KONTRA_DEV_S3_PORT:-8333}}
+      KONTRA_S3_BUCKET: ${KONTRA_S3_BUCKET:-kontra}
+      KONTRA_S3_REGION: ${KONTRA_S3_REGION:-us-east-1}
+      KONTRA_S3_ACCESS_KEY: ${KONTRA_S3_ACCESS_KEY:?set KONTRA_S3_ACCESS_KEY}
+      KONTRA_S3_SECRET_KEY: ${KONTRA_S3_SECRET_KEY:?set KONTRA_S3_SECRET_KEY}
+      KONTRA_LEDGER: ${KONTRA_LEDGER:-postgres}
+      # Passed through when set; empty means the gate's default.
+      KONTRA_SIGNING_KEYS: ${KONTRA_SIGNING_KEYS:-}
+      KONTRA_RESOLVERS: ${KONTRA_RESOLVERS:-}
+      KONTRA_FEE_BPS: ${KONTRA_FEE_BPS:-}
+      KONTRA_GRACE_SECONDS: ${KONTRA_GRACE_SECONDS:-}
+      KONTRA_SWEEP_INTERVAL: ${KONTRA_SWEEP_INTERVAL:-}
+      KONTRA_PUBLISHER_FRESHNESS: ${KONTRA_PUBLISHER_FRESHNESS:-}
+      KONTRA_MAX_INPUT_BYTES: ${KONTRA_MAX_INPUT_BYTES:-}
+      KONTRA_GITHUB_CLIENT_ID: ${KONTRA_GITHUB_CLIENT_ID:-}
+      KONTRA_GITHUB_CLIENT_SECRET: ${KONTRA_GITHUB_CLIENT_SECRET:-}
+      KONTRA_STRIPE_SECRET: ${KONTRA_STRIPE_SECRET:-}
+      KONTRA_STRIPE_WEBHOOK_SECRET: ${KONTRA_STRIPE_WEBHOOK_SECRET:-}
+    ports:
+      - "${KONTRA_DEV_BIND:-127.0.0.1}:${KONTRA_DEV_GATE_PORT:-8080}:8080"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      temporal:
+        condition: service_started
+    healthcheck:
+      # Never through a proxy (an empty ProxyHandler): compose copies a Docker client's
+      # proxy settings into the container, and urllib would send even 127.0.0.1 there. The
+      # healthcheck alone: the gate's own clients keep the environment it was given.
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8080/healthz', timeout=3)"
+      interval: 3s
+      timeout: 5s
+      retries: 100
+      start_period: 10s
+    restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: 0 # on three networks: never a router between them (see the header)
+    networks: [control, database, bucket]
+
+volumes:
+  postgres:
+  s3:
+
+networks:
+  control:
+    ipam:
+      config:
+        # Outside Docker's default pools (172.17-31.0.0/16, 192.168.0.0/16), so no network
+        # Docker allocates by itself collides with it; KONTRA_CONTROL_NET moves it. Dynamic
+        # addresses come from ip_range only, so nothing else can take Temporal's .2.
+        - subnet: ${KONTRA_CONTROL_NET:-172.16.251}.0/28
+          ip_range: ${KONTRA_CONTROL_NET:-172.16.251}.8/29
+  temporal-db:
+  database:
+  bucket:
