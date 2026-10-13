@@ -12,6 +12,8 @@ Every cell can be enforced.
 - `callbackguard/` — the one check the Authorizer cannot make: a Nexus completion callback
   token may only complete the operation it was issued for (see below). Separate on
   purpose: it reads request bodies, the policy never does.
+- `revocation/` — refuses the worker tokens of sessions the gate revoked (see below): a
+  wrapper around Temporal's default claim mapper that only ever refuses more.
 - `cmd/kontra-temporal` — the server binary (`serve`, `setup-schema`, `register-namespace`).
 - `dynamicconfig/kontra.yaml` — Nexus features on, cross-namespace commands off, per-namespace
   limits.
@@ -77,6 +79,20 @@ token, whose request id is set. A token then completes only its own operation: t
 id is a UUID that only that operation's caller and handler know. Every other URL is refused
 too, because a callback is an HTTP request Temporal itself makes and v1.32.1 does not
 validate the URL on every API (UpdateWorkflowExecution skips it).
+
+### Revoked sessions (`revocation`)
+
+Temporal's default claim mapper checks a token's signature, expiry and audience, and cannot
+know that the gate revoked the session the token was minted from: a revoked API key's worker
+token kept polling the party's task queues and starting workflows for up to its 15 minutes.
+Every token the gate mints names its session (`sid`), and the gate publishes the sessions it
+revoked in the last 20 minutes as sha256 digests (`GET /v1/auth/revocations`). `revocation.List`
+polls that list (`KONTRA_REVOCATIONS_REFRESH`) and `revocation.Check` wraps the default mapper
+on the public frontend: after the mapper accepts a token, a token whose `sid` is listed, or
+that names none, is refused `PERMISSION_DENIED`. If the list cannot be fetched, the last one
+stays in force and the failure is logged: revocations happen at the gate, and stopping every
+worker whenever the gate is unreachable would turn a gate outage into a Temporal one. A gate
+that answers 404 publishes no list (it predates it): nothing is refused, and that is logged.
 
 ### Defence in depth (dynamic config, pinned: checked at startup, enforced while running)
 
@@ -161,6 +177,8 @@ KONTRA_DB=postgres ... bin/kontra-temporal setup-schema
 | `KONTRA_JWKS_URLS` | *(empty)* | comma-separated JWKS URIs (`https://…` or `file://…`); empty rejects every token |
 | `KONTRA_JWKS_REFRESH` | `1m` | JWKS refresh interval |
 | `KONTRA_JWT_AUDIENCE` | `kontra:temporal` | required JWT `aud`; always checked (empty means the default) |
+| `KONTRA_REVOCATIONS_URL` | the gate of the first JWKS URL: `http(s)://host/.well-known/jwks.json` gives `http(s)://host/v1/auth/revocations`; none for any other JWKS URL | the gate's list of revoked sessions; `off` runs without one (a revoked session's worker tokens then work until they expire) |
+| `KONTRA_REVOCATIONS_REFRESH` | `5s` | how often the list is fetched |
 | `KONTRA_TEMPORAL_DYNAMIC_CONFIG` | *(built-in default)* | dynamic config file to poll (the gate writes per-namespace overrides here) |
 | `KONTRA_DYNAMIC_CONFIG_POLL` | `10s` | how often the server re-reads the dynamic config file |
 | `KONTRA_LOG_LEVEL` / `KONTRA_LOG_FORMAT` | `info` / `json` | logging |
@@ -207,8 +225,11 @@ a Docker client's proxy settings into every container.
   namespace. Its isolation is the network alone (loopback by default; one address on a
   private network shared only with the gate otherwise). Internode mTLS would add a second
   lock.
-- A worker token stays valid until its `exp` (15 minutes): revoking a session at the gate
-  does not reach Temporal before that. Temporal's claim mapper also accepts a token with no
-  `exp`; the gate never signs one (`KeyRing._sign` refuses), and nothing here checks it.
+- A revoked session's worker token is refused within one revocation poll (5 s) while the
+  gate's list can be read; when it cannot, the last list fetched stays in force and the
+  failure is logged (`revocation list: cannot refresh it`), so a session revoked meanwhile
+  keeps its worker tokens until their `exp` (15 minutes). Temporal's claim mapper also
+  accepts a token with no `exp`; the gate never signs one (`KeyRing._sign` refuses), and
+  nothing here checks it.
 - Rate limits are per namespace; unauthenticated `GetSystemInfo` / health calls are limited
   only by the frontend's global limits and the TLS proxy in front of it.

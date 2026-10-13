@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	chasmnexus "go.temporal.io/server/chasm/lib/nexusoperation"
 	"go.temporal.io/server/common/dynamicconfig"
@@ -23,7 +24,7 @@ func clearEnv(t *testing.T) {
 		"KONTRA_INTERNAL_FRONTEND_BIND_IP", "KONTRA_INTERNAL_FRONTEND_HTTP_PORT", "KONTRA_DB",
 		"KONTRA_SQLITE_FILE", "KONTRA_FRONTEND_PORT", "KONTRA_INTERNAL_FRONTEND_PORT",
 		"KONTRA_HISTORY_PORT", "KONTRA_MATCHING_PORT", "KONTRA_WORKER_PORT", "KONTRA_JWKS_URLS",
-		"KONTRA_JWT_AUDIENCE",
+		"KONTRA_JWT_AUDIENCE", "KONTRA_REVOCATIONS_URL", "KONTRA_REVOCATIONS_REFRESH",
 	} {
 		t.Setenv(key, "")
 	}
@@ -305,6 +306,50 @@ func TestPinnedFileValuesAreComparedSafely(t *testing.T) {
 	} {
 		if err := checkDynamicConfig([]byte(yaml)); err == nil {
 			t.Errorf("accepted %q", yaml)
+		}
+	}
+}
+
+// TestTheGatesRevocationListIsOnByDefault: a server whose JWKS is the gate's (compose, the
+// chart) polls the gate's revocation list without any other setting, so revoking a key
+// reaches Temporal (the review's F3); only an explicit "off" or a JWKS that is not a
+// gate's runs without one.
+func TestTheGatesRevocationListIsOnByDefault(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("KONTRA_JWKS_URLS", "http://gate:8080/.well-known/jwks.json")
+	s, err := loadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.revocationsURL != "http://gate:8080/v1/auth/revocations" || s.revocationsRefresh != 5*time.Second {
+		t.Fatalf("default: %q every %v", s.revocationsURL, s.revocationsRefresh)
+	}
+
+	t.Setenv("KONTRA_REVOCATIONS_URL", "off")
+	if s, _ = loadSettings(); s.revocationsURL != "" {
+		t.Fatalf("off: %q", s.revocationsURL)
+	}
+	t.Setenv("KONTRA_REVOCATIONS_URL", "https://gate.internal/v1/auth/revocations")
+	t.Setenv("KONTRA_REVOCATIONS_REFRESH", "2s")
+	if s, _ = loadSettings(); s.revocationsURL != "https://gate.internal/v1/auth/revocations" || s.revocationsRefresh != 2*time.Second {
+		t.Fatalf("explicit: %q every %v", s.revocationsURL, s.revocationsRefresh)
+	}
+
+	clearEnv(t)
+	t.Setenv("KONTRA_JWKS_URLS", "file:///etc/kontra/jwks.json")
+	if s, _ = loadSettings(); s.revocationsURL != "" {
+		t.Fatalf("a JWKS file names no gate: %q", s.revocationsURL)
+	}
+	for _, bad := range []map[string]string{
+		{"KONTRA_REVOCATIONS_URL": "gate:8080/v1/auth/revocations"},
+		{"KONTRA_REVOCATIONS_REFRESH": "0s"},
+	} {
+		clearEnv(t)
+		for k, v := range bad {
+			t.Setenv(k, v)
+		}
+		if _, err := loadSettings(); err == nil {
+			t.Errorf("%v accepted", bad)
 		}
 	}
 }
