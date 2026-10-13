@@ -1,7 +1,9 @@
 """The ``kontra`` command (PRD §12).
 
 ```
-kontra login [--gate URL] [--dev --handle H]   device flow; key made and registered
+kontra login [--gate URL] [--email ADDR] [--dev --handle H]
+                                               device flow (or a mailed link); key registered
+kontra keys create|list|revoke                 API keys for programs (KONTRA_API_KEY)
 kontra init <name> [--party P]                 scaffold an offering (§6.1)
 kontra dev [up|down|status|logs]               the local stack (compose.yaml)
 kontra publish | serve | contract [--dir D]    sell worker.py's offerings (§11.4, §6.5)
@@ -32,6 +34,7 @@ from kontra.cli._account import balance, login, topup
 from kontra.cli._buyer import hire, job, jobs, quote
 from kontra.cli._common import KontraGroup, fail
 from kontra.cli._dev import dev
+from kontra.cli._keys import keys
 from kontra.cli._pull import pull
 from kontra.cli._seller import contract, init, publish, serve
 
@@ -56,6 +59,7 @@ def mcp() -> None:
 
 for _command in (
     login,
+    keys,
     init,
     dev,
     publish,
