@@ -15,6 +15,32 @@ fakes), the Temporal Authorizer that every party's worker is subject to, the exa
 
 > Status: alpha (`0.1.0`). Python 3.11+.
 
+## Quickstart
+
+```sh
+pip install kontra-sdk
+kontra login --email you@example.com   # a sign-in link by mail; the page asks for the code
+                                       # this command prints (sign-ups are by invitation)
+kontra balance                         # you are in; `kontra quote` and `kontra hire` next
+```
+
+`kontra login` talks to `https://api.kontra.run` unless `--gate` or `KONTRA_GATE` says
+otherwise, and writes your profile and your encryption key to `~/.kontra`. Plain
+`kontra login` opens the same sign-in in your browser instead.
+
+**Programs use an API key**, not your login: a key hires, reads and runs `kontra serve`, and
+can never publish, change your encryption key or make other keys.
+
+```sh
+kontra keys create --label ci          # prints the key once; the gate keeps only its hash
+export KONTRA_API_KEY=kontra_sk_...    # Kontra(), kontra serve and kontra mcp pick it up
+kontra keys list
+kontra keys revoke key_0123456789abcdef
+```
+
+A program also needs your key file (`~/.kontra/key`) to decrypt what it buys: copy it to the
+machine, or point `KONTRA_HOME` at a directory holding it. Nothing else is read or written.
+
 ## Install
 
 ```sh
@@ -59,9 +85,9 @@ kontra serve                  # run the worker; on a dev profile it publishes th
 Against the real marketplace:
 
 ```sh
-kontra login --gate <gate URL>    # device flow in the browser; makes this machine's key
-kontra publish                    # needs a recent login; prints the contract hash and endpoint
-kontra serve                      # on the machine that does the work
+kontra login --email you@example.com   # or plain `kontra login` (browser); makes this machine's key
+kontra publish                         # needs a recent login, never a key; prints the hash and endpoint
+kontra serve                           # on the machine that does the work (a key will do here)
 ```
 
 A published version is fixed: change a type or `offering.yaml` and bump the version, or
@@ -151,9 +177,11 @@ See [docs/buyers.md](docs/buyers.md).
 - **The Authorizer.** Kontra runs its own Temporal server. Every token on the public frontend
   is one weak role, `<namespace>:worker`, confined to its own namespace by an allowlist; no
   token can reach an Operator or Admin API, so a compromised seller machine cannot repoint an
-  offering. A callback guard closes an upstream Temporal gap that would let one seller forge
-  another's Nexus completion. Both are in [`temporal/authorizer`](temporal/authorizer), public
-  so you can read the policy you run under.
+  offering. The policy is in [`temporal/authorizer`](temporal/authorizer), public so you can
+  read the rules you run under.
+- **Logins and keys.** A person signs in through a device code that only their own screen
+  shows, approved in the browser or through a mailed link whose page asks for that code. An
+  API key is for programs: it never publishes, whatever its age.
 
 What Kontra can and cannot see, the threat model, and the limits: [docs/security.md](docs/security.md).
 
@@ -163,7 +191,7 @@ What Kontra can and cannot see, the threat model, and the limits: [docs/security
 |---|---|
 | [docs/sellers.md](docs/sellers.md) | writing, testing, publishing and serving an offering |
 | [docs/buyers.md](docs/buyers.md) | hiring from the CLI, a script, a workflow, or an agent |
-| [docs/security.md](docs/security.md) | threat model, encryption, the Authorizer and the callback guard |
+| [docs/security.md](docs/security.md) | threat model, encryption and the Authorizer |
 | [docs/architecture.md](docs/architecture.md) | the five seams, the one-way rule, how names are built |
 | [docs/decisions.md](docs/decisions.md) | implementation decisions, checked against Temporal and nexgen |
 | [spec/](spec/README.md) | the contract document's `x-kontra` extension and reserved types |
