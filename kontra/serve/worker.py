@@ -13,8 +13,8 @@ generated one, then yours) and ``interceptors`` (Kontra's first, then yours). Th
 keywords are read from temporalio's own signature, so a new temporalio keyword passes
 through without a Kontra release.
 
-Starting (:meth:`Worker.run` / :meth:`Worker.run_async`), in order: load the profile and
-session, install the process's Kontra runtime, connect to Temporal as the ``worker`` role
+Starting (:meth:`Worker.run` / :meth:`Worker.run_async`), in order: load the session
+(``KONTRA_API_KEY``, else the profile), install the process's Kontra runtime, connect to Temporal as the ``worker`` role
 (the JWT is refreshed in the background, §10.3) with the pydantic converter and the codec,
 fetch the gate's JWKS, then the **hash lock** (§11.2): each offering's contract hash must
 equal the catalog's, or the worker refuses to start ("republish or bump the version"). An
@@ -252,8 +252,9 @@ class Worker:
     ) -> None:
         """Connect, verify and build the inner workers, without polling yet.
 
-        ``session``: a logged-in :class:`kontra.auth.Session` (default: the profile in
-        ``home`` / ``$KONTRA_HOME``). ``client``: a Temporal client to share the connection
+        ``session``: a logged-in :class:`kontra.auth.Session` (default: ``KONTRA_API_KEY``
+        if set, else the profile in ``home`` / ``$KONTRA_HOME``; a key serves as well as a
+        login, it only cannot publish). ``client``: a Temporal client to share the connection
         of (its namespace must be the profile's; the codec is added here). ``gate``: the gate
         client (default: the session's). The last three exist for tests.
         """
@@ -278,9 +279,9 @@ class Worker:
         home: str | Path | None,
     ) -> None:
         if session is None:
-            session = Session(Profile.load(home))
+            session = Session.from_env(home)  # KONTRA_API_KEY, else the profile
             stack.push_async_callback(session.aclose)
-        profile = session.profile
+        profile = await session.resolve()
         gate = gate or session.gate
         home_dir = _home_dir(profile, home)
         identity = session.identity()

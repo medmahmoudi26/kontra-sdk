@@ -2,7 +2,8 @@
 
 It runs next to the agent (decisions I5): only this machine holds the key that decrypts a
 delivery, so a hosted server would have to read every input and output it relays. Every
-tool is a thin layer over the buyer SDK with the local profile -- the same gate routes and
+tool is a thin layer over the buyer SDK with the local profile (or ``KONTRA_API_KEY``: an
+agent can hire with a key, never publish) -- the same gate routes and
 the same checks as a script (the input is validated against the sealed contract before it
 is encrypted, ``max_price`` is enforced before anything is locked, a delivery is checked
 against the output schema after it is decrypted). The server only adds what an agent needs:
@@ -42,6 +43,7 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, Field
 
 from kontra import __version__
+from kontra.auth import api_key_from_env
 from kontra.contract.errors import join_path
 from kontra.contract.names import is_job_id
 from kontra.contract.units import format_duration
@@ -226,8 +228,9 @@ class _Seen:
 class KontraTools:
     """The tools' behaviour, over one :class:`~kontra.hire.Kontra` client.
 
-    ``kontra=None``: a client on the local profile, made on first use and closed by
-    :meth:`aclose`. A given client belongs to the caller and is never closed here.
+    ``kontra=None``: a client on the local profile (or ``KONTRA_API_KEY``), made on first
+    use and closed by :meth:`aclose`. A given client belongs to the caller and is never
+    closed here.
     """
 
     def __init__(self, kontra: Kontra | None = None, *, inline_limit: int = INLINE_LIMIT) -> None:
@@ -772,7 +775,7 @@ async def _answer(work: Awaitable[BaseModel]) -> CallToolResult:
 
 def server(kontra: Kontra | None = None, *, inline_limit: int = INLINE_LIMIT) -> MCPServer[None]:
     """The MCP server with the eight tools, on ``kontra`` (default: a client on the local
-    profile, made on first use). Run it with ``.run("stdio")``, or connect to it in-process
+    profile or ``KONTRA_API_KEY``, made on first use). Run it with ``.run("stdio")``, or connect to it in-process
     (``mcp.Client(server(...))``) in tests."""
     tools = KontraTools(kontra, inline_limit=inline_limit)
 
@@ -910,17 +913,27 @@ def server(kontra: Kontra | None = None, *, inline_limit: int = INLINE_LIMIT) ->
     return app
 
 
+def startup_problem() -> str | None:
+    """Why ``kontra mcp`` cannot serve, checked before any agent connects: no credential
+    (``KONTRA_API_KEY``, else a profile), a malformed key, or no key file to decrypt with.
+    None when it can. The message never quotes a credential."""
+    try:
+        if api_key_from_env() is None:
+            Profile.load()
+        Profile.identity()
+    except ProfileError as err:
+        return str(err)
+    return None
+
+
 def main() -> None:
     """``kontra mcp``: serve the tools on stdio to an agent on this machine. stdout is the
     protocol channel, so everything else (logs, the not-logged-in message) goes to stderr."""
     logging.basicConfig(
         level=logging.WARNING, stream=sys.stderr, format="kontra mcp: %(levelname)s %(message)s"
     )
-    try:
-        # Refuse to start, rather than fail on the agent's first call.
-        Profile.load()
-        Profile.identity()
-    except ProfileError as err:
-        sys.stderr.write(f"kontra mcp: {err}\n")
-        raise SystemExit(1) from None
+    problem = startup_problem()  # refuse to start, rather than fail on the agent's first call
+    if problem is not None:
+        sys.stderr.write(f"kontra mcp: {problem}\n")
+        raise SystemExit(1)
     server().run("stdio")

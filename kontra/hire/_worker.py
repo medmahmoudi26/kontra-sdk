@@ -194,8 +194,8 @@ async def worker(
 
     The hire activities are registered next to ``activities``; ``client`` (default: the
     profile's, connected as the ``worker`` role) gets the buyer's data converter. ``kontra``
-    is the buyer client the activities use (default: ``Kontra()`` from the profile, closed
-    with the worker). Other keywords go to ``temporalio.worker.Worker`` unchanged.
+    is the buyer client the activities use (default: ``Kontra()`` -- ``KONTRA_API_KEY``, else
+    the profile -- closed with the worker). Other keywords go to ``temporalio.worker.Worker`` unchanged.
     """
     owned = kontra is None
     k = kontra if kontra is not None else Kontra()
