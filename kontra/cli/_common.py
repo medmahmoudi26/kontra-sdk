@@ -52,6 +52,9 @@ MAX_INPUT_BYTES = 4 * 1024 * 1024
 _HINTS = {
     "stale_session": "your login is too old for this (it needs a recent one): run "
     "`kontra login` and try again",
+    "fresh_login_required": "an API key hires and serves, but publishing, setting your key "
+    "and managing keys need a person's recent login: unset KONTRA_API_KEY and run "
+    "`kontra login`",
     "invalid_token": "the gate no longer accepts this session: run `kontra login`",
 }
 

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
-from kontra.cli._account import gate_url_or_fail
+from kontra.cli._account import gate_url
 from kontra.cli._common import emit_json, fail, printable, run
 
 if TYPE_CHECKING:
@@ -137,7 +137,11 @@ def _default_output(name: str, lang: str, package: str | None) -> Path:
     metavar="P",
     help="Java only, required: the base package; its last segment names the directory.",
 )
-@click.option("--gate", metavar="URL", help="The gate (default: $KONTRA_GATE, else the profile's).")
+@click.option(
+    "--gate",
+    metavar="URL",
+    help="The gate (default: $KONTRA_GATE, else the profile's, else https://api.kontra.run).",
+)
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 def pull(
     offering: str,
@@ -162,7 +166,7 @@ def pull(
     if package is not None and _JAVA_PACKAGE.fullmatch(package) is None:
         fail(f"--package {package!r} is not a Java package name (e.g. com.example.enrich)")
     OfferingRef.parse(offering)  # a malformed reference fails before any request
-    url = _catalog_url(gate_url_or_fail(gate))
+    url = _catalog_url(gate_url(gate))
 
     async def fetch() -> m.CatalogEntry:
         async with GateClient(url) as client:  # the catalog is public: no credentials sent
