@@ -41,6 +41,9 @@ ETAG = '"' + "0123456789abcdef" * 2 + '"'
 #: An AWS multipart upload id is about 150 characters; leave plenty.
 UPLOAD_ID = "u" * 1024
 AGE_KEY = "age1" + "q" * 58
+API_KEY = m.API_KEY_PREFIX + "k" * 43
+#: The longest address the gate takes: a 64-character local part, 254 in all.
+EMAIL = "e" * 64 + "@" + "d" * 61 + "." + "d" * 61 + "." + "d" * 57 + ".example"
 #: The gates' relayed-payload limit (2 MiB) and heartbeat limit (64 KiB), as base64.
 PAYLOAD_B64 = base64.b64encode(b"\0" * (2 * MiB)).decode()
 HEARTBEAT_B64 = base64.b64encode(b"\0" * (64 * 1024)).decode()
@@ -226,7 +229,10 @@ def _largest_request(model: type[BaseModel]) -> dict[str, Any]:
             "refresh_token": "r" * 43,
             "device_code": "d" * 43,
             "handle": HANDLE,
+            "api_key": API_KEY,
         },
+        m.MagicLinkRequest: {"email": EMAIL, "device_user_code": "BCDF-GHJK"},
+        m.ApiKeyCreate: {"label": "l" * 64},
         m.DevLogin: {"handle": HANDLE},
         m.SetKey: {"public_key": AGE_KEY},
         m.PublishRequest: {"document": CONTRACT},
@@ -263,6 +269,8 @@ _BODY_LIMIT = {
     "model",
     [
         m.TokenRequest,
+        m.MagicLinkRequest,
+        m.ApiKeyCreate,
         m.DevLogin,
         m.SetKey,
         m.PublishRequest,
