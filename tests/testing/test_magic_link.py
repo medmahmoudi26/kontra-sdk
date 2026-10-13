@@ -111,8 +111,8 @@ async def test_a_malformed_request_is_422(invite: Invite, body: dict[str, str]) 
 
 
 async def test_rate_limits_count_every_request_invited_or_not(invite: Invite) -> None:
-    """Per address and per client. A limit that counted only mail sent would tell an
-    attacker who is invited."""
+    """Per address (from one client) and per client. A limit that counted only mail sent
+    would tell an attacker who is invited."""
     gate = invite.gate
     gate.allow_email("ann@example.com")
     start, _ = await invite.device()
@@ -132,6 +132,74 @@ async def test_rate_limits_count_every_request_invited_or_not(invite: Invite) ->
     with pytest.raises(GateError) as e:
         await anon.magic_link("user9@example.com", "BCDF-GHJK")
     assert e.value.status == 429
+
+
+def _from(gate: FakeGate, address: str) -> GateClient:
+    """An anonymous client of ``gate`` connecting from ``address``."""
+    transport = httpx.ASGITransport(app=gate.app, client=(address, 4242))
+    return GateClient(gate.base_url, transport=transport)
+
+
+async def test_strangers_cannot_spend_an_addresses_budget(invite: Invite) -> None:
+    """The review's F2: five requests for Ann's address, from anywhere and with any code,
+    used to lock Ann out of sign-in for an hour. An address's budget is now counted per
+    requesting network (an IPv4 /24, an IPv6 /48): the stranger spends his own, and Ann, from
+    her own network, still gets her link."""
+    gate = invite.gate
+    gate.allow_email("ann@example.com")
+    mallory = _from(gate, "192.0.2.66")
+    for _ in range(gate.magic_link_rate_per_email):
+        await mallory.magic_link("ann@example.com", "BCDF-GHJK")
+    for again in (mallory, _from(gate, "192.0.2.67")):  # another address of his network too
+        with pytest.raises(GateError) as e:
+            await again.magic_link("ann@example.com", "BCDF-GHJK")
+        assert e.value.status == 429  # he is limited, from his network
+    assert gate.outbox == []
+    ann = _from(gate, "203.0.113.5")
+    start = await ann.device_start()
+    assert await ann.magic_link("ann@example.com", start.user_code) == m.MagicLinkSent()
+    [mail] = gate.outbox
+    assert mail.to == "ann@example.com"
+
+
+async def test_a_strangers_pending_codes_do_not_use_up_the_addresses_mail(invite: Invite) -> None:
+    """With pending codes of his own, a stranger makes the gate mail Ann links; the mails he
+    causes count against his network, so Ann's own request still gets one. Only past the
+    address's cap over every network together does mail stop (distributed abuse)."""
+    gate = invite.gate
+    gate.allow_email("ann@example.com")
+    mallory = _from(gate, "192.0.2.66")
+    for _ in range(gate.magic_link_rate_per_email):
+        start = await mallory.device_start()
+        await mallory.magic_link("ann@example.com", start.user_code)
+    assert len(gate.outbox) == gate.magic_link_rate_per_email  # unsolicited, and capped
+    ann = _from(gate, "203.0.113.5")
+    start = await ann.device_start()
+    await ann.magic_link("ann@example.com", start.user_code)
+    assert len(gate.outbox) == gate.magic_link_rate_per_email + 1
+    # Many networks together reach the address's own cap, and then nothing more goes out.
+    capped = FakeGate(None, dev=False, sweep_interval=0, magic_link_max_per_email=3)
+    capped.allow_email("ann@example.com")
+    for i in range(5):
+        c = _from(capped, f"2001:db8:{i + 1}::1")
+        start = await c.device_start()
+        assert await c.magic_link("ann@example.com", start.user_code) == m.MagicLinkSent()
+    assert len(capped.outbox) == 3
+
+
+async def test_one_machines_ipv6_prefix_is_one_budget() -> None:
+    """Rotating through the /64s of one routed /48 buys no more requests for an address."""
+    gate = FakeGate(None, dev=False, sweep_interval=0, magic_link_rate_per_email=2)
+    statuses = []
+    for i in range(4):
+        try:
+            await _from(gate, f"2001:db8:66:{i}::1").magic_link("ann@example.com", "BCDF-GHJK")
+            statuses.append(202)
+        except GateError as e:
+            statuses.append(e.status)
+    assert statuses == [202, 202, 429, 429]
+    other = _from(gate, "2001:db8:67::1")
+    assert await other.magic_link("ann@example.com", "BCDF-GHJK") == m.MagicLinkSent()
 
 
 async def test_the_link_signs_up_an_invited_address_then_logs_it_in(invite: Invite) -> None:

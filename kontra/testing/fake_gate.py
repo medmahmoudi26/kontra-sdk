@@ -44,6 +44,7 @@ import binascii
 import contextlib
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -165,6 +166,8 @@ MAGIC_LINK_ATTEMPTS = 3
 KEY_USE_RESOLUTION = timedelta(minutes=1)
 #: ``GET /v1/keys`` lists every live key, then the latest revoked ones, this many in all.
 KEYS_LISTED = 100
+#: ``GET /v1/sessions`` lists at most this many sign-ins.
+SESSIONS_LISTED = 100
 #: A relayed Nexus payload (quote or start input): Temporal's own default blob limit.
 MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 MAX_PROGRESS_BYTES = 64 * 1024
@@ -175,6 +178,9 @@ AGE_MAGIC = b"age-encryption.org/v1\n"
 MAX_BLOB_BYTES = 64 * 1024 * 1024
 NOTE_MAX = 2000
 WORKER_TTL = timedelta(minutes=15)
+#: How long a revoked session stays on ``GET /v1/auth/revocations``: past any worker token's
+#: life, with room for the clocks of the gate and Temporal to disagree.
+REVOCATION_WINDOW = WORKER_TTL + timedelta(minutes=5)
 LIST_LIMIT_MAX = 200
 SEARCH_LIMIT_MAX = 100
 SEARCH_Q_MAX = 200
@@ -345,7 +351,12 @@ class _Session:
     party: str
     auth_time: datetime
     via: str
-    revoked: bool = False
+    revoked_at: datetime | None = None
+    created_at: datetime | None = None
+
+    @property
+    def revoked(self) -> bool:
+        return self.revoked_at is not None
 
 
 @dataclass
@@ -394,6 +405,10 @@ class _MagicLink:
     email: str
     device_user_code: str
     expires_at: datetime
+    #: Who asked for it (the requester's network, :func:`_requester_network`) and when: the
+    #: mail limits count by these.
+    client: str = ""
+    created_at: datetime | None = None
     consumed_at: datetime | None = None
     attempts: int = 0
 
@@ -606,7 +621,14 @@ class FakeGate:
     does, since approving any requested handle is logging in as anyone, which is what dev
     login is. ``signup``: ``allowlist`` mails sign-in links only to the addresses of
     :meth:`allow_email`; ``open`` to any address (the default on a ``dev`` gate, as the
-    platform's ``KONTRA_SIGNUP``). Mail goes to :attr:`outbox`.
+    platform's ``KONTRA_SIGNUP``). Mail goes to :attr:`outbox`. ``github``: the device page
+    signs in with GitHub (``GateInfo.github_sign_in``; :meth:`approve_device` is the human
+    doing it). Without it, and off a dev gate, the device page approves nothing, as on
+    production: email is the way in.
+    ``magic_link_rate_per_email``: sign-in link requests (429 past it) and mails one address
+    gets from one client an hour; ``magic_link_rate_per_client``: requests one client makes
+    an hour; ``magic_link_max_per_email``: mails one address gets an hour from every client
+    together (past it the request is answered as usual and no mail goes out).
 
     The clock offset (:meth:`advance`) moves token ``iat``/``exp`` too: a seller's
     handler verifying a hold token issued *after* an advance on the machine's clock sees
@@ -635,9 +657,11 @@ class FakeGate:
         quote_timeout: float = 10.0,
         device_auto_approve: bool | None = None,
         device_interval: int = 1,
+        github: bool = False,
         signup: Literal["allowlist", "open"] | None = None,
         magic_link_rate_per_email: int = 5,
         magic_link_rate_per_client: int = 30,
+        magic_link_max_per_email: int = 20,
         magic_link_rate_window: timedelta = timedelta(hours=1),
         part_size: int = 16 * 1024 * 1024,
         max_input_bytes: int = 5 * 1000**3,
@@ -671,9 +695,11 @@ class FakeGate:
         self.quote_timeout = quote_timeout
         self.device_auto_approve = dev if device_auto_approve is None else device_auto_approve
         self.device_interval = device_interval
+        self.github = github
         self.signup: Literal["allowlist", "open"] = signup or ("open" if dev else "allowlist")
         self.magic_link_rate_per_email = magic_link_rate_per_email
         self.magic_link_rate_per_client = magic_link_rate_per_client
+        self.magic_link_max_per_email = magic_link_max_per_email
         self.magic_link_rate_window = magic_link_rate_window
         self.part_size = part_size
         self.max_input_bytes = max_input_bytes
@@ -849,7 +875,7 @@ class FakeGate:
         return token
 
     def _open_session(self, party: str, auth_time: datetime, via: str) -> m.TokenResponse:
-        session = _Session(secrets.token_hex(16), party, auth_time, via)
+        session = _Session(secrets.token_hex(16), party, auth_time, via, created_at=self.now())
         self.sessions[session.id] = session
         return m.TokenResponse(
             access_token=self._issue_access(session),
@@ -904,7 +930,8 @@ class FakeGate:
             raise GateHTTPError(
                 403,
                 "fresh_login_required",
-                "an API key cannot do this (publish, set a key, manage API keys); "
+                "an API key cannot do this (publish, set a key, manage API keys, resolve "
+                "disputes); "
                 "log in as a person with `kontra login`",
             )
         if self.now() - who.auth_time >= self.freshness:
@@ -917,9 +944,12 @@ class FakeGate:
         return who
 
     def require_resolver(self, who: Principal) -> Principal:
+        """A resolver's fresh human session: splitting escrow is not for an API key or an
+        old login (a stolen refresh token). The list is checked first, so anyone else gets
+        ``not_resolver`` and a resolver learns that a new sign-in is what is missing."""
         if who.party not in self.resolvers:
             raise GateHTTPError(403, "not_resolver", "only a dispute resolver may do this")
-        return who
+        return self.require_fresh(who)
 
     def require_dev(self) -> None:
         if not self.dev:
@@ -929,13 +959,36 @@ class FakeGate:
         """Revoke a session; an API key's session takes its key with it (a key whose session
         is gone could never be exchanged again)."""
         session = self.sessions.get(session_id)
-        if session is not None:
-            session.revoked = True
+        if session is not None and session.revoked_at is None:
+            session.revoked_at = self.now()
         for key in self.api_keys.values():
             if key.session_id == session_id and key.revoked_at is None:
                 key.revoked_at = self.now()
 
     # ------------------------------------------------------------------ identity routes
+
+    def info(self) -> m.GateInfo:
+        """``GET /v1/info``: this gate's dev switch and ways in. Its mail is the outbox, so
+        email sign-in is always on."""
+        return m.GateInfo(dev=self.dev, email_sign_in=True, github_sign_in=self.github)
+
+    def revocations(self) -> m.Revocations:
+        """``GET /v1/auth/revocations``: sessions revoked within :data:`REVOCATION_WINDOW`,
+        newest first, as sha256 digests of their ids."""
+        since = self.now() - REVOCATION_WINDOW
+        recent = sorted(
+            (
+                s
+                for s in self.sessions.values()
+                if s.revoked_at is not None and s.revoked_at > since
+            ),
+            key=lambda s: s.revoked_at or since,
+            reverse=True,
+        )[: m.REVOCATION_WINDOW_MAX]
+        return m.Revocations(
+            window_seconds=int(REVOCATION_WINDOW.total_seconds()),
+            sessions=[hashlib.sha256(s.id.encode("ascii")).hexdigest() for s in recent],
+        )
 
     async def dev_login(self, handle: str) -> m.TokenResponse:
         party = await self.ensure_party(handle)
@@ -1057,7 +1110,8 @@ class FakeGate:
         if session is None:
             raise GateHTTPError(400, "invalid_grant", "refresh token is not valid")
         if rec.used:
-            session.revoked = True
+            if session.revoked_at is None:
+                session.revoked_at = self.now()
             raise GateHTTPError(
                 400,
                 "invalid_grant",
@@ -1112,7 +1166,7 @@ class FakeGate:
         key_id = "key_" + secrets.token_hex(8)
         while key_id in self.api_keys:  # pragma: no cover - 64 random bits
             key_id = "key_" + secrets.token_hex(8)
-        session = _Session(secrets.token_hex(16), who.party, now, "api_key")
+        session = _Session(secrets.token_hex(16), who.party, now, "api_key", created_at=now)
         self.sessions[session.id] = session
         self.api_keys[key_id] = _ApiKey(key_id, who.party, label, session.id, now)
         self._api_key_ids[_digest(secret)] = key_id
@@ -1141,6 +1195,50 @@ class FakeGate:
             key.revoked_at = self.now()
         self.revoke_session(key.session_id)
 
+    # ------------------------------------------------------------------ sign-ins
+
+    def _signs_in(self, session: _Session) -> bool:
+        """A person's login (not a key's) that can still get tokens: not revoked, with an
+        unused refresh token that has not expired."""
+        now = self.now()
+        return (
+            session.via != "api_key"
+            and session.revoked_at is None
+            and any(
+                r.session_id == session.id and not r.used and now < r.expires_at
+                for r in self._refresh.values()
+            )
+        )
+
+    def list_sessions(self, who: Principal) -> m.SessionList:
+        """``GET /v1/sessions``: the party's sign-ins, newest first (keys are /v1/keys)."""
+        mine = sorted(
+            (s for s in self.sessions.values() if s.party == who.party and self._signs_in(s)),
+            key=lambda s: s.created_at or s.auth_time,
+            reverse=True,
+        )[:SESSIONS_LISTED]
+        return m.SessionList(
+            sessions=[
+                m.SessionView(
+                    id=s.id,
+                    via=s.via,
+                    auth_time=s.auth_time,
+                    created_at=s.created_at or s.auth_time,
+                    current=s.id == who.session_id,
+                )
+                for s in mine
+            ]
+        )
+
+    def end_session(self, who: Principal, session_id: str) -> None:
+        """``DELETE /v1/sessions/{id}``: end one of the party's sign-ins (this one too).
+        Another party's, a key's (``/v1/keys``) or an unknown id is not found; one ended
+        already changes nothing."""
+        session = self.sessions.get(session_id)
+        if session is None or session.party != who.party or session.via == "api_key":
+            raise GateHTTPError(404, "not_found", "no such session")
+        self.revoke_session(session_id)
+
     # ------------------------------------------------------------------ magic links
 
     def allow_email(self, email: str) -> str:
@@ -1159,6 +1257,18 @@ class FakeGate:
     def _may_sign_in(self, email: str) -> bool:
         return self.signup == "open" or email in self.allowed_emails
 
+    def _mails_allowed(self, email: str, network: str, now: datetime) -> bool:
+        """The platform's database caps: one address gets at most ``rate_per_email`` mails
+        an hour asked from one network, and ``max_per_email`` from all of them."""
+        since = now - self.magic_link_rate_window
+        mailed = [
+            link
+            for link in self._magic.values()
+            if link.email == email and link.created_at is not None and link.created_at > since
+        ]
+        mine = sum(1 for link in mailed if link.client == network)
+        return mine < self.magic_link_rate_per_email and len(mailed) < self.magic_link_max_per_email
+
     def _count_magic_request(self, key: str, limit: int, now: datetime) -> bool:
         """Record one request under ``key``; False when it is over ``limit`` this window."""
         seen = self._magic_rate.setdefault(key, deque())
@@ -1171,10 +1281,17 @@ class FakeGate:
         """``POST /v1/auth/magic``. Mail goes out only for an address that may sign in and a
         user code that is pending; every other request gets the identical answer, and every
         request counts against the rate limits, so neither the answer nor a 429 says who is
-        invited."""
+        invited. An address's limits are counted per requesting network (an IPv4 /24, an
+        IPv6 /48, as the platform counts them; ``client`` is the requester's address): a
+        stranger who asks for links to an address spends his own network's budget, never
+        its owner's. Past :attr:`magic_link_max_per_email` mails to one address an hour,
+        from every network together, no more go out (the answer stays the same)."""
         now = self.now()
         email = req.email.lower()
-        by_email = self._count_magic_request("email:" + email, self.magic_link_rate_per_email, now)
+        network = _requester_network(client)
+        by_email = self._count_magic_request(
+            f"email:{email}:network:{network}", self.magic_link_rate_per_email, now
+        )
         by_client = self._count_magic_request(
             "client:" + client, self.magic_link_rate_per_client, now
         )
@@ -1188,10 +1305,19 @@ class FakeGate:
                 headers={"Retry-After": str(retry)},
             )
         device = self._device_by_user_code(req.device_user_code)
-        if device is not None and self._pending(device) and self._may_sign_in(email):
+        if (
+            device is not None
+            and self._pending(device)
+            and self._may_sign_in(email)
+            and self._mails_allowed(email, network, now)
+        ):
             token = secrets.token_urlsafe(32)
             self._magic[_digest(token)] = _MagicLink(
-                email, device.user_code, min(now + MAGIC_LINK_TTL, device.expires_at)
+                email,
+                device.user_code,
+                min(now + MAGIC_LINK_TTL, device.expires_at),
+                client=network,
+                created_at=now,
             )
             link = f"{self.base_url}/auth/magic?t={token}"
             self.outbox.append(
@@ -2677,6 +2803,19 @@ def _frontend_of(control: TemporalControl | None) -> str:
     return target if isinstance(target, str) and target else "temporal.invalid:7233"
 
 
+def _requester_network(client: str) -> str:
+    """The network a sign-in link request is charged to, as the platform counts it: the
+    client's IPv4 /24 or IPv6 /48 (one machine easily holds a whole routed IPv6 /48, so a
+    budget per address would let one stranger use up an address's mail by himself).
+    Anything that is not an address (a test client's name) is its own network."""
+    try:
+        net = ipaddress.ip_network(client, strict=False)
+    except ValueError:
+        return client
+    prefix = 24 if net.version == 4 else 48
+    return str(net.supernet(new_prefix=prefix)) if net.prefixlen > prefix else str(net)
+
+
 def _digest(secret: str) -> str:
     return hashlib.sha256(secret.encode("ascii", "replace")).hexdigest()
 
@@ -2857,6 +2996,13 @@ def _build_app(gate: FakeGate) -> FastAPI:
     async def jwks() -> JSONResponse:
         return JSONResponse(gate.keys.jwks())
 
+    async def info() -> m.GateInfo:
+        return gate.info()
+
+    async def revocations(response: Response) -> m.Revocations:
+        no_store(response)
+        return gate.revocations()
+
     async def device_start(response: Response) -> m.DeviceStart:
         no_store(response)
         return gate.device_start()
@@ -2906,6 +3052,8 @@ def _build_app(gate: FakeGate) -> FastAPI:
         return Response(status_code=204)
 
     add("jwks", jwks)
+    add("info", info)
+    add("revocations", revocations)
     add("device_start", device_start)
     add("token", token)
     add("magic_link", magic_link)
@@ -2918,6 +3066,17 @@ def _build_app(gate: FakeGate) -> FastAPI:
     add("create_api_key", create_api_key)
     add("api_keys", api_keys)
     add("revoke_api_key", revoke_api_key)
+
+    async def sessions(who: Fresh, response: Response) -> m.SessionList:
+        no_store(response)
+        return gate.list_sessions(who)
+
+    async def end_session(who: Fresh, session_id: str) -> Response:
+        gate.end_session(who, session_id)
+        return Response(status_code=204)
+
+    add("sessions", sessions)
+    add("end_session", end_session)
 
     # ---------------------------------------------------------------- catalog
 

@@ -35,6 +35,8 @@ Call = Callable[[GateClient], Awaitable[Any]]
 #: route name -> (how to call it, the path parameters that call must produce)
 CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     "jwks": (lambda c: c.jwks(), {}),
+    "info": (lambda c: c.info(), {}),
+    "revocations": (lambda c: c.revocations(), {}),
     "device_start": (lambda c: c.device_start(), {}),
     "token": (
         lambda c: c.token(m.TokenRequest(grant_type="refresh_token", refresh_token="r")),
@@ -50,6 +52,8 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     "create_api_key": (lambda c: c.create_api_key("ci"), {}),
     "api_keys": (lambda c: c.api_keys(), {}),
     "revoke_api_key": (lambda c: c.revoke_api_key(KEY_ID), {"key_id": KEY_ID}),
+    "sessions": (lambda c: c.sessions(), {}),
+    "end_session": (lambda c: c.end_session(JOB), {"session_id": JOB}),
     "publish": (lambda c: c.publish({"nexusrpc": "1.0.0"}), {}),
     "search": (lambda c: c.search("enrich"), {}),
     "get_offering": (
