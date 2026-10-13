@@ -166,7 +166,7 @@ services:
     # nothing else -- no network, a read-only root -- running one fixed command: CHOWN, and
     # DAC_READ_SEARCH to walk the directories SeaweedFS creates 0700 for itself (on every
     # start after the first, the walk finds them all its own already).
-    image: chrislusf/seaweedfs:3.80@sha256:1055999e08eed1789b0ae45d235126e4495e23d3fb9d6396293fd42539b1ae6a
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
     entrypoint: ["chown", "-R", "10001:10001", "/data"]
     volumes:
       - s3:/data
@@ -181,7 +181,7 @@ services:
     # The claim-check bucket (ciphertext only). SeaweedFS: MinIO's images can no longer be
     # pulled anonymously.
     # chrislusf/seaweedfs:3.80
-    image: chrislusf/seaweedfs:3.80@sha256:1055999e08eed1789b0ae45d235126e4495e23d3fb9d6396293fd42539b1ae6a
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
     # Credentials: the identities config, which this writes to the tmpfs before the image's
     # own entrypoint starts SeaweedFS. Not compose `configs`: compose copies their content
     # into the container's root filesystem, which read_only refuses.
