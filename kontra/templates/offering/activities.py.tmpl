@@ -1,0 +1,27 @@
+"""Plain Temporal activities: nothing from kontra is imported here (D1). Heartbeat as you
+would for Temporal anyway; Kontra's worker forwards the details to the buyer, encrypted,
+as the job's progress."""
+
+import re
+from collections import Counter
+
+from temporalio import activity
+
+from models import {{Class}}Output
+
+_WORD = re.compile(r"[\w']+")
+
+
+@activity.defn
+async def count_words(text: str) -> {{Class}}Output:
+    counts: Counter[str] = Counter()
+    lines = text.splitlines()
+    for number, line in enumerate(lines, 1):
+        counts.update(word.lower() for word in _WORD.findall(line))
+        if number % 1000 == 0:
+            activity.heartbeat(
+                {"percent": round(100 * number / len(lines), 1), "message": f"{number} lines"}
+            )
+    return {{Class}}Output(
+        words=sum(counts.values()), lines=len(lines), top=dict(counts.most_common(10))
+    )

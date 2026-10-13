@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The reserved definitions of a Kontra contract document (decisions I2). A document carries each one it uses under exactly this name, byte for byte (after RFC 8785 canonicalisation); the catalog refuses any difference, and seller definitions may not start with Kontra.",
+  "$defs": {
+    "KontraArtifact": {
+      "description": "A file in the claim-check bucket, encrypted (age) to the job's parties: a reference, never the bytes. size and sha256 are of the plaintext; a download verifies both.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "content_type",
+        "key",
+        "sha256",
+        "size"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 32,
+          "maxLength": 32,
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "content_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        }
+      }
+    },
+    "KontraQuote": {
+      "description": "The answer of the quote operation. ok: a fixed price (amount_minor in the currency's minor unit, e.g. cents) valid for a job of at most max_duration_seconds. rejected: the seller will not take this input, with a reason. busy: try again after eta_seconds.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "rejected",
+            "busy"
+          ]
+        },
+        "amount_minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9]{2,7}$"
+        },
+        "max_duration_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2592000
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "eta_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2592000
+        }
+      }
+    }
+  }
+}

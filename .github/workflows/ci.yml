@@ -1,0 +1,284 @@
+# The gate every change passes (PRD §19.4). Each job runs one `make` target, so
+# `make check` locally is exactly this workflow minus e2e.
+#
+# Required checks (branch protection on `dev` and `main`): lint, typecheck, test,
+# test (3.11), seams, seams (3.11), deny-matrix. `deny-matrix` is seam ①, the Authorizer's
+# policy: the Go deny matrix and the same cells over the wire against the real server
+# binary (docs/security.md).
+#
+# e2e runs after all of them against `kontra dev` (compose: the Temporal image built here,
+# the published gate image). The gate is private (kontra-cloud): `gate-image` checks that its
+# image can be read first, and when it cannot, says so in a warning and the run summary and
+# e2e shows as skipped -- it never passes by quietly running nothing. While the image is
+# private, a pull request from a fork is skipped the same way, and says why: its code would
+# run on the runner that pulled the gate (one `docker save` away from leaving with it).
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [dev]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The uv that wrote uv.lock; `make sync` installs with --locked.
+  UV_VERSION: "0.11.7"
+  FORCE_COLOR: "1"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: make sync
+      - run: make lint
+
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: make sync
+      - run: make typecheck
+
+  # Every Python the package claims (requires-python >= 3.11). The 3.12 leg keeps the name
+  # `test` that branch protection requires; the others are `test (3.11)`, and so on.
+  test:
+    name: ${{ matrix.python == '3.12' && 'test' || format('test ({0})', matrix.python) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    env:
+      PYTHON: ${{ matrix.python }} # make sync: uv sync --python $(PYTHON)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-suffix: py${{ matrix.python }}
+      - run: make sync
+      # Downloads Temporal CLI 1.9.1 (checksum-verified) and sets KONTRA_TEMPORAL_CLI, so a
+      # dev server that cannot start fails the run instead of skipping its tests.
+      - run: make test
+
+  # The seams on every Python the package claims too: the codec's plaintext rules, the
+  # contract's canonical form and hash and the ledger are what a 3.11 difference must not
+  # change unseen (`test` leaves them out, so nothing runs twice).
+  seams:
+    name: ${{ matrix.python == '3.12' && 'seams' || format('seams ({0})', matrix.python) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    env:
+      PYTHON: ${{ matrix.python }} # make sync: uv sync --python $(PYTHON)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-suffix: py${{ matrix.python }}
+      - run: make sync
+      - run: make seams
+
+  deny-matrix:
+    name: deny-matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # Hosted runners have the memory for a parallel Temporal server compile.
+      GOFLAGS: -p=4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: temporal/authorizer/go.mod
+          cache-dependency-path: temporal/authorizer/go.sum
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: make sync
+      - name: Go deny matrix, callback guard and config pins (go vet, go test)
+        run: make go
+      - name: The same policy over the wire (builds bin/kontra-temporal, runs tests/temporal)
+        run: make wire
+
+  gate-image:
+    name: gate-image
+    needs: [lint, typecheck, test, seams, deny-matrix]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      packages: read # see the gate image when the package grants this repository access
+    outputs:
+      available: ${{ steps.probe.outputs.available }}
+      public: ${{ steps.public.outputs.public }}
+    env:
+      GATE_IMAGE: ghcr.io/medmahmoudi26/kontra-gate:dev
+      # Empty unless this is a pull request; compared in the shell, never interpolated.
+      HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+    steps:
+      # Anyone may read a public image, and then nothing here is secret. A private one is
+      # the gate's code (Python): it is pulled only with this repository's credential, and
+      # never for a fork's pull request, whose code would run next to it (decisions I14).
+      - name: Can anyone read the gate image?
+        id: public
+        run: |
+          for attempt in 1 2; do
+            if docker manifest inspect "$GATE_IMAGE" > /dev/null 2>&1; then
+              echo "public=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "public=false" >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR (read)
+        if: >-
+          steps.public.outputs.public != 'true'
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
+        continue-on-error: true # the probe below reports an image it cannot read
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Can e2e use it?
+        id: probe
+        env:
+          PUBLIC: ${{ steps.public.outputs.public }}
+        run: |
+          skip() {
+            echo "::warning title=e2e skipped::$1"
+            {
+              echo "### e2e skipped"
+              echo
+              echo "$1"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          if [ "$PUBLIC" = true ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+            skip "e2e skipped: $GATE_IMAGE is not public, and this pull request comes from a fork, whose code does not run next to a private gate image. To run e2e, a maintainer pushes the branch to this repository and opens the pull request from there."
+          fi
+          for attempt in 1 2 3; do
+            if docker manifest inspect "$GATE_IMAGE" > /dev/null; then
+              echo "available=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          skip "e2e skipped: $GATE_IMAGE cannot be read. The gate is built in the private kontra-cloud repository; make its package public, or grant this repository read access to it (package settings, Manage Actions access)."
+
+  e2e:
+    name: e2e
+    needs: gate-image
+    # gate-image decides, the fork rule included; repeated here, where the PR's code runs.
+    if: >-
+      needs.gate-image.outputs.available == 'true'
+      && (needs.gate-image.outputs.public == 'true'
+          || github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read # pull the gate image
+    env:
+      GATE_IMAGE: ghcr.io/medmahmoudi26/kontra-gate:dev
+      TEMPORAL_IMAGE: kontra-temporal:ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to GHCR (read)
+        if: needs.gate-image.outputs.public != 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Log out as soon as the image is here: every later step runs this branch's code, and
+      # the credential would otherwise sit in ~/.docker/config.json for it to read.
+      - name: Pull the gate image
+        run: |
+          docker pull --quiet "$GATE_IMAGE"
+          docker logout ghcr.io
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the Temporal image (temporal/authorizer/Dockerfile)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: temporal/authorizer
+          file: temporal/authorizer/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.TEMPORAL_IMAGE }}
+          cache-from: type=gha,scope=kontra-temporal
+          cache-to: type=gha,mode=max,scope=kontra-temporal
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: make sync
+      - name: kontra dev up, then tests/e2e (make e2e)
+        run: |
+          export KONTRA_HOME="$RUNNER_TEMP/kontra-home"
+          export KONTRA_TEMPORAL_IMAGE="$TEMPORAL_IMAGE"
+          export KONTRA_GATE_IMAGE="$GATE_IMAGE"
+          make e2e
+      - name: Stack logs
+        if: failure()
+        run: KONTRA_HOME="$RUNNER_TEMP/kontra-home" .venv/bin/kontra dev logs --tail 300
+      - name: kontra dev down
+        if: always()
+        run: KONTRA_HOME="$RUNNER_TEMP/kontra-home" .venv/bin/kontra dev down --volumes

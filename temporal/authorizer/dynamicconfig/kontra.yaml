@@ -1,0 +1,100 @@
+# Kontra's Temporal dynamic config (PRD §10.6, decisions I12).
+#
+# A per-namespace setting without constraints is the default for EACH namespace
+# separately: one party's load never spends another party's budget. The gate may append
+# per-namespace overrides (the server re-reads this file every KONTRA_DYNAMIC_CONFIG_POLL,
+# default 10s), for example:
+#
+#   frontend.namespaceRPS:
+#     - value: 1000
+#       constraints: {namespace: acme}
+#     - value: 200
+#
+# kontra-temporal refuses to start on an unknown key, a value of the wrong type, or a
+# change to one of the isolation settings below; while it runs, it serves those settings
+# from its own code whatever this file says (Temporal re-reads the file every poll and
+# only logs other problems, so whoever edits it must keep it valid).
+
+# --- Features ------------------------------------------------------------------------
+# Standalone Nexus operations: how a buyer's script hires without a worker (decisions I4).
+nexusoperation.enableStandalone:
+  - value: true
+history.enableChasm:
+  - value: true
+
+# --- Isolation (PRD §10.4). Pinned: checked at startup, enforced while running -------
+# Workflow commands that target another namespace (start child, signal external, cancel
+# external) are refused by history, so a worker of C cannot reach A from a workflow task.
+system.enableCrossNamespaceCommands:
+  - value: false
+# Streaming RPCs (replication streams, reflection) go through the authorizer.
+system.disableStreamingAuthorizer:
+  - value: false
+# A task token from namespace B is refused in a request that names namespace A.
+frontend.enableTokenNamespaceEnforcement:
+  - value: true
+# Nexus headers a caller may not set (workflow callers, then standalone operations):
+# Temporal's defaults plus the three its Nexus transport reads back as the callback token,
+# request id and links, which a caller's header would otherwise replace.
+component.nexusoperations.disallowedHeaders:
+  - value: [request-timeout, xdc-redirection-api, xdc-redirection-source-cell, xdc-redirection,
+            caller-name, caller-type, call-initiation, temporal-principal-type, temporal-principal-name,
+            nexus-callback-temporal-callback-token, nexus-request-id, nexus-link]
+nexusoperation.disallowedHeaders:
+  - value: [request-timeout, xdc-redirection-api, xdc-redirection-source-cell, xdc-redirection,
+            caller-name, caller-type, call-initiation, temporal-principal-type, temporal-principal-name,
+            nexus-callback-temporal-callback-token, nexus-request-id, nexus-link]
+# Deny reasons come from the Kontra authorizer's result; any other authorizer error is
+# reported as a generic PermissionDenied.
+frontend.exposeAuthorizerErrors:
+  - value: false
+
+# --- Per-namespace rate limits (per frontend instance; one instance per deployment) --
+frontend.namespaceRPS:
+  - value: 200
+frontend.namespaceBurstRatio:
+  - value: 2
+frontend.namespaceRPS.visibility:
+  - value: 20
+# Concurrent long-running requests (polls) per namespace. A Python worker holds about five
+# polls per task type, so this fits several dozen workers per party.
+frontend.namespaceCount:
+  - value: 400
+frontend.persistenceNamespaceMaxQPS:
+  - value: 1000
+history.persistenceNamespaceMaxQPS:
+  - value: 1000
+matching.persistenceNamespaceMaxQPS:
+  - value: 1000
+
+# --- Per-namespace size limits ------------------------------------------------------
+# Payloads above 256 KiB are claim-checked by the codec (decisions I7), so histories stay
+# small; these caps bound what a misbehaving party can make Kontra store.
+limit.blobSize.error:
+  - value: 2097152      # 2 MiB per payload
+limit.blobSize.warn:
+  - value: 524288       # 512 KiB
+limit.memoSize.error:
+  - value: 65536        # 64 KiB
+limit.historySize.error:
+  - value: 20971520     # 20 MiB per workflow history
+limit.historySize.warn:
+  - value: 5242880      # 5 MiB
+limit.historyCount.error:
+  - value: 20480        # events per workflow history
+limit.historyCount.warn:
+  - value: 10240
+limit.numPendingActivities.error:
+  - value: 1000
+limit.numPendingChildExecutions.error:
+  - value: 1000
+limit.numPendingSignals.error:
+  - value: 1000
+limit.numPendingCancelRequests.error:
+  - value: 1000
+nexusoperation.limit.operation.concurrencyPerWorkflow.max:
+  - value: 100
+
+# --- Global (the same for every namespace) -----------------------------------------
+limit.maxIDLength:
+  - value: 255

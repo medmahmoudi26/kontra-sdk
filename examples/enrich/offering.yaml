@@ -1,0 +1,10 @@
+# offering.yaml — declarative facts only. Nothing in here names code (D11).
+name: acme/enrich
+version: 1.2.0
+description: Resolve a URL list to company records
+pricing_hint: "$0.001 per url, $0.01 minimum"   # display only; the price comes from quote()
+max_duration: 6h          # becomes the Nexus schedule-to-close timeout
+review_window: 24h
+max_concurrent_jobs: 10   # quote returns busy + eta beyond this
+max_output_bytes: 5GB     # the gate refuses artifact uploads beyond this
+artifact_retention: 7d    # after accept; the buyer must download by then
