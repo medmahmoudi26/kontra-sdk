@@ -17,6 +17,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -363,6 +364,33 @@ def test_s3_credentials_reach_seaweedfs_without_a_writable_root(tmp_path: Path) 
 
 
 _PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+#: A proxy nothing can reach: whatever is sent to it fails.
+_PROXY = "http://proxy.invalid:3128"
+
+
+def _pulled(image: str) -> bool:
+    return _REAL_RUN(["docker", "image", "inspect", image], capture_output=True).returncode == 0
+
+
+def _proxied_client(tmp_path: Path) -> dict[str, str]:
+    """The environment of a Docker client configured with :data:`_PROXY` (its
+    ``config.json``), which compose copies into every container it creates; nothing proxy
+    related comes from our own environment."""
+    client = tmp_path / "docker-config"
+    client.mkdir()
+    (client / "config.json").write_text(
+        json.dumps({"proxies": {"default": {"httpProxy": _PROXY, "httpsProxy": _PROXY}}})
+    )
+    # The compose plugin is found through the client's config directory.
+    real = Path(os.environ.get("DOCKER_CONFIG") or Path.home() / ".docker") / "cli-plugins"
+    if real.is_dir():
+        (client / "cli-plugins").symlink_to(real)
+    clean = {
+        k: v
+        for k, v in os.environ.items()
+        if k.upper() not in (*_PROXY_VARS, "NO_PROXY", "ALL_PROXY")
+    }
+    return {**clean, "DOCKER_CONFIG": str(client)}
 
 
 @needs_compose
@@ -382,18 +410,10 @@ def test_temporal_never_sends_its_internal_traffic_to_a_proxy(tmp_path: Path) ->
     assert {var: env.get(var) for var in _PROXY_VARS} == dict.fromkeys(_PROXY_VARS, "")
 
     image = services["postgres"]["image"]
-    if _REAL_RUN(["docker", "image", "inspect", image], capture_output=True).returncode != 0:
+    if not _pulled(image):
         pytest.skip(f"{image} is not pulled here")
-    client = tmp_path / "docker-config"
-    client.mkdir()
-    proxy = "http://proxy.invalid:3128"
-    (client / "config.json").write_text(
-        json.dumps({"proxies": {"default": {"httpProxy": proxy, "httpsProxy": proxy}}})
-    )
-    # The compose plugin is found through the client's config directory.
-    real = Path(os.environ.get("DOCKER_CONFIG") or Path.home() / ".docker") / "cli-plugins"
-    if real.is_dir():
-        (client / "cli-plugins").symlink_to(real)
+    client = _proxied_client(tmp_path)
+    proxy = _PROXY
     probe = tmp_path / "probe.yaml"
     probe.write_text(
         json.dumps(
@@ -411,7 +431,6 @@ def test_temporal_never_sends_its_internal_traffic_to_a_proxy(tmp_path: Path) ->
     )
 
     def run(config: Path) -> dict[str, str]:
-        clean = {k: v for k, v in os.environ.items() if k.upper() not in _PROXY_VARS}
         proc = _REAL_RUN(
             [
                 *("docker", "compose", "-p", "kontra-proxy-test", "-f", str(config)),
@@ -419,7 +438,7 @@ def test_temporal_never_sends_its_internal_traffic_to_a_proxy(tmp_path: Path) ->
             ],
             capture_output=True,
             text=True,
-            env={**clean, "DOCKER_CONFIG": str(client)},
+            env=client,
             timeout=120,
             check=False,
         )
@@ -432,6 +451,184 @@ def test_temporal_never_sends_its_internal_traffic_to_a_proxy(tmp_path: Path) ->
     bare = tmp_path / "bare.yaml"
     bare.write_text(probe.read_text().replace('"environment"', '"labels"'))
     assert run(bare) == dict.fromkeys(_PROXY_VARS, proxy)
+
+
+#: The healthchecks before they turned proxies off: what a check does that honours the
+#: proxy compose copies into its container.
+_PROXIED_CHECKS = {
+    "s3": ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/healthz"],
+    "gate": [
+        "CMD",
+        *("python3", "-c"),
+        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)",
+    ],
+}
+#: What answers each check where its service would, run in the service's own image (the
+#: services need each other, and SeaweedFS half a minute): busybox nc reads the request and
+#: answers 200; Python serves /healthz.
+_STAND_INS: dict[str, list[str]] = {
+    "s3": [
+        *("nc", "-lk", "-p", "8333", "-e", "sh", "-c"),
+        # $$: compose would interpolate a single one.
+        'while IFS= read -r l && [ "$${l%?}" ]; do :; done;'
+        " printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 0\\r\\n\\r\\n'",
+    ],
+    "gate": [
+        *("python3", "-c"),
+        "import http.server as h\n"
+        "class H(h.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200 if self.path == '/healthz' else 404)\n"
+        "        self.end_headers()\n"
+        "h.HTTPServer(('127.0.0.1', 8080), H).serve_forever()\n",
+    ],
+}
+
+
+@needs_compose
+def test_healthchecks_never_go_through_a_proxy(tmp_path: Path) -> None:
+    """A healthcheck runs in its container's environment, where compose has copied a
+    Docker client's proxy settings, and wget and urllib send even 127.0.0.1 to that proxy:
+    on a machine with a client proxy the bucket and the gate never became healthy, and
+    `kontra dev up` waited for nothing. Compose has no environment for a healthcheck
+    alone, and the gate's own must stay as the operator set it (its internet egress,
+    GitHub and Stripe, goes through an operator's proxy), so each HTTP check turns
+    proxies off itself (busybox wget ``-Y off``, an empty urllib ``ProxyHandler``),
+    whatever its service's environment holds (the bucket's own is proxy-free too, for
+    SeaweedFS's sake: :func:`test_the_bucket_never_sends_its_own_traffic_to_a_proxy`).
+    pg_isready speaks to Postgres's local socket, never through a proxy.
+
+    The second half runs both checks, exactly as compose resolved them, as healthchecks of
+    containers of their services' images created under a client configured with a proxy,
+    each against a stand-in answering on its service's port: they become healthy. In the
+    same containers the previous checks fail: the proxy is in their environment."""
+    services = _resolved(tmp_path)["services"]
+    checks = {
+        name: svc["healthcheck"]["test"]
+        for name, svc in services.items()
+        if "healthcheck" in svc and not svc["healthcheck"].get("disable")
+    }
+    assert set(checks) == {"postgres", "s3", "gate"}
+    kind, line = checks["postgres"]
+    assert (kind, line.split()[0]) == ("CMD-SHELL", "pg_isready")
+    assert " -h" not in line  # the local socket
+    wget = ("wget", "-Y", "off", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz")
+    assert checks["s3"] == ["CMD", *wget]
+    assert checks["gate"][:3] == ["CMD", "python3", "-c"]
+    assert "u.build_opener(u.ProxyHandler({})).open(" in checks["gate"][3]
+    gate_env = services["gate"].get("environment") or {}  # the gate itself is left alone
+    assert not [k for k in gate_env if k.upper() in (*_PROXY_VARS, "NO_PROXY", "ALL_PROXY")]
+
+    s3_image = services["s3"]["image"]
+    if not _pulled(s3_image):
+        pytest.skip(f"{s3_image} is not pulled here")
+    gate_images = [os.environ.get("KONTRA_GATE_IMAGE"), services["gate"]["image"]]
+    gate_image = next((i for i in [*gate_images, "kontra-gate:dev"] if i and _pulled(i)), None)
+    images = {"s3": s3_image} | ({"gate": gate_image} if gate_image else {})
+    probes = {
+        name: {
+            "image": image,
+            "entrypoint": _STAND_INS[name],
+            "network_mode": "none",  # nothing leaves: the proxy is unreachable too
+            "healthcheck": {"test": checks[name], "interval": "1s", "retries": 30},
+        }
+        for name, image in images.items()
+    }
+    probes["s3"]["tmpfs"] = ["/data"]  # the image's VOLUME: no anonymous volume to leak
+    config = tmp_path / "health.yaml"
+    config.write_text(json.dumps({"services": probes}))
+    client = _proxied_client(tmp_path)
+    compose = (
+        *("docker", "compose", "-p", f"kontra-health-test-{uuid.uuid4().hex[:8]}"),
+        *("-f", str(config)),
+    )
+
+    def run(*args: str, timeout: float = 120) -> subprocess.CompletedProcess[str]:
+        return _REAL_RUN(
+            [*compose, *args],
+            capture_output=True,
+            text=True,
+            env=client,
+            timeout=timeout,
+            check=False,
+        )
+
+    try:
+        up = run("up", "-d", "--wait", "--wait-timeout", "60", timeout=180)
+        assert up.returncode == 0, up.stderr + run("logs").stdout
+        for name in probes:
+            seen = run("exec", "-T", name, "printenv", "http_proxy")
+            assert seen.stdout.strip() == _PROXY  # what the checks ran with
+            proxied = _PROXIED_CHECKS[name]
+            argv = ["sh", "-c", proxied[1]] if proxied[0] == "CMD-SHELL" else proxied[1:]
+            assert run("exec", "-T", name, *argv).returncode != 0, name
+            assert run("exec", "-T", name, *checks[name][1:]).returncode == 0, name
+    finally:
+        down = run("down", "-v", "--remove-orphans", "-t", "1")
+        assert down.returncode == 0, down.stderr
+    if gate_image is None:
+        pytest.skip("the gate's check ran statically only: no gate image is pulled here")
+
+
+@needs_compose
+def test_the_bucket_never_sends_its_own_traffic_to_a_proxy(tmp_path: Path) -> None:
+    """SeaweedFS's master, volume server, filer and S3 gateway dial one another over gRPC
+    at the container's own address, which Go does not exempt from HTTP(S)_PROXY as it does
+    loopback. Under a Docker client configured with a proxy (compose copies it into every
+    container) they reached nothing: the bucket never became healthy, so neither did the
+    gate, whatever the healthchecks did. The service sets all four variables empty, as
+    Temporal does; SeaweedFS connects to nothing outside its container.
+
+    The second half runs the service as compose resolved it (entrypoint, command,
+    environment, user, read-only root, healthcheck) on a network of its own, a tmpfs for its
+    volume, under a client configured with an unreachable proxy: it becomes healthy. The
+    same service without those four entries dials the proxy (its log names it)."""
+    s3 = _resolved(tmp_path)["services"]["s3"]
+    env = s3["environment"]
+    assert {var: env.get(var) for var in _PROXY_VARS} == dict.fromkeys(_PROXY_VARS, "")
+    if not _pulled(s3["image"]):
+        pytest.skip(f"{s3['image']} is not pulled here")
+    kept = ("image", "entrypoint", "command", "environment", "user", "read_only", "cap_drop")
+    fixed: dict[str, Any] = {k: s3[k] for k in (*kept, "security_opt") if k in s3}
+    # The image's VOLUME as a tmpfs owned by the service's user (s3-owner's part): no
+    # anonymous volume to leak. (Docker copies the image's root-owned /data mode onto it.)
+    uid, gid = s3["user"].split(":")
+    fixed["tmpfs"] = [*s3.get("tmpfs", []), f"/data:uid={uid},gid={gid},size=64m"]
+    fixed["healthcheck"] = {"test": s3["healthcheck"]["test"], "interval": "1s", "retries": 120}
+    bare = {**fixed, "environment": {k: v for k, v in env.items() if k not in _PROXY_VARS}}
+    config = tmp_path / "bucket.yaml"
+    config.write_text(json.dumps({"services": {"fixed": fixed, "bare": bare}}))
+    client = _proxied_client(tmp_path)
+    compose = (
+        *("docker", "compose", "-p", f"kontra-bucket-proxy-test-{uuid.uuid4().hex[:8]}"),
+        *("-f", str(config)),
+    )
+
+    def run(*args: str, timeout: float = 120) -> subprocess.CompletedProcess[str]:
+        return _REAL_RUN(
+            [*compose, *args],
+            capture_output=True,
+            text=True,
+            env=client,
+            timeout=timeout,
+            check=False,
+        )
+
+    try:
+        assert run("up", "-d", "bare").returncode == 0
+        up = run("up", "-d", "--wait", "--wait-timeout", "150", "fixed", timeout=210)
+        assert up.returncode == 0, up.stderr + run("logs", "fixed").stdout
+        assert run("exec", "-T", "fixed", "printenv", "http_proxy").stdout == "\n"
+        # Control: the same service under the same client, without the four entries.
+        assert run("exec", "-T", "bare", "printenv", "http_proxy").stdout.strip() == _PROXY
+        deadline, logs = time.monotonic() + 60, ""
+        while "proxy.invalid" not in logs and time.monotonic() < deadline:
+            time.sleep(1)
+            logs = run("logs", "--no-log-prefix", "bare").stdout
+        assert "proxy.invalid" in logs, logs[-2000:]
+    finally:
+        down = run("down", "-v", "--remove-orphans", "-t", "1")
+        assert down.returncode == 0, down.stderr
 
 
 def test_third_party_images_are_pinned_by_digest() -> None:

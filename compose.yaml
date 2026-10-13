@@ -208,6 +208,15 @@ services:
         "credentials": [{"accessKey": "${KONTRA_S3_ACCESS_KEY:?set KONTRA_S3_ACCESS_KEY}",
         "secretKey": "${KONTRA_S3_SECRET_KEY:?set KONTRA_S3_SECRET_KEY}"}],
         "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
+      # Never a proxy. Compose copies a Docker client's proxy settings into every container,
+      # and Go exempts only loopback from them: SeaweedFS's master, volume server, filer and
+      # S3 gateway dial one another over gRPC at the container's own address, so with a
+      # client proxy they reached nothing and the bucket never started (measured). SeaweedFS
+      # connects to nothing outside this container. An empty value wins over the injected one.
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
     volumes:
       - s3:/data
     # Not root: the volume is this uid's (s3-owner). The image has no user of its own, and
@@ -221,7 +230,10 @@ services:
     ports:
       - "${KONTRA_DEV_BIND:-127.0.0.1}:${KONTRA_DEV_S3_PORT:-8333}:8333"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/healthz"]
+      # Never through a proxy (-Y off), whatever the environment holds: compose copies a
+      # Docker client's proxy settings into the container, and wget would send even
+      # 127.0.0.1 there.
+      test: ["CMD", "wget", "-Y", "off", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
       interval: 2s
       timeout: 5s
       retries: 60
@@ -339,11 +351,14 @@ services:
       temporal:
         condition: service_started
     healthcheck:
+      # Never through a proxy (an empty ProxyHandler): compose copies a Docker client's
+      # proxy settings into the container, and urllib would send even 127.0.0.1 there. The
+      # healthcheck alone: the gate's own clients keep the environment it was given.
       test:
         - CMD
         - python3
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"
+        - "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8080/healthz', timeout=3)"
       interval: 3s
       timeout: 5s
       retries: 100

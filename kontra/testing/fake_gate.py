@@ -2309,8 +2309,11 @@ class FakeGate:
         a.completed, a.ciphertext_sha256 = True, digest
 
     def download_artifact(self, who: Principal, key: str) -> m.DownloadUrl:
-        """Outputs go to the job's buyer and seller; inputs to any party (the key is the
-        capability and the bytes are ciphertext)."""
+        """Outputs go to the job's seller at any time, and to its buyer once the job
+        delivered (state ``completed``: in review or later) -- before that the buyer could
+        still cancel for a refund, so an output whose key leaked early (in a progress
+        message, say) would be the work for nothing: 409 ``not_delivered``. Inputs go to any
+        party (the key is the capability and the bytes are ciphertext)."""
         a = self.artifacts.get(key)
         if a is None or not a.completed:
             raise GateHTTPError(404, "artifact_not_found", "no such artifact")
@@ -2318,6 +2321,13 @@ class FakeGate:
             job = self.jobs.get(a.job_id)
             if job is None or who.party not in (job.record.buyer, job.record.seller):
                 raise GateHTTPError(404, "artifact_not_found", "no such artifact")
+            if who.party != job.record.seller and job.record.state is not m.JobState.COMPLETED:
+                raise GateHTTPError(
+                    409,
+                    "not_delivered",
+                    f"job is {job.record.state.value}; "
+                    "its buyer may fetch its outputs once it delivered",
+                )
         exp, expires_at = self._exp()
         return m.DownloadUrl(
             url=self._sign_url("GET", f"/_blob/a/{key}", None, exp),

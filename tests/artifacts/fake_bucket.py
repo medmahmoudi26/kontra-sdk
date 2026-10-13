@@ -87,6 +87,9 @@ class FakeBucket:
         self.cut_download_at: int | None = None
         self.ignore_range = False
         self.blob_put_status = 200
+        #: How many more download URLs to refuse with 409 ``not_delivered`` (the gate has
+        #: not counted the job's delivery yet).
+        self.not_delivered = 0
         #: Called with the part number before a part is stored (to mutate the source file).
         self.on_part: Callable[[int], None] | None = None
         self.record_bodies = False
@@ -158,6 +161,9 @@ class FakeBucket:
             a = self.artifacts.get(key)
             if a is None or not a.completed:
                 return _error(404, "not_found", "no such artifact")
+            if self.not_delivered:
+                self.not_delivered -= 1
+                return _error(409, "not_delivered", "job is working")
             return _json(
                 200,
                 m.DownloadUrl(url=f"{BUCKET}/get/{key}", size=a.size, expires_at=_soon()),

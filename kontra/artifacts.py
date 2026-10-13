@@ -40,6 +40,7 @@ import httpx
 
 from kontra.codec import age
 from kontra.contract.names import is_job_id
+from kontra.gate_client import GateError
 from kontra.gate_client import models as m
 from kontra.types import Artifact
 
@@ -58,6 +59,14 @@ _TAG = 16
 _CT_CHUNK = age.CHUNK_SIZE + _TAG
 _ATTEMPTS = 4
 _BACKOFF = 0.5
+#: How long a download waits for the gate to count its job's delivery. The gate gives the
+#: buyer a job's outputs only once the job delivered (409 ``not_delivered`` before: until
+#: then the buyer could still cancel for a refund), and it learns of a delivery by
+#: observing the seller's workflow -- a sweep after the buyer's own call (``Job.result``, a
+#: buyer workflow's ``execute``) already returned the artifact references. One sweep is
+#: seconds; this is the bound ``kontra.hire`` gives ``accept`` after ``result``.
+_DELIVERY_WAIT = 60.0
+_DELIVERY_POLL_START, _DELIVERY_POLL_MAX = 0.2, 2.0
 
 _EXTRA_TYPES = {
     ".jsonl": "application/x-ndjson",
@@ -302,9 +311,25 @@ async def upload(
 # --------------------------------------------------------------------------- download
 
 
+async def _download_url(gate: ArtifactGate, key: str) -> m.DownloadUrl:
+    """The gate's GET URL for ``key``, waiting (bounded) while the gate has not yet counted
+    the delivery of the artifact's job. Any other refusal is final at once."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + _DELIVERY_WAIT
+    delay = _DELIVERY_POLL_START
+    while True:
+        try:
+            return await gate.download_artifact(key)
+        except GateError as e:
+            if (e.status, e.code) != (409, "not_delivered") or loop.time() + delay > end:
+                raise
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, _DELIVERY_POLL_MAX)
+
+
 async def _ciphertext(gate: ArtifactGate, key: str) -> AsyncIterator[bytes]:
     """The stored ciphertext, in order, resuming after a dropped connection."""
-    info = await gate.download_artifact(key)
+    info = await _download_url(gate, key)
     total, received, problem = info.size, 0, ""
     for attempt in range(_ATTEMPTS):
         if attempt:
