@@ -409,6 +409,14 @@ class GateClient:
     async def jwks(self) -> dict[str, Any]:
         return await self._object("jwks")
 
+    async def info(self) -> m.GateInfo:
+        """What this gate offers before sign-in: dev login, email sign-in, GitHub."""
+        return await self._model("info", m.GateInfo)
+
+    async def revocations(self) -> m.Revocations:
+        """The sessions revoked in the gate's window, as sha256 digests of their ids."""
+        return await self._model("revocations", m.Revocations)
+
     async def device_start(self) -> m.DeviceStart:
         return await self._model("device_start", m.DeviceStart)
 
@@ -458,6 +466,16 @@ class GateClient:
         """Revoke a key: its exchanges fail at once, and its access and worker tokens stop
         working on their next request."""
         await self._none("revoke_api_key", path={"key_id": key_id})
+
+    async def sessions(self) -> m.SessionList:
+        """The party's sign-ins (people's logins, not keys), newest first; ``current`` is
+        this one. Needs a fresh human session."""
+        return await self._model("sessions", m.SessionList)
+
+    async def end_session(self, session_id: str) -> None:
+        """End one of the party's sign-ins: its refresh tokens stop at once, its access and
+        worker tokens on their next request. Needs a fresh human session."""
+        await self._none("end_session", path={"session_id": session_id})
 
     # catalog
     async def publish(self, document: dict[str, Any]) -> m.CatalogEntry:

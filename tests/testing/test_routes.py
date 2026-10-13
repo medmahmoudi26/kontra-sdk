@@ -107,6 +107,7 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
 
     assert (await anon.health())["status"] == "ok"
     assert (await anon.jwks())["keys"]
+    assert (await anon.info()).dev  # a dev gate: dev login, play money
     start = await anon.device_start()
     dev_tokens = await anon.token(
         m.TokenRequest(
@@ -207,6 +208,11 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     assert [k.id for k in (await buyer.gate.api_keys()).keys] == [made.id]
     await buyer.gate.revoke_api_key(made.id)
     await seller.gate.revoke()
+    [mine] = (await buyer.gate.sessions()).sessions  # people's sign-ins; never a key's
+    assert mine.current
+    await buyer.gate.end_session(mine.id)  # the buyer signs out this way
+    revoked = await anon.revocations()  # the key's session and both logins
+    assert len(revoked.sessions) == 3
 
     missing = {r.name for r in ROUTES} - rec.ok
     assert not missing, f"never answered 2xx: {sorted(missing)}"
@@ -223,6 +229,7 @@ PATH_VALUES = {
     "key": "0" * 32,
     "sha256": "0" * 64,
     "key_id": "key_" + "0" * 16,
+    "session_id": "0" * 32,
 }
 
 
@@ -244,17 +251,22 @@ async def _call(gate: FakeGate, route: Route, token: str | None) -> httpx.Respon
 
 @pytest.fixture
 async def tokens(world: World) -> dict[str, str]:
-    """A party's access token, a resolver's, the party's Temporal worker token, and an
-    access token exchanged for one of the party's API keys (made a moment ago)."""
+    """A party's access token, a resolver's, the party's Temporal worker token, and access
+    tokens exchanged for an API key of the party's and of the resolver's (made a moment
+    ago)."""
     alice = await world.party("alice")
     judge = await world.party("judge")
-    key = (await alice.gate.create_api_key("probe")).key
-    exchanged = await world.anon().token(m.TokenRequest(grant_type="api_key", api_key=key))
+
+    async def exchanged(key: str) -> str:
+        req = m.TokenRequest(grant_type="api_key", api_key=key)
+        return (await world.anon().token(req)).access_token
+
     return {
         "party": await alice.access_token(),
         "resolver": await judge.access_token(),
         "worker": (await alice.gate.temporal_token()).token,
-        "api_key": exchanged.access_token,
+        "api_key": await exchanged((await alice.gate.create_api_key("probe")).key),
+        "resolver_key": await exchanged((await judge.gate.create_api_key("bot")).key),
     }
 
 
@@ -304,6 +316,15 @@ async def test_each_row_enforces_its_auth(world: World, tokens: dict[str, str], 
         assert with_party == (403, "not_resolver")
         assert with_key == (403, "not_resolver")
         assert (await status(tokens["resolver"]))[0] not in denied
+        # Splitting escrow takes the resolver's fresh human session: never a key of theirs
+        # (the review's F4), nor a login older than the window (a stolen refresh token).
+        assert await status(tokens["resolver_key"]) == (403, "fresh_login_required")
+        gate.advance(timedelta(minutes=11))
+        try:
+            stale = await status(tokens["resolver"])
+        finally:
+            gate.advance(-timedelta(minutes=11))
+        assert stale == (403, "stale_session")
     else:  # pragma: no cover - a new auth kind needs a rule here
         pytest.fail(f"unknown auth {row.auth}")
 

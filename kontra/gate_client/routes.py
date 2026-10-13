@@ -15,7 +15,10 @@ adding a row here, in the same PR.
                    403 ``fresh_login_required`` (decisions I19).
 * ``worker``    -- the party's Temporal *worker* JWT, also accepted on seller routes so a
                    worker needs one credential (``kontra serve``).
-* ``resolver``  -- a party listed in the gate's ``KONTRA_RESOLVERS``.
+* ``resolver``  -- a party listed in the gate's ``KONTRA_RESOLVERS`` (anyone else: 403
+                   ``not_resolver``), with a ``fresh`` session: a resolver splits escrow, so
+                   an API key gets 403 ``fresh_login_required`` and an old login 403
+                   ``stale_session``, checked after the resolver list.
 * ``dev``       -- only when the gate runs with ``KONTRA_DEV=1``; 404 otherwise.
 """
 
@@ -49,6 +52,10 @@ P = "/v1"
 ROUTES: tuple[Route, ...] = (
     # auth & identity
     Route("jwks", "GET", "/.well-known/jwks.json", "none", None, None),
+    # What this gate offers before sign-in (dev login, email, GitHub), for clients to show.
+    Route("info", "GET", f"{P}/info", "none", None, m.GateInfo),
+    # Recently revoked sessions, for Kontra's Temporal server to refuse their worker tokens.
+    Route("revocations", "GET", f"{P}/auth/revocations", "none", None, m.Revocations),
     Route("device_start", "POST", f"{P}/auth/device", "none", None, m.DeviceStart),
     Route("token", "POST", f"{P}/auth/token", "none", m.TokenRequest, m.TokenResponse),
     Route(
@@ -79,6 +86,9 @@ ROUTES: tuple[Route, ...] = (
     ),
     Route("api_keys", "GET", f"{P}/keys", "fresh", None, m.ApiKeyList),
     Route("revoke_api_key", "DELETE", f"{P}/keys/{{key_id}}", "fresh", None, None, status=204),
+    # The party's sign-ins (people's logins), to find and end one: a fresh human session only
+    Route("sessions", "GET", f"{P}/sessions", "fresh", None, m.SessionList),
+    Route("end_session", "DELETE", f"{P}/sessions/{{session_id}}", "fresh", None, None, status=204),
     # catalog
     Route("publish", "POST", f"{P}/catalog", "fresh", m.PublishRequest, m.CatalogEntry),
     Route("search", "GET", f"{P}/catalog", "none", None, m.CatalogList),

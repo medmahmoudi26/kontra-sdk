@@ -117,6 +117,8 @@ async def test_a_key_hires_and_serves_but_never_counts_as_fresh(world: World) ->
         program.create_api_key("another"),
         program.api_keys(),
         program.revoke_api_key(made.id),
+        program.sessions(),
+        program.end_session("0" * 32),
     ):
         assert await _code(call) == (403, "fresh_login_required")
     assert {r.name for r in ROUTES if r.auth == "fresh"} == {
@@ -125,6 +127,8 @@ async def test_a_key_hires_and_serves_but_never_counts_as_fresh(world: World) ->
         "create_api_key",
         "api_keys",
         "revoke_api_key",
+        "sessions",
+        "end_session",
     }
 
 

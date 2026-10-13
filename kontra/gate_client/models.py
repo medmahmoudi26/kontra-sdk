@@ -44,6 +44,7 @@ __all__ = [
     "EMAIL_MAX",
     "MAX_API_KEYS",
     "MAX_PARTS",
+    "REVOCATION_WINDOW_MAX",
     "USER_CODE_ALPHABET",
     "USER_CODE_PATTERN",
     "AcceptRequest",
@@ -67,6 +68,7 @@ __all__ = [
     "DownloadUrl",
     "ErrorBody",
     "Escrow",
+    "GateInfo",
     "HireRequest",
     "HireView",
     "HoldClaims",
@@ -87,7 +89,10 @@ __all__ = [
     "RejectRequest",
     "ResolveRequest",
     "ResultView",
+    "Revocations",
     "SellerJobView",
+    "SessionList",
+    "SessionView",
     "SetKey",
     "StartRequest",
     "TemporalToken",
@@ -415,6 +420,61 @@ class TemporalToken(_M):
     namespace: _Name
     temporal_address: _Long
     role: Literal["worker"] = "worker"
+
+
+#: The most sessions :class:`Revocations` lists. Far above what a gate revokes in a window;
+#: a list that would be longer is a flood, and a gate answers it with the newest this many.
+REVOCATION_WINDOW_MAX = 200_000
+_SESSION_DIGEST = r"^[0-9a-f]{64}$"
+
+
+class Revocations(_M):
+    """``GET /v1/auth/revocations`` (public): the sessions revoked in the last
+    ``window_seconds``, each as the sha256 (hex) of its id -- the ``sid`` claim of every token
+    the gate mints. The window outlasts the longest Temporal worker token (15 minutes), so a
+    worker token whose session is revoked is on this list until it expires. Kontra's Temporal
+    server polls it and refuses those tokens (decisions I19): revoking an API key or a login
+    reaches Temporal within seconds, not when the token expires. A digest says nothing to
+    whoever reads the list without the token."""
+
+    window_seconds: int
+    sessions: list[Annotated[str, StringConstraints(pattern=_SESSION_DIGEST)]] = Field(
+        max_length=REVOCATION_WINDOW_MAX
+    )
+
+
+_SESSION_ID = r"^[0-9a-f]{32}$"
+_SessionId = Annotated[str, StringConstraints(max_length=32, pattern=_SESSION_ID)]
+
+
+class SessionView(_M):
+    """One of the party's sign-ins (``GET /v1/sessions``): a person's login that can still get
+    tokens, never an API key's (those are ``/v1/keys``). ``via`` is how the person proved who
+    they are (``device:email``, ``device:github``, ``device:dev``, ``dev-login``);
+    ``current`` marks the session asking. One the person does not recognise -- a device
+    login they were tricked into approving -- is ended with ``DELETE /v1/sessions/{id}``."""
+
+    id: _SessionId
+    via: _Name
+    auth_time: datetime
+    created_at: datetime
+    current: bool = False
+
+
+class SessionList(_M):
+    sessions: list[SessionView] = Field(max_length=_PAGE_MAX)
+
+
+class GateInfo(_M):
+    """``GET /v1/info`` (public): what this gate offers before anyone signs in, so a client
+    shows only what works here. ``dev``: ``KONTRA_DEV=1`` -- dev login
+    (``POST /v1/auth/dev-login``) exists and new parties get play money; never on
+    production. ``email_sign_in``: ``POST /v1/auth/magic`` mails sign-in links (the only way
+    in on production). ``github_sign_in``: the device page signs in with GitHub."""
+
+    dev: bool
+    email_sign_in: bool
+    github_sign_in: bool
 
 
 class Me(_M):
