@@ -142,6 +142,61 @@ async def test_broken_tokens_are_denied(cluster: Cluster, cell: str, make_token:
     )
 
 
+async def test_a_revoked_sessions_worker_token_is_refused(cluster: Cluster) -> None:
+    """The review's F3: the gate revoked a key (or a login), and its worker token -- valid by
+    signature, expiry and audience, all Temporal's claim mapper checks -- used to keep
+    polling the party's task queues and starting work for up to 15 minutes. Kontra's server
+    polls the gate's revocation list and refuses it within a refresh."""
+    token = cluster.signer.api_key(app.SELLER_NAMESPACE, sid="stolen-key-session")
+    other = cluster.signer.api_key(app.SELLER_NAMESPACE, sid="the-owners-login")
+    client = await connect_public(cluster, app.SELLER_NAMESPACE)
+
+    def describe(t: str) -> Any:
+        return client.workflow_service.describe_namespace(
+            DescribeNamespaceRequest(namespace=app.SELLER_NAMESPACE),
+            metadata={"authorization": f"Bearer {t}"},
+        )
+
+    await assert_allowed("revocation/live-session", describe(token))
+    cluster.jwks.revoke("stolen-key-session")
+    deadline = asyncio.get_running_loop().time() + 20
+    while True:  # the server reads the list every second
+        try:
+            await describe(token)
+        except RPCError as e:
+            if e.status == RPCStatusCode.PERMISSION_DENIED:
+                break
+            raise
+        if asyncio.get_running_loop().time() > deadline:
+            pytest.fail("a revoked session's worker token is still accepted")
+        await asyncio.sleep(0.5)
+    record("revocation/revoked-session", "deny", "PERMISSION_DENIED")
+    await assert_denied(
+        "revocation/revoked-session-poll",
+        client.workflow_service.poll_activity_task_queue(
+            PollActivityTaskQueueRequest(
+                namespace=app.SELLER_NAMESPACE, task_queue=TaskQueue(name=app.SELLER_TASK_QUEUE)
+            ),
+            metadata={"authorization": f"Bearer {token}"},
+        ),
+    )
+    await assert_allowed("revocation/other-session", describe(other))
+
+
+async def test_a_token_naming_no_session_is_refused(cluster: Cluster) -> None:
+    """Every token the gate mints names its session; one that does not cannot be checked
+    against the revocation list, so it is refused."""
+    token = cluster.signer.api_key(app.SELLER_NAMESPACE, sid=None)
+    client = await connect_public(cluster, app.SELLER_NAMESPACE)
+    await assert_denied(
+        "revocation/no-session",
+        client.workflow_service.describe_namespace(
+            DescribeNamespaceRequest(namespace=app.SELLER_NAMESPACE),
+            metadata={"authorization": f"Bearer {token}"},
+        ),
+    )
+
+
 def _past() -> Any:
     from datetime import datetime, timedelta
 

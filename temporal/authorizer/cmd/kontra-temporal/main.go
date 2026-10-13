@@ -34,6 +34,7 @@ import (
 
 	kontra "github.com/medmahmoudi26/kontra-sdk/temporal/authorizer"
 	"github.com/medmahmoudi26/kontra-sdk/temporal/authorizer/callbackguard"
+	"github.com/medmahmoudi26/kontra-sdk/temporal/authorizer/revocation"
 )
 
 const usage = `usage:
@@ -93,6 +94,18 @@ func serve() error {
 	if err != nil {
 		return err
 	}
+	// Worker tokens of the sessions the gate revoked are refused within a refresh, not
+	// when they expire (revocation package).
+	var revoked *revocation.List
+	if s.revocationsURL == "" {
+		logger.Warn("no revocation list (KONTRA_REVOCATIONS_URL=off, or a JWKS that is not " +
+			"a gate's): a revoked session's worker tokens work until they expire")
+	} else {
+		revoked = revocation.New(s.revocationsURL, nil, logger)
+		ctx, stop := context.WithCancel(context.Background())
+		defer stop()
+		go revoked.Run(ctx, s.revocationsRefresh)
+	}
 
 	server, err := temporal.NewServer(
 		temporal.ForServices(temporal.Services), // includes the internal frontend
@@ -106,11 +119,16 @@ func serve() error {
 		// Nexus handler needs, so a token completes only its own operation (callbackguard).
 		temporal.WithChainedFrontendGrpcInterceptors(callbackguard.Intercept),
 		// The public frontend verifies JWTs with Temporal's default claim mapper and key
-		// provider (no custom mapper, PRD §10.3). The internal frontend ignores this and
-		// maps every caller to Temporal's internal principal.
+		// provider (PRD §10.3), and then refuses a token whose session the gate revoked:
+		// that wrapper only ever refuses more. The internal frontend ignores this and maps
+		// every caller to Temporal's internal principal.
 		temporal.WithClaimMapper(func(cfg *config.Config) authorization.ClaimMapper {
 			keys := authorization.NewDefaultTokenKeyProvider(&cfg.Global.Authorization, logger)
-			return authorization.NewDefaultJWTClaimMapper(keys, &cfg.Global.Authorization, logger)
+			mapper := authorization.NewDefaultJWTClaimMapper(keys, &cfg.Global.Authorization, logger)
+			if revoked == nil {
+				return mapper
+			}
+			return revocation.Check(mapper, revoked)
 		}),
 		temporal.WithAudienceGetter(func(cfg *config.Config) authorization.JWTAudienceMapper {
 			return authorization.NewAudienceMapper(cfg.Global.Authorization.Audience)
@@ -127,6 +145,7 @@ func serve() error {
 		tag.NewInt("internal-frontend-http-port", internal.HTTPPort),
 		tag.NewStringTag("persistence", s.db),
 		tag.NewStringTag("dynamic-config", dcPath),
+		tag.NewStringTag("revocations", s.revocationsURL),
 	)
 	return server.Start() // blocks until SIGINT or SIGTERM
 }
