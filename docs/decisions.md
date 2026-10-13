@@ -419,3 +419,44 @@ The delivery reaches the buyer from Temporal as soon as the seller's run complet
 gate marks the job delivered on its next sweep. So `kontra.artifacts` treats `not_delivered`
 as "not yet": the download retries with backoff for up to 60 seconds -- the same limit
 `kontra.hire` uses for `accept` right after `result` -- and every other error fails at once.
+
+## I19. Sign-in by email, and API keys for programs
+
+The production gate signs people in with an email address (the PRD's D21) and gives programs
+API keys (D22). Seam ② gains `POST /v1/auth/magic`, the `api_key` grant of
+`POST /v1/auth/token` and `/v1/keys`; the fake gate implements all of it (an allowlist,
+`FakeGate.allow_email`, and an in-memory outbox instead of mail). Three rules decide what the
+new credentials can do, and each closes an attack the obvious design leaves open.
+
+1. **An API key never satisfies freshness.** A key owns one session whose `auth_time` is the
+   key's `created_at`, so by the clock alone a key made a minute ago would pass the gate's
+   freshness window. The gate therefore marks the session (`via = 'api_key'`) and every
+   `fresh` route answers it 403 `fresh_login_required`, whatever its age; an old human login
+   keeps its own 403 `stale_session`. A key hires, reads, accepts, disputes and runs `kontra
+   serve` (every `party` and `party|worker` route, `/v1/auth/temporal-token` included), and
+   never publishes, sets the party's encryption key, or makes, lists or revokes keys. A
+   stolen key thus cannot repoint what a party sells, swap the key its deliveries are
+   encrypted to, or mint itself a successor; revoking it (or its session) stops its tokens on
+   their next request, because the gate checks the session id per request. The key is
+   `kontra_sk_` plus 32 random bytes, shown once and stored as its sha256; its id (`key_` plus
+   16 random hex) is never derived from it, and an unknown key and a revoked one get the same
+   400 `invalid_grant`. The SDK keeps nothing on disk for a key (`Session.from_api_key`,
+   `KONTRA_API_KEY`), refreshes by exchanging it again, sends it only over TLS or to this
+   machine, and never shows it in an error, even a malformed one (a key with a stray newline
+   is still the secret).
+2. **A magic link only approves a device authorization whose code the human types.** Every
+   sign-in starts an RFC 8628 device authorization (the CLI's, or the console's), and the
+   link's page asks for that authorization's user code, which only the requester's screen
+   shows: the mail carries the link and never the code. Without that, an attacker starts a
+   device login, asks the gate to mail the victim a link for it, and the victim -- who did
+   ask to sign in somewhere, perhaps, or simply clicks -- logs the attacker in. With it, the
+   victim's mail is a genuine link that approves nothing, since no screen of theirs shows the
+   attacker's code; three wrong codes burn the link. The request answers the same 202
+   whether or not the address is invited, has an account, or the code is pending, and its
+   rate limits count every request, so neither the answer nor a 429 says who is on the
+   allowlist.
+3. **A GET never consumes.** Mail scanners and link previews fetch links before people do. If
+   opening `/auth/magic?t=` used the token, a scanner would burn every link (or, with a
+   lenient page, sign someone in). The page only shows the form; the POST that carries the
+   typed code consumes the link, atomically, once: a second POST, also one racing the first,
+   finds it used.
