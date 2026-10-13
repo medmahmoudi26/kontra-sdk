@@ -11,6 +11,7 @@ from kontra.gate_client import models as m
 from kontra.gate_client.routes import BY_NAME
 
 KEY = m.API_KEY_PREFIX + "Ab3_-" * 8 + "xyz"
+HANDOFF = "h" * 43
 CODE = "BCDF-GHJK"
 
 
@@ -170,6 +171,11 @@ def test_magic_link_sent_says_one_thing() -> None:
         ({"grant_type": "api_key", "api_key": KEY, "refresh_token": "r"}, "api_key"),
         ({"grant_type": "api_key", "api_key": KEY, "device_code": "d"}, "api_key"),
         ({"grant_type": "api_key", "api_key": KEY, "handle": "bob"}, "api_key"),
+        ({"grant_type": "handoff", "handoff": HANDOFF}, None),
+        ({"grant_type": "handoff"}, "handoff"),
+        ({"grant_type": "handoff", "handoff": HANDOFF, "refresh_token": "r"}, "handoff"),
+        ({"grant_type": "handoff", "handoff": HANDOFF, "handle": "bob"}, "handoff"),
+        ({"grant_type": "api_key", "api_key": KEY, "handoff": HANDOFF}, "api_key"),
     ],
 )
 def test_each_grant_takes_exactly_its_own_fields(
@@ -180,6 +186,12 @@ def test_each_grant_takes_exactly_its_own_fields(
         assert found is None
     else:
         assert found == f"the {problem} grant takes {problem} only"
+
+
+@pytest.mark.parametrize("handoff", ["", HANDOFF[:-1], HANDOFF + "x", HANDOFF[:-1] + "=", " " * 43])
+def test_a_handoff_has_the_minted_shape(handoff: str) -> None:
+    with pytest.raises(ValidationError):
+        m.TokenRequest(grant_type="handoff", handoff=handoff)
 
 
 @pytest.mark.parametrize(

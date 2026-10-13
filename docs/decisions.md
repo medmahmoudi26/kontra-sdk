@@ -491,3 +491,16 @@ below), and each has its rule here.
    lenient page, sign someone in). The page only shows the form; the POST that carries the
    typed code consumes the link, atomically, once: a second POST, also one racing the first,
    finds it used.
+4. **The browser that types the code lands signed in.** Seen in production: the link's page
+   approved the device and then said "go back to where you started", and people expected
+   the opposite -- the console, signed in, in the tab they were looking at. A console
+   session lives only in the tab that made it (its tokens are in that tab's
+   `sessionStorage`), so the page now hands this browser its own: having approved, it sends
+   the browser to the console with a one-time **handoff** (32 random bytes) in the URL
+   fragment, which never reaches a server; the console removes it from the address bar and
+   trades it once, within `HANDOFF_TTL_SECONDS` (two minutes), for a session of its own
+   (`grant_type=handoff` on `POST /v1/auth/token`; stored as its sha256, unknown, used and
+   expired ones all `400 invalid_grant`). The session is as fresh as the approval, so a new
+   account can set its key at once. Nothing about rule 2 moves: the handoff exists only
+   after the right code was typed, so it goes to whoever typed it -- the person who also
+   holds the screen that asked -- and the device that asked still gets its own session.
