@@ -57,6 +57,7 @@ def test_every_row_is_served_with_its_method_path_and_models() -> None:
             assert body.field_info.annotation is row.request, row.name
         if row.response is not None and not row.stream:
             assert api.response_model is row.response, row.name
+        assert api.status_code == row.status, row.name
         names = {p.alias for p in api.dependant.query_params}
         assert names == QUERY.get(row.name, set()), row.name
     # the only other routes are the gate's own signed blob URLs, not part of the API
@@ -115,6 +116,12 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
         )
     )
     assert dev_tokens.party == "devicer"
+    # a sign-in link for a pending device (a dev gate's sign-up is open): one mail, no code in it
+    linked = await anon.device_start()
+    assert (await anon.magic_link("Devicer@Example.com", linked.user_code)).status == "sent"
+    [mail] = gate.outbox
+    assert mail.to == "devicer@example.com"
+    assert linked.user_code not in mail.text
 
     seller = await world.party()  # dev_login, me, set_key, then token (refresh) on first use
     buyer = await world.party()
@@ -195,6 +202,10 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     assert topped.credited
     assert (await buyer.gate.balance()).available_minor == topped.balance.available_minor  # type: ignore[union-attr]
     assert (await worker.me()).party == seller.profile.party
+
+    made = await buyer.gate.create_api_key("ci")  # a fresh human session mints, lists, revokes
+    assert [k.id for k in (await buyer.gate.api_keys()).keys] == [made.id]
+    await buyer.gate.revoke_api_key(made.id)
     await seller.gate.revoke()
 
     missing = {r.name for r in ROUTES} - rec.ok
@@ -211,6 +222,7 @@ PATH_VALUES = {
     "job_id": "0" * 32,
     "key": "0" * 32,
     "sha256": "0" * 64,
+    "key_id": "key_" + "0" * 16,
 }
 
 
@@ -232,13 +244,17 @@ async def _call(gate: FakeGate, route: Route, token: str | None) -> httpx.Respon
 
 @pytest.fixture
 async def tokens(world: World) -> dict[str, str]:
-    """A party's access token, a resolver's, and the party's Temporal worker token."""
+    """A party's access token, a resolver's, the party's Temporal worker token, and an
+    access token exchanged for one of the party's API keys (made a moment ago)."""
     alice = await world.party("alice")
     judge = await world.party("judge")
+    key = (await alice.gate.create_api_key("probe")).key
+    exchanged = await world.anon().token(m.TokenRequest(grant_type="api_key", api_key=key))
     return {
         "party": await alice.access_token(),
         "resolver": await judge.access_token(),
         "worker": (await alice.gate.temporal_token()).token,
+        "api_key": exchanged.access_token,
     }
 
 
@@ -259,6 +275,7 @@ async def test_each_row_enforces_its_auth(world: World, tokens: dict[str, str], 
     anonymous = await status(None)
     with_party = await status(tokens["party"])
     with_worker = await status(tokens["worker"])
+    with_key = await status(tokens["api_key"])
     if row.auth in ("none", "dev"):
         assert anonymous[0] not in denied, anonymous
         return
@@ -266,13 +283,17 @@ async def test_each_row_enforces_its_auth(world: World, tokens: dict[str, str], 
     if row.auth == "party|worker":
         assert with_party[0] not in denied, with_party
         assert with_worker[0] not in denied, with_worker
+        assert with_key[0] not in denied, with_key  # a program serves and reads with a key
         return
     # a worker token is never a party's access token
     assert with_worker[0] == 401, with_worker
     if row.auth == "party":
         assert with_party[0] not in denied, with_party
+        assert with_key[0] not in denied, with_key  # a program hires with a key
     elif row.auth == "fresh":
         assert with_party[0] not in denied, with_party
+        # Acceptance 6: an API key's session never counts as fresh, though the key is new.
+        assert with_key == (403, "fresh_login_required"), with_key
         gate.advance(timedelta(minutes=11))  # the login is now older than the window
         try:
             stale = await status(tokens["party"])
@@ -281,6 +302,7 @@ async def test_each_row_enforces_its_auth(world: World, tokens: dict[str, str], 
         assert stale == (403, "stale_session")
     elif row.auth == "resolver":
         assert with_party == (403, "not_resolver")
+        assert with_key == (403, "not_resolver")
         assert (await status(tokens["resolver"]))[0] not in denied
     else:  # pragma: no cover - a new auth kind needs a rule here
         pytest.fail(f"unknown auth {row.auth}")

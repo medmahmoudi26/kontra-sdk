@@ -415,6 +415,15 @@ class GateClient:
     async def token(self, req: m.TokenRequest) -> m.TokenResponse:
         return await self._model("token", m.TokenResponse, body=req)
 
+    async def magic_link(self, email: str, device_user_code: str) -> m.MagicLinkSent:
+        """Ask the gate to email ``email`` a sign-in link for the device authorization
+        ``device_user_code``. The answer is the same whether or not a mail goes out."""
+        return await self._model(
+            "magic_link",
+            m.MagicLinkSent,
+            body=m.MagicLinkRequest(email=email, device_user_code=device_user_code),
+        )
+
     async def dev_login(self, handle: str) -> m.TokenResponse:
         return await self._model("dev_login", m.TokenResponse, body=m.DevLogin(handle=handle))
 
@@ -433,6 +442,22 @@ class GateClient:
 
     async def party(self, party: str) -> m.PartyView:
         return await self._model("party", m.PartyView, path={"party": party})
+
+    # API keys
+    async def create_api_key(self, label: str) -> m.ApiKeyCreated:
+        """A new API key for programs (needs a fresh human session). The key is in the
+        answer this once; the gate keeps only its hash."""
+        return await self._model(
+            "create_api_key", m.ApiKeyCreated, body=m.ApiKeyCreate(label=label)
+        )
+
+    async def api_keys(self) -> m.ApiKeyList:
+        return await self._model("api_keys", m.ApiKeyList)
+
+    async def revoke_api_key(self, key_id: str) -> None:
+        """Revoke a key: its exchanges fail at once, and its access and worker tokens stop
+        working on their next request."""
+        await self._none("revoke_api_key", path={"key_id": key_id})
 
     # catalog
     async def publish(self, document: dict[str, Any]) -> m.CatalogEntry:

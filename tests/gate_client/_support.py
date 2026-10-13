@@ -28,8 +28,15 @@ def minimal(model: type[BaseModel]) -> dict[str, Any]:
     return out
 
 
-#: Values for constrained string fields (opaque gate-assigned ids, digests).
-PATTERNED = {r"^[0-9a-f]{32}$": "0" * 32, r"^[0-9a-f]{64}$": "0" * 64}
+#: Values for constrained string fields (opaque gate-assigned ids, digests, API keys).
+PATTERNED = {
+    r"^[0-9a-f]{32}$": "0" * 32,
+    r"^[0-9a-f]{64}$": "0" * 64,
+    m.API_KEY_ID_PATTERN: "key_" + "0" * 16,
+    m.API_KEY_PATTERN: m.API_KEY_PREFIX + "k" * 43,
+    m.API_KEY_LABEL_PATTERN: "ci",
+    m.USER_CODE_PATTERN: "BCDF-GHJK",
+}
 
 
 def _value(tp: Any) -> Any:

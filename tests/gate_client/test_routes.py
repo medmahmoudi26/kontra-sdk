@@ -19,6 +19,7 @@ from kontra.gate_client.routes import BY_NAME, ROUTES, Route
 from ._support import NOW, Recorder, event, json_response, minimal, query, sse, static
 
 JOB = "0123456789abcdef0123456789abcdef"
+KEY_ID = "key_0123456789abcdef"
 EP = "k" + "a" * 32
 SHA = "0" * 64
 WP = m.WirePayload(b64="AAAA")
@@ -39,12 +40,16 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
         lambda c: c.token(m.TokenRequest(grant_type="refresh_token", refresh_token="r")),
         {},
     ),
+    "magic_link": (lambda c: c.magic_link("alice@example.com", "BCDF-GHJK"), {}),
     "dev_login": (lambda c: c.dev_login("alice"), {}),
     "revoke": (lambda c: c.revoke(), {}),
     "temporal_token": (lambda c: c.temporal_token(), {}),
     "me": (lambda c: c.me(), {}),
     "set_key": (lambda c: c.set_key("age1abc"), {}),
     "party": (lambda c: c.party("acme"), {"party": "acme"}),
+    "create_api_key": (lambda c: c.create_api_key("ci"), {}),
+    "api_keys": (lambda c: c.api_keys(), {}),
+    "revoke_api_key": (lambda c: c.revoke_api_key(KEY_ID), {"key_id": KEY_ID}),
     "publish": (lambda c: c.publish({"nexusrpc": "1.0.0"}), {}),
     "search": (lambda c: c.search("enrich"), {}),
     "get_offering": (
