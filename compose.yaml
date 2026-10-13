@@ -109,7 +109,7 @@ x-database-url: &database-url postgresql+asyncpg://${KONTRA_PG_USER:-kontra}:${K
 services:
   postgres:
     # postgres:16-alpine (postgres-relay runs the same image: keep the two in step)
-    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
     environment:
       POSTGRES_USER: ${KONTRA_PG_USER:-kontra}
       POSTGRES_PASSWORD: ${KONTRA_PG_PASSWORD:?set KONTRA_PG_PASSWORD}
@@ -139,7 +139,7 @@ services:
     # `database` that connects to it reaches Postgres, which it reaches anyway.) It is
     # busybox nc from the Postgres image itself, so the stack trusts no further image.
     # No capabilities, read-only, not root.
-    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
     entrypoint: ["nc"]
     command: ["-lk", "-p", "5432", "-e", "nc", "postgres", "5432"]
     # The image's stop signal is SIGINT (Postgres' smart shutdown); nc stops on SIGTERM.
