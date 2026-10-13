@@ -67,6 +67,7 @@ class FakeGate:
         dev: bool = True,
         skew: float = 0,
         jwt: bool = False,
+        github: bool = True,
     ) -> None:
         self.clock = clock
         self.party = party
@@ -78,6 +79,8 @@ class FakeGate:
         self.skew = skew
         #: Issue Temporal tokens as JWT-shaped strings carrying iat/exp, like the real gate.
         self.jwt = jwt
+        #: What ``GET /v1/info`` says the device page offers (None: a gate without the route).
+        self.github: bool | None = github
         #: Like the real gate (RFC 9700 §4.14.2): a used refresh token presented again
         #: revokes the session, after which no refresh token works.
         self.used: set[str] = set()
@@ -158,6 +161,10 @@ class FakeGate:
             return ok(self._tokens())
         if path == "/v1/auth/device":
             return ok(self.device)
+        if path == "/v1/info":
+            if self.github is None:
+                return err(404, "not_found")
+            return ok(m.GateInfo(dev=self.dev, email_sign_in=True, github_sign_in=self.github))
         if path == "/v1/auth/dev-login":
             self.party = body["handle"]
             return ok(self._tokens())

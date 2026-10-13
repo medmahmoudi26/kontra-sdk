@@ -669,6 +669,25 @@ async def _open_browser(url: str) -> None:
         await asyncio.to_thread(webbrowser.open, url)
 
 
+async def _check_device_page(gate: GateClient, gate_url: str) -> None:
+    """Fail at once, with the command that works, when the gate's device page can approve
+    nothing: a production gate signs in by email only, and that sign-in starts here (the
+    page does not mail links, decisions I19). A gate that predates ``GET /v1/info`` is
+    tried as before."""
+    try:
+        offered = await gate.info()
+    except GateError as e:
+        if e.status in (404, 405):
+            return
+        raise
+    if not (offered.github_sign_in or offered.dev):
+        raise LoginError(
+            "email_sign_in",
+            f"{gate_url} signs in by email: run `kontra login --email you@example.com` "
+            "(the mail brings a link whose page asks for the code this command prints)",
+        )
+
+
 async def login_device(
     gate_url: str,
     handle: str | None = None,
@@ -698,11 +717,15 @@ async def login_device(
     clock = clock or time.monotonic
     expired = "the login code expired; run the login again"
     if address is not None:
+        # The same for every address: the gate never says which of these applies.
         expired = (
             f"the login code expired before the link was used; run the login again (no mail? "
-            f"check {address} and its spam folder: sign-ups are by invitation)"
+            f"check {address} and its spam folder: sign-ups are by invitation, and an address "
+            "gets only so many links an hour, also when someone else asks for them)"
         )
     async with GateClient(gate_url, transport=transport) as gate:
+        if address is None:
+            await _check_device_page(gate, gate_url)
         start = await gate.device_start()
         if address is not None:
             await gate.magic_link(address, start.user_code)

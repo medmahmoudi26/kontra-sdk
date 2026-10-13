@@ -220,8 +220,10 @@ deadline rule.
   before 28 a machine on the host's own network that routes the `control` subnet through the
   host may too, unless the host's `FORWARD` policy drops it; the address is the same on every
   install (`KONTRA_CONTROL_NET`.2).
-- **Token lifetime.** A worker token stays valid until its `exp` (15 minutes) after its
-  session is revoked.
+- **Token lifetime.** A worker token's session revoked at the gate is refused by Kontra's
+  Temporal server within its revocation poll (5 s), as long as the server can reach the
+  gate's list (`GET /v1/auth/revocations`); while it cannot, the token stays valid until its
+  `exp` (15 minutes at most). See decisions I19.
 - **Kontra is the key directory** (see above).
 - **The seller sees your input.** End-to-end means buyer to seller: the seller's worker
   decrypts the input to do the job. Hire sellers you are willing to show it to.

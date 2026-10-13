@@ -330,7 +330,7 @@ On a dev profile, `kontra serve` publishes an unpublished version itself, so
 ## Publishing and serving
 
 ```sh
-kontra login --email you@example.com   # sign-in link by mail (or plain `kontra login`: browser)
+kontra login --email you@example.com   # sign-in link by mail (`kontra dev`: kontra login --dev)
 kontra publish                         # from the offering directory, or --dir
 kontra serve                           # on the machine that does the work
 ```

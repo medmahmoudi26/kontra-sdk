@@ -426,7 +426,9 @@ The production gate signs people in with an email address (the PRD's D21) and gi
 API keys (D22). Seam ② gains `POST /v1/auth/magic`, the `api_key` grant of
 `POST /v1/auth/token` and `/v1/keys`; the fake gate implements all of it (an allowlist,
 `FakeGate.allow_email`, and an in-memory outbox instead of mail). Three rules decide what the
-new credentials can do, and each closes an attack the obvious design leaves open.
+new credentials can do, and each closes an attack the obvious design leaves open. An
+adversarial review of the first build found four places where they did not hold (F1-F5
+below), and each has its rule here.
 
 1. **An API key never satisfies freshness.** A key owns one session whose `auth_time` is the
    key's `created_at`, so by the clock alone a key made a minute ago would pass the gate's
@@ -437,13 +439,28 @@ new credentials can do, and each closes an attack the obvious design leaves open
    never publishes, sets the party's encryption key, or makes, lists or revokes keys. A
    stolen key thus cannot repoint what a party sells, swap the key its deliveries are
    encrypted to, or mint itself a successor; revoking it (or its session) stops its tokens on
-   their next request, because the gate checks the session id per request. The key is
+   their next request, because the gate checks the session id per request. The `resolver`
+   rows (list disputes, split an escrow) need a fresh human session as well, checked after
+   the resolver list: a key a resolver party made for its CI once split escrow like its
+   owner (F4). The key is
    `kontra_sk_` plus 32 random bytes, shown once and stored as its sha256; its id (`key_` plus
    16 random hex) is never derived from it, and an unknown key and a revoked one get the same
    400 `invalid_grant`. The SDK keeps nothing on disk for a key (`Session.from_api_key`,
    `KONTRA_API_KEY`), refreshes by exchanging it again, sends it only over TLS or to this
    machine, and never shows it in an error, even a malformed one (a key with a stray newline
    is still the secret).
+
+   **Revocation reaches Temporal.** Temporal verifies a worker token offline (signature,
+   expiry, audience), so a revoked key's worker token kept polling the party's task queues
+   and starting workflows for up to its 15 minutes (F3). Every token the gate mints names its
+   session (`sid`); the gate publishes the sessions revoked in the last 20 minutes as sha256
+   digests (`GET /v1/auth/revocations`, public: a digest is worth nothing without the token),
+   and Kontra's Temporal server polls it every 5 s (`temporal/authorizer/revocation`) and
+   refuses, after Temporal's own checks, a token whose session is listed or that names none.
+   If the list cannot be fetched the last one stays in force: revocations happen at the gate,
+   and stopping every worker whenever the gate is unreachable would turn a gate outage into
+   a Temporal one. Taking an address off the allowlist (`gate.admin disallow`) revokes the
+   sessions and keys of its party by default (F5): keys never expire on their own.
 2. **A magic link only approves a device authorization whose code the human types.** Every
    sign-in starts an RFC 8628 device authorization (the CLI's, or the console's), and the
    link's page asks for that authorization's user code, which only the requester's screen
@@ -451,10 +468,24 @@ new credentials can do, and each closes an attack the obvious design leaves open
    device login, asks the gate to mail the victim a link for it, and the victim -- who did
    ask to sign in somewhere, perhaps, or simply clicks -- logs the attacker in. With it, the
    victim's mail is a genuine link that approves nothing, since no screen of theirs shows the
-   attacker's code; three wrong codes burn the link. The request answers the same 202
-   whether or not the address is invited, has an account, or the code is pending, and its
-   rate limits count every request, so neither the answer nor a 429 says who is on the
-   allowlist.
+   attacker's code; three wrong codes burn the link. That holds only while **no page of the
+   gate shows a code it did not issue to that screen**: the first gate's `/device` page
+   offered "Email me a sign-in link" for the code in its URL, so an attacker who sent a victim
+   his own `verification_uri_complete` had the gate mail her a real link and tell her, twice,
+   the code to type -- his -- and her sign-in logged his client in as her, fresh enough to
+   mint keys (F1). Email sign-in therefore starts at the client only (`kontra login --email`,
+   the console); the device page asks for no address, and plain `kontra login` against a
+   gate whose device page approves nothing (`GET /v1/info`: no GitHub, not a dev gate) says
+   to use `--email` instead of opening it. A person also sees their sign-ins
+   (`GET /v1/sessions`, the console's account page: how each proved itself, when) and ends
+   one they do not recognise (`DELETE /v1/sessions/{id}`), which reaches Temporal like any
+   revocation. The request answers the same 202 whether or not
+   the address is invited, has an account, or the code is pending, and its rate limits count
+   every request, so neither the answer nor a 429 says who is on the allowlist. They count
+   **per requesting client**: a per-address budget anyone could spend let five requests from
+   a stranger lock an address out of sign-in for an hour, and five mails caused with his own
+   pending codes fill its quota on every replica (F2); a higher cap over all clients is the
+   only one strangers share.
 3. **A GET never consumes.** Mail scanners and link previews fetch links before people do. If
    opening `/auth/magic?t=` used the token, a scanner would burn every link (or, with a
    lenient page, sign someone in). The page only shows the form; the POST that carries the

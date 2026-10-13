@@ -26,7 +26,8 @@ kontra balance                         # you are in; `kontra quote` and `kontra 
 
 `kontra login` talks to `https://api.kontra.run` unless `--gate` or `KONTRA_GATE` says
 otherwise, and writes your profile and your encryption key to `~/.kontra`. Plain
-`kontra login` opens the same sign-in in your browser instead.
+`kontra login` approves the code in your browser instead, on a gate whose page offers a way
+to (GitHub, or `kontra dev`).
 
 **Programs use an API key**, not your login: a key hires, reads and runs `kontra serve`, and
 can never publish, change your encryption key or make other keys.
