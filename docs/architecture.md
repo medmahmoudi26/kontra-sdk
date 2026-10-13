@@ -213,7 +213,10 @@ false` routes between bridge networks and has no such boundary.
 Temporal's proxy variables are set empty: compose copies a Docker client's proxy settings into
 every container, and Go exempts only loopback from a proxy, so Temporal's connections to its own
 internal frontend (at its `control` address) would otherwise go to the proxy, and it would not
-start.
+start. SeaweedFS's are empty for the same reason (its master, volume server, filer and S3
+gateway dial one another over gRPC at the container's address). The healthchecks turn proxies
+off themselves (busybox `wget -Y off`, an empty urllib `ProxyHandler`), so the gate's own
+environment, whose internet egress honours an operator's proxy, stays as given.
 
 Every service runs with no capabilities (`cap_drop: [ALL]`, none added back), with
 `no-new-privileges` and on a read-only root filesystem: code that takes one over cannot open

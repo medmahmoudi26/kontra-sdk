@@ -154,10 +154,6 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
         recipients=[buyer.profile.public_key or "", seller.profile.public_key or ""],
         job_id=one.job_id,
     )  # create_artifact + complete_artifact
-    got = await download(
-        buyer.gate, art, buyer.identity(), tmp_path / "got.txt"
-    )  # download_artifact
-    assert got.read_text() == "records\n"
     blobs = GateBlobStore(worker)
     digest = hashlib.sha256(b"blob").hexdigest()
     await blobs.put(digest, b"blob")  # create_blob
@@ -168,6 +164,10 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     )
     await gate.sweep()
     assert (await buyer.gate.job(one.job_id)).state is m.JobState.COMPLETED
+    got = await download(
+        buyer.gate, art, buyer.identity(), tmp_path / "got.txt"
+    )  # download_artifact: the buyer's, once delivered
+    assert got.read_text() == "records\n"
     assert (await worker.seller_job(one.job_id)).buyer_public_key == buyer.profile.public_key
     assert [j.job_id for j in (await worker.jobs(as_="seller")).items] == [one.job_id]
     events = [e async for e in buyer.gate.progress(one.job_id)]

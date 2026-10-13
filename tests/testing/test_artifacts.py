@@ -56,7 +56,7 @@ class Bench:
 @pytest.fixture
 async def bench(tmp_path: Path) -> AsyncIterator[Bench]:
     control = ScriptedControl(responder=lambda p, h: ok_quote(100))
-    gate = FakeGate(control, sweep_interval=0, part_size=PART)
+    gate = FakeGate(control, sweep_interval=0, part_size=PART, resolvers=["judge"])
     async with gate:
         t = httpx.ASGITransport(app=gate.app)
         seller = await logged_in(gate.base_url, tmp_path / "acme", "acme", t)
@@ -91,16 +91,127 @@ async def test_an_output_round_trips_in_parts(bench: Bench) -> None:
     assert stored.completed
     assert art.content_type == "application/x-ndjson"
     assert len(art.key) == 32
-    out = await download(bench.buyer.gate, art, bench.buyer.identity(), bench.tmp / "got.jsonl")
-    assert out.read_bytes() == src.read_bytes()
     again = await download(
         bench.seller.gate, art, bench.seller.identity(), bench.tmp / "mine.jsonl"
     )
     assert again.read_bytes() == src.read_bytes()
+    # The buyer's copy waits for the delivery.
+    bench.control.observe_as("acme", f"job-{bench.job.job_id}", ObservedStatus.COMPLETED, b"r")
+    await bench.gate.sweep()
+    out = await download(bench.buyer.gate, art, bench.buyer.identity(), bench.tmp / "got.jsonl")
+    assert out.read_bytes() == src.read_bytes()
     assert src.read_bytes() not in stored.data()  # the gate holds ciphertext
     with pytest.raises(GateError) as e:
         await bench.stranger.gate.download_artifact(art.key)  # outputs: the job's parties only
     assert (e.value.status, e.value.code) == (404, "artifact_not_found")
+
+
+async def test_the_buyer_fetches_an_output_only_once_the_job_delivered(bench: Bench) -> None:
+    """Like the platform gate: a seller that leaks an output's key before delivering (in a
+    progress message, say) must not hand the buyer the work while the buyer can still cancel
+    for a full refund. The buyer's fetch waits until the gate counted the delivery (state
+    ``completed``: in review or later); the seller's never waits; a job that closed without
+    a delivery (canceled, failed: refunded) never releases its outputs to the buyer."""
+
+    async def output(job_id: str) -> str:
+        art = await upload(
+            bench.worker, bench.file("o.bin", 100), recipients=bench.recipients, job_id=job_id
+        )
+        return art.key
+
+    async def refused(key: str) -> GateError:
+        with pytest.raises(GateError) as e:
+            await bench.buyer.gate.download_artifact(key)
+        assert (e.value.status, e.value.code) == (409, "not_delivered")
+        return e.value
+
+    async def hire() -> str:
+        q = await bench.buyer.gate.quote("acme/enrich", wire(json_payload({})))
+        assert q.quote_id is not None
+        return (await bench.buyer.gate.hire(q.quote_id)).job_id
+
+    def script(job_id: str, status: ObservedStatus, result: bytes | None = None) -> None:
+        bench.control.observe_as("acme", f"job-{job_id}", status, result)
+
+    done = bench.job.job_id
+    key = await output(done)
+    assert "submitted" in str(await refused(key))
+    script(done, ObservedStatus.RUNNING)
+    await bench.gate.sweep()
+    assert "working" in str(await refused(key))
+    assert (await bench.worker.download_artifact(key)).size > 0  # the seller, any time
+    script(done, ObservedStatus.COMPLETED, b"result")
+    assert "working" in str(await refused(key))  # completed, but not observed yet
+    await bench.gate.sweep()
+    view = await bench.buyer.gate.job(done)
+    assert (view.state, view.escrow) == (m.JobState.COMPLETED, m.Escrow.HELD)  # in review
+    assert (await bench.buyer.gate.download_artifact(key)).size > 0
+    await bench.buyer.gate.reject(done, "wrong records")
+    assert (await bench.buyer.gate.download_artifact(key)).size > 0  # what is disputed
+    with pytest.raises(GateError) as e:
+        await bench.stranger.gate.download_artifact(key)
+    assert (e.value.status, e.value.code) == (404, "artifact_not_found")
+
+    # The attack this closes: fetch the leaked output, then cancel for a full refund.
+    canceled = await hire()
+    key = await output(canceled)
+    await refused(key)
+    assert (await bench.buyer.gate.cancel(canceled)).state is m.JobState.CANCELED
+    await refused(key)
+    assert (await bench.seller.gate.download_artifact(key)).size > 0
+
+    failed = await hire()
+    key = await output(failed)
+    script(failed, ObservedStatus.RUNNING)
+    await bench.gate.sweep()
+    script(failed, ObservedStatus.FAILED)
+    await bench.gate.sweep()
+    assert (await bench.buyer.gate.job(failed)).state is m.JobState.FAILED
+    await refused(key)
+    assert (await bench.seller.gate.download_artifact(key)).size > 0
+
+
+async def test_the_buyer_keeps_its_outputs_through_settlement(bench: Bench) -> None:
+    """Delivered is for good: whatever settles the escrow afterwards -- the buyer's accept,
+    a dispute and the resolver's split, the review window closing -- the buyer still
+    fetches its outputs (until retention deletes them). The resolver is no party to the
+    job and fetches none, as before."""
+    judge = await logged_in(bench.gate.base_url, bench.tmp / "judge", "judge", bench.transport)
+
+    async def delivered_output() -> tuple[str, str]:
+        q = await bench.buyer.gate.quote("acme/enrich", wire(json_payload({})))
+        assert q.quote_id is not None
+        job_id = (await bench.buyer.gate.hire(q.quote_id)).job_id
+        art = await upload(
+            bench.worker, bench.file("o.bin", 100), recipients=bench.recipients, job_id=job_id
+        )
+        bench.control.observe_as("acme", f"job-{job_id}", ObservedStatus.COMPLETED, b"result")
+        await bench.gate.sweep()
+        assert (await bench.buyer.gate.job(job_id)).state is m.JobState.COMPLETED
+        return job_id, art.key
+
+    try:
+        accepted, key = await delivered_output()
+        assert (await bench.buyer.gate.accept(accepted)).escrow is m.Escrow.RELEASED
+        assert (await bench.buyer.gate.download_artifact(key)).size > 0
+
+        disputed, key = await delivered_output()
+        await bench.buyer.gate.reject(disputed, "half the records are empty")
+        split = m.ResolveRequest(buyer_minor=50, seller_minor=50, note="half were fine")
+        assert (await judge.gate.resolve(disputed, split)).escrow is m.Escrow.RESOLVED
+        assert (await bench.buyer.gate.download_artifact(key)).size > 0
+        assert (await bench.seller.gate.download_artifact(key)).size > 0
+        with pytest.raises(GateError) as e:
+            await judge.gate.download_artifact(key)
+        assert (e.value.status, e.value.code) == (404, "artifact_not_found")
+
+        lapsed, key = await delivered_output()
+        bench.gate.advance(timedelta(hours=2))  # past the 1h review window
+        await bench.gate.sweep()
+        assert (await bench.buyer.gate.job(lapsed)).escrow is m.Escrow.RELEASED
+        assert (await bench.buyer.gate.download_artifact(key)).size > 0
+    finally:
+        await judge.aclose()
 
 
 async def test_an_input_is_readable_by_any_party_holding_the_key(bench: Bench) -> None:
@@ -249,7 +360,7 @@ async def test_complete_checks_parts_and_digest(bench: Bench) -> None:
     done = m.ArtifactComplete(upload_id=up.upload_id, etags=etags, ciphertext_sha256=good)
     await bench.worker.complete_artifact(up.key, done)
     await bench.worker.complete_artifact(up.key, done)  # idempotent
-    url = await bench.buyer.gate.download_artifact(up.key)
+    url = await bench.worker.download_artifact(up.key)
     async with await bench.raw() as http:
         r = await http.get(url.url, headers={"Range": "bytes=10-"})
         assert r.status_code == 206

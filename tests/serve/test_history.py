@@ -65,11 +65,15 @@ async def until(probe: Callable[[], Awaitable[_T]], ok: Callable[[_T], bool]) ->
 
 
 def _done(count: int) -> Callable[[HistorySummary | None], bool]:
-    """A summary of a waiting run with ``count`` activities completed along its chain."""
+    """A summary of a waiting run with ``count`` activities completed along its chain.
+
+    The pending activities and the history are two reads, so right as the last activity
+    completes a summary can count it and still list it as running: wait for both to agree."""
     return lambda s: (
         s is not None
         and s.activities_completed == count
         and s.last_event == "ActivityTaskCompleted"
+        and not s.activities_running
     )
 
 

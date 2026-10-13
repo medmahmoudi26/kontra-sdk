@@ -12,6 +12,7 @@ from typing import Any
 import pyrage
 import pytest
 
+from kontra import artifacts as artifacts_module
 from kontra.artifacts import ArtifactError, download, guess_content_type, iter_plaintext, upload
 from kontra.codec import age
 from kontra.gate_client import GateError
@@ -138,6 +139,49 @@ async def test_download_resumes_after_dropped_connection(
     assert out.read_bytes() == data
     gets = [u for meth, u in bucket.requests if meth == "GET" and u.startswith(BUCKET)]
     assert len(gets) == 2
+
+
+async def test_a_download_waits_for_the_gate_to_count_the_delivery(
+    gate: Any, bucket: FakeBucket, tmp_path: Path, seller: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The buyer holds a delivery's artifact references as soon as its own call returns;
+    the gate refuses it the outputs (409 ``not_delivered``) until its next sweep counted
+    the delivery. A download waits that out instead of failing right after ``result()``."""
+    monkeypatch.setattr(artifacts_module, "_DELIVERY_POLL_START", 0.001)
+    src = tmp_path / "late.bin"
+    data = _write(src, 1000)
+    art = await upload(gate, src, recipients=[seller[1]], job_id=JOB)
+    bucket.not_delivered = 3
+    out = await download(gate, art, seller[0], tmp_path / "late.out")
+    assert out.read_bytes() == data
+    asked = [u for meth, u in bucket.requests if meth == "GET" and "/v1/artifacts/" in u]
+    assert len(asked) == 4
+    bucket.not_delivered = 2
+    assert b"".join([c async for c in iter_plaintext(gate, art, seller[0])]) == data
+
+
+async def test_a_download_the_gate_never_releases_gives_up(
+    gate: Any, bucket: FakeBucket, tmp_path: Path, seller: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bounded: an output whose job never delivers (a key that leaked from an open job)
+    is refused after the wait, and nothing lands; other refusals are not waited on."""
+    monkeypatch.setattr(artifacts_module, "_DELIVERY_POLL_START", 0.001)
+    monkeypatch.setattr(artifacts_module, "_DELIVERY_POLL_MAX", 0.001)
+    monkeypatch.setattr(artifacts_module, "_DELIVERY_WAIT", 0.05)
+    src = tmp_path / "never.bin"
+    _write(src, 1000)
+    art = await upload(gate, src, recipients=[seller[1]], job_id=JOB)
+    bucket.not_delivered = 10**9
+    with pytest.raises(GateError) as e:
+        await download(gate, art, seller[0], tmp_path / "never.out")
+    assert (e.value.status, e.value.code) == (409, "not_delivered")
+    assert [name for name in os.listdir(tmp_path) if "never.out" in name] == []
+    bucket.requests.clear()
+    bucket.delete(art.key)
+    with pytest.raises(GateError) as e:
+        await download(gate, art, seller[0], tmp_path / "gone.out")
+    assert e.value.status == 404
+    assert len([u for _, u in bucket.requests if "/v1/artifacts/" in u]) == 1
 
 
 @pytest.mark.parametrize("offset", [0, 30, 150, 500, 70_000, 400_000])

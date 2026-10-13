@@ -402,3 +402,20 @@ The cancel is now two steps, in the pure rules (`kontra.escrow`) so both gates s
 A closed run's status never changes, so two replicas cannot reach different answers. The
 seller's run ends `TERMINATED` (not `CANCELED`) after a buyer's cancel; the reason the job
 records is still "canceled by buyer".
+
+## I18. A buyer gets a job's outputs only once it delivered
+
+An output artifact was downloadable by the job's buyer while the job was still open. A
+seller that let an artifact key out early (in a progress message, say) let the buyer take
+the work and then cancel for a full refund.
+
+Both gates now give a job's buyer its outputs only once the job's state is `completed`
+(delivered: in review, accepted, disputed, resolved -- escrow never pairs `completed` with a
+refund). Before that, and for failed or canceled jobs, the buyer gets 409 `not_delivered`.
+The seller may always download its outputs; an input keeps its rule (the key is the
+capability, the bytes are ciphertext to the job's parties).
+
+The delivery reaches the buyer from Temporal as soon as the seller's run completes, while the
+gate marks the job delivered on its next sweep. So `kontra.artifacts` treats `not_delivered`
+as "not yet": the download retries with backoff for up to 60 seconds -- the same limit
+`kontra.hire` uses for `accept` right after `result` -- and every other error fails at once.
