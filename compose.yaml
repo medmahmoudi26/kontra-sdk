@@ -108,14 +108,24 @@ x-database-url: &database-url postgresql+asyncpg://${KONTRA_PG_USER:-kontra}:${K
 
 services:
   postgres:
-    # postgres:16-alpine (postgres-relay runs the same image: keep the two in step)
+    # postgres:18-alpine (postgres-relay runs the same image: keep the two in step)
     image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
     environment:
       POSTGRES_USER: ${KONTRA_PG_USER:-kontra}
       POSTGRES_PASSWORD: ${KONTRA_PG_PASSWORD:?set KONTRA_PG_PASSWORD}
       POSTGRES_DB: ${KONTRA_PG_DB:-kontra}
+    # 18 moved the cluster: PGDATA is /var/lib/postgresql/18/docker and the image's VOLUME
+    # rose from /var/lib/postgresql/data to /var/lib/postgresql. The named volume follows
+    # it rather than pinning PGDATA back, because .../data does not exist in the 18 image:
+    # Docker would create it root-owned, and this container -- `user: postgres`, cap_drop
+    # ALL -- cannot chmod it, so initdb fails ("could not change permissions"). Mounted at
+    # /var/lib/postgresql the volume inherits the image's own postgres-owned directory.
+    #
+    # A volume written by 16 is NOT upgraded: 18 finds no 18/docker in it and initialises an
+    # empty cluster beside the old files. `kontra dev` data is disposable, but say it out
+    # loud -- `kontra dev down --volumes` before the first `up` on 18.
     volumes:
-      - postgres:/var/lib/postgresql/data
+      - postgres:/var/lib/postgresql
     user: postgres
     read_only: true
     cap_drop: [ALL]
@@ -152,7 +162,8 @@ services:
       net.ipv4.ip_forward: 0 # on two networks: never a router between them (see the header)
     tmpfs:
       # The image's VOLUME: a tmpfs here instead of an anonymous volume per container.
-      - /var/lib/postgresql/data:size=1m
+      # 18 raised it from /var/lib/postgresql/data to /var/lib/postgresql.
+      - /var/lib/postgresql:size=1m
     depends_on:
       postgres:
         condition: service_healthy

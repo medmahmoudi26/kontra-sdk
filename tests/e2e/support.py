@@ -341,6 +341,15 @@ class Stack:
 
     # ------------------------------------------------------------------ the disks
 
+    def postgres_data_dir(self) -> str:
+        """Where this Postgres keeps its cluster, asked rather than remembered: the
+        official image moved it from /var/lib/postgresql/data to
+        /var/lib/postgresql/<major>/docker in 18, and a privacy scan that greps a path
+        that no longer exists is a scan that finds nothing and says so loudly."""
+        found = self.psql("postgres", "SHOW data_directory;").strip()
+        assert found.startswith("/"), f"postgres gave no data directory: {found!r}"
+        return found
+
     def scan_files(self, service: str, directory: str, needles: Sequence[bytes]) -> list[str]:
         """The files under ``directory`` in ``service``'s container that hold any of
         ``needles`` byte for byte: what is on disk rather than what the service serves --
