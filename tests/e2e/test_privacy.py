@@ -183,7 +183,7 @@ async def test_ac08_no_plaintext_of_a_100mb_job_in_the_bucket_or_temporal(
         # byte only: what a store compressed (a large Postgres value, a compressible
         # object) is not seen here, but the input and output are random and would not be.
         stack.psql("postgres", "CHECKPOINT;")
-        where = (("postgres", "/var/lib/postgresql/data"), ("s3", "/data"))
+        where = (("postgres", stack.postgres_data_dir()), ("s3", "/data"))
         disks = {
             svc: await asyncio.to_thread(stack.scan_files, svc, path, real) for svc, path in where
         }
@@ -293,7 +293,7 @@ async def test_ac13_heartbeats_reach_the_buyer_in_order_and_the_gate_keeps_ciphe
     bucket = await asyncio.to_thread(stack.scan_bucket, needles(tag))
     stack.psql("postgres", "CHECKPOINT;")
     on_disk = await asyncio.to_thread(
-        stack.scan_files, "postgres", "/var/lib/postgresql/data", needles(tag)
+        stack.scan_files, "postgres", stack.postgres_data_dir(), needles(tag)
     )
     print(
         "  "
