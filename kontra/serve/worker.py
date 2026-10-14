@@ -48,7 +48,7 @@ from kontra.codec import GateBlobStore, KontraCodec, data_converter
 from kontra.codec.age import public_key_of
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
-from kontra.profile import Profile, kontra_home
+from kontra.profile import NotLoggedIn, Profile, kontra_home
 from kontra.serve.handler import OfferingService, service_handler
 from kontra.serve.hold import HoldVerifier
 from kontra.serve.interceptors import KontraInterceptor
@@ -73,11 +73,35 @@ _JOB_PAGES = 20
 _URL_LOGGERS = ("httpx",)
 #: The longest a stopping worker waits for temporalio's own threads to leave Python code.
 _SETTLE_TIMEOUT = 5.0
+#: The longest a failed worker waits for the gate to say whether it still accepts its session.
+_REFUSAL_TIMEOUT = 10.0
 
 
 class ServeError(RuntimeError):
-    """The worker refuses to start: a contract that drifted from the catalog, an
-    unpublished version, a key that does not match the profile."""
+    """The worker refuses to start -- a contract that drifted from the catalog, an
+    unpublished version, a key that does not match the profile -- or stopped because its
+    credentials were revoked."""
+
+
+async def _refused(session: Session | None) -> str | None:
+    """After an inner worker failed: why, when it is that the gate no longer accepts the
+    worker's session -- its API key revoked, its login signed out or disallowed. Temporal
+    refuses that session's tokens within seconds of the gate (the revocation list), and
+    temporalio reports it as a bare ``RuntimeError("Workflow worker failed")`` over a
+    PermissionDenied deep in its core: a seller who revoked a key on purpose, or found one
+    revoked, deserves the reason and what to do. Asked of the gate, never read from the
+    error's text. None when the gate still accepts the session, or cannot be asked in time:
+    the failure is another one, and is raised as it came."""
+    if session is None:
+        return None
+    try:
+        async with asyncio.timeout(_REFUSAL_TIMEOUT):
+            await session.gate.me()
+    except NotLoggedIn as e:
+        return f"the worker stopped, refused by Temporal: {e}"
+    except Exception:  # unreachable, slow, or failing otherwise: not this function's call
+        return None
+    return None
 
 
 def seller_data_converter(codec: KontraCodec) -> DataConverter:
@@ -209,6 +233,7 @@ class Worker:
         self._stop = asyncio.Event()
         self._ready = asyncio.Event()
         self._client: Client | None = None
+        self._session: Session | None = None
         self._running = False
         self.progress: ProgressForwarder | None = None
         self.jobs: JobDirectory | None = None
@@ -266,6 +291,7 @@ class Worker:
         except BaseException:
             await stack.aclose()
             self._inner, self._services, self._client = (), (), None
+            self._session = None
             raise
         self._stack = stack
 
@@ -282,6 +308,7 @@ class Worker:
             session = Session.from_env(home)  # KONTRA_API_KEY, else the profile
             stack.push_async_callback(session.aclose)
         profile = await session.resolve()
+        self._session = session
         gate = gate or session.gate
         home_dir = _home_dir(profile, home)
         identity = session.identity()
@@ -510,7 +537,14 @@ class Worker:
         try:
             await self.prepare(session=session, client=client, gate=gate, home=home)
             with self._signals(handle_signals):
-                await self._serve()
+                try:
+                    await self._serve()
+                except Exception as failure:
+                    # Before aclose(), which closes a session the worker made itself.
+                    reason = await _refused(self._session)
+                    if reason is None:
+                        raise
+                    raise ServeError(reason) from failure
         finally:
             # Release whoever waits in wait_ready(): this run will never be ready (a start
             # that failed, say a hash-lock refusal), and aclose() replaces the event.
@@ -629,6 +663,7 @@ class Worker:
         """Release what :meth:`prepare` acquired (inner workers that never ran included)."""
         stack, self._stack = self._stack, None
         self._inner, self._services, self._client = (), (), None
+        self._session = None
         try:
             if stack is not None:
                 await stack.aclose()
