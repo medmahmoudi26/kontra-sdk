@@ -73,7 +73,8 @@ standalone operation whose id the forger knows.
 `callbackguard.Intercept` runs on both frontends after authorization. For every caller but
 the internal principal it accepts a completion callback, on any API that can carry one
 (StartWorkflowExecution, ExecuteMultiOperation, UpdateWorkflowExecution,
-StartActivityExecution — found by walking the request's type, not by a list), only in the
+StartActivityExecution, StartNexusOperationExecution — found by walking the request's type,
+not by a list), only in the
 shape a handler needs: a Nexus callback to exactly `temporal://system`, with exactly one
 token, whose request id is set. A token then completes only its own operation: the request
 id is a UUID that only that operation's caller and handler know. Every other URL is refused

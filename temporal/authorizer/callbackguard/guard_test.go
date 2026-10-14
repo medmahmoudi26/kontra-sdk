@@ -206,11 +206,19 @@ func TestEveryCarrierIsChecked(t *testing.T) {
 	refused(t, &ws.UpdateWorkflowExecutionRequest{Namespace: "other", Request: &updatepb.Request{
 		CompletionCallbacks: []*commonpb.Callback{bad},
 	}})
+	refused(t, &ws.StartNexusOperationExecutionRequest{Namespace: "other", CompletionCallbacks: []*commonpb.Callback{bad}})
 }
 
 // TestCallbackCarriers pins which WorkflowService requests can carry a callback at all. The
 // guard walks any request that can, so a new one is covered; this test makes a reviewer
 // look at it when Temporal adds one.
+//
+// It has done its job once: go.temporal.io/api v1.63.6 gave
+// StartNexusOperationExecutionRequest a `completion_callbacks` field (18), making the
+// standalone-operation start a carrier like the four before it. Nothing in the guard
+// changed — it finds carriers by walking the type — and nothing in the Authorizer changed
+// either: StartNexusOperationExecution was already in AllowedAPIs, in the token's own
+// namespace (decisions I4), and the guard now checks the callbacks it may carry.
 func TestCallbackCarriers(t *testing.T) {
 	var got []string
 	methods := ws.File_temporal_api_workflowservice_v1_service_proto.Services().ByName("WorkflowService").Methods()
@@ -224,7 +232,13 @@ func TestCallbackCarriers(t *testing.T) {
 			got = append(got, string(methods.Get(i).Name()))
 		}
 	}
-	want := []string{"ExecuteMultiOperation", "StartActivityExecution", "StartWorkflowExecution", "UpdateWorkflowExecution"}
+	want := []string{
+		"ExecuteMultiOperation",
+		"StartActivityExecution",
+		"StartNexusOperationExecution",
+		"StartWorkflowExecution",
+		"UpdateWorkflowExecution",
+	}
 	slices.Sort(got)
 	if !slices.Equal(got, want) {
 		t.Fatalf("requests that can carry a completion callback: %v, want %v", got, want)
