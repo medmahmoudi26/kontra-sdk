@@ -104,7 +104,6 @@ async def world(
 
 
 async def test_the_worker_published_its_offering_on_a_dev_profile(world: World) -> None:
-    pk = world.seller.public_key
     assert world.entry.contract_hash == world.bound.contract_hash()
     assert world.entry.task_queue == world.bound.offering_id.task_queue
     assert world.entry.service == "acme.upper"
@@ -603,7 +602,6 @@ async def test_an_edited_type_after_publish_refuses_to_start(world: World, tmp_p
 
     path = write_offering(tmp_path)
     published = seller.bind(path)
-    pk = world.seller.public_key
     await world.seller.gate.publish(published.document())
     edited = seller.bind_v2(path)
     ours, theirs = edited.contract_hash(), published.contract_hash()

@@ -201,7 +201,7 @@ def test_schema_first(tmp_path: Path) -> None:
     contract written by hand hashes like the derived one, and an edit moves the hash."""
     path = write_offering(tmp_path)
     derived = seller.bind(path)
-    pk = generate_identity()[1]
+    generate_identity()[1]
     hand = tmp_path / "contract.yaml"
     hand.write_text(to_yaml(nexgen_view(derived.document())))
     bound = offering(path, workflow=UpperFlow, quote=seller.quote, contract=hand)
