@@ -154,8 +154,8 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
         chosen = _pick(worker.offerings, only)
 
         async def go() -> list[m.CatalogEntry]:
-            async with Session.load() as session:
-                profile = session.profile
+            async with Session.from_env() as session:
+                profile = await session.resolve()
                 key = public_key_of(session.identity())
                 if profile.public_key is not None and profile.public_key != key:
                     fail(
@@ -196,7 +196,8 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
 @click.command()
 @_DIR
 def serve(directory: Path) -> None:
-    """Run worker.py's worker with this machine's profile (Ctrl-C stops it gracefully)."""
+    """Run worker.py's worker with this machine's profile, or KONTRA_API_KEY (Ctrl-C stops
+    it gracefully)."""
     import logging
 
     if not logging.getLogger().handlers:

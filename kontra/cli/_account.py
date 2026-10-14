@@ -9,13 +9,15 @@ import click
 
 from kontra.cli._common import default_handle, emit_json, fail, printable, run
 
-__all__ = ["GATE_ENV", "balance", "gate_url_or_fail", "login", "topup"]
+__all__ = ["GATE_ENV", "balance", "configured_gate", "gate_url", "login", "topup"]
 
-#: The gate to log in to when ``--gate`` is not given (else the profile's).
+#: The gate to log in to when ``--gate`` is not given (else the profile's, else
+#: :data:`kontra.auth.DEFAULT_GATE_URL`). The same name as ``kontra.auth.GATE_ENV``, spelled
+#: here so ``kontra --help`` does not import the SDK.
 GATE_ENV = "KONTRA_GATE"
 
 
-def gate_url_or_fail(given: str | None) -> str:
+def configured_gate(given: str | None) -> str | None:
     """``--gate``, else ``$KONTRA_GATE``, else the gate of the profile on this machine."""
     from kontra.profile import Profile, ProfileError
 
@@ -27,12 +29,29 @@ def gate_url_or_fail(given: str | None) -> str:
     try:
         return Profile.load().gate_url
     except ProfileError:
-        fail(f"which gate? pass --gate URL (or set {GATE_ENV}); `kontra dev` runs a local one")
+        return None
+
+
+def gate_url(given: str | None) -> str:
+    """:func:`configured_gate`, else Kontra's own (``https://api.kontra.run``). ``kontra
+    dev`` passes its local gate itself."""
+    from kontra.auth import DEFAULT_GATE_URL
+
+    return configured_gate(given) or DEFAULT_GATE_URL
 
 
 @click.command()
 @click.option(
-    "--gate", "gate", metavar="URL", help=f"The gate (default: ${GATE_ENV}, else the profile's)."
+    "--gate",
+    "gate",
+    metavar="URL",
+    help=f"The gate (default: ${GATE_ENV}, else the profile's, else https://api.kontra.run).",
+)
+@click.option(
+    "--email",
+    metavar="ADDR",
+    help="Sign in through a link mailed to ADDR instead of a browser here; the page asks "
+    "for the code this command prints.",
 )
 @click.option(
     "--dev", is_flag=True, help="Log in to a `kontra dev` gate at once, without a browser."
@@ -57,6 +76,7 @@ def gate_url_or_fail(given: str | None) -> str:
 @click.option("--json", "as_json", is_flag=True, help="Print the profile as JSON.")
 def login(
     gate: str | None,
+    email: str | None,
     dev: bool,
     handle: str | None,
     tls: bool | None,
@@ -64,12 +84,18 @@ def login(
     replace_key: bool,
     as_json: bool,
 ) -> None:
-    """Log in: device flow (or --dev), make this machine's key, register it, save the profile."""
+    """Log in: device flow (approved in a browser, or with --email through a mailed link;
+    or --dev), make this machine's key, register it, save the profile."""
+    from kontra.auth import API_KEY_ENV
     from kontra.auth import login as do_login
     from kontra.gate_client import GateError
     from kontra.profile import KEY_FILE, kontra_home
 
-    url = gate_url_or_fail(gate)
+    if dev and email is not None:
+        fail("--email is for a real gate; a `kontra dev` login (--dev) needs no mail")
+    url = configured_gate(gate) if dev else gate_url(gate)
+    if url is None:  # a dev login only makes sense against a `kontra dev` gate
+        fail(f"which gate? pass --gate URL (or set {GATE_ENV}); `kontra dev` runs a local one")
     if dev and handle is None:
         handle = default_handle()
     try:
@@ -78,6 +104,7 @@ def login(
                 url,
                 handle=handle,
                 dev=dev,
+                email=email,
                 open_browser=not no_browser,
                 replace_key=replace_key,
                 tls=tls,
@@ -99,6 +126,12 @@ def login(
     click.echo(f"  key       {profile.public_key} ({home / KEY_FILE})")
     if profile.dev:
         click.echo("  this is a dev gate: play money, `kontra topup` credits at once")
+    if os.environ.get(API_KEY_ENV):
+        click.echo(
+            f"note: {API_KEY_ENV} is set, and commands use it instead of this login "
+            "(unset it to publish or manage keys)",
+            err=True,
+        )
 
 
 def _amount(text: str, currency: str) -> Decimal:

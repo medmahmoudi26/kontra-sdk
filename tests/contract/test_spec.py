@@ -142,11 +142,16 @@ def test_find_spec_dir_fails_loudly(tmp_path: Path) -> None:
         spec_mod.find_spec_dir(tmp_path / "kontra")
 
 
-def test_the_wheel_carries_the_spec() -> None:
+def test_the_distributions_carry_the_spec() -> None:
+    """Inside the package (``kontra/_spec``), where :func:`find_spec_dir` looks first: the
+    sdist carries it there, and the wheel's build hook maps ``spec/`` there from a checkout
+    (``tests/packaging`` checks a real build of both)."""
     config = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    wheel = config["tool"]["hatch"]["build"]["targets"]["wheel"]
-    assert wheel["force-include"]["spec"] == "kontra/_spec"
-    assert "/spec" in config["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
+    targets = config["tool"]["hatch"]["build"]["targets"]
+    assert targets["sdist"]["force-include"]["spec"] == "kontra/_spec"
+    assert "/spec" not in targets["sdist"]["include"]  # never spec/ at the sdist's top
+    assert targets["wheel"]["hooks"]["custom"]["path"] == "hatch_build.py"
+    assert '"spec": "kontra/_spec"' in (ROOT / "hatch_build.py").read_text()
 
 
 def test_x_kontra_hash_has_the_spec_shape(enrich_spec: OfferingSpec) -> None:

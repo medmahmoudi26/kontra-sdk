@@ -1,6 +1,7 @@
 """Hiring from a script (PRD §7.1): :class:`Kontra`, :class:`QuoteResult`, :class:`Job`.
 
-``Kontra()`` reads the profile (``$KONTRA_HOME``), installs the buyer runtime (unless the
+``Kontra()`` reads the profile (``$KONTRA_HOME``) -- or, with ``KONTRA_API_KEY`` set, takes
+that key and only the key file from ``$KONTRA_HOME`` -- installs the buyer runtime (unless the
 process already has one) and connects lazily: to the gate on the first call, to Temporal on
 the first hire. Then, for one job:
 
@@ -559,13 +560,16 @@ class Job:
 
 
 class Kontra:
-    """The buyer's client. ``Kontra()`` uses the profile in ``$KONTRA_HOME``; tests pass a
+    """The buyer's client. ``Kontra()`` uses ``KONTRA_API_KEY`` when it is set, else the
+    profile in ``$KONTRA_HOME`` (:meth:`kontra.auth.Session.from_env`); tests pass a
     logged-in ``session``. ``client`` shares an existing Temporal connection (its data
     converter is replaced by the buyer's). ``start_timeout``: how long ``hire`` waits for
     the seller's handler to accept the start before returning the job anyway.
 
     The process's Kontra runtime (``Artifact`` I/O) is installed only if none is: a seller
     worker in the same process keeps its own. Artifacts this client returns are bound to it.
+    An API key's session learns its party from the gate, so with one the key check and the
+    runtime wait for ``async with Kontra()`` or the first call.
     """
 
     def __init__(
@@ -580,18 +584,11 @@ class Kontra:
         if profile is not None and session is not None:
             raise TypeError("pass a profile or a session, not both")
         self._owns_session = session is None
-        if session is None:
-            profile = profile if profile is not None else Profile.load(home)
-            session = Session(profile, home=home)
+        if session is None:  # KONTRA_API_KEY, else the profile, unless a profile is given
+            session = Session(profile, home=home) if profile is not None else Session.from_env(home)
         self._session = session
-        self.profile = session.profile
         identity = session.identity()
         self.public_key = age_crypto.public_key_of(identity)
-        if self.profile.public_key is not None and self.profile.public_key != self.public_key:
-            raise KontraError(
-                f"the key file is not the one {self.profile.party} registered "
-                f"({self.profile.public_key}); copy the right key, or run `kontra login`"
-            )
         self._identity = identity
         self.start_timeout = start_timeout
         self._keys = _CheckedSellerKeys(session.gate, self.contract)
@@ -609,19 +606,44 @@ class Kontra:
         self._infos: dict[str, ContractInfo] = {}
         self._validators: dict[str, InputValidator] = {}
         self._runtime: _runtime.Runtime | None = None
+        self._bound = False
+        self._closed = False
+        if session.resolved:
+            self._know_party()
+
+    def _know_party(self) -> None:
+        """Check the key file against the party's registered key and install the runtime:
+        what needs to know who we are."""
+        profile = self._session.profile
+        if profile.public_key is not None and profile.public_key != self.public_key:
+            raise KontraError(
+                f"the key file is not the one {profile.party} registered "
+                f"({profile.public_key}); copy the right key, or run `kontra login`"
+            )
         try:
             _runtime.current()
         except _runtime.NoRuntime:
             self._runtime = _runtime.Runtime(
-                party=self.profile.party,
-                gate=session.gate,
-                identity=identity,
+                party=profile.party,
+                gate=self._session.gate,
+                identity=self._identity,
                 recipient=self.public_key,
             )
             _runtime.install(self._runtime)
-        self._closed = False
+        self._bound = True
+
+    async def _ready(self) -> None:
+        """Bind, once the session knows who it is (an API key's asks the gate first)."""
+        if not self._bound:
+            await self._session.resolve()
+            if not self._bound:
+                self._know_party()
 
     # ------------------------------------------------------------------ plumbing
+
+    @property
+    def profile(self) -> Profile:
+        return self._session.profile
 
     @property
     def gate(self) -> GateClient:
@@ -650,6 +672,7 @@ class Kontra:
         """The Temporal client for our namespace (connected on first use, as the ``worker``
         role, its JWT refreshed in the background). :class:`TemporalUnavailable` if it
         cannot be reached."""
+        await self._ready()
         if self._client is not None:
             return self._client
         async with self._client_lock:
@@ -676,6 +699,11 @@ class Kontra:
             await self._session.aclose()
 
     async def __aenter__(self) -> Kontra:
+        try:
+            await self._ready()
+        except BaseException:
+            await self.aclose()
+            raise
         return self
 
     async def __aexit__(
@@ -691,6 +719,7 @@ class Kontra:
     async def offering(self, ref: str) -> m.CatalogEntry:
         """The catalog entry ``ref`` resolves to (``acme/enrich``, ``@1``, exact), with its
         contract checked: the document's own hash, and the entry agreeing with it."""
+        await self._ready()
         entry = self._entries.get(ref)
         if entry is None:
             try:
@@ -1345,6 +1374,7 @@ class Kontra:
 
     async def job(self, job_id: str) -> Job:
         """A job hired earlier (by this or another process)."""
+        await self._ready()
         view = await self.gate.job(job_id)
         return Job(
             self,
@@ -1359,6 +1389,7 @@ class Kontra:
         self, *, as_: str = "buyer", state: m.JobState | str | None = None, limit: int = 50
     ) -> list[m.JobView]:
         """Our jobs, newest first (``as_="seller"`` for the jobs we sell), up to ``limit``."""
+        await self._ready()
         out: list[m.JobView] = []
         cursor: str | None = None
         wanted = state.value if isinstance(state, m.JobState) else state
@@ -1373,12 +1404,14 @@ class Kontra:
         return out[:limit]
 
     async def balance(self, currency: str = "USD") -> m.Balance:
+        await self._ready()
         return await self.gate.balance(currency)
 
     async def topup(
         self, amount: Decimal | int | float | str, currency: str = "USD"
     ) -> m.TopupResult:
         """Add ``amount`` (major units, e.g. ``"25.00"``). Play money under ``kontra dev``."""
+        await self._ready()
         return await self.gate.topup(Money.from_decimal(amount, currency).amount_minor, currency)
 
     async def upload(

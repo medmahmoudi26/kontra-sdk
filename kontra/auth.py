@@ -1,7 +1,8 @@
 """Sessions and login (PRD §10.3, §12).
 
-A :class:`Session` turns the profile's long-lived refresh token into what the rest of the
-SDK needs:
+A :class:`Session` turns a long-lived credential -- the profile's refresh token, or a
+program's API key (:meth:`Session.from_api_key`, ``KONTRA_API_KEY``) -- into what the rest
+of the SDK needs:
 
 * a gate access token (15 min), refreshed 60 s before it expires and on a 401, behind
   :attr:`Session.gate`;
@@ -14,10 +15,13 @@ SDK needs:
 The gate rotates the refresh token on every use and revokes the whole session if an old
 one is presented again, so refreshing is serialised: within a process by a lock, between
 processes sharing a profile by :func:`kontra.profile.profile_lock`, and each refresh first
-adopts a token another process may have rotated in the meantime.
+adopts a token another process may have rotated in the meantime. An API key does not rotate:
+its session refreshes by exchanging the key again, and writes nothing anywhere. Such a
+session can hire, serve and read, never publish or manage keys (decisions I19).
 
-Login is the RFC 8628 device flow (:func:`login_device`) or, against ``kontra dev``,
-:func:`dev_login`; :func:`login` runs either and writes the profile and key.
+Login is the RFC 8628 device flow (:func:`login_device`; with ``email``, approved through a
+link the gate mails) or, against ``kontra dev``, :func:`dev_login`; :func:`login` runs
+either and writes the profile and key.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ import base64
 import contextlib
 import json
 import logging
+import os
 import sys
 import time
 import webbrowser
@@ -47,10 +52,14 @@ if TYPE_CHECKING:
     from temporalio.converter import DataConverter
 
 __all__ = [
+    "API_KEY_ENV",
+    "DEFAULT_GATE_URL",
     "DEVICE_GRANT",
+    "GATE_ENV",
     "REFRESH_MARGIN",
     "LoginError",
     "Session",
+    "api_key_from_env",
     "dev_login",
     "login",
     "login_device",
@@ -58,7 +67,14 @@ __all__ = [
 
 log = logging.getLogger("kontra.auth")
 
-DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+DEVICE_GRANT = m.DEVICE_GRANT
+#: A program's credential. When set, :meth:`Session.from_env` -- ``Kontra()``, ``kontra
+#: serve``, ``kontra mcp`` and every CLI command -- uses it instead of the profile.
+API_KEY_ENV = "KONTRA_API_KEY"
+#: The gate, when no ``--gate`` and (for a login) no profile says otherwise.
+GATE_ENV = "KONTRA_GATE"
+#: The gate when nothing is configured at all.
+DEFAULT_GATE_URL = "https://api.kontra.run"
 #: Tokens are replaced this long before they expire (or at half their lifetime if shorter).
 REFRESH_MARGIN = timedelta(seconds=60)
 #: The background refresher never sleeps less than this, so a skewed clock cannot spin it.
@@ -117,6 +133,26 @@ def _jwt_lifetime(token: str) -> timedelta | None:
     return timedelta(seconds=min(exp - iat, _MAX_LIFETIME.total_seconds()))
 
 
+def _check_api_key(value: str, where: str) -> None:
+    """Refuse a value that cannot be an API key, without ever showing it: a key with a
+    stray newline or quote is still the secret."""
+    if not m.is_api_key(value):
+        raise ProfileError(
+            f"{where} is not a Kontra API key ({m.API_KEY_PREFIX} and 43 letters, digits, "
+            "- or _); check it for stray whitespace or quotes"
+        )
+
+
+def api_key_from_env() -> str | None:
+    """``$KONTRA_API_KEY`` when it is set and not empty (checked for shape: a malformed one
+    raises :class:`~kontra.profile.ProfileError`, which never quotes it), else None."""
+    value = os.environ.get(API_KEY_ENV)
+    if not value:
+        return None
+    _check_api_key(value, API_KEY_ENV)
+    return value
+
+
 class LoginError(Exception):
     """A login that cannot complete. ``code`` is the RFC 8628 error (``access_denied``,
     ``expired_token``) or one of ours (``key_mismatch``, ``party_mismatch``, ``insecure_gate``)."""
@@ -150,24 +186,51 @@ class _AccessTokens:
 
 
 class Session:
-    """A logged-in party. ``Session(Profile.load())``, or :meth:`Session.load`.
+    """A logged-in party: ``Session(Profile.load())`` or :meth:`Session.load` for a person's
+    login, :meth:`Session.from_api_key` for a program, :meth:`Session.from_env` for
+    whichever this process was given.
 
-    ``home`` is where a rotated refresh token is written back; by default the directory
-    the profile was loaded from (a profile built in memory is not persisted). ``clock`` and
-    ``sleep`` exist for tests.
+    With a profile, ``home`` is where a rotated refresh token is written back; by default
+    the directory the profile was loaded from (a profile built in memory is not persisted).
+    With an ``api_key`` (``gate_url`` defaults to :data:`DEFAULT_GATE_URL`) nothing is ever
+    written; ``home`` is only where :meth:`identity` reads the party's key, and the session
+    learns who it is from the gate on first use (:meth:`resolve`). ``clock`` and ``sleep``
+    exist for tests.
     """
 
     def __init__(
         self,
-        profile: Profile,
+        profile: Profile | None = None,
         *,
+        api_key: str | None = None,
+        gate_url: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         home: Path | str | None = None,
         clock: Clock | None = None,
         sleep: Sleep | None = None,
     ) -> None:
-        self.profile = profile
-        self._home = Path(home) if home is not None else profile.home
+        if (profile is None) == (api_key is None):
+            raise TypeError("a Session takes a profile or an api_key")
+        if profile is not None:
+            if gate_url is not None:
+                raise TypeError("a profile names its own gate; gate_url is for an api_key")
+            gate_url = profile.gate_url
+            self._home: Path | None = Path(home) if home is not None else profile.home
+            self._identity_home: Path | None = self._home
+        else:
+            assert api_key is not None
+            _check_api_key(api_key, "the API key")
+            gate_url = gate_url or DEFAULT_GATE_URL
+            _check_gate_url(gate_url, dev=False)  # a key is a bearer credential: TLS only
+            self._home = None  # an API key's session persists nothing
+            self._identity_home = Path(home) if home is not None else None
+        self._profile = profile
+        self._api_key = api_key
+        self._gate_url = gate_url
+        #: Who the API key belongs to and its ``created_at``, from its first exchange.
+        self._key_party: str | None = None
+        self._key_auth_time: datetime | None = None
+        self._resolve_lock = asyncio.Lock()
         self._clock = clock or _utcnow
         self._sleep = sleep or asyncio.sleep
         self._access: str | None = None
@@ -176,28 +239,123 @@ class Session:
         #: The refresh token we last read from or wrote to the profile on disk. Only a disk
         #: copy that differs from *this* was written by someone else and is newer than ours;
         #: a disk copy that merely differs from memory may be one we failed to replace.
-        self._disk_token = profile.refresh_token
+        self._disk_token = profile.refresh_token if profile is not None else None
         self._temporal: dict[str, tuple[m.TemporalToken, datetime]] = {}
         self._temporal_lock = asyncio.Lock()
         #: Background api_key refreshers and the client each one keeps fresh.
         self._tasks: dict[asyncio.Task[None], _ApiKeyHolder] = {}
         #: Set by aclose(): no refresher may start after it, as nothing would ever stop it.
         self._closed = False
-        self._gate = GateClient(profile.gate_url, token=_AccessTokens(self), transport=transport)
+        self._gate = GateClient(gate_url, token=_AccessTokens(self), transport=transport)
 
     @classmethod
     def load(
         cls, home: Path | str | None = None, *, transport: httpx.AsyncBaseTransport | None = None
     ) -> Session:
+        """The person's login in ``home`` (``$KONTRA_HOME``). :meth:`from_env` also honours
+        ``KONTRA_API_KEY``."""
         return cls(Profile.load(home), transport=transport)
+
+    @classmethod
+    async def from_api_key(
+        cls,
+        gate_url: str,
+        api_key: str,
+        *,
+        home: Path | str | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+        clock: Clock | None = None,
+        sleep: Sleep | None = None,
+    ) -> Session:
+        """A program's session: ``api_key`` is exchanged now, so a revoked or mistyped key
+        fails here rather than on the first real call, and again whenever the access token
+        runs out. Nothing is written anywhere. ``home`` is where the party's key file
+        (``key``) is read from, for decrypting deliveries."""
+        session = cls(
+            api_key=api_key,
+            gate_url=gate_url,
+            home=home,
+            transport=transport,
+            clock=clock,
+            sleep=sleep,
+        )
+        try:
+            await session.resolve()
+        except BaseException:
+            await session.aclose()
+            raise
+        return session
+
+    @classmethod
+    def from_env(
+        cls, home: Path | str | None = None, *, transport: httpx.AsyncBaseTransport | None = None
+    ) -> Session:
+        """``$KONTRA_API_KEY`` when it is set, to ``$KONTRA_GATE`` (else
+        :data:`DEFAULT_GATE_URL`; a profile's gate is not consulted, so a key never goes to
+        a gate it was not made for by accident); otherwise the profile in ``home``. Does no
+        I/O: an API key's session asks the gate who it is on first use (:meth:`resolve`)."""
+        key = api_key_from_env()
+        if key is not None:
+            gate_url = os.environ.get(GATE_ENV) or DEFAULT_GATE_URL
+            return cls(api_key=key, gate_url=gate_url, home=home, transport=transport)
+        return cls(Profile.load(home), home=home, transport=transport)
 
     @property
     def gate(self) -> GateClient:
         return self._gate
 
+    @property
+    def profile(self) -> Profile:
+        """Who this session is. An API key's session knows only once :meth:`resolve` ran
+        (it does on the first gate call of a :class:`~kontra.hire.Kontra` or a worker)."""
+        if self._profile is None:
+            raise RuntimeError(
+                "this API key's session has not asked the gate who it is yet: "
+                "`await session.resolve()` first"
+            )
+        return self._profile
+
+    @property
+    def resolved(self) -> bool:
+        """Whether :attr:`profile` is known (always, for a person's login)."""
+        return self._profile is not None
+
+    @property
+    def uses_api_key(self) -> bool:
+        return self._api_key is not None
+
+    async def resolve(self) -> Profile:
+        """The profile; for an API key, learned from the gate (the exchange and
+        ``GET /v1/me``) the first time and kept in memory only. ``tls`` to Temporal is on
+        unless the gate is a dev gate, as a fresh login's would be."""
+        if self._profile is not None:
+            return self._profile
+        async with self._resolve_lock:
+            if self._profile is None:
+                await self.access_token()
+                me = await self._gate.me()
+                if me.party != self._key_party or self._key_auth_time is None:
+                    raise ProfileError(
+                        f"the gate says this API key's session is {me.party!r}, but it "
+                        f"exchanged the key for {self._key_party!r}"
+                    )
+                self._profile = Profile(
+                    gate_url=self._gate_url,
+                    temporal_address=me.temporal_address,
+                    party=me.party,
+                    namespace=me.namespace,
+                    refresh_token=None,
+                    auth_time=self._key_auth_time,
+                    public_key=me.public_key,
+                    tls=not me.dev,
+                    dev=me.dev,
+                )
+            return self._profile
+
     def identity(self) -> str:
-        """Our secret age identity, from the same directory as the profile."""
-        return Profile.identity(self._home or kontra_home())
+        """Our secret age identity, from the same directory as the profile (for an API
+        key, the ``home`` it was given, else ``$KONTRA_HOME``)."""
+        return Profile.identity(self._identity_home or kontra_home())
 
     async def aclose(self) -> None:
         self._closed = True
@@ -228,8 +386,14 @@ class Session:
             self._access = None
 
     async def _refresh(self) -> str:
+        if self._api_key is not None:
+            return await self._exchange_api_key(self._api_key)
         async with profile_lock(self._home):
             persist = self._adopt_rotated_token()
+            if self.profile.refresh_token is None:
+                raise NotLoggedIn(
+                    f"the profile of {self.profile.party} holds no session. Run `kontra login`."
+                )
             issued = self._clock()
             req = m.TokenRequest(
                 grant_type="refresh_token", refresh_token=self.profile.refresh_token
@@ -248,6 +412,11 @@ class Session:
                     f"the gate answered for party {tok.party!r} to the refresh token of "
                     f"{self.profile.party!r}; run `kontra login` again"
                 )
+            if tok.refresh_token is None:
+                raise ProfileError(
+                    f"the gate at {self.profile.gate_url} answered a refresh without the next "
+                    "refresh token; run `kontra login` again"
+                )
             changed = (tok.refresh_token, tok.auth_time) != (
                 self.profile.refresh_token,
                 self.profile.auth_time,
@@ -257,6 +426,30 @@ class Session:
                 self.profile.auth_time = tok.auth_time
             if persist and (changed or self.profile.refresh_token != self._disk_token):
                 self._persist()
+        self._access = tok.access_token
+        self._access_refresh_at = _refresh_point(issued, issued + timedelta(seconds=tok.expires_in))
+        return tok.access_token
+
+    async def _exchange_api_key(self, api_key: str) -> str:
+        """The ``api_key`` grant. Nothing rotates and nothing is written: the next refresh
+        exchanges the same key again."""
+        issued = self._clock()
+        try:
+            tok = await self._gate.token(m.TokenRequest(grant_type="api_key", api_key=api_key))
+        except GateError as e:
+            if e.code == "invalid_grant":
+                raise NotLoggedIn(
+                    f"the gate at {self._gate_url} does not accept this API key ({e.message}): "
+                    "it was revoked, or was made on another gate. Make a new one with "
+                    "`kontra keys create`."
+                ) from e
+            raise
+        if self._key_party is None:
+            self._key_party, self._key_auth_time = tok.party, tok.auth_time
+        elif tok.party != self._key_party:
+            raise ProfileError(
+                f"the gate answered for party {tok.party!r} to the API key of {self._key_party!r}"
+            )
         self._access = tok.access_token
         self._access_refresh_at = _refresh_point(issued, issued + timedelta(seconds=tok.expires_in))
         return tok.access_token
@@ -350,6 +543,7 @@ class Session:
             raise TypeError("connect_temporal manages api_key itself")
         if self._closed:
             raise RuntimeError("this Session is closed: it keeps no client's api_key fresh")
+        await self.resolve()
         tok = await self.temporal_token(role)
         kwargs.setdefault("tls", self.profile.tls)
         if data_converter is not None:
@@ -445,6 +639,27 @@ def _print_prompt(start: m.DeviceStart) -> None:
     )
 
 
+def _email_prompt(address: str) -> Callable[[m.DeviceStart], None]:
+    def show(start: m.DeviceStart) -> None:
+        print(
+            f"Check {address} for a sign-in link; when the page asks, type {start.user_code}\n"
+            "  (the code is only on this screen: the mail never carries it)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return show
+
+
+def _plain_email(email: str) -> str:
+    address = email.strip()
+    if not m.is_email(address):
+        raise LoginError(
+            "invalid_email", f"{address} is not a plain email address (like name@example.com)"
+        )
+    return address
+
+
 async def _open_browser(url: str) -> None:
     # Only ever hand the browser an http(s) URL from the gate: never file:, javascript: ...
     if httpx.URL(url).scheme not in ("http", "https"):
@@ -454,11 +669,31 @@ async def _open_browser(url: str) -> None:
         await asyncio.to_thread(webbrowser.open, url)
 
 
+async def _check_device_page(gate: GateClient, gate_url: str) -> None:
+    """Fail at once, with the command that works, when the gate's device page can approve
+    nothing: a production gate signs in by email only, and that sign-in starts here (the
+    page does not mail links, decisions I19). A gate that predates ``GET /v1/info`` is
+    tried as before."""
+    try:
+        offered = await gate.info()
+    except GateError as e:
+        if e.status in (404, 405):
+            return
+        raise
+    if not (offered.github_sign_in or offered.dev):
+        raise LoginError(
+            "email_sign_in",
+            f"{gate_url} signs in by email: run `kontra login --email you@example.com` "
+            "(the mail brings a link whose page asks for the code this command prints)",
+        )
+
+
 async def login_device(
     gate_url: str,
     handle: str | None = None,
     open_browser: bool = True,
     *,
+    email: str | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     prompt: Callable[[m.DeviceStart], None] | None = None,
     sleep: Sleep | None = None,
@@ -466,28 +701,46 @@ async def login_device(
 ) -> m.TokenResponse:
     """RFC 8628 device authorization: show a code, wait for the browser, return tokens.
 
-    ``handle`` is the party to claim on first login. Polling follows §3.5:
-    ``authorization_pending`` keeps the interval, ``slow_down`` adds 5 s for the rest of the
-    flow, a dropped connection doubles it, ``expired_token`` and ``access_denied`` (and the
-    code's own ``expires_in`` running out) end it with :class:`LoginError`.
+    ``handle`` is the party to claim on first login. ``email``: instead of a browser, the
+    gate mails that address a sign-in link (``POST /v1/auth/magic``); its page asks for the
+    code, which only this terminal shows, so a link someone else asked for approves nothing
+    (decisions I19). Polling follows §3.5: ``authorization_pending`` keeps the interval,
+    ``slow_down`` adds 5 s for the rest of the flow, a dropped connection doubles it,
+    ``expired_token`` and ``access_denied`` (and the code's own ``expires_in`` running out)
+    end it with :class:`LoginError`.
     """
     if handle is not None:
         validate_handle(handle)
+    address = _plain_email(email) if email is not None else None
     _check_gate_url(gate_url, dev=False)
     sleep = sleep or asyncio.sleep
     clock = clock or time.monotonic
+    expired = "the login code expired; run the login again"
+    if address is not None:
+        # The same for every address: the gate never says which of these applies.
+        expired = (
+            f"the login code expired before the link was used; run the login again (no mail? "
+            f"check {address} and its spam folder: sign-ups are by invitation, and an address "
+            "gets only so many links an hour, also when someone else asks for them)"
+        )
     async with GateClient(gate_url, transport=transport) as gate:
+        if address is None:
+            await _check_device_page(gate, gate_url)
         start = await gate.device_start()
-        (prompt or _print_prompt)(start)
-        if open_browser:
-            await _open_browser(start.verification_uri_complete)
+        if address is not None:
+            await gate.magic_link(address, start.user_code)
+            (prompt or _email_prompt(address))(start)
+        else:
+            (prompt or _print_prompt)(start)
+            if open_browser:
+                await _open_browser(start.verification_uri_complete)
         interval = max(start.interval, 1)
         deadline = clock() + start.expires_in
         req = m.TokenRequest(grant_type=DEVICE_GRANT, device_code=start.device_code, handle=handle)
         while True:
             await sleep(interval)
             if clock() >= deadline:
-                raise LoginError("expired_token", "the login code expired; run the login again")
+                raise LoginError("expired_token", expired)
             try:
                 return await gate.token(req)
             except httpx.TransportError:
@@ -498,6 +751,8 @@ async def login_device(
                 if e.code == "slow_down":
                     asked = (e.detail or {}).get("interval")
                     interval = max(interval + _SLOW_DOWN_S, asked if isinstance(asked, int) else 0)
+                elif e.code == "expired_token" and address is not None:
+                    raise LoginError(e.code, expired) from e
                 elif e.code in ("expired_token", "access_denied"):
                     raise LoginError(e.code, e.message) from e
                 else:
@@ -519,6 +774,7 @@ async def login(
     *,
     handle: str | None = None,
     dev: bool = False,
+    email: str | None = None,
     home: Path | str | None = None,
     open_browser: bool = True,
     replace_key: bool = False,
@@ -526,9 +782,10 @@ async def login(
     transport: httpx.AsyncBaseTransport | None = None,
     prompt: Callable[[m.DeviceStart], None] | None = None,
 ) -> Profile:
-    """``kontra login``: get tokens (device flow, or :func:`dev_login` with ``dev``), make
-    the encryption key if this machine has none, register its public key with the gate,
-    and write the profile.
+    """``kontra login``: get tokens (device flow -- approved in the browser, or through
+    the link the gate mails ``email`` -- or :func:`dev_login` with ``dev``), make the
+    encryption key if this machine has none, register its public key with the gate, and
+    write the profile.
 
     If the gate already holds a different public key for the party, the login stops with
     ``key_mismatch`` unless ``replace_key``: replacing it makes deliveries to the old key
@@ -539,11 +796,15 @@ async def login(
     if dev:
         if handle is None:
             raise ValueError("a dev login needs a handle")
+        if email is not None:
+            raise ValueError("a dev login takes no email")
         tokens = await dev_login(gate_url, handle, transport=transport)
     else:
         tokens = await login_device(
-            gate_url, handle, open_browser, transport=transport, prompt=prompt
+            gate_url, handle, open_browser, email=email, transport=transport, prompt=prompt
         )
+    if tokens.refresh_token is None:
+        raise LoginError("invalid_response", "the gate answered the login without a refresh token")
     _, public = Profile.ensure_identity(home)
 
     async def bearer() -> str:

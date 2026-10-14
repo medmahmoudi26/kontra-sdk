@@ -35,10 +35,26 @@ from pydantic import (
 )
 
 __all__ = [
+    "API_KEY_ID_PATTERN",
+    "API_KEY_LABEL_PATTERN",
+    "API_KEY_PATTERN",
+    "API_KEY_PREFIX",
     "API_VERSION",
+    "DEVICE_GRANT",
+    "EMAIL_MAX",
+    "HANDOFF_PATTERN",
+    "HANDOFF_TTL_SECONDS",
+    "MAX_API_KEYS",
     "MAX_PARTS",
+    "REVOCATION_WINDOW_MAX",
+    "USER_CODE_ALPHABET",
+    "USER_CODE_PATTERN",
     "AcceptRequest",
     "AccessToken",
+    "ApiKeyCreate",
+    "ApiKeyCreated",
+    "ApiKeyList",
+    "ApiKeyView",
     "ArtifactComplete",
     "ArtifactCreate",
     "ArtifactUpload",
@@ -54,12 +70,15 @@ __all__ = [
     "DownloadUrl",
     "ErrorBody",
     "Escrow",
+    "GateInfo",
     "HireRequest",
     "HireView",
     "HoldClaims",
     "JobList",
     "JobState",
     "JobView",
+    "MagicLinkRequest",
+    "MagicLinkSent",
     "Me",
     "PartyView",
     "ProgressEvent",
@@ -72,7 +91,10 @@ __all__ = [
     "RejectRequest",
     "ResolveRequest",
     "ResultView",
+    "Revocations",
     "SellerJobView",
+    "SessionList",
+    "SessionView",
     "SetKey",
     "StartRequest",
     "TemporalToken",
@@ -83,6 +105,10 @@ __all__ = [
     "TopupResult",
     "UploadPart",
     "WirePayload",
+    "is_api_key",
+    "is_api_key_id",
+    "is_email",
+    "is_user_code",
 ]
 
 API_VERSION = "v1"
@@ -145,11 +171,85 @@ _Activity = Annotated[str, StringConstraints(max_length=_ACTIVITY_MAX)]
 _ETag = Annotated[str, StringConstraints(max_length=_ETAG_MAX, pattern=r"^[\x20-\x7e]*$")]
 #: What ``_ETag`` accepts, for the whole-list check (:meth:`ArtifactComplete._one_error`).
 _ETAG_TEXT = re.compile(rf"[\x20-\x7e]{{0,{_ETAG_MAX}}}", re.ASCII)
+
 #: Unknown keys pydantic reports one by one (``extra_forbidden``, each at its own location):
 #: a few, each short. More, or a longer one, are one error naming the first few.
 _UNKNOWN_REPORTED = 8
 _UNKNOWN_KEY_REPORTED = 64
 _UNKNOWN_NAMED = 3
+
+# --------------------------------------------------------------------------- credentials
+#
+# What people type (an email address) and what the gate mints (keys, ids, user codes) is
+# checked with anchored, ASCII-only patterns: pydantic's ``pattern`` (Rust regex, where ``$``
+# is the end of the text, never before a trailing newline) or ``re.fullmatch``.
+
+#: RFC 8628 §6.1 user codes: no vowels (no words), no look-alikes; ``BCDF-GHJK``.
+USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"
+USER_CODE_PATTERN = rf"^[{USER_CODE_ALPHABET}]{{4}}-[{USER_CODE_ALPHABET}]{{4}}$"
+#: ``kontra_sk_`` + base64url(32 random bytes), unpadded. The gate stores its sha256 only.
+API_KEY_PREFIX = "kontra_sk_"
+API_KEY_PATTERN = rf"^{API_KEY_PREFIX}[A-Za-z0-9_-]{{43}}$"
+#: ``key_`` + 16 random hex: never derived from the key.
+API_KEY_ID_PATTERN = r"^key_[0-9a-f]{16}$"
+#: A key's label: 1 to 64 printable ASCII characters.
+API_KEY_LABEL_PATTERN = r"^[\x20-\x7e]{1,64}$"
+#: The live keys a party may hold at once (the 26th is ``409 too_many_keys``).
+MAX_API_KEYS = 25
+#: A sign-in handoff: base64url(32 random bytes), unpadded. A gate whose link page has just
+#: approved a sign-in sends the browser on to its console with one, in the URL fragment; the
+#: console trades it once, within minutes, for that browser's own session (``handoff`` grant).
+HANDOFF_PATTERN = r"^[A-Za-z0-9_-]{43}$"
+#: How long a handoff may wait to be traded.
+HANDOFF_TTL_SECONDS = 120
+#: RFC 5321's path limit, and its local part's.
+EMAIL_MAX = 254
+_EMAIL_LOCAL_MAX = 64
+#: A plain ``local@domain``: dot-separated atoms of letters, digits and ``_%+-`` (no quoted
+#: strings, comments or display names), and a DNS name of at least two labels whose last
+#: is alphabetic or an IDNA ``xn--`` label (so no IP literal, bracketed or not). Narrower
+#: than RFC 5322 on purpose: the address reaches an SMTP envelope, a mail header and HTML.
+_EMAIL = re.compile(
+    r"[A-Za-z0-9_%+-]+(?:\.[A-Za-z0-9_%+-]+)*"
+    r"@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"(?:[A-Za-z]{2,63}|xn--[A-Za-z0-9-]{1,59})",
+    re.ASCII,
+)
+_API_KEY = re.compile(API_KEY_PATTERN, re.ASCII)
+_API_KEY_ID = re.compile(API_KEY_ID_PATTERN, re.ASCII)
+_USER_CODE = re.compile(USER_CODE_PATTERN, re.ASCII)
+
+# Each with its ceiling too, so a gate refuses an oversized value before any pattern runs.
+_Email = Annotated[str, StringConstraints(strip_whitespace=True, max_length=EMAIL_MAX)]
+_UserCode = Annotated[str, StringConstraints(max_length=9, pattern=USER_CODE_PATTERN)]
+_ApiKey = Annotated[
+    str, StringConstraints(max_length=len(API_KEY_PREFIX) + 43, pattern=API_KEY_PATTERN)
+]
+_ApiKeyId = Annotated[str, StringConstraints(max_length=20, pattern=API_KEY_ID_PATTERN)]
+_KeyLabel = Annotated[str, StringConstraints(max_length=64, pattern=API_KEY_LABEL_PATTERN)]
+_Handoff = Annotated[str, StringConstraints(max_length=43, pattern=HANDOFF_PATTERN)]
+
+
+def is_email(text: str) -> bool:
+    """``text`` is a plain ``local@domain`` address :class:`MagicLinkRequest` accepts (after
+    its whitespace is stripped; this takes it as given)."""
+    if len(text) > EMAIL_MAX or _EMAIL.fullmatch(text) is None:
+        return False
+    return len(text.rpartition("@")[0]) <= _EMAIL_LOCAL_MAX
+
+
+def is_api_key(text: str) -> bool:
+    """``text`` has the shape of a Kontra API key (whether the gate knows it is another matter)."""
+    return _API_KEY.fullmatch(text) is not None
+
+
+def is_api_key_id(text: str) -> bool:
+    return _API_KEY_ID.fullmatch(text) is not None
+
+
+def is_user_code(text: str) -> bool:
+    """``text`` is a device user code exactly as the gate issues it (``BCDF-GHJK``)."""
+    return _USER_CODE.fullmatch(text) is not None
 
 
 class _M(BaseModel):
@@ -197,14 +297,51 @@ class DeviceStart(_M):
     expires_in: int
 
 
-class TokenRequest(_M):
-    """``POST /v1/auth/token``."""
+#: The RFC 8628 grant type, polled with the ``device_code`` of :class:`DeviceStart`.
+DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 
-    grant_type: Literal["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"]
-    device_code: _Long | None = None
-    refresh_token: _Long | None = None
+
+class TokenRequest(_M):
+    """``POST /v1/auth/token``. Each grant takes exactly its own fields
+    (:meth:`grant_error`): ``device_code`` (and, on a first login, ``handle``) for the device
+    grant, ``refresh_token`` for ``refresh_token``, ``api_key`` for ``api_key``, ``handoff``
+    for ``handoff``."""
+
+    grant_type: Literal[
+        "urn:ietf:params:oauth:grant-type:device_code", "refresh_token", "api_key", "handoff"
+    ]
+    # The credentials stay out of ``repr``: a request in a log line or a traceback with
+    # locals must not carry them.
+    device_code: _Long | None = Field(default=None, repr=False)
+    refresh_token: _Long | None = Field(default=None, repr=False)
     #: First login only: the handle to claim (the party id and Temporal namespace).
     handle: _Name | None = None
+    #: The ``api_key`` grant's key (``kontra_sk_`` + 43 characters, :func:`is_api_key`).
+    api_key: _ApiKey | None = Field(default=None, repr=False)
+    #: The ``handoff`` grant's one-time code (:data:`HANDOFF_PATTERN`).
+    handoff: _Handoff | None = Field(default=None, repr=False)
+
+    def grant_error(self) -> str | None:
+        """Why the fields present do not fit ``grant_type``, or None when they do. A gate
+        answers a misfit as RFC 6749 does, 400 ``invalid_request`` with this message; a body
+        that is not a TokenRequest at all is the usual 422."""
+        present = {
+            name
+            for name in ("device_code", "refresh_token", "handle", "api_key", "handoff")
+            if getattr(self, name) is not None
+        }
+        if self.grant_type == DEVICE_GRANT:
+            if "device_code" not in present or present - {"device_code", "handle"}:
+                return "the device_code grant takes device_code only"
+        elif self.grant_type == "refresh_token":
+            if present != {"refresh_token"}:
+                return "the refresh_token grant takes refresh_token only"
+        elif self.grant_type == "handoff":
+            if present != {"handoff"}:
+                return "the handoff grant takes handoff only"
+        elif present != {"api_key"}:
+            return "the api_key grant takes api_key only"
+        return None
 
 
 class DevLogin(_M):
@@ -218,15 +355,72 @@ class TokenResponse(_M):
     access_token: _Long  # gate API JWT, aud "kontra:api"
     token_type: Literal["Bearer"] = "Bearer"  # noqa: S105
     expires_in: int
-    refresh_token: _Long
+    #: The next refresh token (the gate rotates it on every use). None for the ``api_key``
+    #: grant: refreshing that session is exchanging the key again.
+    refresh_token: _Long | None = Field(default=None, repr=False)
     party: _Name
-    #: The ``auth_time`` of the human session this refresh token descends from.
+    #: The ``auth_time`` of the human session this refresh token descends from; for an API
+    #: key, the key's ``created_at`` (an API-key session is never fresh, whatever its age).
     auth_time: datetime
 
 
 class AccessToken(_M):
     access_token: _Long
     expires_in: int
+
+
+class MagicLinkRequest(_M):
+    """``POST /v1/auth/magic``: email a sign-in link that approves the device authorization
+    ``device_user_code`` (decisions I19). The gate lowercases ``email``. It answers 202
+    :class:`MagicLinkSent` whatever happens next -- an address that is not invited, has no
+    account, or a code that is not pending all look the same -- so the route says nothing
+    about who is on the allowlist; 429 when rate-limited (per address and per client)."""
+
+    email: _Email
+    #: The ``user_code`` of the :class:`DeviceStart` to approve, as the gate issued it.
+    device_user_code: _UserCode
+
+    @field_validator("email")
+    @classmethod
+    def _plain_address(cls, value: str) -> str:
+        if not is_email(value):  # the value stays out of the message
+            raise ValueError("not a plain email address (local@domain)")
+        return value
+
+
+class MagicLinkSent(_M):
+    """``POST /v1/auth/magic`` (202). The same answer whether or not a mail went out."""
+
+    status: Literal["sent"] = "sent"
+
+
+class ApiKeyCreate(_M):
+    """``POST /v1/keys`` (fresh human session): an API key for a program."""
+
+    label: _KeyLabel
+
+
+class ApiKeyCreated(_M):
+    """``POST /v1/keys`` (201). ``key`` is shown this once; the gate keeps only its sha256."""
+
+    id: _ApiKeyId
+    label: _KeyLabel
+    created_at: datetime
+    key: _ApiKey = Field(repr=False)
+
+
+class ApiKeyView(_M):
+    """One key of ``GET /v1/keys``; never the key itself."""
+
+    id: _ApiKeyId
+    label: _KeyLabel
+    created_at: datetime
+    last_used_at: datetime | None = None  # the last exchange, to the minute
+    revoked_at: datetime | None = None
+
+
+class ApiKeyList(_M):
+    keys: list[ApiKeyView] = Field(max_length=_PAGE_MAX)
 
 
 class TemporalTokenRequest(_M):
@@ -243,6 +437,61 @@ class TemporalToken(_M):
     namespace: _Name
     temporal_address: _Long
     role: Literal["worker"] = "worker"
+
+
+#: The most sessions :class:`Revocations` lists. Far above what a gate revokes in a window;
+#: a list that would be longer is a flood, and a gate answers it with the newest this many.
+REVOCATION_WINDOW_MAX = 200_000
+_SESSION_DIGEST = r"^[0-9a-f]{64}$"
+
+
+class Revocations(_M):
+    """``GET /v1/auth/revocations`` (public): the sessions revoked in the last
+    ``window_seconds``, each as the sha256 (hex) of its id -- the ``sid`` claim of every token
+    the gate mints. The window outlasts the longest Temporal worker token (15 minutes), so a
+    worker token whose session is revoked is on this list until it expires. Kontra's Temporal
+    server polls it and refuses those tokens (decisions I19): revoking an API key or a login
+    reaches Temporal within seconds, not when the token expires. A digest says nothing to
+    whoever reads the list without the token."""
+
+    window_seconds: int
+    sessions: list[Annotated[str, StringConstraints(pattern=_SESSION_DIGEST)]] = Field(
+        max_length=REVOCATION_WINDOW_MAX
+    )
+
+
+_SESSION_ID = r"^[0-9a-f]{32}$"
+_SessionId = Annotated[str, StringConstraints(max_length=32, pattern=_SESSION_ID)]
+
+
+class SessionView(_M):
+    """One of the party's sign-ins (``GET /v1/sessions``): a person's login that can still get
+    tokens, never an API key's (those are ``/v1/keys``). ``via`` is how the person proved who
+    they are (``device:email``, ``device:github``, ``device:dev``, ``dev-login``);
+    ``current`` marks the session asking. One the person does not recognise -- a device
+    login they were tricked into approving -- is ended with ``DELETE /v1/sessions/{id}``."""
+
+    id: _SessionId
+    via: _Name
+    auth_time: datetime
+    created_at: datetime
+    current: bool = False
+
+
+class SessionList(_M):
+    sessions: list[SessionView] = Field(max_length=_PAGE_MAX)
+
+
+class GateInfo(_M):
+    """``GET /v1/info`` (public): what this gate offers before anyone signs in, so a client
+    shows only what works here. ``dev``: ``KONTRA_DEV=1`` -- dev login
+    (``POST /v1/auth/dev-login``) exists and new parties get play money; never on
+    production. ``email_sign_in``: ``POST /v1/auth/magic`` mails sign-in links (the only way
+    in on production). ``github_sign_in``: the device page signs in with GitHub."""
+
+    dev: bool
+    email_sign_in: bool
+    github_sign_in: bool
 
 
 class Me(_M):

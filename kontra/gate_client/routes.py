@@ -7,12 +7,18 @@ adding a row here, in the same PR.
 
 ``auth``:
 * ``none``      -- public.
-* ``party``     -- ``Authorization: Bearer <gate access token>`` (aud ``kontra:api``).
+* ``party``     -- ``Authorization: Bearer <gate access token>`` (aud ``kontra:api``), from a
+                   human login or from an API key.
 * ``fresh``     -- a party token whose human session (``auth_time``) is younger than the
-                   gate's freshness window; worker tokens never qualify (§10.4).
+                   gate's freshness window, else 403 ``stale_session``; worker tokens never
+                   qualify (§10.4), and an API key's session never does, however new the key:
+                   403 ``fresh_login_required`` (decisions I19).
 * ``worker``    -- the party's Temporal *worker* JWT, also accepted on seller routes so a
                    worker needs one credential (``kontra serve``).
-* ``resolver``  -- a party listed in the gate's ``KONTRA_RESOLVERS``.
+* ``resolver``  -- a party listed in the gate's ``KONTRA_RESOLVERS`` (anyone else: 403
+                   ``not_resolver``), with a ``fresh`` session: a resolver splits escrow, so
+                   an API key gets 403 ``fresh_login_required`` and an old login 403
+                   ``stale_session``, checked after the resolver list.
 * ``dev``       -- only when the gate runs with ``KONTRA_DEV=1``; 404 otherwise.
 """
 
@@ -35,8 +41,10 @@ class Route:
     path: str
     auth: Auth
     request: type[BaseModel] | None
-    response: type[BaseModel] | None  # None: 204, or a stream (see ``stream``)
+    response: type[BaseModel] | None  # None: no body (204), or a stream (see ``stream``)
     stream: bool = False
+    #: The success status. A client accepts any 2xx; the gates answer exactly this.
+    status: int = 200
 
 
 P = "/v1"
@@ -44,10 +52,23 @@ P = "/v1"
 ROUTES: tuple[Route, ...] = (
     # auth & identity
     Route("jwks", "GET", "/.well-known/jwks.json", "none", None, None),
+    # What this gate offers before sign-in (dev login, email, GitHub), for clients to show.
+    Route("info", "GET", f"{P}/info", "none", None, m.GateInfo),
+    # Recently revoked sessions, for Kontra's Temporal server to refuse their worker tokens.
+    Route("revocations", "GET", f"{P}/auth/revocations", "none", None, m.Revocations),
     Route("device_start", "POST", f"{P}/auth/device", "none", None, m.DeviceStart),
     Route("token", "POST", f"{P}/auth/token", "none", m.TokenRequest, m.TokenResponse),
+    Route(
+        "magic_link",
+        "POST",
+        f"{P}/auth/magic",
+        "none",
+        m.MagicLinkRequest,
+        m.MagicLinkSent,
+        status=202,
+    ),
     Route("dev_login", "POST", f"{P}/auth/dev-login", "dev", m.DevLogin, m.TokenResponse),
-    Route("revoke", "POST", f"{P}/auth/revoke", "party", None, None),
+    Route("revoke", "POST", f"{P}/auth/revoke", "party", None, None, status=204),
     Route(
         "temporal_token",
         "POST",
@@ -59,6 +80,15 @@ ROUTES: tuple[Route, ...] = (
     Route("me", "GET", f"{P}/me", "party|worker", None, m.Me),
     Route("set_key", "PUT", f"{P}/me/key", "fresh", m.SetKey, m.Me),
     Route("party", "GET", f"{P}/parties/{{party}}", "none", None, m.PartyView),
+    # API keys for programs: minted, listed and revoked by a fresh human session only
+    Route(
+        "create_api_key", "POST", f"{P}/keys", "fresh", m.ApiKeyCreate, m.ApiKeyCreated, status=201
+    ),
+    Route("api_keys", "GET", f"{P}/keys", "fresh", None, m.ApiKeyList),
+    Route("revoke_api_key", "DELETE", f"{P}/keys/{{key_id}}", "fresh", None, None, status=204),
+    # The party's sign-ins (people's logins), to find and end one: a fresh human session only
+    Route("sessions", "GET", f"{P}/sessions", "fresh", None, m.SessionList),
+    Route("end_session", "DELETE", f"{P}/sessions/{{session_id}}", "fresh", None, None, status=204),
     # catalog
     Route("publish", "POST", f"{P}/catalog", "fresh", m.PublishRequest, m.CatalogEntry),
     Route("search", "GET", f"{P}/catalog", "none", None, m.CatalogList),
@@ -101,6 +131,7 @@ ROUTES: tuple[Route, ...] = (
         "party|worker",
         m.ProgressPost,
         None,
+        status=204,
     ),
     # artifacts & claim-check blobs
     Route(
@@ -118,6 +149,7 @@ ROUTES: tuple[Route, ...] = (
         "party|worker",
         m.ArtifactComplete,
         None,
+        status=204,
     ),
     Route(
         "download_artifact", "GET", f"{P}/artifacts/{{key}}", "party|worker", None, m.DownloadUrl

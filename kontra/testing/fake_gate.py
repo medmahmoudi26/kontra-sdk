@@ -1,8 +1,8 @@
 """An in-process gate (seam ②) that behaves like the real one, for tests with no containers.
 
 :class:`FakeGate` serves every row of :data:`kontra.gate_client.routes.ROUTES` from memory:
-identity (dev login, the device flow, rotating refresh tokens, ES256 tokens and a JWKS),
-parties with Temporal namespaces, the catalog (contract validation, opaque endpoint names,
+identity (dev login, the device flow, magic links to an allowlist, API keys, rotating
+refresh tokens, ES256 tokens and a JWKS), parties with Temporal namespaces, the catalog (contract validation, opaque endpoint names,
 the endpoint created through the control plane), the quote relay, hire with a signed hold
 token, the escrow lifecycle, progress over SSE, artifacts and claim-check blobs behind
 signed URLs, balances and disputes. Its rules are the platform's: the job rules are
@@ -31,7 +31,8 @@ verified against this clock, not the machine's.
 Differences from the platform gate, all deliberate: state is in memory; artifacts and blobs
 are stored in memory behind the gate's own HMAC-signed ``/_blob/`` URLs (not S3); top-ups
 are always instant play money (production would answer with a checkout URL); the device
-flow can approve itself.
+flow can approve itself; mail is not sent but appended to :attr:`FakeGate.outbox`, and the
+magic link's page is :meth:`FakeGate.use_magic_link` (the human typing the device's code).
 """
 
 # No ``from __future__ import annotations`` here: FastAPI reads the route functions'
@@ -43,6 +44,7 @@ import binascii
 import contextlib
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -59,6 +61,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal, TypeVar
+from urllib.parse import parse_qs, urlsplit
 
 import jwt
 import uvicorn
@@ -136,7 +139,9 @@ __all__ = [
     "HOLD_HEADER",
     "FakeGate",
     "GateHTTPError",
+    "MagicOutcome",
     "Principal",
+    "SentMail",
 ]
 
 log = logging.getLogger("kontra.testing.fake_gate")
@@ -148,9 +153,21 @@ AUD_HOLD = "kontra:hold"
 HOLD_HEADER = "kontra-hold"
 QUOTE_OPERATION = "quote"
 EXECUTE_OPERATION = "execute"
-DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+DEVICE_GRANT = m.DEVICE_GRANT
 #: RFC 8628 §6.1: no vowels, no look-alikes.
-USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"
+USER_CODE_ALPHABET = m.USER_CODE_ALPHABET
+#: A typed user code before it is normalised (``bcdf-ghjk``, ``BCDFGHJK``), as the page reads it.
+_TYPED_USER_CODE = re.compile(r"[A-Za-z]{4}-?[A-Za-z]{4}", re.ASCII)
+DEVICE_TTL = timedelta(minutes=10)
+#: A magic link is good for this long, once, and for this many wrong user codes.
+MAGIC_LINK_TTL = timedelta(minutes=10)
+MAGIC_LINK_ATTEMPTS = 3
+#: ``last_used_at`` of an API key moves at most this often.
+KEY_USE_RESOLUTION = timedelta(minutes=1)
+#: ``GET /v1/keys`` lists every live key, then the latest revoked ones, this many in all.
+KEYS_LISTED = 100
+#: ``GET /v1/sessions`` lists at most this many sign-ins.
+SESSIONS_LISTED = 100
 #: A relayed Nexus payload (quote or start input): Temporal's own default blob limit.
 MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 MAX_PROGRESS_BYTES = 64 * 1024
@@ -161,6 +178,9 @@ AGE_MAGIC = b"age-encryption.org/v1\n"
 MAX_BLOB_BYTES = 64 * 1024 * 1024
 NOTE_MAX = 2000
 WORKER_TTL = timedelta(minutes=15)
+#: How long a revoked session stays on ``GET /v1/auth/revocations``: past any worker token's
+#: life, with room for the clocks of the gate and Temporal to disagree.
+REVOCATION_WINDOW = WORKER_TTL + timedelta(minutes=5)
 LIST_LIMIT_MAX = 200
 SEARCH_LIMIT_MAX = 100
 SEARCH_Q_MAX = 200
@@ -180,6 +200,7 @@ _ESCROW_HOLD = {
 }
 _NO_HOLD_OK = frozenset({HoldState.HELD, HoldState.REFUNDED})
 _SECRET_LEN = 43  # secrets.token_urlsafe(32)
+_SECRET = re.compile(r"[A-Za-z0-9_-]{43}", re.ASCII)
 _PATH_VERSION_MAX = 29
 _JSON_PLAIN = b"json/plain"
 _ACTIVITY = re.compile(r"[^\x00-\x1f\x7f]{1,255}")
@@ -312,6 +333,8 @@ class Principal:
     session_id: str
     auth_time: datetime
     kind: Literal["api", "worker"]
+    #: The session is an API key's: it is never fresh (decisions I19).
+    api_key: bool = False
 
 
 @dataclass
@@ -328,7 +351,12 @@ class _Session:
     party: str
     auth_time: datetime
     via: str
-    revoked: bool = False
+    revoked_at: datetime | None = None
+    created_at: datetime | None = None
+
+    @property
+    def revoked(self) -> bool:
+        return self.revoked_at is not None
 
 
 @dataclass
@@ -348,6 +376,69 @@ class _Device:
     party: str | None = None
     approved_at: datetime | None = None
     last_polled: datetime | None = None
+    #: How the human approved it: the session it opens records this.
+    via: str = "device"
+
+
+@dataclass
+class _ApiKey:
+    id: str
+    party: str
+    label: str
+    session_id: str
+    created_at: datetime
+    last_used_at: datetime | None = None
+    revoked_at: datetime | None = None
+
+    def view(self) -> m.ApiKeyView:
+        return m.ApiKeyView(
+            id=self.id,
+            label=self.label,
+            created_at=self.created_at,
+            last_used_at=self.last_used_at,
+            revoked_at=self.revoked_at,
+        )
+
+
+@dataclass
+class _MagicLink:
+    email: str
+    device_user_code: str
+    expires_at: datetime
+    #: Who asked for it (the requester's network, :func:`_requester_network`) and when: the
+    #: mail limits count by these.
+    client: str = ""
+    created_at: datetime | None = None
+    consumed_at: datetime | None = None
+    attempts: int = 0
+
+
+@dataclass(slots=True)
+class _Handoff:
+    """A sign-in the link's page just approved, waiting for that browser's console to trade
+    it for its own session (the ``handoff`` grant): once, within ``HANDOFF_TTL_SECONDS``."""
+
+    party: str
+    auth_time: datetime
+    via: str
+    expires_at: datetime
+    consumed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SentMail:
+    """A mail the gate would have sent (:attr:`FakeGate.outbox`). A sign-in mail carries the
+    link and never the device's user code: the human must type that from their own screen."""
+
+    to: str
+    subject: str
+    text: str
+    link: str
+    sent_at: datetime
+
+
+#: What the magic link's page answers the human who typed a user code into it.
+MagicOutcome = Literal["approved", "wrong_code", "gone", "handle_taken"]
 
 
 @dataclass
@@ -538,8 +629,18 @@ class FakeGate:
     Temporal tokens (default: the control plane's frontend). ``signup_grant``: play money
     a new party gets (USD). ``resolvers``: parties allowed to resolve disputes.
     ``device_auto_approve``: the device flow approves on the first poll, as the handle
-    requested (else :meth:`approve_device`); by default only a ``dev`` gate does, since
-    approving any requested handle is logging in as anyone, which is what dev login is.
+    requested (else :meth:`approve_device`, or a magic link); by default only a ``dev`` gate
+    does, since approving any requested handle is logging in as anyone, which is what dev
+    login is. ``signup``: ``allowlist`` mails sign-in links only to the addresses of
+    :meth:`allow_email`; ``open`` to any address (the default on a ``dev`` gate, as the
+    platform's ``KONTRA_SIGNUP``). Mail goes to :attr:`outbox`. ``github``: the device page
+    signs in with GitHub (``GateInfo.github_sign_in``; :meth:`approve_device` is the human
+    doing it). Without it, and off a dev gate, the device page approves nothing, as on
+    production: email is the way in.
+    ``magic_link_rate_per_email``: sign-in link requests (429 past it) and mails one address
+    gets from one client an hour; ``magic_link_rate_per_client``: requests one client makes
+    an hour; ``magic_link_max_per_email``: mails one address gets an hour from every client
+    together (past it the request is answered as usual and no mail goes out).
 
     The clock offset (:meth:`advance`) moves token ``iat``/``exp`` too: a seller's
     handler verifying a hold token issued *after* an advance on the machine's clock sees
@@ -568,6 +669,12 @@ class FakeGate:
         quote_timeout: float = 10.0,
         device_auto_approve: bool | None = None,
         device_interval: int = 1,
+        github: bool = False,
+        signup: Literal["allowlist", "open"] | None = None,
+        magic_link_rate_per_email: int = 5,
+        magic_link_rate_per_client: int = 30,
+        magic_link_max_per_email: int = 20,
+        magic_link_rate_window: timedelta = timedelta(hours=1),
         part_size: int = 16 * 1024 * 1024,
         max_input_bytes: int = 5 * 1000**3,
         url_ttl: timedelta = timedelta(hours=1),
@@ -600,6 +707,12 @@ class FakeGate:
         self.quote_timeout = quote_timeout
         self.device_auto_approve = dev if device_auto_approve is None else device_auto_approve
         self.device_interval = device_interval
+        self.github = github
+        self.signup: Literal["allowlist", "open"] = signup or ("open" if dev else "allowlist")
+        self.magic_link_rate_per_email = magic_link_rate_per_email
+        self.magic_link_rate_per_client = magic_link_rate_per_client
+        self.magic_link_max_per_email = magic_link_max_per_email
+        self.magic_link_rate_window = magic_link_rate_window
         self.part_size = part_size
         self.max_input_bytes = max_input_bytes
         self.url_ttl = url_ttl
@@ -614,6 +727,20 @@ class FakeGate:
         self.sessions: dict[str, _Session] = {}
         self._refresh: dict[str, _Refresh] = {}
         self._devices: dict[str, _Device] = {}
+        #: Lowercased addresses that may sign in by email (``signup="allowlist"``).
+        self.allowed_emails: set[str] = set()
+        #: ``(provider, subject)`` -> party: who an email address signs in as.
+        self.identities: dict[tuple[str, str], str] = {}
+        #: Every mail the gate sent, oldest first.
+        self.outbox: list[SentMail] = []
+        self._magic: dict[str, _MagicLink] = {}  # by the link token's sha256
+        self._handoffs: dict[str, _Handoff] = {}  # by the handoff's sha256
+        #: Every handoff the link's page issued, oldest first (what the platform's page puts
+        #: in the console URL's fragment).
+        self.handoffs: list[str] = []
+        self._magic_rate: dict[str, deque[datetime]] = {}
+        self.api_keys: dict[str, _ApiKey] = {}  # by id
+        self._api_key_ids: dict[str, str] = {}  # the key's sha256 -> id
         self.offerings: dict[str, _Offering] = {}
         self._by_endpoint: dict[str, str] = {}
         self.quotes: dict[str, _Quote] = {}
@@ -764,7 +891,7 @@ class FakeGate:
         return token
 
     def _open_session(self, party: str, auth_time: datetime, via: str) -> m.TokenResponse:
-        session = _Session(secrets.token_hex(16), party, auth_time, via)
+        session = _Session(secrets.token_hex(16), party, auth_time, via, created_at=self.now())
         self.sessions[session.id] = session
         return m.TokenResponse(
             access_token=self._issue_access(session),
@@ -804,9 +931,25 @@ class FakeGate:
             raise _unauthorized("invalid_token", "unknown session")
         if session.revoked:
             raise _unauthorized("invalid_token", "the session was revoked; log in again")
-        return Principal(party, sid, session.auth_time, "worker" if worker else "api")
+        return Principal(
+            party,
+            sid,
+            session.auth_time,
+            "worker" if worker else "api",
+            api_key=session.via == "api_key",
+        )
 
     def require_fresh(self, who: Principal) -> Principal:
+        """A human login younger than :attr:`freshness`. An API key's session never
+        qualifies, however new the key (its ``auth_time`` is the key's creation)."""
+        if who.api_key:
+            raise GateHTTPError(
+                403,
+                "fresh_login_required",
+                "an API key cannot do this (publish, set a key, manage API keys, resolve "
+                "disputes); "
+                "log in as a person with `kontra login`",
+            )
         if self.now() - who.auth_time >= self.freshness:
             raise GateHTTPError(
                 403,
@@ -817,20 +960,51 @@ class FakeGate:
         return who
 
     def require_resolver(self, who: Principal) -> Principal:
+        """A resolver's fresh human session: splitting escrow is not for an API key or an
+        old login (a stolen refresh token). The list is checked first, so anyone else gets
+        ``not_resolver`` and a resolver learns that a new sign-in is what is missing."""
         if who.party not in self.resolvers:
             raise GateHTTPError(403, "not_resolver", "only a dispute resolver may do this")
-        return who
+        return self.require_fresh(who)
 
     def require_dev(self) -> None:
         if not self.dev:
             raise GateHTTPError(404, "not_found", "Not Found")
 
     def revoke_session(self, session_id: str) -> None:
+        """Revoke a session; an API key's session takes its key with it (a key whose session
+        is gone could never be exchanged again)."""
         session = self.sessions.get(session_id)
-        if session is not None:
-            session.revoked = True
+        if session is not None and session.revoked_at is None:
+            session.revoked_at = self.now()
+        for key in self.api_keys.values():
+            if key.session_id == session_id and key.revoked_at is None:
+                key.revoked_at = self.now()
 
     # ------------------------------------------------------------------ identity routes
+
+    def info(self) -> m.GateInfo:
+        """``GET /v1/info``: this gate's dev switch and ways in. Its mail is the outbox, so
+        email sign-in is always on."""
+        return m.GateInfo(dev=self.dev, email_sign_in=True, github_sign_in=self.github)
+
+    def revocations(self) -> m.Revocations:
+        """``GET /v1/auth/revocations``: sessions revoked within :data:`REVOCATION_WINDOW`,
+        newest first, as sha256 digests of their ids."""
+        since = self.now() - REVOCATION_WINDOW
+        recent = sorted(
+            (
+                s
+                for s in self.sessions.values()
+                if s.revoked_at is not None and s.revoked_at > since
+            ),
+            key=lambda s: s.revoked_at or since,
+            reverse=True,
+        )[: m.REVOCATION_WINDOW_MAX]
+        return m.Revocations(
+            window_seconds=int(REVOCATION_WINDOW.total_seconds()),
+            sessions=[hashlib.sha256(s.id.encode("ascii")).hexdigest() for s in recent],
+        )
 
     async def dev_login(self, handle: str) -> m.TokenResponse:
         party = await self.ensure_party(handle)
@@ -846,7 +1020,7 @@ class FakeGate:
                 break
         self._devices[_digest(device_code)] = _Device(
             user_code=user_code,
-            expires_at=now + timedelta(minutes=10),
+            expires_at=now + DEVICE_TTL,
             interval=self.device_interval,
         )
         return m.DeviceStart(
@@ -855,21 +1029,30 @@ class FakeGate:
             verification_uri=f"{self.base_url}/device",
             verification_uri_complete=f"{self.base_url}/device?user_code={user_code}",
             interval=self.device_interval,
-            expires_in=600,
+            expires_in=int(DEVICE_TTL.total_seconds()),
         )
 
     def _device_by_user_code(self, user_code: str) -> _Device | None:
         return next((d for d in self._devices.values() if d.user_code == user_code), None)
 
-    async def approve_device(self, user_code: str, party: str) -> bool:
+    async def approve_device(self, user_code: str, party: str, *, via: str = "device") -> bool:
         """Approve a pending device login as ``party`` (created if missing), as a human
         would on the verification page. False when the code is not pending."""
         device = self._device_by_user_code(user_code)
-        if device is None or device.status != "pending" or self.now() >= device.expires_at:
+        if device is None or not self._pending(device):
             return False
         await self.ensure_party(party)
         device.status, device.party, device.approved_at = "approved", party, self.now()
+        device.via = via
         return True
+
+    def _pending(self, device: _Device) -> bool:
+        return device.status == "pending" and self.now() < device.expires_at
+
+    def pending_user_codes(self) -> list[str]:
+        """The user codes of the device logins waiting for a human, oldest first: what the
+        person at the terminal reads off their screen, for a test to type in for them."""
+        return [d.user_code for d in self._devices.values() if self._pending(d)]
 
     def deny_device(self, user_code: str) -> bool:
         device = self._device_by_user_code(user_code)
@@ -879,16 +1062,16 @@ class FakeGate:
         return True
 
     async def token(self, req: m.TokenRequest) -> m.TokenResponse:
-        if req.grant_type == DEVICE_GRANT:
-            if req.device_code is None or req.refresh_token is not None:
-                raise GateHTTPError(
-                    400, "invalid_request", "the device_code grant takes device_code only"
-                )
+        misfit = req.grant_error()
+        if misfit is not None:
+            raise GateHTTPError(400, "invalid_request", misfit)
+        if req.device_code is not None:
             return await self._exchange_device(req.device_code, req.handle)
-        if req.refresh_token is None or req.device_code is not None or req.handle is not None:
-            raise GateHTTPError(
-                400, "invalid_request", "the refresh_token grant takes refresh_token only"
-            )
+        if req.api_key is not None:
+            return self._exchange_api_key(req.api_key)
+        if req.handoff is not None:
+            return self._exchange_handoff(req.handoff)
+        assert req.refresh_token is not None
         return self._rotate(req.refresh_token)
 
     async def _exchange_device(self, device_code: str, handle: str | None) -> m.TokenResponse:
@@ -921,7 +1104,7 @@ class FakeGate:
             assert device.party is not None
             assert device.approved_at is not None
             device.status = "consumed"
-            return self._open_session(device.party, device.approved_at, "device")
+            return self._open_session(device.party, device.approved_at, device.via)
         last, device.last_polled = device.last_polled, now
         if last is not None and now - last < timedelta(seconds=device.interval):
             device.interval += 5
@@ -945,7 +1128,8 @@ class FakeGate:
         if session is None:
             raise GateHTTPError(400, "invalid_grant", "refresh token is not valid")
         if rec.used:
-            session.revoked = True
+            if session.revoked_at is None:
+                session.revoked_at = self.now()
             raise GateHTTPError(
                 400,
                 "invalid_grant",
@@ -963,6 +1147,284 @@ class FakeGate:
             party=session.party,
             auth_time=session.auth_time,
         )
+
+    # ------------------------------------------------------------------ API keys
+
+    def _exchange_api_key(self, api_key: str) -> m.TokenResponse:
+        """The ``api_key`` grant: an access token for the key's own session, no refresh
+        token. An unknown key and a revoked one get the same answer."""
+        key_id = self._api_key_ids.get(_digest(api_key))
+        key = self.api_keys.get(key_id) if key_id is not None else None
+        session = self.sessions.get(key.session_id) if key is not None else None
+        if key is None or session is None or key.revoked_at is not None or session.revoked:
+            raise GateHTTPError(400, "invalid_grant", "the API key is not valid")
+        now = self.now()
+        if key.last_used_at is None or now - key.last_used_at >= KEY_USE_RESOLUTION:
+            key.last_used_at = now
+        return m.TokenResponse(
+            access_token=self._issue_access(session),
+            expires_in=int(self.access_ttl.total_seconds()),
+            refresh_token=None,
+            party=key.party,
+            auth_time=key.created_at,
+        )
+
+    def create_api_key(self, who: Principal, label: str) -> m.ApiKeyCreated:
+        """A new key for ``who`` (a fresh human session, enforced by the route) and the
+        session it owns, whose ``auth_time`` is the key's creation."""
+        live = [k for k in self.api_keys.values() if k.party == who.party and k.revoked_at is None]
+        if len(live) >= m.MAX_API_KEYS:
+            raise GateHTTPError(
+                409,
+                "too_many_keys",
+                f"a party holds at most {m.MAX_API_KEYS} live API keys; revoke one first",
+            )
+        now = self.now()
+        secret = m.API_KEY_PREFIX + secrets.token_urlsafe(32)
+        key_id = "key_" + secrets.token_hex(8)
+        while key_id in self.api_keys:  # pragma: no cover - 64 random bits
+            key_id = "key_" + secrets.token_hex(8)
+        session = _Session(secrets.token_hex(16), who.party, now, "api_key", created_at=now)
+        self.sessions[session.id] = session
+        self.api_keys[key_id] = _ApiKey(key_id, who.party, label, session.id, now)
+        self._api_key_ids[_digest(secret)] = key_id
+        return m.ApiKeyCreated(id=key_id, label=label, created_at=now, key=secret)
+
+    def list_api_keys(self, who: Principal) -> m.ApiKeyList:
+        """Every live key of the party, newest first, then its latest revoked ones."""
+        mine = [k for k in self.api_keys.values() if k.party == who.party]
+        live = sorted(
+            (k for k in mine if k.revoked_at is None), key=lambda k: k.created_at, reverse=True
+        )
+        revoked = sorted(
+            (k for k in mine if k.revoked_at is not None),
+            key=lambda k: k.revoked_at or k.created_at,
+            reverse=True,
+        )
+        return m.ApiKeyList(keys=[k.view() for k in [*live, *revoked][:KEYS_LISTED]])
+
+    def revoke_api_key(self, who: Principal, key_id: str) -> None:
+        """Revoke one of the party's keys and its session (its tokens die on their next
+        request). Revoking a revoked key changes nothing; another party's is not found."""
+        key = self.api_keys.get(key_id)
+        if key is None or key.party != who.party:
+            raise GateHTTPError(404, "not_found", "no such API key")
+        if key.revoked_at is None:
+            key.revoked_at = self.now()
+        self.revoke_session(key.session_id)
+
+    # ------------------------------------------------------------------ sign-ins
+
+    def _signs_in(self, session: _Session) -> bool:
+        """A person's login (not a key's) that can still get tokens: not revoked, with an
+        unused refresh token that has not expired."""
+        now = self.now()
+        return (
+            session.via != "api_key"
+            and session.revoked_at is None
+            and any(
+                r.session_id == session.id and not r.used and now < r.expires_at
+                for r in self._refresh.values()
+            )
+        )
+
+    def list_sessions(self, who: Principal) -> m.SessionList:
+        """``GET /v1/sessions``: the party's sign-ins, newest first (keys are /v1/keys)."""
+        mine = sorted(
+            (s for s in self.sessions.values() if s.party == who.party and self._signs_in(s)),
+            key=lambda s: s.created_at or s.auth_time,
+            reverse=True,
+        )[:SESSIONS_LISTED]
+        return m.SessionList(
+            sessions=[
+                m.SessionView(
+                    id=s.id,
+                    via=s.via,
+                    auth_time=s.auth_time,
+                    created_at=s.created_at or s.auth_time,
+                    current=s.id == who.session_id,
+                )
+                for s in mine
+            ]
+        )
+
+    def end_session(self, who: Principal, session_id: str) -> None:
+        """``DELETE /v1/sessions/{id}``: end one of the party's sign-ins (this one too).
+        Another party's, a key's (``/v1/keys``) or an unknown id is not found; one ended
+        already changes nothing."""
+        session = self.sessions.get(session_id)
+        if session is None or session.party != who.party or session.via == "api_key":
+            raise GateHTTPError(404, "not_found", "no such session")
+        self.revoke_session(session_id)
+
+    # ------------------------------------------------------------------ magic links
+
+    def allow_email(self, email: str) -> str:
+        """Put ``email`` on the sign-up allowlist (``python -m gate.admin allow``); returns
+        it as stored (lowercased)."""
+        address = email.strip()
+        if not m.is_email(address):
+            raise ValueError("not a plain email address (local@domain)")
+        address = address.lower()
+        self.allowed_emails.add(address)
+        return address
+
+    def disallow_email(self, email: str) -> None:
+        self.allowed_emails.discard(email.strip().lower())
+
+    def _may_sign_in(self, email: str) -> bool:
+        return self.signup == "open" or email in self.allowed_emails
+
+    def _mails_allowed(self, email: str, network: str, now: datetime) -> bool:
+        """The platform's database caps: one address gets at most ``rate_per_email`` mails
+        an hour asked from one network, and ``max_per_email`` from all of them."""
+        since = now - self.magic_link_rate_window
+        mailed = [
+            link
+            for link in self._magic.values()
+            if link.email == email and link.created_at is not None and link.created_at > since
+        ]
+        mine = sum(1 for link in mailed if link.client == network)
+        return mine < self.magic_link_rate_per_email and len(mailed) < self.magic_link_max_per_email
+
+    def _count_magic_request(self, key: str, limit: int, now: datetime) -> bool:
+        """Record one request under ``key``; False when it is over ``limit`` this window."""
+        seen = self._magic_rate.setdefault(key, deque())
+        while seen and now - seen[0] >= self.magic_link_rate_window:
+            seen.popleft()
+        seen.append(now)
+        return len(seen) <= limit
+
+    def request_magic_link(self, req: m.MagicLinkRequest, client: str) -> m.MagicLinkSent:
+        """``POST /v1/auth/magic``. Mail goes out only for an address that may sign in and a
+        user code that is pending; every other request gets the identical answer, and every
+        request counts against the rate limits, so neither the answer nor a 429 says who is
+        invited. An address's limits are counted per requesting network (an IPv4 /24, an
+        IPv6 /48, as the platform counts them; ``client`` is the requester's address): a
+        stranger who asks for links to an address spends his own network's budget, never
+        its owner's. Past :attr:`magic_link_max_per_email` mails to one address an hour,
+        from every network together, no more go out (the answer stays the same)."""
+        now = self.now()
+        email = req.email.lower()
+        network = _requester_network(client)
+        by_email = self._count_magic_request(
+            f"email:{email}:network:{network}", self.magic_link_rate_per_email, now
+        )
+        by_client = self._count_magic_request(
+            "client:" + client, self.magic_link_rate_per_client, now
+        )
+        if not (by_email and by_client):
+            retry = int(self.magic_link_rate_window.total_seconds())
+            raise GateHTTPError(
+                429,
+                "rate_limited",
+                "too many sign-in links asked for; try again later",
+                {"retry_after_seconds": retry},
+                headers={"Retry-After": str(retry)},
+            )
+        device = self._device_by_user_code(req.device_user_code)
+        if (
+            device is not None
+            and self._pending(device)
+            and self._may_sign_in(email)
+            and self._mails_allowed(email, network, now)
+        ):
+            token = secrets.token_urlsafe(32)
+            self._magic[_digest(token)] = _MagicLink(
+                email,
+                device.user_code,
+                min(now + MAGIC_LINK_TTL, device.expires_at),
+                client=network,
+                created_at=now,
+            )
+            link = f"{self.base_url}/auth/magic?t={token}"
+            self.outbox.append(
+                SentMail(
+                    to=email,
+                    subject="Your Kontra sign-in link",
+                    text=(
+                        f"Open this link to sign in to Kontra:\n\n{link}\n\n"
+                        "The page asks for the code your terminal or browser shows. "
+                        "If you did not ask to sign in, ignore this mail: nobody can use "
+                        "the link without that code. It expires in 10 minutes."
+                    ),
+                    link=link,
+                    sent_at=now,
+                )
+            )
+        return m.MagicLinkSent()
+
+    async def use_magic_link(
+        self, link: str, user_code: str, *, handle: str | None = None
+    ) -> MagicOutcome:
+        """What the link's page does when the human submits the user code they typed
+        (opening the page consumes nothing). A wrong code counts an attempt and the
+        third burns the link. The right one consumes the link and approves the device: as
+        the party of the email's identity, or, on the address's first sign-in, as a new
+        party ``handle`` (default: the handle the device asked for). ``gone``: the link is
+        unknown, used, expired or burned, the address is no longer allowed, or the device
+        is no longer pending. ``handle_taken``: the handle belongs to another party; the
+        link stays usable for another handle (the page's signed grant, on the platform)."""
+        token = parse_qs(urlsplit(link).query).get("t", [link])
+        rec = (
+            self._magic.get(_digest(token[0]))
+            if len(token) == 1 and _SECRET.fullmatch(token[0])
+            else None
+        )
+        now = self.now()
+        if rec is None or rec.consumed_at is not None or now >= rec.expires_at:
+            return "gone"
+        if not self._may_sign_in(rec.email):
+            rec.consumed_at = now
+            return "gone"
+        typed = _normalize_user_code(user_code)
+        if typed is None or not hmac.compare_digest(typed, rec.device_user_code):
+            rec.attempts += 1
+            if rec.attempts >= MAGIC_LINK_ATTEMPTS:
+                rec.consumed_at = now
+            return "wrong_code"
+        device = self._device_by_user_code(rec.device_user_code)
+        if device is None or not self._pending(device):
+            rec.consumed_at = now
+            return "gone"
+        party = self.identities.get(("email", rec.email))
+        if party is None:
+            wanted = handle or device.requested_handle
+            if wanted is None:
+                raise ValueError(f"{rec.email} signs in for the first time: pass handle=")
+            if not is_handle(wanted):
+                raise GateHTTPError(422, "invalid_handle", "not a party handle")
+            if wanted in self.parties:
+                return "handle_taken"
+            rec.consumed_at = now  # before any await: a racing submit finds it used
+            try:
+                await self.ensure_party(wanted, new=True)
+            except GateHTTPError as e:
+                if e.code != "handle_taken":
+                    raise
+                rec.consumed_at = None  # nothing was approved: another handle may follow
+                return "handle_taken"
+            self.identities[("email", rec.email)] = wanted
+            party = wanted
+        rec.consumed_at = now
+        approved = await self.approve_device(device.user_code, party, via="device:email")
+        if approved:
+            self._new_handoff(party, now, "device:email")
+        return "approved" if approved else "gone"
+
+    def _new_handoff(self, party: str, auth_time: datetime, via: str) -> str:
+        handoff = secrets.token_urlsafe(32)
+        expires = self.now() + timedelta(seconds=m.HANDOFF_TTL_SECONDS)
+        self._handoffs[_digest(handoff)] = _Handoff(party, auth_time, via, expires)
+        self.handoffs.append(handoff)
+        return handoff
+
+    def _exchange_handoff(self, handoff: str) -> m.TokenResponse:
+        rec = self._handoffs.get(_digest(handoff)) if _SECRET.fullmatch(handoff) else None
+        if rec is None or rec.consumed or self.now() >= rec.expires_at:
+            raise GateHTTPError(400, "invalid_grant", "the sign-in handoff is not valid")
+        rec.consumed = True
+        return self._open_session(rec.party, rec.auth_time, rec.via)
 
     def temporal_token(self, who: Principal) -> m.TemporalToken:
         """The party's Temporal *worker* JWT: the only Temporal token there is (decisions
@@ -990,9 +1452,10 @@ class FakeGate:
 
     # ------------------------------------------------------------------ parties
 
-    async def ensure_party(self, handle: str) -> _Party:
+    async def ensure_party(self, handle: str, *, new: bool = False) -> _Party:
         """The party ``handle``, created (namespace registered, signup grant paid) if
-        missing."""
+        missing. ``new``: it must not exist yet (409 ``handle_taken``): a sign-up never
+        joins someone else's party."""
         try:
             validate_handle(handle)
         except NameError_ as e:
@@ -1001,6 +1464,8 @@ class FakeGate:
         async with lock:
             existing = self.parties.get(handle)
             if existing is not None:
+                if new:
+                    raise GateHTTPError(409, "handle_taken", f"the handle {handle} is taken")
                 return existing
             if self.control is not None:
                 try:
@@ -2372,8 +2837,32 @@ def _frontend_of(control: TemporalControl | None) -> str:
     return target if isinstance(target, str) and target else "temporal.invalid:7233"
 
 
+def _requester_network(client: str) -> str:
+    """The network a sign-in link request is charged to, as the platform counts it: the
+    client's IPv4 /24 or IPv6 /48 (one machine easily holds a whole routed IPv6 /48, so a
+    budget per address would let one stranger use up an address's mail by himself).
+    Anything that is not an address (a test client's name) is its own network."""
+    try:
+        net = ipaddress.ip_network(client, strict=False)
+    except ValueError:
+        return client
+    prefix = 24 if net.version == 4 else 48
+    return str(net.supernet(new_prefix=prefix)) if net.prefixlen > prefix else str(net)
+
+
 def _digest(secret: str) -> str:
     return hashlib.sha256(secret.encode("ascii", "replace")).hexdigest()
+
+
+def _normalize_user_code(typed: str) -> str | None:
+    """``bcdf-ghjk``, ``BCDFGHJK`` -> ``BCDF-GHJK``; anything else -> None. Checked as
+    typed (anchored, bounded) before it is case-folded, as the gate's page does."""
+    if len(typed) > 9 or _TYPED_USER_CODE.fullmatch(typed) is None:
+        return None
+    code = typed.replace("-", "").upper()
+    if any(c not in USER_CODE_ALPHABET for c in code):
+        return None
+    return f"{code[:4]}-{code[4:]}"
 
 
 def _is_number(text: str) -> bool:
@@ -2520,9 +3009,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
     app.add_exception_handler(EscrowError, escrow_error)
     app.add_exception_handler(Exception, crash)
 
-    def add(
-        name: str, endpoint: Callable[..., Any], *, status_code: int = 200, **kwargs: Any
-    ) -> None:
+    def add(name: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
         route = BY_NAME[name]
         app.add_api_route(
             route.path,
@@ -2531,7 +3018,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
             name=name,
             operation_id=name,
             response_model=None if route.stream else route.response,
-            status_code=status_code,
+            status_code=route.status,
             **kwargs,
         )
 
@@ -2543,6 +3030,13 @@ def _build_app(gate: FakeGate) -> FastAPI:
     async def jwks() -> JSONResponse:
         return JSONResponse(gate.keys.jwks())
 
+    async def info() -> m.GateInfo:
+        return gate.info()
+
+    async def revocations(response: Response) -> m.Revocations:
+        no_store(response)
+        return gate.revocations()
+
     async def device_start(response: Response) -> m.DeviceStart:
         no_store(response)
         return gate.device_start()
@@ -2550,6 +3044,10 @@ def _build_app(gate: FakeGate) -> FastAPI:
     async def token(body: m.TokenRequest, response: Response) -> m.TokenResponse:
         no_store(response)
         return await gate.token(body)
+
+    async def magic_link(request: Request, body: m.MagicLinkRequest) -> m.MagicLinkSent:
+        client = request.client.host if request.client is not None else ""
+        return gate.request_magic_link(body, client)
 
     async def dev_login(body: m.DevLogin, response: Response) -> m.TokenResponse:
         no_store(response)
@@ -2574,15 +3072,45 @@ def _build_app(gate: FakeGate) -> FastAPI:
     async def party_view(party: str) -> m.PartyView:
         return gate.party_view(party)
 
+    async def create_api_key(
+        who: Fresh, body: m.ApiKeyCreate, response: Response
+    ) -> m.ApiKeyCreated:
+        no_store(response)
+        return gate.create_api_key(who, body.label)
+
+    async def api_keys(who: Fresh) -> m.ApiKeyList:
+        return gate.list_api_keys(who)
+
+    async def revoke_api_key(who: Fresh, key_id: str) -> Response:
+        gate.revoke_api_key(who, key_id)
+        return Response(status_code=204)
+
     add("jwks", jwks)
+    add("info", info)
+    add("revocations", revocations)
     add("device_start", device_start)
     add("token", token)
+    add("magic_link", magic_link)
     add("dev_login", dev_login, dependencies=[Depends(_dev_only)])
-    add("revoke", revoke, status_code=204)
+    add("revoke", revoke)
     add("temporal_token", temporal_token)
     add("me", me)
     add("set_key", set_key)
     add("party", party_view)
+    add("create_api_key", create_api_key)
+    add("api_keys", api_keys)
+    add("revoke_api_key", revoke_api_key)
+
+    async def sessions(who: Fresh, response: Response) -> m.SessionList:
+        no_store(response)
+        return gate.list_sessions(who)
+
+    async def end_session(who: Fresh, session_id: str) -> Response:
+        gate.end_session(who, session_id)
+        return Response(status_code=204)
+
+    add("sessions", sessions)
+    add("end_session", end_session)
 
     # ---------------------------------------------------------------- catalog
 
@@ -2674,7 +3202,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
     add("start", start)
     add("result", result)
     add("progress", progress, response_class=StreamingResponse)
-    add("post_progress", post_progress, status_code=204)
+    add("post_progress", post_progress)
 
     # ---------------------------------------------------------------- artifacts & blobs
 
@@ -2695,7 +3223,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
         return gate.get_blob(sha256)
 
     add("create_artifact", create_artifact)
-    add("complete_artifact", complete_artifact, status_code=204)
+    add("complete_artifact", complete_artifact)
     add("download_artifact", download_artifact)
     add("create_blob", create_blob)
     add("get_blob", get_blob)

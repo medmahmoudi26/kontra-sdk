@@ -473,7 +473,6 @@ async def test_silence_releases_when_the_review_window_closes(shop: Shop) -> Non
 
 
 async def test_reject_disputes_and_the_resolver_splits(shop: Shop) -> None:
-    judge = await shop.world.party("judge")
     b0, s0, k0 = await shop.balances()
     job = await shop.hire(1000)
     shop.observe(job.job_id, ObservedStatus.COMPLETED, b"r")
@@ -483,6 +482,7 @@ async def test_reject_disputes_and_the_resolver_splits(shop: Shop) -> None:
     shop.gate.advance(timedelta(hours=2))
     await shop.gate.sweep()  # a dispute is not released by the window
     assert (await shop.buyer.gate.job(job.job_id)).escrow is m.Escrow.DISPUTED
+    judge = await shop.world.party("judge")  # a resolver signs in to decide: a fresh session
     with pytest.raises(GateError) as e:
         await judge.gate.resolve(job.job_id, m.ResolveRequest(buyer_minor=1, seller_minor=1))
     assert (e.value.status, e.value.code) == (422, "invalid_split")

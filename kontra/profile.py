@@ -171,9 +171,11 @@ class Profile(BaseModel):
     party: str
     namespace: str
     #: A bearer credential: kept out of ``repr`` so a log line, a traceback with locals or
-    #: an error reporter never carries it.
-    refresh_token: str = Field(repr=False)
-    #: When the human session behind ``refresh_token`` logged in (publishing needs a fresh one).
+    #: an error reporter never carries it. None only in the in-memory profile of an API
+    #: key's session (:meth:`kontra.auth.Session.from_api_key`), which is never written.
+    refresh_token: str | None = Field(repr=False)
+    #: When the human session behind ``refresh_token`` logged in (publishing needs a fresh
+    #: one); for an API key, the key's creation (such a session is never fresh).
     auth_time: AwareDatetime
     #: Our age recipient (``age1...``), as registered with the gate.
     public_key: str | None = None

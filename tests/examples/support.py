@@ -33,7 +33,7 @@ _T = TypeVar("_T")
 REPO = Path(__file__).resolve().parents[2]
 EXAMPLES = REPO / "examples"
 #: The sellers, by directory. Their offering names start with ``acme/``.
-SELLERS = ("enrich", "legacy-actor")
+SELLERS = ("enrich", "legacy-actor", "hello")
 KEY_FILE = EXAMPLES / "example-public-key.txt"
 #: What a buyer is funded with, in cents.
 START = 10_000
@@ -154,7 +154,7 @@ class Buyer:
 
 @dataclass
 class Market:
-    """A marketplace with ``acme`` serving both example sellers, and the sites they fetch."""
+    """A marketplace with ``acme`` serving every example seller, and the sites they fetch."""
 
     mp: Marketplace
     seller: TestParty
