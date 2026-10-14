@@ -84,6 +84,13 @@ var AllowedAPIs = setOf(
 	ws.WorkflowService_ListWorkflowExecutions_FullMethodName,
 	ws.WorkflowService_CountWorkflowExecutions_FullMethodName,
 
+	// A seller's own backlog. DescribeTaskQueue with report_stats returns
+	// ApproximateBacklogCount/Age and the add and dispatch rates per task-queue type:
+	// metadata, no payloads, and only for a queue in the token's own namespace. Without
+	// it a seller cannot run `temporal task-queue describe`, and KEDA's Temporal scaler
+	// -- which calls exactly this RPC -- cannot scale workers against Kontra's frontend.
+	ws.WorkflowService_DescribeTaskQueue_FullMethodName,
+
 	// Clients: standalone Nexus operations.
 	ws.WorkflowService_StartNexusOperationExecution_FullMethodName,
 	ws.WorkflowService_DescribeNexusOperationExecution_FullMethodName,

@@ -377,6 +377,88 @@ for contract X is never served by code running contract Y.
 A new version is a new document, endpoint and task queue. Jobs hired on the old version
 finish on a worker that still serves it.
 
+## Scaling
+
+One `kontra serve` is one worker. To decide whether you need more, read the backlog of the
+version's task queue — the one `kontra publish` printed. Your worker token may call
+`DescribeTaskQueue` in your own namespace, so Temporal's own CLI works unchanged:
+
+```sh
+# A worker token (15 minutes), the namespace and the frontend address, from the gate.
+read -r token namespace address <<<"$(
+  curl -fsS https://api.kontra.run/v1/auth/temporal-token \
+       -H "Authorization: Bearer $KONTRA_API_KEY" \
+       -H 'Content-Type: application/json' -d '{"role":"worker"}' |
+  python -c 'import json,sys; d=json.load(sys.stdin); print(d["token"], d["namespace"], d["temporal_address"])'
+)"
+
+temporal task-queue describe \
+  --address "$address" --namespace "$namespace" --api-key "$token" \
+  --task-queue 'acme/enrich@1.2.0' --report-stats
+```
+
+`--report-stats` is the part that matters: `ApproximateBacklogCount` and
+`ApproximateBacklogAge` say how far behind you are, and `TasksAddRate` against
+`TasksDispatchRate` says whether the gap is growing or closing. Read them per task-queue
+type — a workflow backlog and an activity backlog scale differently. The numbers are
+Temporal's own and are approximate by design; an idle queue is unloaded after about five
+minutes, and then reports zero rather than "no data".
+
+Nothing else about your queue is readable with that token: it cannot describe a queue in
+any other namespace, and the stats carry no payload (see [security.md](security.md)).
+
+### KEDA
+
+Because the RPC is the plain one, [KEDA](https://keda.sh)'s Temporal scaler works against
+Kontra's frontend with no shim. Put a worker token in a secret and point the scaler at the
+version's task queue:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kontra-worker-token
+type: Opaque
+stringData:
+  apiKey: <the token field of POST /v1/auth/temporal-token>
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-trigger-auth-kontra
+spec:
+  secretTargetRef:
+    - parameter: apiKey          # `apiKey` is an auth parameter, never trigger metadata
+      name: kontra-worker-token
+      key: apiKey
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: enrich-workers
+spec:
+  scaleTargetRef:
+    name: enrich-worker          # the Deployment running `kontra serve`
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  triggers:
+    - type: temporal
+      metadata:
+        endpoint: temporal.kontra.run:7233
+        namespace: acme
+        taskQueue: acme/enrich@1.2.0
+        queueTypes: activity     # the scaler's default is workflow only
+        targetQueueSize: "5"     # scale up while the backlog is above this
+      authenticationRef:
+        name: keda-trigger-auth-kontra
+```
+
+A worker token lives 15 minutes, so whatever refreshes that secret is yours to run — the
+same loop `kontra serve` runs internally, as a small CronJob calling the route above. Pick
+`queueTypes` to match where your work is: the activity queue if it is in activities, the
+workflow queue if it is in workflow tasks. Scaling on both against one `targetQueueSize`
+oscillates, because the two backlogs drain at different rates.
+
 ## Getting paid
 
 | Event | Money |

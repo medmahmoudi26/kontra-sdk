@@ -69,7 +69,7 @@ workflows need a worker.
 
 | Caller | Temporal sees | Authorizer allows |
 |---|---|---|
-| `worker` in `acme` (seller or buyer) | JWT, `acme:worker` | an explicit allowlist of WorkflowService calls in `acme` only, including standalone Nexus operations |
+| `worker` in `acme` (seller or buyer) | JWT, `acme:worker` | an explicit allowlist of WorkflowService calls in `acme` only, including standalone Nexus operations and `DescribeTaskQueue` on `acme`'s own queues |
 | any JWT | — | **no** OperatorService or AdminService call, ever; no Nexus HTTP dispatch on the public listener |
 | control plane | the internal frontend's own principal (`AuthType "temporal"`, `Subject "internal"`) | everything; it is reachable only on the internal listener |
 

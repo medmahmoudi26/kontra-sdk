@@ -161,6 +161,8 @@ var matrix = []cell{
 	{"worker-A", "acme:worker", acmeWorker, query, "acme", allow, allow, deny},
 	{"worker-A", "acme:worker", acmeWorker, describe, "acme", allow, allow, deny},
 	{"worker-A", "acme:worker", acmeWorker, describeNS, "acme", allow, allow, deny},
+	// A seller's own backlog, for `temporal task-queue describe` and KEDA (issue #9).
+	{"worker-A", "acme:worker", acmeWorker, describeTQ, "acme", allow, allow, deny},
 	{"worker-A", "acme:worker + every role", acmeAll, poll, "acme", allow, allow, allow},
 	// --- worker in namespace A: denied anything in B -----------------------------------
 	{"worker-A", "acme:worker", acmeWorker, start, "buyer", deny, allow, deny},
@@ -169,6 +171,9 @@ var matrix = []cell{
 	{"worker-A", "acme:worker", acmeWorker, poll, "other", deny, allow, deny},
 	{"worker-A", "acme:worker", acmeWorker, describeOp, "buyer", deny, allow, deny},
 	{"worker-A", "acme:worker", acmeWorker, describeNS, "buyer", deny, allow, deny},
+	// Allowed in acme, refused in every other namespace: the backlog is the token's own.
+	{"worker-A", "acme:worker", acmeWorker, describeTQ, "buyer", deny, allow, deny},
+	{"worker-A", "acme:worker", acmeWorker, describeTQ, "other", deny, allow, deny},
 	// --- worker in namespace A: denied all Operator and Admin APIs ---------------------
 	{"worker-A", "acme:worker", acmeWorker, listClusters, "", deny, allow, deny},
 	{"worker-A", "acme:worker", acmeWorker, addSearchAttr, "acme", deny, allow, deny},
@@ -190,7 +195,6 @@ var matrix = []cell{
 	{"worker-A", "acme:worker", acmeWorker, resetWF, "acme", deny, allow, deny},
 	{"worker-A", "acme:worker", acmeWorker, schedule, "acme", deny, allow, deny},
 	{"worker-A", "acme:worker", acmeWorker, versioning, "acme", deny, allow, deny},
-	{"worker-A", "acme:worker", acmeWorker, describeTQ, "acme", deny, allow, deny},
 	{"worker-A", "acme:worker", acmeWorker, deleteOp, "acme", deny, allow, deny},
 	// --- worker in namespace A: denied calls that name no namespace --------------------
 	{"worker-A", "acme:worker", acmeWorker, listNS, "", deny, allow, deny},

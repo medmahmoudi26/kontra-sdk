@@ -22,6 +22,7 @@ import temporal_callback_forgery as forgery
 import temporal_isolation_app as app
 from conftest import Cluster, connect_public
 from temporalio.api.common.v1 import Callback, Payloads, WorkflowExecution, WorkflowType
+from temporalio.api.enums.v1 import DescribeTaskQueueMode, TaskQueueType
 from temporalio.api.nexus.v1 import EndpointSpec, EndpointTarget
 from temporalio.api.operatorservice.v1 import (
     CreateNexusEndpointRequest,
@@ -37,6 +38,7 @@ from temporalio.api.update.v1 import Meta as UpdateMeta
 from temporalio.api.update.v1 import Request as UpdateRequest
 from temporalio.api.workflowservice.v1 import (
     DescribeNamespaceRequest,
+    DescribeTaskQueueRequest,
     DescribeWorkflowExecutionRequest,
     GetWorkflowExecutionHistoryRequest,
     ListNamespacesRequest,
@@ -458,6 +460,60 @@ async def test_seller_worker_token_runs_in_its_own_namespace(cluster: Cluster) -
         out = await handle.result()
         assert out.n == 10
         record("positive/seller/result", "allow", f"n={out.n}")
+
+
+async def test_seller_describes_its_own_task_queue_backlog(cluster: Cluster) -> None:
+    """A seller worker JWT reads its own backlog, and only its own (issue #9).
+
+    This is what ``temporal task-queue describe`` and KEDA's Temporal scaler call. The
+    response is metadata -- counts, ages and rates -- and the poller identities of the
+    seller's own workers; no payload crosses it.
+    """
+    token = cluster.signer.api_key(app.SELLER_NAMESPACE)
+    seller = await connect_public(cluster, app.SELLER_NAMESPACE, api_key=token)
+
+    def request(namespace: str) -> DescribeTaskQueueRequest:
+        return DescribeTaskQueueRequest(
+            namespace=namespace,
+            task_queue=TaskQueue(name=app.SELLER_TASK_QUEUE),
+            api_mode=DescribeTaskQueueMode.DESCRIBE_TASK_QUEUE_MODE_ENHANCED,
+            task_queue_types=[
+                TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW,
+                TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY,
+            ],
+            report_stats=True,
+            report_pollers=True,
+        )
+
+    async with Worker(
+        seller,
+        task_queue=app.SELLER_TASK_QUEUE,
+        workflows=[app.EnrichJob],
+        nexus_service_handlers=[app.EnrichHandler()],
+    ):
+        response = await assert_allowed(
+            "worker-A/acme:worker/DescribeTaskQueue(acme)",
+            seller.workflow_service.describe_task_queue(request(app.SELLER_NAMESPACE)),
+        )
+        # report_stats is the half KEDA scales on; it must come back populated, not empty.
+        versions = list(response.versions_info.values())
+        assert versions, "enhanced describe returned no version info"
+        by_type = versions[0].types_info
+        assert TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW in by_type
+        stats = by_type[TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW].stats
+        assert stats.approximate_backlog_count >= 0
+        record(
+            "positive/seller/DescribeTaskQueue(stats)",
+            "allow",
+            f"backlog={stats.approximate_backlog_count}",
+        )
+
+    # The same token, the same queue name, another namespace: the backlog is the token's own.
+    for namespace in (app.BUYER_NAMESPACE, app.OTHER_NAMESPACE):
+        await assert_denied(
+            f"cross-ns/acme:worker/DescribeTaskQueue({namespace})",
+            seller.workflow_service.describe_task_queue(request(namespace)),
+        )
 
 
 async def test_standalone_nexus_hire_through_public_frontend(cluster: Cluster) -> None:
