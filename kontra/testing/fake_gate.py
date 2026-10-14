@@ -56,7 +56,15 @@ import threading
 import time
 import types
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -338,11 +346,27 @@ class Principal:
 
 
 @dataclass
+class _PartyKey:
+    """One recipient of a party. Revoking sets ``revoked_at`` and keeps the row: an
+    in-flight job encrypted to a revoked seller key is still that seller's to decrypt, and
+    a dispute may need the key on record (decisions I7)."""
+
+    label: str
+    public_key: str
+    added_at: datetime
+    revoked_at: datetime | None = None
+
+
+@dataclass
 class _Party:
     handle: str
     namespace: str
     created_at: datetime
-    public_key: str | None = None
+    keys: list[_PartyKey] = field(default_factory=list)
+
+    def recipients(self) -> list[str]:
+        """The unrevoked keys, oldest first: what a counterparty encrypts to."""
+        return [k.public_key for k in self.keys if k.revoked_at is None]
 
 
 @dataclass
@@ -463,7 +487,10 @@ class _Offering:
         f = self.info.facts
         return " ".join([self.id.full_name, f.description, *f.tags, f.pricing_hint or ""]).lower()
 
-    def entry(self) -> m.CatalogEntry:
+    def entry(self, recipients: Sequence[str]) -> m.CatalogEntry:
+        """``recipients``: the seller party's unrevoked keys NOW. They are catalog data,
+        not contract data -- the document seals no key (spec v2, decisions I7) -- so the
+        caller reads them from the party row rather than from the sealed facts."""
         oid, f = self.id, self.info.facts
         return m.CatalogEntry(
             offering=oid.key,
@@ -478,7 +505,7 @@ class _Offering:
             endpoint=self.endpoint,
             service=oid.service_name,
             task_queue=oid.task_queue,
-            public_key=f.public_key,
+            recipients=list(recipients),
             published_at=self.published_at,
             retired=self.retired,
         )
@@ -1491,19 +1518,55 @@ class FakeGate:
         return m.Me(
             party=p.handle,
             namespace=p.namespace,
-            public_key=p.public_key,
+            keys=[
+                m.PartyKey(label=k.label, public_key=k.public_key, added_at=k.added_at)
+                for k in p.keys
+                if k.revoked_at is None
+            ],
             temporal_address=self.temporal_address,
             created_at=p.created_at,
             dev=self.dev,
         )
 
-    def set_key(self, who: Principal, public_key: str) -> m.Me:
+    def add_recipient(self, who: Principal, label: str, public_key: str) -> m.Me:
+        """Add one recipient. Adding never replaces, so a second machine is one more
+        recipient and ``key_mismatch`` no longer exists; adding the same key again under
+        the same label is a no-op, so `kontra login` twice on one machine is idempotent."""
         try:
             check_public_key(public_key)
         except ValueError as e:
             raise GateHTTPError(422, "invalid_key", str(e)) from None
-        self._party(who.party).public_key = public_key
+        if not label or len(label) > 64 or not label.isprintable():
+            raise GateHTTPError(422, "invalid_label", "a label is 1 to 64 printable characters")
+        p = self._party(who.party)
+        for k in p.keys:
+            if k.public_key == public_key:
+                if k.revoked_at is not None:
+                    raise GateHTTPError(
+                        409,
+                        "key_revoked",
+                        "that key was revoked for this party; make a new one",
+                    )
+                return self.me(who)
+        if any(k.label == label for k in p.keys if k.revoked_at is None):
+            raise GateHTTPError(409, "label_taken", f"this party already has a key {label!r}")
+        if len(p.recipients()) >= m.RECIPIENTS_MAX:
+            raise GateHTTPError(
+                409,
+                "too_many_keys",
+                f"a party holds at most {m.RECIPIENTS_MAX} recipients; revoke one first",
+            )
+        p.keys.append(_PartyKey(label=label, public_key=public_key, added_at=self.now()))
         return self.me(who)
+
+    def revoke_recipient(self, who: Principal, public_key: str) -> None:
+        """Stop encrypting to this key. The row stays (see :class:`_PartyKey`)."""
+        p = self._party(who.party)
+        for k in p.keys:
+            if k.public_key == public_key and k.revoked_at is None:
+                k.revoked_at = self.now()
+                return
+        raise GateHTTPError(404, "key_not_found", "this party has no such unrevoked recipient")
 
     def reputation(self, party: str) -> tuple[int, int, int]:
         """(released, refunded, disputed) of the seller's jobs: §17's raw counts. Self-hires
@@ -1529,12 +1592,16 @@ class FakeGate:
                 disputed += 1
         return released, refunded, disputed
 
+    def catalog_entry(self, row: _Offering) -> m.CatalogEntry:
+        """A catalog entry with the seller's recipients as they are now."""
+        return row.entry(self._party(row.id.party).recipients())
+
     def party_view(self, handle: str) -> m.PartyView:
         p = self._party(handle)
         released, refunded, disputed = self.reputation(handle)
         return m.PartyView(
             party=handle,
-            public_key=p.public_key,
+            recipients=p.recipients(),
             released=released,
             refunded=refunded,
             disputed=disputed,
@@ -1610,7 +1677,7 @@ class FakeGate:
                     "could not create the Nexus endpoint yet; publish again shortly",
                 ) from None
         row.endpoint_ready = True
-        return row.entry()
+        return self.catalog_entry(row)
 
     def resolve_ref(self, ref: OfferingRef) -> _Offering | None:
         """The highest visible version ``ref`` accepts (§7.4)."""
@@ -1643,7 +1710,7 @@ class FakeGate:
         row = self.offerings.get(key) if key is not None else None
         if row is None or not row.endpoint_ready or row.retired:
             raise GateHTTPError(404, "endpoint_not_found", "no offering has this endpoint")
-        return row.entry()
+        return self.catalog_entry(row)
 
     def search(self, q: str | None, cursor: str | None, limit: int) -> m.CatalogList:
         latest: dict[tuple[str, str], _Offering] = {}
@@ -1743,7 +1810,7 @@ class FakeGate:
                     "contract_hash": row.info.contract_hash,
                     "endpoint": row.endpoint,
                     "service": oid.service_name,
-                    "seller_public_key": facts.public_key,
+                    "seller_recipients": self._party(oid.party).recipients(),
                     **fields,
                 }
             )
@@ -1884,12 +1951,13 @@ class FakeGate:
                 {"amount_minor": q.amount.amount_minor, "max_price_minor": req.max_price_minor},
             )
         me = self._party(who.party)
-        if me.public_key is None:
-            raise GateHTTPError(
-                409,
-                "no_public_key",
-                "set your encryption key first (kontra login): the delivery is encrypted to it",
-            )
+        # The buyer's party keys are NOT consulted: the job's key comes with the request
+        # and the gate signs THAT into the hold token (decisions I7). So hiring needs no
+        # key setup at all -- a fresh machine, CI with an API key, `kontra mcp`.
+        try:
+            check_public_key(req.buyer_key)
+        except ValueError as e:
+            raise GateHTTPError(422, "invalid_key", str(e)) from None
         row = self.offerings.get(q.offering)
         if row is None or not row.endpoint_ready or row.retired:
             raise GateHTTPError(409, "offering_unavailable", f"{q.offering} is not available")
@@ -1923,7 +1991,7 @@ class FakeGate:
         job = _Job(
             record=record,
             buyer_ns=me.namespace,
-            buyer_key=me.public_key,
+            buyer_key=req.buyer_key,
             contract_hash=row.info.contract_hash,
             endpoint=row.endpoint,
             service=oid.service_name,
@@ -1968,7 +2036,7 @@ class FakeGate:
             amount_minor=q.amount.amount_minor,
             currency=q.amount.currency,
             max_duration_seconds=int(q.max_duration.total_seconds()),
-            seller_public_key=row.info.facts.public_key,
+            seller_recipients=self._party(oid.party).recipients(),
             expires_at=job.hold_expires_at,
         )
 
@@ -3066,8 +3134,13 @@ def _build_app(gate: FakeGate) -> FastAPI:
     async def me(who: PartyOrWorker) -> m.Me:
         return gate.me(who)
 
-    async def set_key(who: Fresh, body: m.SetKey) -> m.Me:
-        return gate.set_key(who, body.public_key)
+    async def add_recipient(who: Fresh, body: m.AddKey, response: Response) -> m.Me:
+        response.status_code = 201
+        return gate.add_recipient(who, body.label, body.public_key)
+
+    async def revoke_recipient(who: Fresh, public_key: str) -> Response:
+        gate.revoke_recipient(who, public_key)
+        return Response(status_code=204)
 
     async def party_view(party: str) -> m.PartyView:
         return gate.party_view(party)
@@ -3095,7 +3168,8 @@ def _build_app(gate: FakeGate) -> FastAPI:
     add("revoke", revoke)
     add("temporal_token", temporal_token)
     add("me", me)
-    add("set_key", set_key)
+    add("add_recipient", add_recipient)
+    add("revoke_recipient", revoke_recipient)
     add("party", party_view)
     add("create_api_key", create_api_key)
     add("api_keys", api_keys)
@@ -3125,7 +3199,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
         return gate.search(q, cursor, limit)
 
     async def get_offering(party: str, name: str, version: str) -> m.CatalogEntry:
-        return gate.resolve_path(party, name, version).entry()
+        return gate.catalog_entry(gate.resolve_path(party, name, version))
 
     async def card(party: str, name: str, version: str) -> JSONResponse:
         return JSONResponse(gate.resolve_path(party, name, version).card)

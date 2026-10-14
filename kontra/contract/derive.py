@@ -236,9 +236,9 @@ def inline_non_object_defs(defs: Mapping[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- derive
 
 
-def _facts(spec: OfferingSpec, public_key: str) -> dict[str, Any]:
+def _facts(spec: OfferingSpec) -> dict[str, Any]:
     try:
-        return XKontra.from_offering(spec, public_key).to_block()
+        return XKontra.from_offering(spec).to_block()
     except ValidationError as exc:
         first = exc.errors()[0]
         raise ContractError(
@@ -286,7 +286,7 @@ def _service(spec: OfferingSpec, input_name: str, output_name: str) -> dict[str,
 
 
 def derive_document(
-    spec: OfferingSpec, input_type: type[Any], output_type: type[Any], public_key: str
+    spec: OfferingSpec, input_type: type[Any], output_type: type[Any]
 ) -> dict[str, Any]:
     """Types-first: the sealed contract document for a workflow ``run(input) -> output``.
     Deterministic: the same models and offering always give the same bytes and hash."""
@@ -345,7 +345,7 @@ def derive_document(
         "$schema": DIALECT,
         "services": _service(spec, names["input"], names["output"]),
         "$defs": {k: defs[k] for k in sorted(defs)},
-        "x-kontra": _facts(spec, public_key),
+        "x-kontra": _facts(spec),
     }
     sealed = seal(doc)
     validate_document(sealed)  # derivation must only ever emit what the catalog accepts
@@ -357,9 +357,7 @@ def derive_document(
 _HAND_KEYS = ("nexusrpc", "$schema", "services", "$defs")
 
 
-def merge_document(
-    spec: OfferingSpec, nexus_doc: Mapping[str, Any], public_key: str
-) -> dict[str, Any]:
+def merge_document(spec: OfferingSpec, nexus_doc: Mapping[str, Any]) -> dict[str, Any]:
     """Schema-first: validate a hand-written Nexus document against the catalog rules and
     merge the offering facts into ``x-kontra``. Reserved ``Kontra*`` definitions it uses
     but lacks are added from ``spec/``; nothing else is changed."""
@@ -386,7 +384,7 @@ def merge_document(
         for name in sorted(_spec.reserved_names()):
             if name not in typed_defs and f"#/$defs/{name}" in used:
                 typed_defs[name] = _spec.reserved_def(name)
-    doc["x-kontra"] = _facts(spec, public_key)
+    doc["x-kontra"] = _facts(spec)
     ordered = {k: doc[k] for k in (*_HAND_KEYS, "x-kontra") if k in doc}
     sealed = seal(ordered)
     validate_document(sealed)

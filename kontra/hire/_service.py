@@ -122,7 +122,8 @@ class Prepared(BaseModel):
     endpoint: str
     service: str
     max_duration_seconds: int
-    seller_public_key: str
+    #: Every recipient the seller can read with, as the hire answer named them.
+    seller_recipients: list[str]
     price: str
     currency: str
     #: The contract's self-contained output schema, to find artifacts in the delivery.

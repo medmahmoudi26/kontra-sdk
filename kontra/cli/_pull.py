@@ -78,8 +78,8 @@ def verify_entry(ref: str, entry: m.CatalogEntry) -> ContractInfo:
         problems.append(f"the document is {info.offering.key}, the entry says {entry.offering}")
     if info.offering.full_name != wanted.full or not wanted.matches(info.offering.version):
         problems.append(f"asked for {ref}, got {info.offering.key}")
-    if info.facts.public_key != entry.public_key:
-        problems.append("the entry's public key is not the one the document seals")
+    if info.facts.party != entry.party:
+        problems.append(f"the document is {info.facts.party}'s, the entry says {entry.party}")
     if info.offering.service_name != entry.service:
         problems.append(f"the entry's service {entry.service!r} is not the document's")
     if problems:

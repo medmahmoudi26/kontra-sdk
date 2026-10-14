@@ -20,6 +20,7 @@ from temporalio import activity
 from temporalio.client import Client
 from temporalio.exceptions import ApplicationError
 
+from kontra.codec.age import generate_identity as age_generate_identity
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
 from kontra.hire._client import Kontra, _refusal  # pyright: ignore[reportPrivateUsage]
@@ -86,7 +87,7 @@ class HireActivities:
             endpoint=hired.endpoint,
             service=hired.service,
             max_duration_seconds=hired.max_duration_seconds,
-            seller_public_key=hired.seller_public_key,
+            seller_recipients=list(hired.seller_recipients),
             price=str(q.price),
             currency=hired.currency,
             output_schema=info.output_schema,
@@ -110,7 +111,10 @@ class HireActivities:
             return
         gate = self.kontra.gate
         try:
-            hired = await gate.hire(quote_id, max_price_minor=-1)
+            # A cap below any price never locks, so this never needs a usable job key;
+            # the gate still requires one, so send a throwaway public half.
+            _, throwaway = age_generate_identity()
+            hired = await gate.hire(quote_id, buyer_key=throwaway, max_price_minor=-1)
         except GateError as err:
             job_id = (err.detail or {}).get("job_id") if err.code == "quote_used" else None
             if not isinstance(job_id, str):

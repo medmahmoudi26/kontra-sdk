@@ -27,7 +27,7 @@ __all__ = [
     "x_kontra_schema",
 ]
 
-X_KONTRA_FILE = "x-kontra.v1.json"
+X_KONTRA_FILE = "x-kontra.v2.json"
 KONTRA_TYPES_FILE = "kontra-types.v1.json"
 #: Definitions whose name starts with this belong to the spec, never to a seller.
 RESERVED_PREFIX = "Kontra"
@@ -61,7 +61,7 @@ def _load(name: str) -> dict[str, Any]:
 
 
 def x_kontra_schema() -> dict[str, Any]:
-    """``spec/x-kontra.v1.json`` (a fresh copy; callers may mutate it)."""
+    """``spec/x-kontra.v2.json`` (a fresh copy; callers may mutate it)."""
     return copy.deepcopy(_load(X_KONTRA_FILE))
 
 

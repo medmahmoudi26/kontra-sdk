@@ -163,10 +163,14 @@ class BuyerKeys(Protocol):
 
 
 class SellerKeys(Protocol):
-    """Buyer side: the ``age1...`` key of the offering behind a Nexus endpoint. Implementations
-    look it up (hire response cache, then ``GateClient.by_endpoint``); never parse the name."""
+    """Buyer side: the ``age1...`` recipients of the party behind a Nexus endpoint.
 
-    async def seller_key(self, endpoint: str) -> str: ...
+    A seller holds a SET of them -- one per deployment -- so the input is encrypted to all
+    of them and whichever worker picks the task up can decrypt it (decisions I7).
+    Implementations look the set up (hire response cache, then ``GateClient.by_endpoint``);
+    never parse the endpoint name."""
+
+    async def seller_recipients(self, endpoint: str) -> Sequence[str]: ...
 
 
 class BlobStore(Protocol):
@@ -250,8 +254,14 @@ async def _raw_body(resp: httpx.Response) -> AsyncIterator[bytes]:
 
 
 class KontraCodec(PayloadCodec, WithSerializationContext):
-    """See the module docstring for the recipient rules. ``identity``/``recipient`` are
-    this party's age keypair; they must belong together.
+    """See the module docstring for the recipient rules.
+
+    ``identity`` is THIS machine's age secret key -- the one thing that decrypts.
+    ``recipients`` is the party's whole set, which is what "to ourselves" means once a
+    seller runs a fleet: a result written by one worker must be readable by the seller's
+    laptop and by its other deployments, not only by the pod that wrote it. This
+    machine's own public key must be in the set, or the codec could not read back what it
+    just wrote.
 
     ``services`` (seller): the exact names of the Nexus services this worker generated from
     its offerings (:attr:`~kontra.contract.names.OfferingId.service_name`). Only their
@@ -264,7 +274,7 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
     def __init__(
         self,
         identity: str,
-        recipient: str,
+        recipients: Sequence[str],
         *,
         role: Literal["seller", "buyer"],
         buyer_keys: BuyerKeys | None = None,
@@ -273,6 +283,7 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         claim_check_threshold: int = 256 * 1024,
         services: Iterable[str] = (),
         max_claim_check: int = MAX_CLAIM_CHECK,
+        extra_identities: Callable[[], Sequence[str]] | None = None,
     ) -> None:
         if role not in ("seller", "buyer"):
             raise ValueError("role must be 'seller' or 'buyer'")
@@ -280,8 +291,16 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
             ours = age.public_key_of(identity)
         except age.AgeError as e:
             raise ValueError(f"identity: {e}") from None
-        if ours != recipient:
-            raise ValueError("recipient is not the public key of identity")
+        if isinstance(recipients, str):
+            raise TypeError("recipients is a sequence of age keys, not one key")
+        ordered = _distinct(list(recipients))
+        if not ordered:
+            raise ValueError("recipients must hold at least this machine's own key")
+        for r in ordered:
+            if not age.is_recipient(r):
+                raise ValueError("every recipient must be an age X25519 recipient (age1...)")
+        if ours not in ordered:
+            raise ValueError("recipients must contain the public key of identity")
         if claim_check_threshold < 0:
             raise ValueError("claim_check_threshold must be >= 0")
         if max_claim_check < 1:
@@ -294,7 +313,11 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         if generated and role != "seller":
             raise ValueError("services is for the seller role: a buyer replies to no Nexus call")
         self._identity = identity
-        self._recipient = recipient
+        self._recipients = ordered
+        #: More secret keys to try when decrypting, read at each call because the set
+        #: grows: a buyer makes one per job at hire and shreds it at accept (decisions
+        #: I7). Never used to encrypt -- only :attr:`_recipients` says who may read.
+        self._extra_identities = extra_identities
         self._role: Literal["seller", "buyer"] = role
         self._buyer_keys = buyer_keys
         self._seller_keys = seller_keys
@@ -338,7 +361,7 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
                     return await self._nexus_call_recipients(ctx)
                 if self._generated(ctx) and ctx.operation in _PLAINTEXT_SELLER_OPERATIONS:
                     return None
-                return [self._recipient]
+                return list(self._recipients)
             if isinstance(ctx, WorkflowSerializationContext):
                 job_id = job_id_from_workflow_id(ctx.workflow_id)
                 if job_id is not None:
@@ -347,11 +370,11 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
                             f"cannot encrypt job {job_id}'s payload: no buyer key lookup"
                         )
                     buyer = await _resolve(self._buyer_keys.buyer_key, job_id, "buyer")
-                    return _distinct([self._recipient, buyer])
-            return [self._recipient]
+                    return _distinct([*self._recipients, buyer])
+            return list(self._recipients)
         if isinstance(ctx, NexusSerializationContext):
             return await self._nexus_call_recipients(ctx)
-        return [self._recipient]
+        return list(self._recipients)
 
     async def _nexus_call_recipients(self, ctx: NexusSerializationContext) -> list[str]:
         """A Nexus call's input: the seller behind the endpoint (never derived from its
@@ -360,8 +383,8 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
             raise CodecError(
                 f"cannot encrypt a Nexus input for endpoint {ctx.endpoint!r}: no seller key lookup"
             )
-        seller = await _resolve(self._seller_keys.seller_key, ctx.endpoint, "seller")
-        return _distinct([seller, self._recipient])
+        seller = await _resolve_many(self._seller_keys.seller_recipients, ctx.endpoint, "seller")
+        return _distinct([*seller, *self._recipients])
 
     def _generated(self, ctx: NexusSerializationContext) -> bool:
         """``ctx`` names one of the services this worker generated, by its exact name."""
@@ -466,9 +489,20 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         if p.metadata.get(_VERSION_KEY) != _VERSION:
             raise InvalidPayload("unsupported kontra payload version")
 
+    def _identities(self) -> list[str]:
+        """Every secret key this codec may decrypt with: this machine's, then the job
+        keys. age tries each stanza against each identity and stops at the first that
+        opens the file key."""
+        found = [self._identity]
+        if self._extra_identities is not None:
+            for extra in self._extra_identities():
+                if extra not in found:
+                    found.append(extra)
+        return found
+
     def _open(self, ciphertext: bytes) -> Payload:
         try:
-            plain = age.decrypt(ciphertext, self._identity)
+            plain = age.decrypt(ciphertext, self._identities())
         except age.AgeError as e:
             raise InvalidPayload(f"cannot decrypt payload: {e}") from e
         inner = Payload()
@@ -562,6 +596,26 @@ async def _resolve(lookup: Callable[[str], Awaitable[str]], arg: str, who: str) 
     if not age.is_recipient(key):
         raise CodecError(f"the {who}'s key is not an age X25519 recipient")
     return key
+
+
+async def _resolve_many(
+    lookup: Callable[[str], Awaitable[Sequence[str]]], arg: str, who: str
+) -> list[str]:
+    """Like :func:`_resolve`, for a party's whole recipient set. An empty set is an error,
+    not "encrypt to nobody": a party with no recipient cannot be sent anything."""
+    try:
+        keys = await lookup(arg)
+    except Exception as e:
+        raise CodecError(f"cannot resolve the {who}'s keys: {e}") from e
+    if isinstance(keys, str) or not isinstance(keys, Sequence):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise CodecError(f"the {who}'s keys are not a list of age X25519 recipients")
+    ordered = _distinct(list(keys))
+    if not ordered:
+        raise CodecError(f"the {who} has no recipient to encrypt to")
+    for key in ordered:
+        if not age.is_recipient(key):
+            raise CodecError(f"one of the {who}'s keys is not an age X25519 recipient")
+    return ordered
 
 
 def _distinct(keys: list[str]) -> list[str]:

@@ -70,37 +70,11 @@ def init(name: str, party: str | None) -> None:
     click.echo("  kontra dev && kontra serve    # a local Kontra, then sell it there")
 
 
-def _public_key(given: str | None) -> str:
-    """``--public-key``, else the profile's key, else the key file's: the document seals
-    the seller's key, so its hash depends on it."""
-    from kontra.codec.age import is_recipient, public_key_of
-    from kontra.profile import Profile, ProfileError
-
-    if given is not None:
-        if not is_recipient(given):
-            fail(f"--public-key {given!r} is not an age recipient (age1...)")
-        return given
-    try:
-        profile = Profile.load()
-    except ProfileError:
-        profile = None
-    if profile is not None and profile.public_key is not None:
-        return profile.public_key
-    try:
-        return public_key_of(Profile.identity(profile.home if profile is not None else None))
-    except ProfileError:
-        fail(
-            "the document carries your public key and none is set up here: run `kontra "
-            "login` (or `kontra dev`), or pass --public-key age1..."
-        )
-
-
 @click.command()
 @_DIR
 @_OFFERING
 @click.option("--nexgen", is_flag=True, help="The nexgen view: the document without x-kontra.")
 @click.option("--json", "as_json", is_flag=True, help="JSON instead of YAML.")
-@click.option("--public-key", metavar="AGE1", help="Seal this key instead of the profile's.")
 @click.option(
     "-o",
     "--output",
@@ -112,7 +86,6 @@ def contract(
     only: str | None,
     nexgen: bool,
     as_json: bool,
-    public_key: str | None,
     output: Path | None,
 ) -> None:
     """Print the contract document derived from worker.py's offerings (what `publish` sends)."""
@@ -120,12 +93,11 @@ def contract(
 
     from kontra.contract import nexgen_view, to_yaml
 
-    key = _public_key(public_key)
     with load_worker(directory) as worker:
         chosen = _pick(worker.offerings, only)
         if output is not None and len(chosen) > 1:
             fail(f"worker.py binds {len(chosen)} offerings; pick one with --offering for -o")
-        docs = [b.document(key) for b in chosen]
+        docs = [b.document() for b in chosen]
     if nexgen:
         docs = [nexgen_view(d) for d in docs]
     if as_json:
@@ -146,7 +118,6 @@ def contract(
 def publish(directory: Path, only: str | None, as_json: bool) -> None:
     """Publish worker.py's offerings to the catalog (needs a recent login)."""
     from kontra.auth import Session
-    from kontra.codec.age import public_key_of
     from kontra.contract import contract_hash
     from kontra.gate_client import models as m
 
@@ -156,12 +127,9 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
         async def go() -> list[m.CatalogEntry]:
             async with Session.from_env() as session:
                 profile = await session.resolve()
-                key = public_key_of(session.identity())
-                if profile.public_key is not None and profile.public_key != key:
-                    fail(
-                        f"the key file is not the one {profile.party} registered "
-                        f"({profile.public_key}); copy the right key, or run `kontra login`"
-                    )
+                # No key is sealed into a document any more (spec v2, decisions I7), so
+                # publishing needs none: a seller may add or revoke a recipient without
+                # republishing.
                 for b in chosen:
                     if b.offering_id.party != profile.party:
                         fail(
@@ -170,7 +138,7 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
                         )
                 entries: list[m.CatalogEntry] = []
                 for b in chosen:
-                    doc = b.document(key)
+                    doc = b.document()
                     entry = await session.gate.publish(doc)
                     ours = contract_hash(doc)
                     if (entry.offering, entry.contract_hash) != (b.key, ours):

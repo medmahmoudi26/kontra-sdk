@@ -36,6 +36,7 @@ from kontra.cli._common import KontraGroup, fail
 from kontra.cli._dev import dev
 from kontra.cli._keys import keys
 from kontra.cli._pull import pull
+from kontra.cli._recipients import recipients
 from kontra.cli._seller import contract, init, publish, serve
 
 __all__ = ["cli", "main"]
@@ -60,6 +61,7 @@ def mcp() -> None:
 for _command in (
     login,
     keys,
+    recipients,
     init,
     dev,
     publish,

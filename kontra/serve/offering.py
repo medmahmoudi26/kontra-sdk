@@ -27,7 +27,6 @@ from typing import Any, cast, get_type_hints
 from pydantic import BaseModel
 from temporalio import workflow as temporal_workflow
 
-from kontra.codec.age import generate_identity
 from kontra.contract import (
     ContractError,
     InputValidator,
@@ -171,8 +170,8 @@ class BoundOffering:
         self.quote = quote
         self.contract_path = contract_path
         self._nexus_document = dict(nexus_document) if nexus_document is not None else None
-        self._documents: dict[str, dict[str, Any]] = {}
-        self._validators: dict[str, InputValidator] = {}
+        self._document: dict[str, Any] | None = None
+        self._validator: InputValidator | None = None
 
     @property
     def offering_id(self) -> OfferingId:
@@ -187,31 +186,32 @@ class BoundOffering:
     def schema_first(self) -> bool:
         return self._nexus_document is not None
 
-    def document(self, public_key: str) -> dict[str, Any]:
-        """The sealed contract document for this binding and the seller's key: derived from
-        the workflow's types, or the hand-written document merged with offering.yaml."""
-        doc = self._documents.get(public_key)
-        if doc is None:
-            doc = self._documents[public_key] = self.build_document(public_key)
-        return doc
+    def document(self) -> dict[str, Any]:
+        """The sealed contract document for this binding: derived from the workflow's
+        types, or the hand-written document merged with offering.yaml.
 
-    def build_document(self, public_key: str) -> dict[str, Any]:
+        No key goes in. Spec v2 seals the party (the first component of ``name``) and
+        nothing else, so a seller may add or revoke a recipient without republishing --
+        which would be a new version, a new endpoint and a new task queue (decisions I7)."""
+        if self._document is None:
+            self._document = self.build_document()
+        return self._document
+
+    def build_document(self) -> dict[str, Any]:
         """:meth:`document`, built afresh and not remembered."""
         if self._nexus_document is not None:
-            return merge_document(self.spec, self._nexus_document, public_key)
-        return derive_document(self.spec, self.input_type, self.output_type, public_key)
+            return merge_document(self.spec, self._nexus_document)
+        return derive_document(self.spec, self.input_type, self.output_type)
 
-    def contract_hash(self, public_key: str) -> str:
+    def contract_hash(self) -> str:
         """The hash the catalog, this worker and every hold token must agree on (§11.2)."""
-        return contract_hash(self.document(public_key))
+        return contract_hash(self.document())
 
-    def validator(self, public_key: str) -> InputValidator:
+    def validator(self) -> InputValidator:
         """Validates ``execute``/``quote`` inputs against the served contract."""
-        found = self._validators.get(public_key)
-        if found is None:
-            found = InputValidator(self.document(public_key))
-            self._validators[public_key] = found
-        return found
+        if self._validator is None:
+            self._validator = InputValidator(self.document())
+        return self._validator
 
     def __repr__(self) -> str:
         return (
@@ -257,7 +257,6 @@ def offering(
         contract_path=contract_path,
         nexus_document=nexus_doc,
     )
-    # Fail at import, not at the first job: derive (or validate) once with a throwaway key.
-    # The real document is built with the seller's key when the worker starts.
-    bound.build_document(generate_identity()[1])
+    # Fail at import, not at the first job: derive (or validate) the document once here.
+    bound.build_document()
     return bound

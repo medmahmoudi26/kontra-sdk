@@ -54,10 +54,14 @@ class KeyLookup(Protocol):
 class Runtime:
     party: str
     gate: GateClient
-    #: ``AGE-SECRET-KEY-1...``
+    #: ``AGE-SECRET-KEY-1...``: this machine's key, the one thing that decrypts.
     identity: str
-    #: ``age1...``, our own public key
+    #: ``age1...``, this machine's own public key.
     recipient: str
+    #: The party's whole recipient set (``age1...``), this machine's included: what "to
+    #: ourselves" means for a seller running more than one deployment (decisions I7).
+    #: Empty means "just this machine", for a buyer that registered nothing.
+    recipients: list[str] = field(default_factory=list[str])
     #: seller side: job id -> buyer key (filled by the Nexus handler, gate on miss)
     jobs: KeyLookup | None = None
     extra_recipients: list[str] = field(default_factory=list[str])
@@ -69,7 +73,7 @@ class Runtime:
     async def recipients_for_current_job(self) -> list[str]:
         """Seller side: ourselves and the job's buyer (job directory, gate on miss).
         Outside a job: ourselves only."""
-        out = [self.recipient, *self.extra_recipients]
+        out = [self.recipient, *self.recipients, *self.extra_recipients]
         ctx = _job.get()
         if ctx is not None and self.jobs is not None:
             out.append(await self.jobs.buyer_key(ctx.job_id))

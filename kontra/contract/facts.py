@@ -1,4 +1,4 @@
-"""The ``x-kontra`` block (``spec/x-kontra.v1.json``): the offering facts as published.
+"""The ``x-kontra`` block (``spec/x-kontra.v2.json``): the offering facts as published.
 
 Unlike :class:`~kontra.contract.offering.OfferingSpec`, which forgives the spellings people
 type, this model accepts only canonical spellings from a document (``6h``, never
@@ -51,7 +51,14 @@ def check_public_key(value: object) -> str:
 
 
 class XKontra(BaseModel):
-    """Offering facts plus the seller's public key and the contract hash."""
+    """Offering facts and the contract hash.
+
+    No key is sealed here (spec v2, decisions I7). A party holds a SET of age recipients
+    and may add or revoke one at any time; sealing one into the document would make
+    "mount the key on a second worker host" a republish, and a republish is a new version,
+    a new endpoint and a new task queue. The document seals the party instead -- it is the
+    first component of :attr:`name` -- and the recipients live in the catalog, which the
+    buyer reads at quote and hire time."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -65,7 +72,6 @@ class XKontra(BaseModel):
     max_concurrent_jobs: int | None = None
     max_output_bytes: int
     artifact_retention: timedelta
-    public_key: str
     contract_hash: str | None = None
 
     @field_validator("name", mode="before")
@@ -118,11 +124,6 @@ class XKontra(BaseModel):
     def _max_concurrent_jobs(cls, v: object) -> int | None:
         return check_concurrency(v)
 
-    @field_validator("public_key", mode="before")
-    @classmethod
-    def _public_key(cls, v: object) -> str:
-        return check_public_key(v)
-
     @field_validator("contract_hash", mode="before")
     @classmethod
     def _contract_hash(cls, v: object) -> str | None:
@@ -141,9 +142,7 @@ class XKontra(BaseModel):
         return format_size(v)
 
     @classmethod
-    def from_offering(
-        cls, spec: OfferingSpec, public_key: str, contract_hash: str | None = None
-    ) -> XKontra:
+    def from_offering(cls, spec: OfferingSpec, contract_hash: str | None = None) -> XKontra:
         return cls(
             name=spec.name,
             version=spec.version,
@@ -155,13 +154,19 @@ class XKontra(BaseModel):
             max_concurrent_jobs=spec.max_concurrent_jobs,
             max_output_bytes=spec.max_output_bytes,
             artifact_retention=spec.artifact_retention,
-            public_key=public_key,
             contract_hash=contract_hash,
         )
 
     @property
     def offering_id(self) -> OfferingId:
         return OfferingId.from_parts(self.name, self.version)
+
+    @property
+    def party(self) -> str:
+        """The seller the document names. ``name`` is built by
+        ``kontra.contract.names``, which also reads it back into its parts -- the one
+        place allowed to (decisions I1)."""
+        return self.offering_id.party
 
     def to_block(self) -> dict[str, Any]:
         """The ``x-kontra`` JSON: canonical strings, unset members omitted."""
