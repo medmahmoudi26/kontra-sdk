@@ -1,6 +1,7 @@
 # GOLDEN FILE (seam ③), checked by tests/examples/test_golden.py: the contract `kontra
-# publish` derives from models.py and offering.yaml, sealed with the EXAMPLE key in
-# ../example-public-key.txt. Publishing seals your key, so your contract_hash differs.
+# publish` derives from models.py and offering.yaml. No key is sealed into a contract
+# (spec x-kontra.v2.json), so this is the document -- and the contract_hash -- that
+# anyone publishing this example gets.
 # Regenerate after a deliberate contract change:
 #   UPDATE_GOLDEN=1 pytest tests/examples/test_golden.py
 nexusrpc: "1.0.0"
@@ -126,5 +127,4 @@ x-kontra:
   max_concurrent_jobs: 20
   max_output_bytes: "10MB"
   artifact_retention: "1d"
-  public_key: age1lmxatsm78mm3tnsr7syhsc5tfetvrm2aqpur9cxl8gcymp0uufes0yme79
-  contract_hash: sha256:bf133af4e3a9a9029c758994d1be55bb7e56f93893bb6204d602a33f5bbfb3a6
+  contract_hash: sha256:21020c25c367f7d4a9cb200a8f3355b1847e0cb134c3cd2f13dca0b0acddd869

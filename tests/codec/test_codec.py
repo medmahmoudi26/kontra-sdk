@@ -7,7 +7,7 @@ temporalio's own context plumbing."""
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -68,11 +68,13 @@ class Keys:
             raise LookupError("gate unreachable")
         return self.buyer  # type: ignore[return-value]
 
-    async def seller_key(self, endpoint: str) -> str:
+    async def seller_recipients(self, endpoint: str) -> Sequence[str]:
         self.asked.append(("seller", endpoint))
         if self.fail:
             raise LookupError("gate unreachable")
-        return self.seller  # type: ignore[return-value]
+        if isinstance(self.seller, (list, tuple)):
+            return list(self.seller)  # pyright: ignore[reportUnknownArgumentType]
+        return [self.seller]  # type: ignore[list-item]
 
 
 class Blobs:
@@ -95,7 +97,7 @@ class Blobs:
 
 def seller_codec(**kw: object) -> KontraCodec:
     kw.setdefault("buyer_keys", Keys())
-    return KontraCodec(SELLER[0], SELLER[1], role="seller", **kw)  # type: ignore[arg-type]
+    return KontraCodec(SELLER[0], [SELLER[1]], role="seller", **kw)  # type: ignore[arg-type]
 
 
 #: For a seller-role codec that calls an offering: the endpoint's seller is someone else.
@@ -104,7 +106,7 @@ OTHER_SELLER = Keys(seller=STRANGER[1])
 
 def buyer_codec(**kw: object) -> KontraCodec:
     kw.setdefault("seller_keys", Keys())
-    return KontraCodec(BUYER[0], BUYER[1], role="buyer", **kw)  # type: ignore[arg-type]
+    return KontraCodec(BUYER[0], [BUYER[1]], role="buyer", **kw)  # type: ignore[arg-type]
 
 
 def payload(data: bytes = b'"hello ' + MARKER + b'"') -> Payload:
@@ -361,26 +363,30 @@ async def test_unresolvable_recipient_fails_closed(
 
 
 def test_constructor_validation() -> None:
-    with pytest.raises(ValueError, match="public key"):
-        KontraCodec(SELLER[0], BUYER[1], role="seller")
+    with pytest.raises(ValueError, match="must contain the public key"):
+        KontraCodec(SELLER[0], [BUYER[1]], role="seller")
+    with pytest.raises(TypeError, match="sequence of age keys"):
+        KontraCodec(SELLER[0], SELLER[1], role="seller")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="at least this machine"):
+        KontraCodec(SELLER[0], [], role="seller")
     with pytest.raises(ValueError, match="role"):
-        KontraCodec(SELLER[0], SELLER[1], role="admin")  # type: ignore[arg-type]
+        KontraCodec(SELLER[0], [SELLER[1]], role="admin")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="identity"):
-        KontraCodec("AGE-SECRET-KEY-1nope", SELLER[1], role="seller")
+        KontraCodec("AGE-SECRET-KEY-1nope", [SELLER[1]], role="seller")
     with pytest.raises(ValueError, match="threshold"):
-        KontraCodec(SELLER[0], SELLER[1], role="seller", claim_check_threshold=-1)
+        KontraCodec(SELLER[0], [SELLER[1]], role="seller", claim_check_threshold=-1)
     with pytest.raises(ValueError, match="max_claim_check"):
-        KontraCodec(SELLER[0], SELLER[1], role="seller", max_claim_check=0)
+        KontraCodec(SELLER[0], [SELLER[1]], role="seller", max_claim_check=0)
     # One name is not a collection of names (it would read as its characters).
     with pytest.raises(TypeError, match="collection"):
-        KontraCodec(SELLER[0], SELLER[1], role="seller", services=SERVICE)
+        KontraCodec(SELLER[0], [SELLER[1]], role="seller", services=SERVICE)
     with pytest.raises(ValueError, match="non-empty"):
-        KontraCodec(SELLER[0], SELLER[1], role="seller", services=[SERVICE, ""])
+        KontraCodec(SELLER[0], [SELLER[1]], role="seller", services=[SERVICE, ""])
     with pytest.raises(ValueError, match="seller role"):
-        KontraCodec(BUYER[0], BUYER[1], role="buyer", services=[SERVICE])
-    codec = KontraCodec(SELLER[0], SELLER[1], role="seller", services=(SERVICE, SERVICE))
+        KontraCodec(BUYER[0], [BUYER[1]], role="buyer", services=[SERVICE])
+    codec = KontraCodec(SELLER[0], [SELLER[1]], role="seller", services=(SERVICE, SERVICE))
     assert codec.services == frozenset({SERVICE})
-    assert KontraCodec(BUYER[0], BUYER[1], role="buyer").services == frozenset()
+    assert KontraCodec(BUYER[0], [BUYER[1]], role="buyer").services == frozenset()
 
 
 # --------------------------------------------------------------------------- decode

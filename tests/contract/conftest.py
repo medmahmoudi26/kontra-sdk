@@ -21,4 +21,4 @@ def enrich_spec() -> OfferingSpec:
 
 @pytest.fixture
 def enrich_doc(enrich_spec: OfferingSpec) -> dict[str, Any]:
-    return derive_document(enrich_spec, EnrichInput, EnrichOutput, PUBLIC_KEY)
+    return derive_document(enrich_spec, EnrichInput, EnrichOutput)

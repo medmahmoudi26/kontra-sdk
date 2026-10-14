@@ -8,6 +8,7 @@ import itertools
 import json
 import os
 import uuid
+from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,12 @@ from kontra.codec import GateBlobStore, KontraCodec
 from kontra.gate_client import models as m
 from kontra.serve import HOLD_HEADER, seller_data_converter
 from kontra.testing import Marketplace, TestParty
+
+#: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
+#: (`Profile.new_pending_job_identity`); a test that drives the route itself only needs a
+#: well-formed recipient (decisions I7).
+_A_BUYER_KEY = "age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el"
+
 
 HERE = Path(__file__).parent
 MARKER = "kontra-serve-marker-5f1d"
@@ -71,13 +78,14 @@ class CountingTransport(httpx.AsyncBaseTransport):
 
 
 class Keys:
-    """The buyer codec's ``SellerKeys``: endpoint -> seller key, as the hire answer says."""
+    """The buyer codec's ``SellerKeys``: endpoint -> the seller's recipients, as the hire
+    answer says."""
 
     def __init__(self) -> None:
         self.keys: dict[str, str] = {}
 
-    async def seller_key(self, endpoint: str) -> str:
-        return self.keys[endpoint]
+    async def seller_recipients(self, endpoint: str) -> Sequence[str]:
+        return [self.keys[endpoint]]
 
 
 class Buyer:
@@ -94,7 +102,7 @@ class Buyer:
         self.keys = Keys()
         self.codec = KontraCodec(
             party.identity,
-            party.public_key,
+            [party.public_key],
             role="buyer",
             seller_keys=self.keys,
             blobs=GateBlobStore(party.gate) if claim_check_threshold is not None else None,
@@ -123,7 +131,7 @@ class Buyer:
         q = await self.quote(entry, value)
         assert q.status == m.QuoteStatus.OK, q
         assert q.quote_id is not None
-        hired = await self.party.gate.hire(q.quote_id)
+        hired = await self.party.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
         self.keys.keys[hired.endpoint] = hired.seller_public_key
         return hired
 

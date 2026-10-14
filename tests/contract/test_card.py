@@ -20,7 +20,6 @@ from google.protobuf.message import Message
 from kontra.contract import ContractError, OfferingSpec, agent_card, derive_document
 from kontra.contract.card import CONTRACT_EXTENSION_URI
 
-from .conftest import PUBLIC_KEY
 from .sample_models import EnrichInput, EnrichOutput
 
 URL = "https://gate.kontra.run/a2a/acme/enrich@1.2.0"
@@ -84,7 +83,7 @@ def test_card_carries_the_contract_hash_not_the_endpoint(enrich_doc: dict[str, A
     params = ext["params"]
     assert params["contractHash"] == enrich_doc["x-kontra"]["contract_hash"]
     assert params["offering"] == "acme/enrich@1.2.0"
-    assert params["publicKey"] == PUBLIC_KEY
+    assert "publicKey" not in params  # a contract seals no key (spec v2, decisions I7)
     assert params["maxConcurrentJobs"] == 10
     # endpoints are opaque and assigned after sealing (decisions I1): never in a card
     assert "endpoint" not in json.dumps(card).lower()
@@ -95,7 +94,7 @@ def test_card_without_tags_or_hint(enrich_spec: OfferingSpec) -> None:
         update={"tags": [], "pricing_hint": None, "max_concurrent_jobs": None}
     )
     card = agent_card(
-        derive_document(spec, EnrichInput, EnrichOutput, PUBLIC_KEY),
+        derive_document(spec, EnrichInput, EnrichOutput),
         url=URL,
         protocol_binding="HTTP+JSON",
     )

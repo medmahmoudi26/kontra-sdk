@@ -28,6 +28,12 @@ from kontra.testing.fake_gate import FakeGate
 from .conftest import World
 from .support import json_payload, ok_quote, wire
 
+#: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
+#: (`Profile.new_pending_job_identity`); a test that drives the route itself only needs a
+#: well-formed recipient (decisions I7).
+_A_BUYER_KEY = "age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el"
+
+
 QUERY = {
     "search": {"q", "cursor", "limit"},
     "jobs": {"as", "state", "cursor", "limit"},
@@ -139,7 +145,7 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     async def hired() -> m.HireView:
         q = await buyer.gate.quote(entry.name, wire(json_payload({"text": "hi"})))
         assert q.quote_id is not None
-        return await buyer.gate.hire(q.quote_id, max_price_minor=500)
+        return await buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY, max_price_minor=500)
 
     worker = world.bearer((await seller.gate.temporal_token()).token)  # kontra serve's credential
 

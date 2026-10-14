@@ -64,7 +64,7 @@ def offering_doc(party: str, public_key: str, **facts: Any) -> dict[str, Any]:
         "artifact_retention": "1d",
     }
     spec.update(facts)
-    return derive_document(parse_offering(spec), EnrichInput, EnrichOutput, public_key)
+    return derive_document(parse_offering(spec), EnrichInput, EnrichOutput)
 
 
 def handle(prefix: str = "p") -> str:

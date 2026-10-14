@@ -25,6 +25,12 @@ from kontra.testing.fake_gate import FakeGate
 
 from .support import ScriptedControl, json_payload, logged_in, offering_doc, ok_quote, wire
 
+#: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
+#: (`Profile.new_pending_job_identity`); a test that drives the route itself only needs a
+#: well-formed recipient (decisions I7).
+_A_BUYER_KEY = "age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el"
+
+
 PART = 64 * 1024
 
 
@@ -67,7 +73,7 @@ async def bench(tmp_path: Path) -> AsyncIterator[Bench]:
         )
         q = await buyer.gate.quote("acme/enrich", wire(json_payload({})))
         assert q.quote_id is not None
-        job = await buyer.gate.hire(q.quote_id)
+        job = await buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
         token = (await seller.gate.temporal_token()).token
 
         async def bearer() -> str:
@@ -128,7 +134,7 @@ async def test_the_buyer_fetches_an_output_only_once_the_job_delivered(bench: Be
     async def hire() -> str:
         q = await bench.buyer.gate.quote("acme/enrich", wire(json_payload({})))
         assert q.quote_id is not None
-        return (await bench.buyer.gate.hire(q.quote_id)).job_id
+        return (await bench.buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)).job_id
 
     def script(job_id: str, status: ObservedStatus, result: bytes | None = None) -> None:
         bench.control.observe_as("acme", f"job-{job_id}", status, result)
@@ -181,7 +187,7 @@ async def test_the_buyer_keeps_its_outputs_through_settlement(bench: Bench) -> N
     async def delivered_output() -> tuple[str, str]:
         q = await bench.buyer.gate.quote("acme/enrich", wire(json_payload({})))
         assert q.quote_id is not None
-        job_id = (await bench.buyer.gate.hire(q.quote_id)).job_id
+        job_id = (await bench.buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)).job_id
         art = await upload(
             bench.worker, bench.file("o.bin", 100), recipients=bench.recipients, job_id=job_id
         )

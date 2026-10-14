@@ -47,7 +47,7 @@ def readers(p: Payload) -> set[str]:
 @pytest.fixture
 async def client() -> AsyncIterator[Client]:
     async with await WorkflowEnvironment.start_time_skipping() as env:
-        codec = KontraCodec(SELLER[0], SELLER[1], role="seller", buyer_keys=BuyerKeys())
+        codec = KontraCodec(SELLER[0], [SELLER[1]], role="seller", buyer_keys=BuyerKeys())
         config = env.client.config()
         config["data_converter"] = data_converter(codec)
         yield Client(**config)

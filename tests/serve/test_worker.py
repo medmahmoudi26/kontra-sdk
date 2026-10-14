@@ -349,18 +349,18 @@ async def test_the_hash_lock_publishes_on_a_dev_profile(bound: Any) -> None:
     pk = generate_identity()[1]
     gate = _CatalogGate(None)
     hashes = await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=True), pk)  # type: ignore[arg-type]
-    assert gate.published == [bound.document(pk)]
-    assert hashes == {bound.key: bound.contract_hash(pk)}
+    assert gate.published == [bound.document()]
+    assert hashes == {bound.key: bound.contract_hash()}
 
 
 async def test_the_hash_lock_names_both_hashes(bound: Any) -> None:
     pk = generate_identity()[1]
     theirs = "sha256:" + "1" * 64
-    gate = _CatalogGate(_entry(bound.document(pk), contract_hash=theirs))
+    gate = _CatalogGate(_entry(bound.document(), contract_hash=theirs))
     for dev in (False, True):  # a dev profile does not paper over drift either
         with pytest.raises(ServeError) as refused:
             await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=dev), pk)  # type: ignore[arg-type]
-        assert bound.contract_hash(pk) in str(refused.value)
+        assert bound.contract_hash() in str(refused.value)
         assert theirs in str(refused.value)
     assert gate.published == []
 
@@ -373,13 +373,13 @@ async def test_a_retired_version_with_open_jobs_is_served_with_a_warning(
     gate = _CatalogGate(
         None,
         [_job(bound.key), _job("acme/other@1.0.0")],
-        hired_hash=bound.contract_hash(pk),
+        hired_hash=bound.contract_hash(),
     )
     hashes = await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=False), pk)  # type: ignore[arg-type]
-    assert hashes == {bound.key: bound.contract_hash(pk)}
+    assert hashes == {bound.key: bound.contract_hash()}
     assert "is retired but still has 1 open job(s)" in caplog.text
     caplog.clear()
-    gate = _CatalogGate(_entry(bound.document(pk), retired=True), [_job(bound.key)])
+    gate = _CatalogGate(_entry(bound.document(), retired=True), [_job(bound.key)])
     await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=False), pk)  # type: ignore[arg-type]
     assert "still has 1 open job(s); serving them" in caplog.text
 
@@ -392,7 +392,7 @@ async def test_a_retired_version_with_open_jobs_is_still_hash_locked(bound: Any)
     gate = _CatalogGate(None, [_job(bound.key)], hired_hash=theirs)
     with pytest.raises(ServeError) as refused:
         await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=True), pk)  # type: ignore[arg-type]
-    assert bound.contract_hash(pk) in str(refused.value)
+    assert bound.contract_hash() in str(refused.value)
     assert f"hired under {theirs}" in str(refused.value)
     assert gate.published == []  # a dev profile does not republish a retired version
 
@@ -432,7 +432,7 @@ async def test_one_worker_serves_several_offerings(dev_server: DevServer, tmp_pa
             assert [s.key for s in worker.services] == [a.key, b.key]
             for bound in (a, b):
                 entry = await acme.gate.get_offering(bound.key)
-                assert entry.contract_hash == bound.contract_hash(acme.public_key)
+                assert entry.contract_hash == bound.contract_hash()
                 assert entry.task_queue == bound.key
 
 

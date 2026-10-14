@@ -48,14 +48,17 @@ def test_a_missing_or_wrong_offering_yaml_is_refused(tmp_path: Path) -> None:
         offering(bad, workflow=UpperFlow, quote=seller.quote)
 
 
-def test_the_document_and_hash_follow_the_key(tmp_path: Path) -> None:
+def test_the_document_and_hash_do_not_depend_on_any_key(tmp_path: Path) -> None:
+    """Spec v2 seals no key (decisions I7): the document is the same for every seller of
+    this offering, and so is its hash. It used to be one document per key, which is what
+    made adding a fleet key a republish."""
     bound = seller.bind(write_offering(tmp_path))
-    a, b = generate_identity()[1], generate_identity()[1]
-    assert bound.document(a) is bound.document(a)
-    assert bound.document(a)["x-kontra"]["public_key"] == a
-    assert bound.contract_hash(a) == bound.document(a)["x-kontra"]["contract_hash"]
-    assert bound.contract_hash(a) != bound.contract_hash(b)
-    v = bound.validator(a)
+    assert bound.document() is bound.document()  # built once, remembered
+    assert "public_key" not in bound.document()["x-kontra"]
+    assert bound.contract_hash() == bound.document()["x-kontra"]["contract_hash"]
+    other = seller.bind(write_offering(tmp_path))
+    assert other.contract_hash() == bound.contract_hash()
+    v = bound.validator()
     v.validate({"text": "x"})
     with pytest.raises(ContractError):
         v.validate({"text": "x", "extra": 1})
@@ -200,17 +203,17 @@ def test_schema_first(tmp_path: Path) -> None:
     derived = seller.bind(path)
     pk = generate_identity()[1]
     hand = tmp_path / "contract.yaml"
-    hand.write_text(to_yaml(nexgen_view(derived.document(pk))))
+    hand.write_text(to_yaml(nexgen_view(derived.document())))
     bound = offering(path, workflow=UpperFlow, quote=seller.quote, contract=hand)
     assert bound.schema_first
     assert bound.contract_path == hand
-    assert bound.contract_hash(pk) == derived.contract_hash(pk)
-    doc = nexgen_view(derived.document(pk))
+    assert bound.contract_hash() == derived.contract_hash()
+    doc = nexgen_view(derived.document())
     doc["$defs"]["Order"]["properties"]["text"]["maxLength"] = 10
     hand.write_text(to_yaml(doc))
     edited = offering(path, workflow=UpperFlow, quote=seller.quote, contract=hand)
-    assert edited.contract_hash(pk) != derived.contract_hash(pk)
+    assert edited.contract_hash() != derived.contract_hash()
     with pytest.raises(ContractError):
-        edited.validator(pk).validate({"text": "x" * 11})
+        edited.validator().validate({"text": "x" * 11})
     with pytest.raises(ContractError, match="cannot read the contract"):
         offering(path, workflow=UpperFlow, quote=seller.quote, contract="missing.yaml")

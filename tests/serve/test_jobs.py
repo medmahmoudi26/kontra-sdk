@@ -144,11 +144,11 @@ class Endpoints:
 async def test_seller_keys_come_from_the_catalog_and_are_cached() -> None:
     gate = Endpoints()
     keys = SellerKeyCache(gate)
-    assert await keys.seller_key("k" + "1" * 32) == BUYER
-    assert await keys.seller_key("k" + "1" * 32) == BUYER
+    assert await keys.seller_recipients("k" + "1" * 32) == BUYER
+    assert await keys.seller_recipients("k" + "1" * 32) == BUYER
     assert gate.calls == 1
     with pytest.raises(LookupError):
-        await keys.seller_key("kliar")
+        await keys.seller_recipients("kliar")
     keys.remember("k" + "2" * 32, BUYER)
-    assert await keys.seller_key("k" + "2" * 32) == BUYER
+    assert await keys.seller_recipients("k" + "2" * 32) == BUYER
     assert gate.calls == 2

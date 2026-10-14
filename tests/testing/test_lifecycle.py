@@ -10,7 +10,7 @@ import asyncio
 import base64
 import json
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -36,6 +36,12 @@ from kontra.testing.ledger_contract import assert_invariants
 
 from .seller import PRICE_PER_CHAR, serving
 from .support import handle, json_payload, offering_doc, unwire, wire
+
+#: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
+#: (`Profile.new_pending_job_identity`); a test that drives the route itself only needs a
+#: well-formed recipient (decisions I7).
+_A_BUYER_KEY = "age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el"
+
 
 pytestmark = [pytest.mark.temporal, pytest.mark.timeout(120)]
 
@@ -68,7 +74,7 @@ class Deal:
         )
         assert q.status is m.QuoteStatus.OK, q
         assert q.quote_id is not None
-        return await self.buyer.gate.hire(q.quote_id)
+        return await self.buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
 
     async def start(self, job: m.HireView, text: str, mode: str = "ok") -> None:
         await self.buyer.gate.start(job.job_id, wire(json_payload({"text": text, "mode": mode})))
@@ -106,7 +112,7 @@ async def test_quote_hire_deliver_accept(deal: Deal) -> None:
     async with serving(deal.seller_client(), deal.entry, deal.jwks):
         q = await deal.buyer.gate.quote(deal.entry.name, wire(json_payload({"text": "hello"})))
         assert (q.status, q.amount_minor, q.price) == (m.QuoteStatus.OK, PRICE_PER_CHAR * 5, "5.00")
-        job = await deal.buyer.gate.hire(q.quote_id or "")
+        job = await deal.buyer.gate.hire(q.quote_id or "", buyer_key=_A_BUYER_KEY)
         events: list[m.ProgressEvent] = []
 
         async def follow() -> None:
@@ -522,7 +528,7 @@ async def test_payloads_stay_ciphertext_end_to_end(deal: Deal) -> None:
         assert q.amount_minor == PRICE_PER_CHAR * len(
             text
         )  # the seller read it; the gate could not
-        job = await deal.buyer.gate.hire(q.quote_id or "")
+        job = await deal.buyer.gate.hire(q.quote_id or "", buyer_key=_A_BUYER_KEY)
         await deal.buyer.gate.start(job.job_id, await sealed("execute", {"text": text}))
         await deal.until(job.job_id, lambda v: v.state is m.JobState.COMPLETED)
 
@@ -552,7 +558,7 @@ class _Seller:
     def __init__(self, entry: m.CatalogEntry) -> None:
         self.entry = entry
 
-    async def seller_key(self, endpoint: str) -> str:
+    async def seller_recipients(self, endpoint: str) -> Sequence[str]:
         if endpoint != self.entry.endpoint:
             raise LookupError(endpoint)
-        return self.entry.public_key
+        return self.entry.recipients

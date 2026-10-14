@@ -157,7 +157,10 @@ class _BuyerArtifact(Artifact):
     as a seller and hire as a buyer at once)."""
 
     _gate: GateClient | None = PrivateAttr(default=None)
-    _identity: str | None = PrivateAttr(default=None)
+    #: Every key the client that received this may decrypt with: this machine's and the
+    #: job keys it holds. A delivery is encrypted to the JOB's key (decisions I7), which
+    #: is not a key of the party at all, so one identity is not enough here.
+    _identities: tuple[str, ...] | None = PrivateAttr(default=None)
 
     def __reduce__(self) -> tuple[Any, ...]:
         """Pickled as a plain :class:`Artifact`: the binding (a live gate client and our
@@ -171,19 +174,19 @@ class _BuyerArtifact(Artifact):
         # pydantic would deep-copy the private gate client (and fail on its locks).
         return self
 
-    def _bound(self) -> tuple[GateClient, str]:
-        if self._gate is None or self._identity is None:  # a copy made without the binding
+    def _bound(self) -> tuple[GateClient, Sequence[str]]:
+        if self._gate is None or self._identities is None:  # a copy made without the binding
             rt = _runtime.current()
-            return rt.gate, rt.identity
-        return self._gate, self._identity
+            return rt.gate, rt.all_identities()
+        return self._gate, self._identities
 
     async def download(self, path: str | Path) -> Path:
-        gate, identity = self._bound()
-        return await download(gate, self, identity, Path(path))
+        gate, identities = self._bound()
+        return await download(gate, self, identities, Path(path))
 
     async def chunks(self) -> AsyncIterator[bytes]:
-        gate, identity = self._bound()
-        async for chunk in iter_plaintext(gate, self, identity):
+        gate, identities = self._bound()
+        async for chunk in iter_plaintext(gate, self, identities):
             yield chunk
 
 
@@ -636,14 +639,13 @@ class Kontra:
             self._know_party()
 
     def _know_party(self) -> None:
-        """Check the key file against the party's registered key and install the runtime:
-        what needs to know who we are."""
+        """Install the runtime: what needs to know who we are.
+
+        Nothing is checked against a "the party's key" here any more. A party has a set of
+        recipients and a buyer needs none of them -- each job brings its own key
+        (decisions I7) -- so a machine whose key file is unregistered, or absent, still
+        hires and reads its results."""
         profile = self._session.profile
-        if profile.public_key is not None and profile.public_key != self.public_key:
-            raise KontraError(
-                f"the key file is not the one {profile.party} registered "
-                f"({profile.public_key}); copy the right key, or run `kontra login`"
-            )
         try:
             _runtime.current()
         except _runtime.NoRuntime:
@@ -651,6 +653,7 @@ class Kontra:
                 party=profile.party,
                 gate=self._session.gate,
                 identity=self._identity,
+                more_identities=lambda: tuple(self._job_identities),
                 recipient=self.public_key,
             )
             _runtime.install(self._runtime)
@@ -692,6 +695,16 @@ class Kontra:
     @property
     def party(self) -> str:
         return self.profile.party
+
+    @property
+    def identities(self) -> tuple[str, ...]:
+        """Every secret key this client can decrypt with: this machine's, then the key of
+        each job it holds (decisions I7).
+
+        An :class:`~kontra.types.Artifact` that arrived inside a delivery is already bound
+        to them and downloads itself. One rebuilt from plain JSON -- passed through a
+        workflow result, say -- is not, and :func:`kontra.artifacts.download` wants these."""
+        return (self._identity, *self._job_identities)
 
     @property
     def seller_keys(self) -> SellerKeyCache:
@@ -1386,14 +1399,17 @@ class Kontra:
     def _bind(self, artifact: Artifact) -> Artifact:
         bound = _BuyerArtifact.model_validate(artifact.model_dump())
         bound._gate = self.gate
-        bound._identity = self._identity
+        bound._identities = (self._identity, *self._job_identities)
         return bound
 
     def _progress(self, event: m.ProgressEvent) -> Progress:
         if event.source is m.ProgressSource.HEARTBEAT and event.ciphertext_b64 is not None:
             details: Any = None
             try:
-                plain = age_crypto.decrypt(base64.b64decode(event.ciphertext_b64), self._identity)
+                plain = age_crypto.decrypt(
+                    base64.b64decode(event.ciphertext_b64),
+                    [self._identity, *self._job_identities],
+                )
                 details = json.loads(plain)
             except (age_crypto.AgeError, binascii.Error, ValueError) as err:
                 log.warning("progress event %d does not decrypt for us: %s", event.seq, err)

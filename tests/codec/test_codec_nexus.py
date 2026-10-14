@@ -59,10 +59,10 @@ class Keys:
     async def buyer_key(self, job_id: str) -> str:
         return self.buyers[job_id]
 
-    async def seller_key(self, endpoint: str) -> str:
+    async def seller_recipients(self, endpoint: str) -> Sequence[str]:
         if endpoint not in self.endpoints:
             raise LookupError(endpoint)
-        return SELLER[1]
+        return [SELLER[1]]
 
 
 class LeakyCodec(KontraCodec):
@@ -172,19 +172,21 @@ async def test_nexus_call_recipients_on_both_ends() -> None:
         acme = _client(
             env,
             "acme",
-            KontraCodec(SELLER[0], SELLER[1], role="seller", buyer_keys=keys, services=[SERVICE]),
+            KontraCodec(SELLER[0], [SELLER[1]], role="seller", buyer_keys=keys, services=[SERVICE]),
         )
         leaky = _client(
-            env, "acme", LeakyCodec(SELLER[0], SELLER[1], role="seller", services=[SERVICE])
+            env, "acme", LeakyCodec(SELLER[0], [SELLER[1]], role="seller", services=[SERVICE])
         )
         buyer = _client(
-            env, "default", KontraCodec(BUYER[0], BUYER[1], role="buyer", seller_keys=keys)
+            env, "default", KontraCodec(BUYER[0], [BUYER[1]], role="buyer", seller_keys=keys)
         )
         # A seller-role process: its workflows may hire other offerings.
         reseller = _client(
             env,
             "reseller",
-            KontraCodec(RESELLER[0], RESELLER[1], role="seller", buyer_keys=keys, seller_keys=keys),
+            KontraCodec(
+                RESELLER[0], [RESELLER[1]], role="seller", buyer_keys=keys, seller_keys=keys
+            ),
         )
         hirers = {"buyer": buyer, "reseller": reseller}
         workers = [

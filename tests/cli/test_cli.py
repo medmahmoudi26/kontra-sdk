@@ -385,7 +385,7 @@ def test_pull_verifies_the_catalog_entry() -> None:
     from click.exceptions import ClickException
 
     with load_worker(ENRICH) as worker:
-        doc = worker.offerings[0].build_document(PUBLIC_KEY)
+        doc = worker.offerings[0].build_document()
     assert verify_entry("acme/enrich@1", _entry(doc)).offering.key == "acme/enrich@1.2.0"
 
     tampered = json.loads(json.dumps(doc))

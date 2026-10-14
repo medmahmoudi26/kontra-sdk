@@ -120,5 +120,4 @@ x-kontra:
   max_concurrent_jobs: 10
   max_output_bytes: "5GB"
   artifact_retention: "7d"
-  public_key: age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el
-  contract_hash: sha256:9fbf215aa98e63f5909d3a5cec70915573583e32515f73845c9032632b0a7e38
+  contract_hash: sha256:d52a7d657a3f25268f2bf330f06993e1ed1abb6126b4441d8a27b6b6758224ac

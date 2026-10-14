@@ -334,6 +334,13 @@ class Worker:
             identity=identity,
             recipient=public_key,
             recipients=recipients,
+            # A seller whose workflow hires another offering is a buyer there, and that
+            # sub-job's delivery is encrypted to the JOB's key, which `kontra.hire` wrote
+            # under this home (decisions I7). Read from disk so a delivery decoded outside
+            # the hiring client -- a bound artifact, a later activity -- still opens.
+            # Local to this host: a fleet that hires needs the shared-key work the issue
+            # defers (`kontra hire --share`).
+            more_identities=lambda: tuple(Profile.job_identities(home_dir)),
             jobs=jobs,
         )
         previous = _current_runtime()
