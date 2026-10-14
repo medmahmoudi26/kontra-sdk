@@ -47,7 +47,6 @@ def agent_card(
         "reviewWindow": format_duration(facts.review_window),
         "maxOutputBytes": format_size(facts.max_output_bytes),
         "artifactRetention": format_duration(facts.artifact_retention),
-        "publicKey": facts.public_key,
     }
     if facts.pricing_hint:
         params["pricingHint"] = facts.pricing_hint

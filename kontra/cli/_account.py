@@ -67,12 +67,6 @@ def gate_url(given: str | None) -> str:
 @click.option(
     "--no-browser", is_flag=True, help="Print the device-code URL; do not open a browser."
 )
-@click.option(
-    "--replace-key",
-    is_flag=True,
-    help="Register this machine's key even if the party has another one (deliveries to the "
-    "old key become unreadable here).",
-)
 @click.option("--json", "as_json", is_flag=True, help="Print the profile as JSON.")
 def login(
     gate: str | None,
@@ -81,15 +75,17 @@ def login(
     handle: str | None,
     tls: bool | None,
     no_browser: bool,
-    replace_key: bool,
     as_json: bool,
 ) -> None:
     """Log in: device flow (approved in a browser, or with --email through a mailed link;
-    or --dev), make this machine's key, register it, save the profile."""
+    or --dev), add this machine to the party's recipients, save the profile.
+
+    Logging in on a second machine adds that machine. It never replaces a key, so nothing
+    a login does can make another machine's deliveries unreadable."""
     from kontra.auth import API_KEY_ENV
     from kontra.auth import login as do_login
     from kontra.gate_client import GateError
-    from kontra.profile import KEY_FILE, kontra_home
+    from kontra.profile import Profile, kontra_home
 
     if dev and email is not None:
         fail("--email is for a real gate; a `kontra dev` login (--dev) needs no mail")
@@ -106,7 +102,6 @@ def login(
                 dev=dev,
                 email=email,
                 open_browser=not no_browser,
-                replace_key=replace_key,
                 tls=tls,
             )
         )
@@ -123,7 +118,8 @@ def login(
     )
     tls_state = "on" if profile.tls else "off"
     click.echo(f"  temporal  {printable(profile.temporal_address)} (tls {tls_state})")
-    click.echo(f"  key       {profile.public_key} ({home / KEY_FILE})")
+    click.echo(f"  key       {profile.public_key} ({Profile.key_path(home)})")
+    click.echo("              one of this party's recipients; `kontra recipients list`")
     if profile.dev:
         click.echo("  this is a dev gate: play money, `kontra topup` credits at once")
     if os.environ.get(API_KEY_ENV):

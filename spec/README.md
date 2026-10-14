@@ -6,7 +6,7 @@ here in a checkout, from `kontra/_spec` in the wheel) and never keeps a second c
 
 | File | What it fixes |
 |---|---|
-| `x-kontra.v1.json` | JSON Schema 2020-12 of the `x-kontra` block: the offering facts Kontra adds at the root of a contract document (PRD §11.1). |
+| `x-kontra.v2.json` | JSON Schema 2020-12 of the `x-kontra` block: the offering facts Kontra adds at the root of a contract document (PRD §11.1). |
 | `kontra-types.v1.json` | The canonical bodies of the reserved definitions `KontraArtifact` and `KontraQuote` (decisions I2). |
 
 ## The contract document
@@ -70,7 +70,7 @@ after the hash has been verified.
 * No definition reaches itself through `$ref`, `oneOf` or `allOf` alone (a validator would
   recurse forever); recursion through a property or an item is fine.
 * At most 32 levels deep, 256 KiB canonical, 200 definitions.
-* `x-kontra` validates against `x-kontra.v1.json`, with durations and sizes in canonical
+* `x-kontra` validates against `x-kontra.v2.json`, with durations and sizes in canonical
   form (largest exact duration unit, e.g. `1d` not `24h`; smallest size number, decimal on
   a tie, e.g. `5GB`, `1GiB`), and `contract_hash` equals
   `sha256(RFC 8785 JSON of the document without x-kontra.contract_hash)`.

@@ -51,6 +51,7 @@ __all__ = [
     "USER_CODE_PATTERN",
     "AcceptRequest",
     "AccessToken",
+    "AddKey",
     "ApiKeyCreate",
     "ApiKeyCreated",
     "ApiKeyList",
@@ -80,6 +81,7 @@ __all__ = [
     "MagicLinkRequest",
     "MagicLinkSent",
     "Me",
+    "PartyKey",
     "PartyView",
     "ProgressEvent",
     "ProgressPost",
@@ -95,7 +97,6 @@ __all__ = [
     "SellerJobView",
     "SessionList",
     "SessionView",
-    "SetKey",
     "StartRequest",
     "TemporalToken",
     "TemporalTokenRequest",
@@ -494,25 +495,49 @@ class GateInfo(_M):
     github_sign_in: bool
 
 
+#: The most recipients one party may hold (decisions I7). age writes one ~100-byte stanza
+#: per recipient into every header, so the set is capped to keep that overhead bounded;
+#: one key per fleet, never one per pod, keeps a real deployment far below it.
+RECIPIENTS_MAX = 16
+
+
+class PartyKey(_M):
+    """One age X25519 recipient of a party: a machine, or a fleet's mounted key. Revoked
+    keys are not listed; the gate keeps the row (a dispute may need the key on record)."""
+
+    label: _Name
+    public_key: _Name
+    added_at: datetime
+
+
 class Me(_M):
     party: _Name
     namespace: _Name
-    public_key: _Name | None
+    #: Every unrevoked recipient of this party, newest last. Empty for a party that has
+    #: never added one -- a buyer never needs to, since a job's key is made at hire.
+    keys: list[PartyKey] = Field(default_factory=list, max_length=RECIPIENTS_MAX)
     temporal_address: _Long
     created_at: datetime
     dev: bool = False
 
 
-class SetKey(_M):
-    """``PUT /v1/me/key``: the party's age X25519 recipient (``age1...``). Needs a fresh
-    human session: the key decides who can read future deliveries."""
+class AddKey(_M):
+    """``POST /v1/me/recipients``: one more age X25519 recipient (``age1...``) for this
+    party, under a label that says which machine or fleet holds it. Needs a fresh human
+    session: a recipient can read every delivery made after it is added.
 
+    Adding never replaces: ``kontra login`` on a second machine adds that machine. The
+    party is capped at :data:`RECIPIENTS_MAX`."""
+
+    label: _Name
     public_key: _Name
 
 
 class PartyView(_M):
     party: _Name
-    public_key: _Name | None
+    #: The party's unrevoked recipients: what a counterparty encrypts to. Public by
+    #: construction -- they are public keys.
+    recipients: list[_Name] = Field(default_factory=list, max_length=RECIPIENTS_MAX)
     released: int = 0
     refunded: int = 0
     disputed: int = 0
@@ -543,7 +568,9 @@ class CatalogEntry(_M):
     endpoint: _Name  # opaque, assigned by the catalog; never derived from the offering
     service: _Name
     task_queue: _Name
-    public_key: _Name
+    #: The seller party's unrevoked recipients, as the catalog holds them NOW -- catalog
+    #: data, not contract data: adding a fleet key must never force a republish (I7).
+    recipients: list[_Name] = Field(default_factory=list, max_length=RECIPIENTS_MAX)
     published_at: datetime
     retired: bool = False
 
@@ -599,7 +626,9 @@ class QuoteView(_M):
     contract_hash: _Name
     endpoint: _Name
     service: _Name
-    seller_public_key: _Name
+    #: Every recipient the seller can read with: the buyer encrypts the Nexus input to all
+    #: of them, so whichever worker picks the task up can decrypt it.
+    seller_recipients: list[_Name] = Field(default_factory=list, max_length=RECIPIENTS_MAX)
 
 
 class HireRequest(_M):
@@ -608,6 +637,11 @@ class HireRequest(_M):
 
     quote_id: _Name
     max_price_minor: int | None = None
+    #: The age recipient this job's result is encrypted to, made by the buyer at hire and
+    #: kept next to the job record (``~/.kontra/jobs/<job_id>.key``). The gate signs THIS
+    #: into the hold token's ``buyer_key``; it never consults the party's own keys for the
+    #: buyer side, so hiring needs no key setup and a compromise is scoped to open jobs.
+    buyer_key: _Name
 
 
 class JobState(StrEnum):
@@ -641,7 +675,8 @@ class HireView(_M):
     amount_minor: int
     currency: _Name
     max_duration_seconds: int
-    seller_public_key: _Name
+    #: The seller's recipients at hire: who the buyer encrypts the Nexus input to.
+    seller_recipients: list[_Name] = Field(default_factory=list, max_length=RECIPIENTS_MAX)
     expires_at: datetime  # the hold token's expiry: start before this
 
 
@@ -694,6 +729,9 @@ class SellerJobView(_M):
 
     job_id: _Name
     offering: _Name
+    #: The job's own buyer key, the one the hold token seals: made by the buyer at hire,
+    #: not the buyer party's. The seller's side is unchanged -- it encrypts the result to
+    #: whatever key the signed token names, and caches it per job.
     buyer_public_key: _Name
     contract_hash: _Name
     max_duration_seconds: int

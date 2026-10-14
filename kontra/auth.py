@@ -63,6 +63,7 @@ __all__ = [
     "dev_login",
     "login",
     "login_device",
+    "this_machine_label",
 ]
 
 log = logging.getLogger("kontra.auth")
@@ -346,16 +347,23 @@ class Session:
                     namespace=me.namespace,
                     refresh_token=None,
                     auth_time=self._key_auth_time,
-                    public_key=me.public_key,
+                    public_key=None,  # a party has a SET of recipients; see Profile
                     tls=not me.dev,
                     dev=me.dev,
                 )
             return self._profile
 
+    @property
+    def identity_home(self) -> Path:
+        """Where this session keeps its keys: the profile's directory (for an API key, the
+        ``home`` it was given, else ``$KONTRA_HOME``). Per-job keys live under ``jobs/``
+        here."""
+        return self._identity_home or kontra_home()
+
     def identity(self) -> str:
-        """Our secret age identity, from the same directory as the profile (for an API
-        key, the ``home`` it was given, else ``$KONTRA_HOME``)."""
-        return Profile.identity(self._identity_home or kontra_home())
+        """This machine's secret age identity, from :attr:`identity_home` (or the file
+        ``$KONTRA_KEY_FILE`` names, for a fleet worker)."""
+        return Profile.identity(self.identity_home)
 
     async def aclose(self) -> None:
         self._closed = True
@@ -769,6 +777,18 @@ async def dev_login(
         return await gate.dev_login(handle)
 
 
+def this_machine_label() -> str:
+    """A label for this machine's recipient: its hostname, trimmed to what a label allows
+    and never empty. Only a human-readable name -- nothing authorizes by it."""
+    import socket
+
+    raw = ""
+    with contextlib.suppress(OSError):
+        raw = socket.gethostname()
+    cleaned = "".join(c for c in raw if c.isprintable() and c != "\x7f").strip()[:64]
+    return cleaned or "this machine"
+
+
 async def login(
     gate_url: str,
     *,
@@ -777,19 +797,23 @@ async def login(
     email: str | None = None,
     home: Path | str | None = None,
     open_browser: bool = True,
-    replace_key: bool = False,
     tls: bool | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     prompt: Callable[[m.DeviceStart], None] | None = None,
 ) -> Profile:
     """``kontra login``: get tokens (device flow -- approved in the browser, or through
-    the link the gate mails ``email`` -- or :func:`dev_login` with ``dev``), make the
-    encryption key if this machine has none, register its public key with the gate, and
-    write the profile.
+    the link the gate mails ``email`` -- or :func:`dev_login` with ``dev``), add this
+    machine as one of the party's encryption recipients, and write the profile.
 
-    If the gate already holds a different public key for the party, the login stops with
-    ``key_mismatch`` unless ``replace_key``: replacing it makes deliveries to the old key
-    unreadable on whichever machine holds it, so copying ``key`` over is usually the fix.
+    Logging in no longer *decides* the party's key (decisions I7). A party holds a set of
+    recipients and adding never replaces, so a second machine simply becomes one more:
+    ``key_mismatch`` and ``--replace-key`` are gone, and nothing a login does can make an
+    in-flight delivery to another machine unreadable.
+
+    The key half is a convenience, not a requirement. ``kontra hire`` makes its own key per
+    job and ``kontra serve`` can take one from ``$KONTRA_KEY_FILE``, so a machine that
+    never logs in still works.
+
     ``tls`` (to Temporal) defaults to on unless the gate says it is a dev gate.
     """
     _check_gate_url(gate_url, dev=dev)
@@ -816,16 +840,8 @@ async def login(
             raise LoginError(
                 "party_mismatch", f"logged in as {tokens.party!r} but the gate says {me.party!r}"
             )
-        if me.public_key != public:
-            if me.public_key is not None and not replace_key:
-                raise LoginError(
-                    "key_mismatch",
-                    f"{me.party} already has the public key {me.public_key} and this machine's "
-                    f"key is {public}. Copy the key file from the machine that registered it "
-                    f"into {Path(home) if home is not None else kontra_home()}, or log in "
-                    "again replacing the key.",
-                )
-            me = await gate.set_key(public)
+        if not any(k.public_key == public for k in me.keys):
+            me = await gate.add_recipient(this_machine_label(), public)
     profile = Profile(
         gate_url=gate_url,
         temporal_address=me.temporal_address,

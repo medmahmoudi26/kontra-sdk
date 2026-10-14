@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
@@ -138,26 +139,36 @@ class JobDirectory:
 
 
 class SellerKeyCache:
-    """``endpoint -> seller public key``, from the catalog. Implements the codec's
-    ``SellerKeys``: a seller-role worker whose workflow hires another offering encrypts that
-    Nexus input to the other seller (decisions I7)."""
+    """``endpoint -> the seller party's recipients``, from the catalog. Implements the
+    codec's ``SellerKeys``: a seller-role worker whose workflow hires another offering
+    encrypts that Nexus input to every key that seller can read with (decisions I7).
+
+    The set is what the catalog holds now, so a fleet key added after this entry was
+    cached is missed until it falls out; a worker that cannot decrypt an input is the
+    seller's own signal to restart, exactly as it is for a key it never mounted."""
 
     def __init__(self, gate: EndpointGate, *, limit: int = 1_000) -> None:
         self._gate = gate
-        self._keys: _Lru[str, str] = _Lru(limit)
+        self._keys: _Lru[str, tuple[str, ...]] = _Lru(limit)
 
-    def remember(self, endpoint: str, public_key: str) -> None:
-        """Seed the cache (a hire response already names the seller's key)."""
-        if not age.is_recipient(public_key):
-            raise ValueError("not an age X25519 recipient")
-        self._keys.put(endpoint, public_key)
+    def remember(self, endpoint: str, recipients: Sequence[str]) -> None:
+        """Seed the cache (a hire answer already names the seller's recipients)."""
+        if isinstance(recipients, str):
+            raise TypeError("recipients is a sequence of age keys, not one key")
+        keys = tuple(dict.fromkeys(recipients))
+        if not keys:
+            raise ValueError("a seller with no recipient cannot be sent anything")
+        for key in keys:
+            if not age.is_recipient(key):
+                raise ValueError("not an age X25519 recipient")
+        self._keys.put(endpoint, keys)
 
-    async def seller_key(self, endpoint: str) -> str:
+    async def seller_recipients(self, endpoint: str) -> Sequence[str]:
         found = self._keys.get(endpoint)
         if found is not None:
             return found
         entry = await self._gate.by_endpoint(endpoint)
         if entry.endpoint != endpoint:
             raise LookupError("the catalog answered for another endpoint")
-        self.remember(endpoint, entry.public_key)
-        return entry.public_key
+        self.remember(endpoint, entry.recipients)
+        return tuple(entry.recipients)

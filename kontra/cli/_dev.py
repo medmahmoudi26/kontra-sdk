@@ -352,7 +352,7 @@ def up(
     else:
         party = default_handle()
     home = kontra_home()
-    profile = run(lambda: login(url, handle=party, dev=True, home=home, replace_key=True))
+    profile = run(lambda: login(url, handle=party, dev=True, home=home))
     run(lambda: _wait_temporal(home, _TEMPORAL_TIMEOUT))
     click.echo(f"logged in as {profile.party} (namespace {profile.namespace}), play money")
     click.echo(f"  profile   {home / PROFILE_FILE} (dev)")
