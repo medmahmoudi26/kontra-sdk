@@ -18,6 +18,8 @@ import (
 	"go.temporal.io/server/common/membership/static"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/primitives"
+
+	"github.com/medmahmoudi26/kontra-sdk/temporal/authorizer/revocation"
 )
 
 // defaultAudience is the "aud" of the gate's Temporal worker tokens. The gate signs every
@@ -64,6 +66,11 @@ type settings struct {
 	jwksRefresh time.Duration
 	audience    string
 
+	// The gate's list of revoked sessions ("" = none: a revoked session's worker tokens
+	// work until they expire) and how often it is fetched (revocation package).
+	revocationsURL     string
+	revocationsRefresh time.Duration
+
 	dynamicConfig     string
 	dynamicConfigPoll time.Duration
 	logLevel          string
@@ -86,6 +93,23 @@ func loadSettings() (*settings, error) {
 		logLevel:          e.str("KONTRA_LOG_LEVEL", "info"),
 		logFormat:         e.str("KONTRA_LOG_FORMAT", "json"),
 		metricsAddr:       e.str("KONTRA_METRICS_ADDR", ""),
+	}
+
+	// The gate that publishes the JWKS publishes the revocation list next to it; "off" is
+	// the one way to run without (a JWKS that is not a gate's has no default).
+	s.revocationsRefresh = e.duration("KONTRA_REVOCATIONS_REFRESH", 5*time.Second)
+	switch v := e.str("KONTRA_REVOCATIONS_URL", ""); v {
+	case "":
+		s.revocationsURL = revocation.DefaultURL(s.jwks)
+	case "off":
+	default:
+		if err := revocation.ValidURL(v); err != nil {
+			e.fail("KONTRA_REVOCATIONS_URL: " + err.Error())
+		}
+		s.revocationsURL = v
+	}
+	if s.revocationsRefresh <= 0 {
+		e.fail("KONTRA_REVOCATIONS_REFRESH must be positive")
 	}
 
 	base := e.integer("KONTRA_PORT_BASE", 7233)

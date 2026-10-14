@@ -1,8 +1,9 @@
 """Fixtures for the over-the-wire isolation tests (seam ①, PRD §15 Phase 0).
 
 These start the real ``kontra-temporal`` binary on free ports with SQLite in memory, serve
-a local JWKS that the server's default claim mapper fetches, and mint ES256 JWTs the way
-the gate will. The seller namespaces, buyer namespace and the Nexus endpoint are created
+a local JWKS that the server's default claim mapper fetches and a revocation list it polls
+(the gate's ``GET /v1/auth/revocations``), and mint ES256 JWTs the way the gate will: each
+names a session (``sid``). The seller namespaces, buyer namespace and the Nexus endpoint are created
 through the INTERNAL frontend (the control plane); every assertion that follows is made on
 the PUBLIC frontend, over the wire with real ``temporalio`` clients.
 
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import random
@@ -282,6 +284,7 @@ class Signer:
         kid: str | None = ...,  # type: ignore[assignment]
         key: Any | None = None,
         algorithm: str = "ES256",
+        sid: str | None = ...,  # type: ignore[assignment]
     ) -> str:
         claims: dict[str, Any] = {
             "sub": subject,
@@ -289,6 +292,10 @@ class Signer:
             "exp": exp or datetime.now(UTC) + timedelta(hours=1),
             "iat": datetime.now(UTC),
         }
+        # Every token the gate mints names its session; ``sid=None`` leaves it out.
+        session = uuid.uuid4().hex if sid is ... else sid
+        if session is not None:
+            claims["sid"] = session
         if audience is not None:
             claims["aud"] = audience
         headers = {}
@@ -304,7 +311,8 @@ class Signer:
 
 
 class _JWKS:
-    """A JWKS the server fetches over http:// — a stand-in for the gate's /.well-known."""
+    """A JWKS the server fetches over http:// — a stand-in for the gate's /.well-known — and
+    the gate's revocation list next to it (``/revocations``), which :meth:`revoke` extends."""
 
     def __init__(self) -> None:
         self.key = ec.generate_private_key(ec.SECP256R1())
@@ -312,14 +320,21 @@ class _JWKS:
         pub = json.loads(ECAlgorithm.to_jwk(self.key.public_key()))
         pub.update(kid=self.kid, use="sig", alg="ES256")
         self._body = json.dumps({"keys": [pub]}).encode()
+        self._revoked: list[str] = []
         jwks = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
+                if self.path == "/revocations":
+                    body = json.dumps(
+                        {"window_seconds": 1200, "sessions": list(jwks._revoked)}
+                    ).encode()
+                else:
+                    body = jwks._body
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(jwks._body)
+                self.wfile.write(body)
 
             def log_message(self, *args: Any) -> None:
                 pass
@@ -331,6 +346,14 @@ class _JWKS:
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}/jwks.json"
+
+    @property
+    def revocations_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/revocations"
+
+    def revoke(self, sid: str) -> None:
+        """The gate revoked session ``sid``: list its digest, as the gate does."""
+        self._revoked.append(hashlib.sha256(sid.encode()).hexdigest())
 
     def __enter__(self) -> _JWKS:
         self._thread.start()
@@ -345,6 +368,7 @@ class Cluster:
     public_address: str
     internal_address: str
     signer: Signer
+    jwks: _JWKS
     endpoint_name: str
     endpoint_id: str
     other_endpoint_name: str  # another seller's offering (namespace other)
@@ -371,6 +395,8 @@ def cluster(_binary: str) -> Any:
             "KONTRA_DB": "sqlite",
             "KONTRA_JWKS_URLS": jwks.url,
             "KONTRA_JWKS_REFRESH": "2s",
+            "KONTRA_REVOCATIONS_URL": jwks.revocations_url,
+            "KONTRA_REVOCATIONS_REFRESH": "1s",
             "KONTRA_JWT_AUDIENCE": AUDIENCE,
             "KONTRA_LOG_LEVEL": "error",
         }
@@ -382,6 +408,7 @@ def cluster(_binary: str) -> Any:
                 public_address=public,
                 internal_address=internal,
                 signer=Signer(jwks.key, jwks.kid),
+                jwks=jwks,
                 endpoint_name=endpoints[0][0],
                 endpoint_id=endpoints[0][1],
                 other_endpoint_name=endpoints[1][0],

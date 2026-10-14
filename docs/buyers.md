@@ -19,15 +19,48 @@ door you use.
 
 ```sh
 pip install kontra-sdk
-kontra login --gate <gate URL>    # device flow; makes this machine's age key and registers it
-kontra topup 25                   # a checkout link; under `kontra dev`, play money at once
+kontra login --email you@example.com   # a sign-in link by mail; makes this machine's age key
+kontra topup 25                        # a checkout link; under `kontra dev`, play money at once
 kontra balance
 ```
+
+`kontra login --email` starts a device login and asks the gate to mail you a sign-in link.
+The command prints a code; the link's page asks for it, so a link you did not ask for logs
+nobody in, and a mail scanner that opens the link uses nothing. Sign-ups are by invitation:
+an address that is not invited gets no mail, and the command says so when the code runs out.
+Plain `kontra login` approves the code in your browser instead, where the gate's page offers
+a way to (GitHub, or a handle on a `kontra dev` gate); that page never mails links, so email
+sign-in always starts from the command, and against a gate that signs in by email only plain
+`kontra login` says so. Both talk to `https://api.kontra.run` unless `--gate` or
+`KONTRA_GATE` names another gate.
 
 `kontra login` writes `~/.kontra/profile` and `~/.kontra/key` (both mode 0600). The key is
 your private age identity: deliveries are encrypted to it and nobody else, Kontra included,
 holds a copy. Set `KONTRA_HOME` to keep a profile elsewhere. For a local marketplace,
 `kontra dev` logs you in to its gate instead (see [sellers.md](sellers.md#running-locally-kontra-dev)).
+
+### Programs: API keys
+
+A script, a CI job or a server should not hold your login. Give it an API key:
+
+```sh
+kontra keys create --label nightly   # prints the key, once; the gate keeps only its hash
+kontra keys list                     # ids, labels, when each was last used
+kontra keys revoke key_0123456789abcdef
+```
+
+The program reads the key from `KONTRA_API_KEY`; `Kontra()`, `kontra mcp` and every `kontra`
+command then use it instead of a profile (`KONTRA_GATE` names the gate, by default
+`https://api.kontra.run`). It also needs your key file to decrypt what it buys: copy
+`~/.kontra/key` to the machine, into `KONTRA_HOME`. Nothing is read or written there but that
+file. In code, `kontra.auth.Session.from_api_key(gate_url, key)` makes the same session.
+
+A key quotes, hires, follows, accepts and disputes jobs, and runs `kontra serve`. It never
+publishes, sets your encryption key or manages keys -- those answer 403
+`fresh_login_required` however new the key is -- so a leaked key cannot change what you sell
+or who can read your deliveries. Making, listing and revoking keys need a recent login of
+yours; a party holds at most 25 live keys. A revoked key stops working on its next request to
+the gate, and its workers on Temporal within seconds.
 
 Any party can buy and sell: a buyer is a party with a namespace like a seller.
 
@@ -199,8 +232,8 @@ Register it with your agent's MCP configuration, for example:
 
 The server runs on your machine because only your machine holds the key that decrypts the
 results: a hosted MCP server would have to see your plaintext (`docs/decisions.md` I5). It
-uses the profile in `KONTRA_HOME` and refuses to start without one; it writes nothing to
-stdout but the protocol.
+uses the profile in `KONTRA_HOME` (or `KONTRA_API_KEY` and the key file there) and refuses
+to start without one; it writes nothing to stdout but the protocol.
 
 What the agent should know, and what the tool descriptions tell it:
 

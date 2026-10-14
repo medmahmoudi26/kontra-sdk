@@ -409,11 +409,28 @@ class GateClient:
     async def jwks(self) -> dict[str, Any]:
         return await self._object("jwks")
 
+    async def info(self) -> m.GateInfo:
+        """What this gate offers before sign-in: dev login, email sign-in, GitHub."""
+        return await self._model("info", m.GateInfo)
+
+    async def revocations(self) -> m.Revocations:
+        """The sessions revoked in the gate's window, as sha256 digests of their ids."""
+        return await self._model("revocations", m.Revocations)
+
     async def device_start(self) -> m.DeviceStart:
         return await self._model("device_start", m.DeviceStart)
 
     async def token(self, req: m.TokenRequest) -> m.TokenResponse:
         return await self._model("token", m.TokenResponse, body=req)
+
+    async def magic_link(self, email: str, device_user_code: str) -> m.MagicLinkSent:
+        """Ask the gate to email ``email`` a sign-in link for the device authorization
+        ``device_user_code``. The answer is the same whether or not a mail goes out."""
+        return await self._model(
+            "magic_link",
+            m.MagicLinkSent,
+            body=m.MagicLinkRequest(email=email, device_user_code=device_user_code),
+        )
 
     async def dev_login(self, handle: str) -> m.TokenResponse:
         return await self._model("dev_login", m.TokenResponse, body=m.DevLogin(handle=handle))
@@ -433,6 +450,32 @@ class GateClient:
 
     async def party(self, party: str) -> m.PartyView:
         return await self._model("party", m.PartyView, path={"party": party})
+
+    # API keys
+    async def create_api_key(self, label: str) -> m.ApiKeyCreated:
+        """A new API key for programs (needs a fresh human session). The key is in the
+        answer this once; the gate keeps only its hash."""
+        return await self._model(
+            "create_api_key", m.ApiKeyCreated, body=m.ApiKeyCreate(label=label)
+        )
+
+    async def api_keys(self) -> m.ApiKeyList:
+        return await self._model("api_keys", m.ApiKeyList)
+
+    async def revoke_api_key(self, key_id: str) -> None:
+        """Revoke a key: its exchanges fail at once, and its access and worker tokens stop
+        working on their next request."""
+        await self._none("revoke_api_key", path={"key_id": key_id})
+
+    async def sessions(self) -> m.SessionList:
+        """The party's sign-ins (people's logins, not keys), newest first; ``current`` is
+        this one. Needs a fresh human session."""
+        return await self._model("sessions", m.SessionList)
+
+    async def end_session(self, session_id: str) -> None:
+        """End one of the party's sign-ins: its refresh tokens stop at once, its access and
+        worker tokens on their next request. Needs a fresh human session."""
+        await self._none("end_session", path={"session_id": session_id})
 
     # catalog
     async def publish(self, document: dict[str, Any]) -> m.CatalogEntry:

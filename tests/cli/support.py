@@ -29,7 +29,7 @@ from click.testing import CliRunner, Result
 from kontra.cli import cli
 
 #: Variables a test must never inherit from the developer's shell.
-_SCRUB = ("KONTRA_HOME", "KONTRA_GATE", "KONTRA_NEXGEN", "KONTRA_DEBUG")
+_SCRUB = ("KONTRA_HOME", "KONTRA_GATE", "KONTRA_API_KEY", "KONTRA_NEXGEN", "KONTRA_DEBUG")
 
 
 def handle(prefix: str) -> str:

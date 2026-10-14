@@ -1,6 +1,7 @@
 """The examples are where the PRD puts them (§14: ``examples/{enrich,recon,legacy-actor}``),
-each seller in the §6.1 project layout, its ``worker.py`` exposing the module-level
-``worker`` that ``kontra serve`` runs, binding one ``acme/`` offering."""
+next to ``examples/hello``, the smallest offering; each seller in the §6.1 project layout,
+its ``worker.py`` exposing the module-level ``worker`` that ``kontra serve`` runs, binding
+one ``acme/`` offering."""
 
 from __future__ import annotations
 
@@ -23,14 +24,15 @@ SELLER_FILES = {
 }
 
 
-def test_the_three_examples() -> None:
+def test_the_four_examples() -> None:
     found = {p.name for p in EXAMPLES.iterdir() if p.is_dir() and p.name[0] not in "._"}
-    assert found == {"enrich", "legacy-actor", "recon"}
+    assert found == {"enrich", "hello", "legacy-actor", "recon"}
     assert {"recon.py", "main.py", "README.md"} <= {p.name for p in (EXAMPLES / "recon").iterdir()}
 
 
 @pytest.mark.parametrize(
-    ("name", "offering"), [("enrich", "acme/enrich"), ("legacy-actor", "acme/probe")]
+    ("name", "offering"),
+    [("enrich", "acme/enrich"), ("legacy-actor", "acme/probe"), ("hello", "acme/hello")],
 )
 def test_seller_layout(name: str, offering: str) -> None:
     directory = EXAMPLES / name

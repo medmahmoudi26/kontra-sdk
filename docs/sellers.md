@@ -2,7 +2,8 @@
 
 You write a Temporal workflow. Kontra adds a price, a catalog entry, escrow and encryption around
 it, and buyers hire it through Nexus. The workflow runs on your machine as a plain Temporal
-worker; Kontra never runs your code.
+worker; Kontra never runs your code. The smallest offering, as a five-minute tutorial from
+login to a paid job, is [`examples/hello`](../examples/hello).
 
 - [The project](#the-project)
 - [offering.yaml](#offeringyaml)
@@ -330,10 +331,14 @@ On a dev profile, `kontra serve` publishes an unpublished version itself, so
 ## Publishing and serving
 
 ```sh
-kontra login --gate <gate URL>   # device flow; makes this machine's age key and registers it
-kontra publish                   # from the offering directory, or --dir
-kontra serve                     # on the machine that does the work
+kontra login --email you@example.com   # sign-in link by mail (`kontra dev`: kontra login --dev)
+kontra publish                         # from the offering directory, or --dir
+kontra serve                           # on the machine that does the work
 ```
+
+`kontra login` talks to `https://api.kontra.run` unless `--gate` or `KONTRA_GATE` says
+otherwise; with `--email` the gate mails you a link whose page asks for the code the command
+printed (sign-ups are by invitation; see [buyers.md](buyers.md#setup)).
 
 `kontra publish`:
 
@@ -347,12 +352,19 @@ kontra serve                     # on the machine that does the work
 The gate refuses a document with an external `$ref`, an object without
 `additionalProperties`, or a reserved `Kontra*` type that differs from the spec, naming the
 path at fault. A login older than the gate's freshness window is refused: run `kontra login`
-and publish again.
+and publish again. An API key never publishes, however new (403 `fresh_login_required`):
+publishing is a person's act.
 
 `kontra serve` connects to Temporal with a 15-minute worker token, refreshed in the
 background. That token can do one thing: run workers in your namespace. It cannot publish,
 create or change an endpoint, or reach another namespace (see [security.md](security.md)).
 Ctrl-C stops the worker gracefully.
+
+A server that runs `kontra serve` unattended should use an API key rather than your login:
+`kontra keys create --label worker-1` on your machine, then `KONTRA_API_KEY` and your key file
+(`~/.kontra/key`, into `KONTRA_HOME`) on the server. The worker serves exactly as with a
+login. On a `kontra dev` profile a worker publishes unpublished versions itself; with a key it
+cannot, so publish from your login first (see [buyers.md](buyers.md#programs-api-keys)).
 
 ## Versions
 
@@ -395,7 +407,8 @@ offering("offering.yaml", workflow=EnrichFlow, quote=quote, contract="contract.y
 unchanged. The two files keep different owners (contract vs offering facts) and are never
 merged by hand.
 
-The examples show both shapes: [`examples/enrich`](../examples/enrich) (types-first, with an
-artifact) and [`examples/legacy-actor`](../examples/legacy-actor) (an older job turned into an
-offering). Each keeps its derived `contract.yaml` as a golden file, reproduced byte for byte by
-the tests.
+The examples: [`examples/hello`](../examples/hello) (the smallest offering, one field in and
+one out, as a five-minute tutorial), [`examples/enrich`](../examples/enrich) (types-first, with
+an artifact) and [`examples/legacy-actor`](../examples/legacy-actor) (an older job turned into
+an offering). Each keeps its derived `contract.yaml` as a golden file, reproduced byte for byte
+by the tests.

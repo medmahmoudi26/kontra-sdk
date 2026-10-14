@@ -31,7 +31,7 @@ from kontra.contract import (
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
 
-from .support import Cli
+from .support import Cli, explain
 
 REPO = Path(__file__).resolve().parents[2]
 ENRICH = REPO / "examples" / "enrich"
@@ -289,7 +289,7 @@ def test_a_bug_still_shows_its_traceback(cli: Cli, monkeypatch: pytest.MonkeyPat
     def boom(_: str | None) -> str:
         raise RuntimeError("a bug")
 
-    monkeypatch.setattr(account, "gate_url_or_fail", boom)
+    monkeypatch.setattr(account, "configured_gate", boom)
     result = cli("login", "--dev")
     assert result.exit_code == 1
     assert isinstance(result.exception, RuntimeError)
@@ -511,3 +511,32 @@ def test_the_console_entry_point_keeps_exit_codes(tmp_path: Path) -> None:
     usage = kontra("job")
     assert usage.returncode == 2
     assert "Missing argument" in usage.stderr
+
+
+def test_login_defaults_to_kontras_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no --gate, no KONTRA_GATE and no profile, a login goes to Kontra's own gate."""
+    from datetime import UTC, datetime
+
+    import kontra.auth
+    from kontra.profile import Profile
+
+    asked: list[str] = []
+
+    async def fake_login(url: str, **kwargs: Any) -> Profile:
+        asked.append(url)
+        return Profile(
+            gate_url=url,
+            temporal_address="temporal.kontra.run:443",
+            party="ann",
+            namespace="ann",
+            refresh_token="r",
+            auth_time=datetime.now(UTC),
+            public_key="age1" + "q" * 58,
+        )
+
+    monkeypatch.setattr(kontra.auth, "login", fake_login)
+    result = Cli(tmp_path / "fresh")("login", "--email", "ann@example.com")
+    assert result.exit_code == 0, explain(result)
+    assert asked == ["https://api.kontra.run"]
+    result = Cli(tmp_path / "fresh")("login", "--email", "ann@example.com", KONTRA_API_KEY="k")
+    assert "KONTRA_API_KEY is set" in result.stderr

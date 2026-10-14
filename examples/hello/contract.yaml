@@ -1,0 +1,94 @@
+# GOLDEN FILE (seam ③), checked by tests/examples/test_golden.py: the contract `kontra
+# publish` derives from models.py and offering.yaml, sealed with the EXAMPLE key in
+# ../example-public-key.txt. Publishing seals your key, so your contract_hash differs.
+# Regenerate after a deliberate contract change:
+#   UPDATE_GOLDEN=1 pytest tests/examples/test_golden.py
+nexusrpc: "1.0.0"
+$schema: https://json-schema.org/draft/2020-12/schema
+services:
+  AcmeHello:
+    fqn: acme.hello
+    description: Say hi to a name
+    operations:
+      quote:
+        fqn: quote
+        description: 'Price this input. Cheap and synchronous: answers ok with a fixed price, rejected with a reason, or busy with an ETA. Nothing runs and nothing is charged.'
+        input:
+          $ref: '#/$defs/HelloInput'
+        output:
+          $ref: '#/$defs/KontraQuote'
+      execute:
+        fqn: execute
+        description: Run the job on this input. Requires a Kontra hold token in the kontra-hold header; the result is delivered encrypted to the buyer and paid from escrow.
+        input:
+          $ref: '#/$defs/HelloInput'
+        output:
+          $ref: '#/$defs/HelloOutput'
+$defs:
+  HelloInput:
+    type: object
+    additionalProperties: false
+    properties:
+      name:
+        description: Who to greet.
+        type: string
+        maxLength: 100
+        minLength: 1
+    required:
+    - name
+  HelloOutput:
+    type: object
+    additionalProperties: false
+    properties:
+      greeting:
+        description: Hi <name>.
+        type: string
+    required:
+    - greeting
+  KontraQuote:
+    description: 'The answer of the quote operation. ok: a fixed price (amount_minor in the currency''s minor unit, e.g. cents) valid for a job of at most max_duration_seconds. rejected: the seller will not take this input, with a reason. busy: try again after eta_seconds.'
+    type: object
+    additionalProperties: false
+    properties:
+      amount_minor:
+        type: integer
+        maximum: 9007199254740991
+        minimum: 0
+      currency:
+        type: string
+        pattern: ^[A-Z][A-Z0-9]{2,7}$
+      eta_seconds:
+        type: integer
+        maximum: 2592000
+        minimum: 0
+      max_duration_seconds:
+        type: integer
+        maximum: 2592000
+        minimum: 1
+      reason:
+        type: string
+        maxLength: 1000
+        minLength: 1
+      status:
+        type: string
+        enum:
+        - ok
+        - rejected
+        - busy
+    required:
+    - status
+x-kontra:
+  name: acme/hello
+  version: "0.1.0"
+  description: Say hi to a name
+  pricing_hint: $0.01 per greeting
+  tags:
+  - example
+  - hello
+  max_duration: "5m"
+  review_window: "1d"
+  max_concurrent_jobs: 10
+  max_output_bytes: "10MB"
+  artifact_retention: "7d"
+  public_key: age1lmxatsm78mm3tnsr7syhsc5tfetvrm2aqpur9cxl8gcymp0uufes0yme79
+  contract_hash: sha256:b93edc612bce9f328fed970da6c4f0354890659b758a8db993e1d2924c616813

@@ -89,14 +89,19 @@ Two consequences worth knowing:
 
 - `kontra login` runs a device-code flow and stores a refresh token and an age identity in
   `$KONTRA_HOME` (default `~/.kontra`, files mode 0600). The public key is registered with the
-  gate; the private key never leaves the machine.
+  gate; the private key never leaves the machine. The device code is approved in the browser
+  or through a mailed sign-in link whose page asks for the code only the requester's screen
+  shows; opening the link consumes nothing (decisions I19).
+- A program uses an **API key** (`KONTRA_API_KEY`), stored by the gate as a hash and exchanged
+  for the same 15-minute tokens. Its session never counts as fresh: it cannot publish, set the
+  party's key or manage keys. Revoking it ends its tokens on their next request.
 - `kontra serve` (and a buyer's client) exchanges the session for a **15-minute** ES256 JWT,
   `permissions: ["<namespace>:worker"]`, audience `kontra:temporal`, refreshed in the
   background and swapped into the running Temporal client. Temporal's default claim mapper
   verifies it against the gate's JWKS. Revoking a session stops the refresh; a token already
   issued stays valid until it expires.
-- Publishing is `POST /v1/catalog` with a **fresh human session**: a worker token never
-  qualifies, so a stolen worker credential cannot publish or repoint anything.
+- Publishing is `POST /v1/catalog` with a **fresh human session**: a worker token or an API
+  key never qualifies, so a stolen worker credential or key cannot publish or repoint anything.
 - In production the public Temporal frontend sits behind a TLS-terminating proxy Kontra
   controls; TLS is always on. The public frontend refuses every Operator and Admin call to
   every token (the Authorizer); only the internal frontend, which is never published, accepts
@@ -215,8 +220,10 @@ deadline rule.
   before 28 a machine on the host's own network that routes the `control` subnet through the
   host may too, unless the host's `FORWARD` policy drops it; the address is the same on every
   install (`KONTRA_CONTROL_NET`.2).
-- **Token lifetime.** A worker token stays valid until its `exp` (15 minutes) after its
-  session is revoked.
+- **Token lifetime.** A worker token's session revoked at the gate is refused by Kontra's
+  Temporal server within its revocation poll (5 s), as long as the server can reach the
+  gate's list (`GET /v1/auth/revocations`); while it cannot, the token stays valid until its
+  `exp` (15 minutes at most). See decisions I19.
 - **Kontra is the key directory** (see above).
 - **The seller sees your input.** End-to-end means buyer to seller: the seller's worker
   decrypts the input to do the job. Hire sellers you are willing to show it to.
