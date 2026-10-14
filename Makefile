@@ -177,7 +177,12 @@ $(TEMPORAL_CLI):
 	echo "Temporal CLI $(TEMPORAL_CLI_VERSION) at $@"
 
 .PHONY: e2e
-e2e: venv-present ## tests/e2e against `kontra dev` (brings the stack up; `kontra dev down` stops it)
+# $(KONTRA_TEMPORAL_CLI) because acceptance 1 scaffolds a project and runs ITS tests, and
+# `kontra.testing.Marketplace` starts a Temporal dev server from that CLI. Every other
+# suite declares it; e2e did not, and nothing noticed while the job was skipped -- on a
+# machine that had run `make test` once the cache was already warm, and on a fresh runner
+# the scaffolded project failed with "ephemeral server executable does not exist".
+e2e: venv-present $(KONTRA_TEMPORAL_CLI) ## tests/e2e against `kontra dev` (brings the stack up; `kontra dev down` stops it)
 	@test -d $(E2E_TESTS) || { echo "$(E2E_TESTS) does not exist: there are no end-to-end tests to run" >&2; exit 1; }
 	@docker image inspect "$$KONTRA_TEMPORAL_IMAGE" >/dev/null 2>&1 || [[ "$$KONTRA_TEMPORAL_IMAGE" == */* ]] || \
 		{ echo "image $$KONTRA_TEMPORAL_IMAGE not found: run \`make temporal\`, or set KONTRA_TEMPORAL_IMAGE" >&2; exit 1; }
