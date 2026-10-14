@@ -136,7 +136,7 @@ def test_compose_publishes_only_public_ports_on_loopback(tmp_path: Path) -> None
     assert (relay["cap_drop"], relay["read_only"], relay["user"]) == (["ALL"], True, "postgres")
     assert relay["stop_signal"] == "SIGTERM"  # the image's SIGINT does not stop nc
     # A tmpfs over the image's VOLUME, or every relay container leaves an anonymous volume.
-    assert relay["tmpfs"] == ["/var/lib/postgresql/data:size=1m"]
+    assert relay["tmpfs"] == ["/var/lib/postgresql:size=1m"]
     assert relay["image"] == services["postgres"]["image"]  # the stack trusts no further image
     # A container inherits the host's ip_forward=1: a service on two networks would route
     # between them (a peer on `database` routing through the relay reaches Temporal's
@@ -190,7 +190,8 @@ def test_every_service_runs_without_privileges(tmp_path: Path) -> None:
     tmpfs = {name: svc["tmpfs"] for name, svc in services.items() if svc.get("tmpfs")}
     assert tmpfs == {
         "postgres": ["/var/run/postgresql:size=1m"],  # its socket and lock file
-        "postgres-relay": ["/var/lib/postgresql/data:size=1m"],  # the image's VOLUME, unused
+        # the image's VOLUME, unused (18 raised it from .../data)
+        "postgres-relay": ["/var/lib/postgresql:size=1m"],
         "s3": ["/tmp:size=1m"],  # the identities config and SeaweedFS's unix sockets
     }
     # No long-running service as root. Postgres as its own user: its entrypoint needs root
@@ -200,7 +201,8 @@ def test_every_service_runs_without_privileges(tmp_path: Path) -> None:
     users = {name: svc["user"] for name, svc in services.items() if "user" in svc}
     assert users == {"postgres": "postgres", "postgres-relay": "postgres", "s3": "10001:10001"}
     assert owner["entrypoint"][2] == services["s3"]["user"]
-    assert {v["target"] for v in services["postgres"]["volumes"]} == {"/var/lib/postgresql/data"}
+    # 18 keeps the cluster at /var/lib/postgresql/<major>/docker, inside this mount.
+    assert {v["target"] for v in services["postgres"]["volumes"]} == {"/var/lib/postgresql"}
     assert {v["target"] for v in services["s3"]["volumes"]} == {"/data"}
 
 
