@@ -49,7 +49,12 @@ def test_golden_contract(name: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "offering"), [("enrich", "acme/enrich@1.2.0"), ("legacy-actor", "acme/probe@1.0.0")]
+    ("name", "offering"),
+    [
+        ("enrich", "acme/enrich@1.2.0"),
+        ("legacy-actor", "acme/probe@1.0.0"),
+        ("hello", "acme/hello@0.1.0"),
+    ],
 )
 def test_golden_contract_passes_the_catalog(name: str, offering: str) -> None:
     """The golden file is a document the catalog accepts: its own sealed hash, the catalog's

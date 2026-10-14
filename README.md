@@ -95,6 +95,10 @@ A published version is fixed: change a type or `offering.yaml` and bump the vers
 `kontra serve` refuses to start ("republish or bump the version"). See
 [docs/sellers.md](docs/sellers.md).
 
+[`examples/hello`](examples/hello) is the smallest offering (a name in, `Hi <name>` out, a
+cent a job) and the five-minute tutorial from login to a paid job; a live copy runs as
+`demo/hello` on [app.kontra.run](https://app.kontra.run).
+
 ## Hire a job
 
 From the shell:
@@ -197,7 +201,7 @@ What Kontra can and cannot see, the threat model, and the limits: [docs/security
 | [docs/decisions.md](docs/decisions.md) | implementation decisions, checked against Temporal and nexgen |
 | [spec/](spec/README.md) | the contract document's `x-kontra` extension and reserved types |
 | [temporal/authorizer](temporal/authorizer/README.md) | the Temporal server, its policy and its configuration |
-| [examples/](examples) | `enrich` (seller), `legacy-actor` (seller), `recon` (buyer workflow) |
+| [examples/](examples) | `hello` (the smallest seller, a five-minute tutorial), `enrich` (seller), `legacy-actor` (seller), `recon` (buyer workflow) |
 
 ## Contributing
 
