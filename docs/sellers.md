@@ -2,7 +2,8 @@
 
 You write a Temporal workflow. Kontra adds a price, a catalog entry, escrow and encryption around
 it, and buyers hire it through Nexus. The workflow runs on your machine as a plain Temporal
-worker; Kontra never runs your code.
+worker; Kontra never runs your code. The smallest offering, as a five-minute tutorial from
+login to a paid job, is [`examples/hello`](../examples/hello).
 
 - [The project](#the-project)
 - [offering.yaml](#offeringyaml)
@@ -406,7 +407,8 @@ offering("offering.yaml", workflow=EnrichFlow, quote=quote, contract="contract.y
 unchanged. The two files keep different owners (contract vs offering facts) and are never
 merged by hand.
 
-The examples show both shapes: [`examples/enrich`](../examples/enrich) (types-first, with an
-artifact) and [`examples/legacy-actor`](../examples/legacy-actor) (an older job turned into an
-offering). Each keeps its derived `contract.yaml` as a golden file, reproduced byte for byte by
-the tests.
+The examples: [`examples/hello`](../examples/hello) (the smallest offering, one field in and
+one out, as a five-minute tutorial), [`examples/enrich`](../examples/enrich) (types-first, with
+an artifact) and [`examples/legacy-actor`](../examples/legacy-actor) (an older job turned into
+an offering). Each keeps its derived `contract.yaml` as a golden file, reproduced byte for byte
+by the tests.
