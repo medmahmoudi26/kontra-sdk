@@ -23,7 +23,6 @@ from kontra.contract import (
 )
 from kontra.contract.formats import check_format, compile_pattern, pattern_problem
 
-from .conftest import PUBLIC_KEY
 from .sample_models import EnrichOutput
 
 SHA = "a" * 64
@@ -107,7 +106,7 @@ class Digits(BaseModel):
 
 
 def test_backslash_d_is_ascii(enrich_spec: OfferingSpec) -> None:
-    v = InputValidator(derive_document(enrich_spec, Digits, EnrichOutput, PUBLIC_KEY))
+    v = InputValidator(derive_document(enrich_spec, Digits, EnrichOutput))
     v.validate({"code": "0123"})
     with pytest.raises(ContractError):
         v.validate({"code": "٣٤"})  # Arabic-Indic digits: \d in Python, not in RE2
@@ -119,7 +118,7 @@ class Node(BaseModel):
 
 
 def test_deep_values_are_refused_not_crashed(enrich_spec: OfferingSpec) -> None:
-    v = InputValidator(derive_document(enrich_spec, Node, Node, PUBLIC_KEY))
+    v = InputValidator(derive_document(enrich_spec, Node, Node))
     value: dict[str, Any] = {}
     for _ in range(60):
         value = {"child": value}

@@ -25,6 +25,11 @@ from kontra.testing.fake_gate import FakeGate
 
 from .support import ScriptedControl, json_payload, logged_in, offering_doc, ok_quote, wire
 
+#: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
+#: (`Profile.new_pending_job_identity`); a test that drives the route itself only needs a
+#: well-formed recipient (decisions I7).
+_A_BUYER_KEY = "age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el"
+
 
 @dataclass
 class Live:
@@ -61,7 +66,7 @@ async def live(tmp_path: Path) -> AsyncIterator[Live]:
     await seller.gate.publish(offering_doc("acme", seller.profile.public_key or ""))
     q = await buyer.gate.quote("acme/enrich", wire(json_payload({"text": "x"})))
     assert q.quote_id is not None
-    job = await buyer.gate.hire(q.quote_id)
+    job = await buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
     token = (await seller.gate.temporal_token()).token
 
     async def bearer() -> str:

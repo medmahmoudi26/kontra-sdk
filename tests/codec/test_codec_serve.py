@@ -15,8 +15,8 @@ import base64
 import json
 import os
 import uuid
-from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterator, Sequence
+from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -45,6 +45,12 @@ from kontra.testing.devserver import (
 )
 
 from .serve_flows import Doc, Measure, Measured
+
+#: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
+#: (`Profile.new_pending_job_identity`); a test that drives the route itself only needs a
+#: well-formed recipient (decisions I7).
+_A_BUYER_KEY = "age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el"
+
 
 pytestmark = [pytest.mark.temporal, pytest.mark.asyncio(loop_scope="module")]
 
@@ -95,8 +101,8 @@ class Keys:
     def __init__(self) -> None:
         self.keys: dict[str, str] = {}
 
-    async def seller_key(self, endpoint: str) -> str:
-        return self.keys[endpoint]
+    async def seller_recipients(self, endpoint: str) -> Sequence[str]:
+        return [self.keys[endpoint]]
 
 
 @dataclass
@@ -107,6 +113,10 @@ class Deal:
     keys: Keys
     client: Client
     seller_gate: Counting
+    #: The secret half of every per-job buyer key this deal made. A delivery is encrypted
+    #: to the job's key, never to a key of the buyer party (decisions I7), so the codec
+    #: decrypts with these.
+    job_identities: list[str] = field(default_factory=list[str])
 
     async def wire(self, value: Any, op: str) -> m.WirePayload:
         payload = self.client.data_converter.payload_converter.to_payloads([value])[0]
@@ -118,12 +128,14 @@ class Deal:
         return m.WirePayload(b64=base64.b64encode(encoded.SerializeToString()).decode())
 
     async def hire(self, value: Any) -> m.HireView:
-        self.keys.keys[self.entry.endpoint] = self.entry.public_key
+        self.keys.keys[self.entry.endpoint] = self.entry.recipients[0]
         q = await self.buyer.gate.quote(self.entry.offering, await self.wire(value, "quote"))
         assert q.status == m.QuoteStatus.OK, q
         assert q.quote_id is not None
-        hired = await self.buyer.gate.hire(q.quote_id)
-        self.keys.keys[hired.endpoint] = hired.seller_public_key
+        secret, job_key = generate_identity()  # what `kontra hire` makes per job
+        self.job_identities.append(secret)
+        hired = await self.buyer.gate.hire(q.quote_id, buyer_key=job_key)
+        self.keys.keys[hired.endpoint] = hired.seller_recipients[0]
         return hired
 
     async def execute(
@@ -171,20 +183,22 @@ async def deal(
         session = Session(Profile.load(acme.home), transport=transport, home=acme.home)
         worker = Worker(offerings=[bound])
         keys = Keys()
+        job_identities: list[str] = []
         codec = KontraCodec(
             bob.identity,
-            bob.public_key,
+            [bob.public_key],
             role="buyer",
             seller_keys=keys,
             blobs=GateBlobStore(bob.gate),
             claim_check_threshold=0,  # every input goes through the bucket
+            extra_identities=lambda: tuple(job_identities),
         )
         config = mp.client(bob.namespace).config()
         config["data_converter"] = seller_data_converter(codec)
         try:
             async with mp.serve(worker, acme, session=session):
                 entry = await bob.gate.get_offering(bound.key)
-                yield Deal(bob, entry, codec, keys, Client(**config), transport)
+                yield Deal(bob, entry, codec, keys, Client(**config), transport, job_identities)
         finally:
             await session.aclose()
 
@@ -232,7 +246,7 @@ async def test_a_quote_fetches_at_most_one_claim_check(deal: Deal) -> None:
     Temporal "system" envelope inside a Nexus input and decodes every payload nested in it.
     One relayed quote naming the same blob a thousand times downloads nothing; an ordinary
     claim-checked quote downloads its blob once."""
-    deal.keys.keys[deal.entry.endpoint] = deal.entry.public_key
+    deal.keys.keys[deal.entry.endpoint] = deal.entry.recipients[0]
     wire = await deal.wire(Doc(text=TEXT), "quote")
     ref = Payload.FromString(base64.b64decode(wire.b64))
     envelope = Payload(
@@ -269,7 +283,7 @@ async def test_an_input_the_seller_cannot_open_is_refused_at_once(deal: Deal) ->
         with pytest.raises(NexusOperationFailureError) as failed:
             await deal.execute(hired, value, hired.hold_token, within=60)
     finally:
-        deal.keys.keys[hired.endpoint] = hired.seller_public_key
+        deal.keys.keys[hired.endpoint] = hired.seller_recipients[0]
     text = " | ".join(str(e) for e in _chain(failed.value))
     assert "cannot be opened" in text, text
     assert _blob_downloads(deal.seller_gate.blob_reads(before)) == 1

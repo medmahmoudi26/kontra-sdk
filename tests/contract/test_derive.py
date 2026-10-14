@@ -21,14 +21,14 @@ from kontra.contract import (
 )
 from kontra.types import Artifact
 
-from .conftest import HERE, PUBLIC_KEY
+from .conftest import HERE
 from .sample_models import EnrichInput, EnrichOutput
 
 GOLDEN = HERE / "golden" / "enrich.contract.yaml"
 
 
 def derive(spec: OfferingSpec, inp: type[Any], out: type[Any] = EnrichOutput) -> dict[str, Any]:
-    return derive_document(spec, inp, out, PUBLIC_KEY)
+    return derive_document(spec, inp, out)
 
 
 def refused(spec: OfferingSpec, inp: type[Any], out: type[Any] = EnrichOutput) -> ContractError:
@@ -329,11 +329,13 @@ def test_operation_types_must_be_models(enrich_spec: OfferingSpec, tp: Any) -> N
     assert err.path == "execute.output"
 
 
-def test_invalid_public_key(enrich_spec: OfferingSpec) -> None:
-    with pytest.raises(ContractError) as info:
-        derive_document(enrich_spec, EnrichInput, EnrichOutput, "age1notakey")
-    assert info.value.path == "x-kontra.public_key"
-    assert "age public key" in info.value.message
+def test_no_key_is_sealed(enrich_spec: OfferingSpec) -> None:
+    """Spec v2 seals no key at all (decisions I7): a contract names the party -- the first
+    component of ``name`` -- and recipients are catalog data, so adding a fleet key never
+    forces a republish."""
+    facts = derive_document(enrich_spec, EnrichInput, EnrichOutput)["x-kontra"]
+    assert "public_key" not in facts
+    assert facts["name"].startswith("acme/")
 
 
 def test_golden_is_checked_in() -> None:

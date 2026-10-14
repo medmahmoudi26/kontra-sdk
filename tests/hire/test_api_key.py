@@ -77,7 +77,7 @@ async def test_a_seller_serves_with_a_key_but_never_publishes(world: World, tmp_
     published = offering(
         write_offering(tmp_path, f"{seller.handle}/text"), workflow=TextFlow, quote=quote_text
     )
-    await seller.gate.publish(published.document(seller.public_key))  # a person publishes
+    await seller.gate.publish(published.document())  # a person publishes
     made = await seller.gate.create_api_key("server")
     session = await Session.from_api_key(world.mp.base_url, made.key, home=seller.home)
     try:

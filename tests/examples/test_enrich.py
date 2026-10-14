@@ -21,7 +21,7 @@ from kontra.testing.fake_gate import AGE_MAGIC
 from kontra.types import Artifact
 
 from .support import START, Market
-from .test_golden import KEY, derive
+from .test_golden import derive
 
 pytestmark = [pytest.mark.temporal, pytest.mark.asyncio(loop_scope="package")]
 
@@ -152,13 +152,13 @@ async def test_no_url_can_fail_the_job(market: Market, tmp_path: Path) -> None:
 
 
 async def test_the_served_contract_is_the_golden_one(market: Market) -> None:
-    """What the worker published is the golden document with the seller's own key: the
-    golden file is the contract buyers really get."""
+    """What the worker published IS the golden document, byte for byte. No key is sealed
+    into a contract any more (spec v2, decisions I7), so there is nothing left that
+    differs between one seller's document and the golden file -- the contract hash is the
+    same one too."""
     buyer = await market.buyer()
     entry = await buyer.k.offering(OFFERING)
     served = json.loads(json.dumps(entry.document))
     golden = derive("enrich")
-    assert served["x-kontra"].pop("public_key") == market.seller.public_key
-    assert golden["x-kontra"].pop("public_key") == KEY
-    del served["x-kontra"]["contract_hash"], golden["x-kontra"]["contract_hash"]
+    assert "public_key" not in served["x-kontra"]
     assert served == golden

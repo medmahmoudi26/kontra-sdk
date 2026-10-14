@@ -23,8 +23,6 @@ from kontra.contract.derive import _Generator, lower_schema  # pyright: ignore[r
 from kontra.contract.validate import check_schema_subset
 from kontra.types import Artifact
 
-from .conftest import PUBLIC_KEY
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -115,7 +113,7 @@ def test_x_kontra_schema_matches_the_model(enrich_spec: OfferingSpec) -> None:
     assert set(XKontra.model_fields) == set(schema["properties"])
     required = [n for n, f in XKontra.model_fields.items() if f.is_required()]
     assert sorted(required) == sorted(schema["required"])
-    block = XKontra.from_offering(enrich_spec, PUBLIC_KEY, "sha256:" + "0" * 64).to_block()
+    block = XKontra.from_offering(enrich_spec, "sha256:" + "0" * 64).to_block()
     Draft202012Validator(schema).validate(block)
     assert XKontra.model_validate(block).to_block() == block
 
@@ -157,7 +155,7 @@ def test_the_distributions_carry_the_spec() -> None:
 def test_x_kontra_hash_has_the_spec_shape(enrich_spec: OfferingSpec) -> None:
     """XKontra is also read on its own (the gate, serve), not only inside
     validate_document, so the model checks what the spec's pattern says."""
-    block = XKontra.from_offering(enrich_spec, PUBLIC_KEY).to_block()
+    block = XKontra.from_offering(enrich_spec).to_block()
     for bad in ["junk", "sha256:" + "0" * 63, "sha256:" + "A" * 64, "sha256:" + "0" * 64 + "\n"]:
         with pytest.raises(ValidationError):
             XKontra.model_validate({**block, "contract_hash": bad})

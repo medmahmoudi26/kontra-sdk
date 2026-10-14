@@ -41,8 +41,8 @@ def _service(bound: BoundOffering) -> OfferingService:
         bound=bound,
         namespace="acme",
         party="acme",
-        contract_hash=bound.contract_hash(PK),
-        validator=bound.validator(PK),
+        contract_hash=bound.contract_hash(),
+        validator=bound.validator(),
         verifier=HoldVerifier(_Nothing()),
         jobs=JobDirectory(_Nothing()),
     )

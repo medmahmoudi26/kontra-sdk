@@ -66,7 +66,7 @@ class Artifact(BaseModel):
         from kontra.artifacts import download
 
         rt = _runtime.current()
-        return await download(rt.gate, self, rt.identity, Path(path))
+        return await download(rt.gate, self, rt.all_identities(), Path(path))
 
     async def chunks(self) -> AsyncIterator[bytes]:
         """Decrypted plaintext, chunk by chunk. The sha256 is verified at the end; a
@@ -75,7 +75,7 @@ class Artifact(BaseModel):
         from kontra.artifacts import iter_plaintext
 
         rt = _runtime.current()
-        async for chunk in iter_plaintext(rt.gate, self, rt.identity):
+        async for chunk in iter_plaintext(rt.gate, self, rt.all_identities()):
             yield chunk
 
     async def lines(self, encoding: str = "utf-8") -> AsyncIterator[str]:

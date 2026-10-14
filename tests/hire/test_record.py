@@ -68,7 +68,7 @@ def _schema() -> dict[str, Any]:
             "artifact_retention": "1d",
         }
     )
-    doc = derive_document(spec, TextJob, TextOut, generate_identity()[1])
+    doc = derive_document(spec, TextJob, TextOut)
     return validate_document(doc).output_schema
 
 

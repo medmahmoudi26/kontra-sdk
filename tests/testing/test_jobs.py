@@ -43,6 +43,11 @@ from kontra.testing.ledger_contract import assert_invariants
 from .conftest import World
 from .support import ScriptedControl, json_payload, ok_quote, quote_payload, wire
 
+#: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
+#: (`Profile.new_pending_job_identity`); a test that drives the route itself only needs a
+#: well-formed recipient (decisions I7).
+_A_BUYER_KEY = "age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el"
+
 
 @dataclass
 class Shop:
@@ -66,7 +71,7 @@ class Shop:
     async def hire(self, amount_minor: int = 1234) -> m.HireView:
         q = await self.quote(amount_minor)
         assert q.quote_id is not None
-        return await self.buyer.gate.hire(q.quote_id)
+        return await self.buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
 
     def observe(
         self, job_id: str, status: ObservedStatus, result: bytes | None = None, **kw: object
@@ -211,7 +216,7 @@ async def test_quote_is_busy_at_the_concurrency_limit_without_asking_the_seller(
     assert q.eta_seconds == math.ceil((deadline - shop.gate.now()).total_seconds())
     assert spare.quote_id is not None
     with pytest.raises(GateError) as e:
-        await shop.buyer.gate.hire(spare.quote_id)
+        await shop.buyer.gate.hire(spare.quote_id, buyer_key=_A_BUYER_KEY)
     assert (e.value.status, e.value.code) == (409, "busy")
 
 
@@ -248,7 +253,7 @@ async def test_hire_locks_the_price_and_signs_a_hold_token(shop: Shop) -> None:
     before = await shop.balances()
     q = await shop.quote(1234)
     assert q.quote_id is not None
-    view = await shop.buyer.gate.hire(q.quote_id, max_price_minor=1234)
+    view = await shop.buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY, max_price_minor=1234)
     assert (view.amount_minor, view.currency, view.offering) == (1234, "USD", shop.entry.offering)
     assert view.workflow_id == f"job-{view.job_id}"
     assert view.operation_id == f"job-{view.job_id}"
@@ -302,7 +307,7 @@ async def test_the_hold_bounds_execute_by_the_claim_checked_input_the_seller_pri
     assert input_size(ref) == 700_000
     shop.control.responder = lambda p, h: ok_quote(100)
     q = await shop.buyer.gate.quote(shop.entry.name, wire(ref))
-    view = await shop.buyer.gate.hire(q.quote_id or "")
+    view = await shop.buyer.gate.hire(q.quote_id or "", buyer_key=_A_BUYER_KEY)
     assert _claims_of(shop, view.hold_token).input_size == 700_000
     # Re-issued for start, the token is the same statement (and the same digest).
     await shop.buyer.gate.start(view.job_id, wire(json_payload({"text": "hi"})))
@@ -315,21 +320,23 @@ async def test_hire_refusals(shop: Shop) -> None:
     q = await shop.quote(1234)
     assert q.quote_id is not None
     with pytest.raises(GateError) as e:
-        await gate.hire(q.quote_id, max_price_minor=1000)
+        await gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY, max_price_minor=1000)
     assert (e.value.status, e.value.code) == (409, "price_above_max")
     with pytest.raises(GateError) as e:
-        await shop.seller.gate.hire(q.quote_id)  # someone else's quote is not found
+        await shop.seller.gate.hire(
+            q.quote_id, buyer_key=_A_BUYER_KEY
+        )  # someone else's quote is not found
     assert (e.value.status, e.value.code) == (404, "quote_not_found")
-    job = await gate.hire(q.quote_id)
+    job = await gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
     with pytest.raises(GateError) as e:
-        await gate.hire(q.quote_id)
+        await gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
     assert (e.value.status, e.value.code) == (409, "quote_used")
     assert e.value.detail == {"job_id": job.job_id}
     late = await shop.quote()
     assert late.quote_id is not None
     shop.gate.advance(timedelta(minutes=11))
     with pytest.raises(GateError) as e:
-        await gate.hire(late.quote_id)
+        await gate.hire(late.quote_id, buyer_key=_A_BUYER_KEY)
     assert (e.value.status, e.value.code) == (409, "quote_expired")
 
 
@@ -337,11 +344,13 @@ async def test_hire_without_funds_frees_the_quote(shop: Shop) -> None:
     q = await shop.quote(50_000)  # the buyer has 100.00
     assert q.quote_id is not None
     with pytest.raises(GateError) as e:
-        await shop.buyer.gate.hire(q.quote_id)
+        await shop.buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
     assert (e.value.status, e.value.code) == (402, "insufficient_funds")
     assert (await shop.buyer.gate.jobs()).items == []
     await shop.buyer.gate.topup(50_000)
-    job = await shop.buyer.gate.hire(q.quote_id)  # the same quote, after a top-up
+    job = await shop.buyer.gate.hire(
+        q.quote_id, buyer_key=_A_BUYER_KEY
+    )  # the same quote, after a top-up
     assert job.amount_minor == 50_000
 
 
@@ -350,7 +359,7 @@ async def test_a_republished_contract_makes_old_quotes_stale(shop: Shop) -> None
     assert q.quote_id is not None
     await shop.world.publish(shop.seller, max_concurrent_jobs=2, description="new contract")
     with pytest.raises(GateError) as e:
-        await shop.buyer.gate.hire(q.quote_id)
+        await shop.buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
     assert (e.value.status, e.value.code) == (409, "quote_stale")
 
 
@@ -361,7 +370,7 @@ async def test_a_buyer_without_a_key_cannot_hire(shop: Shop) -> None:
     q = await keyless.quote("acme/enrich", wire(json_payload({})))
     assert q.quote_id is not None
     with pytest.raises(GateError) as e:
-        await keyless.hire(q.quote_id)
+        await keyless.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
     assert (e.value.status, e.value.code) == (409, "no_public_key")
 
 
@@ -779,7 +788,7 @@ async def test_the_sweeper_runs_by_itself_in_asgi_mode(tmp_path: object) -> None
         buyer = await logged_in(gate.base_url, tmp_path / "bob", "bob", t)  # type: ignore[operator]
         await seller.gate.publish(offering_doc("acme", seller.profile.public_key or ""))
         q = await buyer.gate.quote("acme/enrich", wire(json_payload({})))
-        job = await buyer.gate.hire(q.quote_id or "")
+        job = await buyer.gate.hire(q.quote_id or "", buyer_key=_A_BUYER_KEY)
         gate.advance(timedelta(hours=2))
         for _ in range(200):
             if (await buyer.gate.job(job.job_id)).escrow is m.Escrow.REFUNDED:
