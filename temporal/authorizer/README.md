@@ -48,6 +48,14 @@ queries), activity heartbeats, worker heartbeat/shutdown, start / signal / signa
 (start / describe / poll / cancel / terminate / list / count). Nothing administrative is on
 it.
 
+`DescribeTaskQueue` is on it too, for a different reason: it is how a seller reads the
+backlog of its *own* task queue. With `report_stats` it returns `ApproximateBacklogCount`,
+`ApproximateBacklogAge`, `TasksAddRate` and `TasksDispatchRate` per task-queue type —
+metadata, never a payload — and it is scoped to the token's namespace like everything else
+here. Without it `temporal task-queue describe` fails for sellers and KEDA's Temporal
+scaler, which calls exactly this RPC, cannot scale workers against Kontra's frontend. It
+sits in the same class as `DescribeNamespace` and `CountWorkflowExecutions`.
+
 ### Why there is no publisher role
 
 The PRD's `publisher` role — a token allowed to create a Nexus endpoint whose name started

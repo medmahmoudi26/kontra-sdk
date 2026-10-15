@@ -118,7 +118,7 @@ name parsing and no request-body inspection:
 |---|---|---|
 | no token | health, `GetSystemInfo`, `GetClusterInfo` | everything else |
 | malformed token (expired, unknown key, `alg: none`, HS256 with the public key, wrong or missing audience, a gate API token) | -- | everything, at claim mapping |
-| `worker` in namespace A (seller or buyer) | an explicit allowlist of WorkflowService calls in A: task polling and responding, heartbeats, start / signal / query / describe / cancel of A's workflows, standalone Nexus operations in A | any other namespace; every OperatorService and AdminService call; the Nexus HTTP API; namespace admin, batch, schedules, resets, deletes, deployments |
+| `worker` in namespace A (seller or buyer) | an explicit allowlist of WorkflowService calls in A: task polling and responding, heartbeats, start / signal / query / describe / cancel of A's workflows, standalone Nexus operations in A, and `DescribeTaskQueue` on A's own queues (backlog stats for `temporal task-queue describe` and KEDA — metadata, no payloads) | any other namespace; every OperatorService and AdminService call; the Nexus HTTP API; namespace admin, batch, schedules, resets, deletes, deployments |
 | any other role (`admin`, `write`, `read`, `temporal-system:*`), even next to `worker` | nothing beyond what `worker` in A grants | everything those roles grant on stock Temporal |
 | the control plane | everything | -- (it exists only on the internal listener) |
 
