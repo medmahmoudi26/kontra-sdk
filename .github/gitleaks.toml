@@ -1,4 +1,4 @@
-# gitleaks configuration for this repository: the default rules, plus two narrow allowances.
+# gitleaks configuration for this repository: the default rules, plus three narrow allowances.
 #
 # The tests use the artifact key 0123456789abcdef0123456789abcdef (and its first half) as an
 # obviously fake fixture; gitleaks' generic-api-key rule reads it as a 32-character key. Only
@@ -26,3 +26,10 @@ regexes = ['''^0123456789abcdef(?:0123456789abcdef)?$''']
 description = "a KONTRA_* variable name is not a secret (compose.yaml lists them in prose)"
 regexTarget = "secret"
 regexes = ['''^KONTRA_[A-Z0-9_]+[.,;:]?$''']
+
+[[allowlists]]
+description = "an age X25519 recipient (age1...) is a public key: parties publish them"
+regexTarget = "secret"
+# Exactly a recipient: age1 + 58 bech32 characters. An identity (AGE-SECRET-KEY-1...) is a
+# secret and stays a finding; so does anything else in the same position.
+regexes = ['''^age1[02-9ac-hj-np-z]{58}$''']
