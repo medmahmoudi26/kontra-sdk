@@ -168,10 +168,23 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
 
 @click.command()
 @_DIR
-def serve(directory: Path) -> None:
+@click.option(
+    "--metrics",
+    metavar="IP:PORT",
+    help="Serve the Temporal SDK's Prometheus metrics at http://IP:PORT/metrics (default: off).",
+)
+@click.option(
+    "--otlp",
+    metavar="URL",
+    help="Export Temporal's traces over OTLP/gRPC to URL, e.g. http://localhost:4317 "
+    "(default: off; needs kontra-sdk[opentelemetry]).",
+)
+def serve(directory: Path, metrics: str | None, otlp: str | None) -> None:
     """Run worker.py's worker with this machine's profile, or KONTRA_API_KEY (Ctrl-C stops
     it gracefully)."""
     import logging
+
+    from kontra.serve.telemetry import TelemetryError, metrics_runtime, otlp_tracing
 
     if not logging.getLogger().handlers:
         logging.basicConfig(
@@ -179,6 +192,22 @@ def serve(directory: Path) -> None:
         )
     # One line per HTTP request (token refreshes, progress posts) drowns what matters.
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    with load_worker(directory) as worker:
-        worker.run()
-    logging.getLogger("kontra.serve").info("stopped")
+    log = logging.getLogger("kontra.serve")
+    try:
+        tracing = otlp_tracing(otlp) if otlp is not None else None
+        runtime = metrics_runtime(metrics) if metrics is not None else None
+    except TelemetryError as e:
+        fail(str(e))
+    if runtime is not None:
+        log.info("serving the Temporal SDK's metrics at http://%s/metrics", metrics)
+    if tracing is not None:
+        log.info("exporting traces to %s", otlp)
+    try:
+        with load_worker(directory) as worker:
+            worker.run(
+                runtime=runtime, interceptors=[tracing.interceptor] if tracing is not None else []
+            )
+    finally:
+        if tracing is not None:
+            tracing.shutdown()
+    log.info("stopped")

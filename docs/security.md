@@ -76,7 +76,7 @@ assigns. Ciphertext is standard age, so a party can decrypt what it received wit
 |---|---|
 | job inputs, results and failure messages (including stack traces) | a quote's answer: price, currency, a refusal's reason, a busy ETA (it must lock the price) |
 | a quote's input (relayed byte for byte) | who hired which offering, when, at what price, and the job's state; the reason a buyer gives for rejecting a delivery (it is a gate call, not a payload) |
-| the seller's heartbeat details (progress is encrypted to the buyer) | workflow metadata in Temporal: workflow ids, task queues, activity names, timers, timestamps, states, event counts, payload sizes |
+| the seller's heartbeat details (progress is encrypted to the buyer) | workflow metadata in Temporal: workflow ids, task queues, activity names, timers, timestamps, states, event counts, payload sizes; each task queue's backlog, rates and pollers (a worker's identity, `pid@host` by default, build id, and the SDK name and version its heartbeat names), which `kontra status --workers` shows the seller |
 | artifacts and claim-checked payloads, including the plaintext sha256 an `Artifact` reference carries (it travels inside the encrypted delivery) | the size and sha256 of each ciphertext (age's overhead is fixed, so plaintext sizes follow) and each artifact's content type |
 | any private key: every key is generated on the machine that holds it -- a buyer's per job, a seller's per deployment -- and never leaves it | public keys (the seller's recipient set, the job's buyer key), contract documents, offering facts, balances |
 
@@ -222,10 +222,14 @@ deadline rule.
   namespace; its isolation is the network alone: loopback by default, and in `compose.yaml`
   Temporal's fixed address on the `control` network (a pinned subnet, `KONTRA_CONTROL_NET`),
   shared only with the gate. It does not listen on `temporal-db`, whose only other member is
-  the Postgres relay; Postgres and the gate's migration job reach the database through that
+  the Postgres relay (and, with `kontra dev up --observability`, Prometheus, held to the
+  same terms); Postgres and the gate's migration job reach the database through that
   relay and cannot reach Temporal at all; the bucket's network and the published ports never
   carry it. A deployment that adds a container to `control` gives that container the
-  internal frontend. The bind is not the whole wall on `temporal-db`: Linux accepts a packet
+  internal frontend; `kontra dev up --ui` does so on purpose with Temporal's UI, a dev tool
+  published on 127.0.0.1 only that production never runs (as is the codec server it starts,
+  which decrypts with the machine's key for whoever reaches its loopback port). The bind is
+  not the whole wall on `temporal-db`: Linux accepts a packet
   for any of its addresses on any interface, so a peer there that routes Temporal's `control`
   address through Temporal's `temporal-db` address reaches it (measured); that takes
   `NET_ADMIN` (or `NET_RAW`), which the relay -- no capabilities, not root -- lacks. The host

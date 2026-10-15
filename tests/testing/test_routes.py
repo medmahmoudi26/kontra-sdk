@@ -148,6 +148,7 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
         return await buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY, max_price_minor=500)
 
     worker = world.bearer((await seller.gate.temporal_token()).token)  # kontra serve's credential
+    assert (await worker.workers(entry.offering)).task_queue == entry.task_queue
 
     # job 1: started through the gate, progress, an output artifact, delivered, rejected, resolved
     one = await hired()

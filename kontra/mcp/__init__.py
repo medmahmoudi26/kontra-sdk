@@ -2,7 +2,8 @@
 
 The third door to the buyer side, next to a script and a workflow, with the same semantics:
 eight MCP tools -- ``search``, ``describe``, ``quote``, ``hire``, ``status``, ``result``,
-``accept``, ``reject`` -- built on :class:`kontra.hire.Kontra` with the local profile. It
+``accept``, ``reject`` -- and, for a seller, ``workers`` (its own versions' Workers view,
+decisions I21), built on :class:`kontra.hire.Kontra` with the local profile. It
 runs on the agent's machine, over stdio, because only that machine holds the key that
 decrypts the results (decisions I5).
 

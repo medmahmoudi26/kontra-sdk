@@ -1,4 +1,5 @@
-"""The MCP server: the eight tools of PRD §7.3 on :class:`kontra.hire.Kontra`.
+"""The MCP server: the eight tools of PRD §7.3 on :class:`kontra.hire.Kontra`, and
+``workers``, a seller's own Workers view (kontra-cloud#6, decisions I21).
 
 It runs next to the agent (decisions I5): only this machine holds the key that decrypts a
 delivery, so a hosted server would have to read every input and output it relays. Every
@@ -205,6 +206,21 @@ delivery's hashes and what each party chooses to decrypt for it. Give a specific
 
 The reason is NOT encrypted: Kontra stores it and the seller sees it. Do not copy confidential \
 input or output into it."""
+
+WORKERS_DOC = """\
+For a seller: whether YOUR workers keep up with one of YOUR offering versions, as Temporal \
+reports its task queue -- per task-queue type (workflow, activity, nexus) the backlog and the \
+age of its oldest task, the rates tasks are added and dispatched at, and the workers polling \
+(identity, last poll, build id, SDK) -- with a one-line `verdict` such as "activity backlog \
+growing for 5 min, 2 pollers -- scale up" or "idle, 1 poller". `stale` true means Temporal \
+reported nothing at all, which it also does for a task queue idle for about five minutes.
+
+Only an offering version you published: anyone else's is not found. Free; moves no money."""
+
+_OWN_OFFERING_ARG = (
+    "One of your offering versions: an exact party/name@1.2.0, or party/name, party/name@1, "
+    "party/name@1.2 for the latest of yours that matches."
+)
 
 HIRE_NOTE = (
     "The price is held in escrow. It is refunded if the job fails, is canceled or misses its "
@@ -572,6 +588,12 @@ class KontraTools:
         job = await self._job(job_id)
         return out.JobOut(**_job_fields(await job.reject(reason)))
 
+    # ------------------------------------------------------------------ selling
+
+    async def workers(self, offering: str) -> m.WorkersView:
+        """The gate's Workers view, as ``kontra status --workers`` shows it."""
+        return await self.kontra().gate.workers(offering)
+
 
 # --------------------------------------------------------------------------- helpers
 
@@ -774,7 +796,7 @@ async def _answer(work: Awaitable[BaseModel]) -> CallToolResult:
 
 
 def server(kontra: Kontra | None = None, *, inline_limit: int = INLINE_LIMIT) -> MCPServer[None]:
-    """The MCP server with the eight tools, on ``kontra`` (default: a client on the local
+    """The MCP server with the eight tools and ``workers``, on ``kontra`` (default: a client on the local
     profile or ``KONTRA_API_KEY``, made on first use). Run it with ``.run("stdio")``, or connect to it in-process
     (``mcp.Client(server(...))``) in tests."""
     tools = KontraTools(kontra, inline_limit=inline_limit)
@@ -892,6 +914,13 @@ def server(kontra: Kontra | None = None, *, inline_limit: int = INLINE_LIMIT) ->
     ) -> Annotated[CallToolResult, out.JobOut]:
         return await _answer(tools.reject(job_id, reason))
 
+    async def workers(
+        offering: Annotated[
+            str, Field(min_length=1, max_length=200, description=_OWN_OFFERING_ARG)
+        ],
+    ) -> Annotated[CallToolResult, m.WorkersView]:
+        return await _answer(tools.workers(offering))
+
     free = ToolAnnotations(read_only_hint=True, open_world_hint=True)
     money = ToolAnnotations(
         read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True
@@ -908,6 +937,7 @@ def server(kontra: Kontra | None = None, *, inline_limit: int = INLINE_LIMIT) ->
         (result, "Job result", RESULT_DOC, files),
         (accept, "Accept and pay (releases escrow)", ACCEPT_DOC, money),
         (reject, "Reject and dispute", REJECT_DOC, money),
+        (workers, "Your workers (seller)", WORKERS_DOC, free),
     ):
         app.add_tool(fn, name=fn.__name__, title=title, description=doc, annotations=hints)
     return app

@@ -89,6 +89,7 @@ Against the real marketplace:
 kontra login --email you@example.com   # or plain `kontra login` (browser); makes this machine's key
 kontra publish                         # needs a recent login, never a key; prints the hash and endpoint
 kontra serve                           # on the machine that does the work (a key will do here)
+kontra status --workers                # do the workers keep up? Temporal's backlog and pollers
 ```
 
 A published version is fixed: change a type or `offering.yaml` and bump the version, or
@@ -159,7 +160,8 @@ plain Temporal worker whose client carries your keys and which runs the quote-an
 activities. Cancelling the workflow cancels the job and refunds the hold.
 
 From an agent: `kontra mcp` serves eight tools (`search`, `describe`, `quote`, `hire`,
-`status`, `result`, `accept`, `reject`) over stdio, on the machine that holds your key:
+`status`, `result`, `accept`, `reject`), and `workers` for a seller's own versions, over
+stdio, on the machine that holds your key:
 
 ```json
 { "mcpServers": { "kontra": { "command": "kontra", "args": ["mcp"] } } }

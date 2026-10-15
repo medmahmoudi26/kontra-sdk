@@ -46,6 +46,7 @@ __all__ = [
     "HANDOFF_TTL_SECONDS",
     "MAX_API_KEYS",
     "MAX_PARTS",
+    "POLLERS_MAX",
     "REVOCATION_WINDOW_MAX",
     "USER_CODE_ALPHABET",
     "USER_CODE_PATTERN",
@@ -83,6 +84,7 @@ __all__ = [
     "Me",
     "PartyKey",
     "PartyView",
+    "PollerInfo",
     "ProgressEvent",
     "ProgressPost",
     "ProgressSource",
@@ -98,6 +100,9 @@ __all__ = [
     "SessionList",
     "SessionView",
     "StartRequest",
+    "TaskQueueStats",
+    "TaskQueueType",
+    "TaskQueueTypeInfo",
     "TemporalToken",
     "TemporalTokenRequest",
     "TokenRequest",
@@ -106,6 +111,7 @@ __all__ = [
     "TopupResult",
     "UploadPart",
     "WirePayload",
+    "WorkersView",
     "is_api_key",
     "is_api_key_id",
     "is_email",
@@ -164,11 +170,18 @@ _PROGRESS_B64_MAX = 4 * -(-(128 * 1024) // 3)
 #: and 1000 characters; Kontra's server sets 1000 and 255).
 _PENDING_ACTIVITIES_MAX = 2000
 _ACTIVITY_MAX = 1000
+#: A poller's identity and a worker deployment's name, at Temporal's default ID limit
+#: (``limit.maxIDLength``, 1000 characters, which the frontend applies to a poll's identity
+#: too; Kontra's server sets 255). A build id is at most 255 (``limit.workerBuildIdSize``).
+_TEMPORAL_ID_MAX = 1000
+#: The pollers one task-queue type lists: a gate keeps the most recently seen this many.
+POLLERS_MAX = 1000
 
 _Name = Annotated[str, StringConstraints(max_length=_NAME_MAX)]
 _Long = Annotated[str, StringConstraints(max_length=_LONG_MAX)]
 _Text = Annotated[str, StringConstraints(max_length=_TEXT_MAX)]
 _Activity = Annotated[str, StringConstraints(max_length=_ACTIVITY_MAX)]
+_TemporalId = Annotated[str, StringConstraints(max_length=_TEMPORAL_ID_MAX)]
 _ETag = Annotated[str, StringConstraints(max_length=_ETAG_MAX, pattern=r"^[\x20-\x7e]*$")]
 #: What ``_ETag`` accepts, for the whole-list check (:meth:`ArtifactComplete._one_error`).
 _ETAG_TEXT = re.compile(rf"[\x20-\x7e]{{0,{_ETAG_MAX}}}", re.ASCII)
@@ -588,6 +601,87 @@ class CatalogSummary(_M):
 class CatalogList(_M):
     items: list[CatalogSummary] = Field(max_length=_PAGE_MAX)
     next_cursor: _Long | None = None
+
+
+# --------------------------------------------------------------------------- workers
+#
+# Whether a seller's workers keep up with one of its offering versions: what Temporal's
+# ``DescribeTaskQueue`` (``report_stats``) says of the version's task queue in the seller's
+# namespace, per task-queue type, with Temporal's own names (kontra-cloud#6). The verdict
+# and the ``stale`` flag are :mod:`kontra.workers`'s, read from these numbers alone.
+
+
+class TaskQueueType(StrEnum):
+    """Temporal's ``TaskQueueType``: one task queue name is a queue per kind of task."""
+
+    WORKFLOW = "workflow"
+    ACTIVITY = "activity"
+    NEXUS = "nexus"
+
+
+class TaskQueueStats(_M):
+    """Temporal's ``TaskQueueStats`` for one task-queue type. Rates are tasks per second
+    averaged over the last 30 seconds; the backlog is approximate (Temporal's word) and
+    leaves out sticky queues. A number Temporal does not report is zero."""
+
+    approximate_backlog_count: int = Field(default=0, ge=0)
+    #: The age of the oldest task in the backlog, in seconds (a ``Duration`` in Temporal).
+    approximate_backlog_age: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    tasks_add_rate: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    tasks_dispatch_rate: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    #: ``tasks_add_rate - tasks_dispatch_rate``, as Temporal's SDKs report it
+    #: (``BacklogIncreaseRate``): positive while the backlog grows, negative while it drains.
+    backlog_increase_rate: float = Field(default=0.0, allow_inf_nan=False)
+
+
+class PollerInfo(_M):
+    """A worker polling the task queue, as Temporal's ``PollerInfo`` reports it. Temporal
+    keeps a poller listed for about five minutes after its last poll, and a worker whose
+    slots are all busy does not poll, so ``last_access_time`` says how recent a listing is.
+
+    ``build_id`` and ``deployment_name`` are what the worker said of its version when it
+    polled (``WorkerDeploymentOptions``, else ``WorkerVersionCapabilities``); the Python SDK
+    sends a build id even for an unversioned worker, a hash of its loaded code.
+
+    ``sdk_name`` and ``sdk_version`` (``temporal-python``, ``1.34.0``) are not in
+    ``DescribeTaskQueue``'s answer: they are what the worker of this identity said of itself
+    in its last heartbeat on this task queue, as Temporal's ``ListWorkers`` reports it
+    (``WorkerHeartbeat``). A worker sends one every 60 seconds by default, so both are None
+    for a worker that has sent none yet, one that sends none, or a server that keeps none
+    (``frontend.WorkerHeartbeatsEnabled``)."""
+
+    identity: _TemporalId
+    last_access_time: datetime
+    rate_per_second: float = Field(allow_inf_nan=False)
+    build_id: _Name | None = None
+    deployment_name: _TemporalId | None = None
+    sdk_name: _Name | None = None
+    sdk_version: _Name | None = None
+
+
+class TaskQueueTypeInfo(_M):
+    """Temporal's ``TaskQueueTypeInfo``: one task-queue type's pollers, most recently seen
+    first (at most :data:`POLLERS_MAX`), and its stats."""
+
+    pollers: list[PollerInfo] = Field(default_factory=list, max_length=POLLERS_MAX)
+    stats: TaskQueueStats = Field(default_factory=TaskQueueStats)
+
+
+class WorkersView(_M):
+    """``GET /v1/offerings/{party}/{name}/versions/{version}/workers``: the Workers view of
+    one of the caller's own offering versions (another party's is 404, like a missing one).
+
+    ``types_info`` holds every task-queue type the gate described (all three). ``verdict``
+    is one line for people (:func:`kontra.workers.verdict`). ``stale``: Temporal reported
+    nothing -- every number zero and no poller -- which is also what it reports for a task
+    queue it unloaded after about five idle minutes, so the zeros may not be a measurement
+    (:func:`kontra.workers.stale`)."""
+
+    offering: _Name  # acme/enrich@1.2.0, exact
+    task_queue: _Name
+    types_info: dict[TaskQueueType, TaskQueueTypeInfo] = Field(max_length=len(TaskQueueType))
+    verdict: _Name
+    stale: bool
 
 
 # --------------------------------------------------------------------------- quotes & jobs

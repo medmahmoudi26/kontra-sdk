@@ -33,6 +33,7 @@ from kontra.auth import Session, login
 from kontra.contract import derive_document, parse_offering
 from kontra.escrow import Observation, ObservedStatus, Provenance
 from kontra.gate_client import models as m
+from kontra.workers import offline
 
 # --------------------------------------------------------------------------- the contract
 
@@ -173,6 +174,13 @@ class ScriptedControl:
         default_factory=list[tuple[str, str, str | None]]
     )
     fail_stops: int = 0
+    #: what describe_task_queue answers, by (namespace, task queue); else nothing reported
+    task_queues: dict[tuple[str, str], dict[m.TaskQueueType, m.TaskQueueTypeInfo]] = field(
+        default_factory=dict[tuple[str, str], dict[m.TaskQueueType, m.TaskQueueTypeInfo]]
+    )
+    #: every describe_task_queue call: (namespace, task queue)
+    described: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
+    fail_describe: Exception | None = None
 
     def observe_as(
         self,
@@ -280,6 +288,14 @@ class ScriptedControl:
         if self.on_occupy is not None:
             self.on_occupy()
         return self.occupation
+
+    async def describe_task_queue(
+        self, namespace: str, task_queue: str
+    ) -> dict[m.TaskQueueType, m.TaskQueueTypeInfo]:
+        self.described.append((namespace, task_queue))
+        if self.fail_describe is not None:
+            raise self.fail_describe
+        return dict(self.task_queues.get((namespace, task_queue), offline()))
 
     async def start_operation(
         self,

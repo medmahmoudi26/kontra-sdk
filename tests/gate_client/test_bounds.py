@@ -432,6 +432,62 @@ def test_the_largest_legitimate_responses_are_accepted() -> None:
         }
     )
     m.BlobUrl.model_validate({"sha256": SHA, "url": URL, "expires_at": NOW})
+    # A version's task queue at its largest: every type with a full listing of pollers,
+    # each at Temporal's default identity limit and its build id limit, and an SDK name and
+    # version as long as Control lets through (kontra._control fits a heartbeat's to 255).
+    poller = {
+        "identity": "i" * 1000,
+        "last_access_time": NOW,
+        "rate_per_second": 100_000.0,
+        "build_id": "b" * 255,
+        "deployment_name": "d" * 1000,
+        "sdk_name": "n" * 255,
+        "sdk_version": "v" * 255,
+    }
+    info = {
+        "pollers": [poller] * m.POLLERS_MAX,
+        "stats": {
+            "approximate_backlog_count": 2**63 - 1,
+            "approximate_backlog_age": 30 * 86_400.0,
+            "tasks_add_rate": 1e6,
+            "tasks_dispatch_rate": 0.0,
+            "backlog_increase_rate": 1e6,
+        },
+    }
+    m.WorkersView.model_validate(
+        {
+            "offering": REF,
+            "task_queue": REF,
+            "types_info": {kind.value: info for kind in m.TaskQueueType},
+            "verdict": f"activity backlog growing for 30 d, {m.POLLERS_MAX} pollers -- scale up",
+            "stale": False,
+        }
+    )
+
+
+def test_task_queue_stats_refuse_what_temporal_never_reports() -> None:
+    """Counts, ages and rates are never below zero (the backlog's growth may be) and never
+    infinite or NaN; a task-queue type is one of Temporal's three."""
+    m.TaskQueueStats(backlog_increase_rate=-2.5)
+    for bad in (
+        {"approximate_backlog_count": -1},
+        {"approximate_backlog_age": -1.0},
+        {"tasks_add_rate": float("inf")},
+        {"tasks_dispatch_rate": float("nan")},
+        {"backlog_increase_rate": float("-inf")},
+    ):
+        with pytest.raises(ValidationError):
+            m.TaskQueueStats.model_validate(bad)
+    with pytest.raises(ValidationError):
+        m.WorkersView.model_validate(
+            {
+                "offering": REF,
+                "task_queue": REF,
+                "types_info": {"sticky": {}},
+                "verdict": "idle, 1 poller",
+                "stale": False,
+            }
+        )
 
 
 def test_bounds_follow_the_limits_they_name() -> None:

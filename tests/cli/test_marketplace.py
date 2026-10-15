@@ -5,6 +5,7 @@ Temporal dev server, no containers), as a seller and buyers would use it: ``logi
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -134,6 +135,23 @@ async def test_publish_prints_the_contract_hash_and_endpoint(shop: Shop) -> None
 
     contract = await shop.seller.ok("contract", "--dir", str(shop.project))
     assert from_yaml(contract.stdout)["x-kontra"]["contract_hash"] == entry["contract_hash"]
+
+
+async def test_status_lists_the_served_worker_from_temporal(shop: Shop) -> None:
+    """kontra-cloud#6 end to end: the gate asks the dev server's DescribeTaskQueue about
+    the version worker.py names, and `kontra serve`'s worker is listed as its poller."""
+    view: dict[str, Any] = {}
+    for _ in range(100):
+        [view] = await shop.seller.json("status", "--workers", "--dir", str(shop.project))
+        types = view["types_info"]
+        if types["workflow"]["pollers"] and types["nexus"]["pollers"]:
+            break
+        await asyncio.sleep(0.2)
+    assert view["offering"] == view["task_queue"] == shop.key
+    identities = {p["identity"] for t in view["types_info"].values() for p in t["pollers"]}
+    assert len(identities) == 1, identities  # the one `kontra serve` process
+    assert view["stale"] is False
+    assert "no pollers" not in view["verdict"]
 
 
 async def test_publish_refuses_an_offering_of_another_party(shop: Shop) -> None:

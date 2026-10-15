@@ -1,9 +1,10 @@
 """Put the spec files and the ``kontra dev`` stack inside the package of a wheel.
 
-In a checkout they live outside it (``spec/``, ``compose.yaml``: one copy each); the sdist
-carries them already inside (``kontra/_spec``, ``kontra/_dev/compose.yaml``), so that it
-holds the package, the README and the licence and nothing else. A wheel built from either
-tree gets the same files.
+In a checkout they live outside it (``spec/``, ``compose.yaml`` and the ``observability/``
+and ``docs/dashboards/`` files its profiles mount: one copy each); the sdist carries them
+already inside (``kontra/_spec``, ``kontra/_dev/``), so that it holds the package, the README
+and the licence and nothing else. A wheel built from either tree gets the same files. The stack's
+files keep their places relative to ``compose.yaml``, which names them by relative path.
 """
 
 from __future__ import annotations
@@ -14,7 +15,12 @@ from typing import Any
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
 #: checkout path -> path inside the package
-OUTSIDE = {"spec": "kontra/_spec", "compose.yaml": "kontra/_dev/compose.yaml"}
+OUTSIDE = {
+    "spec": "kontra/_spec",
+    "compose.yaml": "kontra/_dev/compose.yaml",
+    "observability": "kontra/_dev/observability",
+    "docs/dashboards": "kontra/_dev/docs/dashboards",
+}
 
 
 class CheckoutFiles(BuildHookInterface):  # type: ignore[type-arg]

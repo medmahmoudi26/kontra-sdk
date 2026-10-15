@@ -65,16 +65,20 @@ from temporalio.api.operatorservice.v1 import (
     CreateNexusEndpointRequest,
     ListNexusEndpointsRequest,
 )
-from temporalio.api.taskqueue.v1 import TaskQueue
+from temporalio.api.taskqueue.v1 import PollerInfo, TaskQueue
+from temporalio.api.worker.v1 import WorkerListInfo
 from temporalio.api.workflowservice.v1 import (
     DescribeNamespaceRequest,
     DescribeNamespaceResponse,
     DescribeNexusOperationExecutionRequest,
     DescribeNexusOperationExecutionResponse,
     DescribeTaskQueueRequest,
+    DescribeTaskQueueResponse,
     DescribeWorkflowExecutionRequest,
     DescribeWorkflowExecutionResponse,
     GetWorkflowExecutionHistoryRequest,
+    ListWorkersRequest,
+    ListWorkersResponse,
     RegisterNamespaceRequest,
     RequestCancelWorkflowExecutionRequest,
     StartNexusOperationExecutionRequest,
@@ -90,6 +94,7 @@ from kontra.codec import _parse_reference as _reference  # pyright: ignore[repor
 from kontra.contract.names import is_endpoint_name
 from kontra.contract.offering import MAX_DURATION_RANGE
 from kontra.escrow import Observation, ObservedStatus, Provenance
+from kontra.gate_client import models as m
 
 __all__ = [
     "CHAIN_READS",
@@ -421,6 +426,10 @@ class TemporalControl(Protocol):
 
     async def occupy_job(self, namespace: str, workflow_id: str, reason: str) -> Occupation: ...
 
+    async def describe_task_queue(
+        self, namespace: str, task_queue: str
+    ) -> dict[m.TaskQueueType, m.TaskQueueTypeInfo]: ...
+
     async def start_operation(
         self,
         namespace: str,
@@ -436,6 +445,95 @@ class TemporalControl(Protocol):
 
 def _time(ts: Timestamp, present: bool) -> datetime | None:
     return ts.ToDatetime(tzinfo=UTC) if present else None
+
+
+#: Temporal's task-queue types, by their names on the gate's wire.
+_TASK_QUEUE_TYPES: Mapping[m.TaskQueueType, TaskQueueType.ValueType] = {
+    m.TaskQueueType.WORKFLOW: TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW,
+    m.TaskQueueType.ACTIVITY: TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY,
+    m.TaskQueueType.NEXUS: TaskQueueType.TASK_QUEUE_TYPE_NEXUS,
+}
+
+
+def _at_least_zero(value: float) -> float:
+    """A rate or an age as reported, or zero for one below zero or not finite (Temporal's
+    approximations; the wire model refuses either)."""
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+#: The longest poller identity and deployment name, and build id, SDK name and SDK version,
+#: the gate's wire carries (:class:`kontra.gate_client.models.PollerInfo`: Temporal's default
+#: ID limit, and 255). Temporal bounds a poll's identity and build id itself; a deprecated
+#: deployment series name and a worker's heartbeat are not bounded everywhere, so what is
+#: longer is cut (an identity) or left out rather than failing the whole description.
+_POLLER_ID_MAX = 1000
+_POLLER_NAME_MAX = 255
+#: A task queue ``ListWorkers``' query can name between single quotes as it is: every one
+#: :mod:`kontra.contract.names` builds (``acme/enrich@1.2.0``).
+_QUOTABLE_TASK_QUEUE = re.compile(r"[A-Za-z0-9@./_:-]+", re.ASCII)
+#: The workers of one task queue ``ListWorkers`` is asked for (one page).
+_WORKERS_PAGE = 1000
+
+#: What a worker's heartbeat says it runs: (``sdk_name``, ``sdk_version``), by identity.
+_Sdks = Mapping[str, tuple[str, str]]
+
+
+def _fit(value: str, longest: int) -> str | None:
+    """``value``, or None when it is empty or longer than the wire carries."""
+    return value if value and len(value) <= longest else None
+
+
+def _poller(p: PollerInfo, sdks: _Sdks) -> m.PollerInfo:
+    """Temporal's ``PollerInfo``, with the version the worker named when it polled (its
+    deployment's, else its version capabilities': an empty string is no version) and the SDK
+    its heartbeat named (``sdks``, from ``ListWorkers``)."""
+    deployment, capabilities = p.deployment_options, p.worker_version_capabilities
+    sdk_name, sdk_version = sdks.get(p.identity, ("", ""))
+    return m.PollerInfo(
+        identity=p.identity[:_POLLER_ID_MAX],
+        last_access_time=p.last_access_time.ToDatetime(tzinfo=UTC),
+        rate_per_second=p.rate_per_second if math.isfinite(p.rate_per_second) else 0.0,
+        build_id=_fit(deployment.build_id or capabilities.build_id, _POLLER_NAME_MAX),
+        deployment_name=_fit(
+            deployment.deployment_name or capabilities.deployment_series_name, _POLLER_ID_MAX
+        ),
+        sdk_name=_fit(sdk_name, _POLLER_NAME_MAX),
+        sdk_version=_fit(sdk_version, _POLLER_NAME_MAX),
+    )
+
+
+def _sdks(task_queue: str, workers: Iterable[WorkerListInfo]) -> dict[str, tuple[str, str]]:
+    """The SDK each worker of ``task_queue`` named in its heartbeat, by identity; of two
+    workers with one identity, the one started last."""
+    found: dict[str, tuple[int, str, str]] = {}
+    for w in workers:
+        if w.task_queue != task_queue or not (w.sdk_name or w.sdk_version):
+            continue
+        started = w.start_time.ToNanoseconds()
+        seen = found.get(w.worker_identity)
+        if seen is None or started > seen[0]:
+            found[w.worker_identity] = (started, w.sdk_name, w.sdk_version)
+    return {identity: (name, version) for identity, (_, name, version) in found.items()}
+
+
+def _type_info(resp: DescribeTaskQueueResponse, sdks: _Sdks) -> m.TaskQueueTypeInfo:
+    """One type's answer: the most recently seen pollers first, and the stats with
+    ``backlog_increase_rate`` as Temporal's SDKs derive it (add rate minus dispatch rate)."""
+    s = resp.stats
+    add, dispatch = _at_least_zero(s.tasks_add_rate), _at_least_zero(s.tasks_dispatch_rate)
+    recent = sorted(resp.pollers, key=lambda p: p.last_access_time.ToNanoseconds(), reverse=True)
+    return m.TaskQueueTypeInfo(
+        pollers=[_poller(p, sdks) for p in recent[: m.POLLERS_MAX]],
+        stats=m.TaskQueueStats(
+            approximate_backlog_count=max(0, s.approximate_backlog_count),
+            approximate_backlog_age=_at_least_zero(
+                s.approximate_backlog_age.ToTimedelta().total_seconds()
+            ),
+            tasks_add_rate=add,
+            tasks_dispatch_rate=dispatch,
+            backlog_increase_rate=add - dispatch,
+        ),
+    )
 
 
 def _event_name(event_type: int) -> str:
@@ -1001,6 +1099,61 @@ class Control:
                 NexusSyncKind.UNAVAILABLE, message=f"no worker is polling {task_queue!r}"
             )
         return NexusSyncResult(NexusSyncKind.TIMEOUT, message=message)
+
+    # ------------------------------------------------------------------ task queues
+
+    async def describe_task_queue(
+        self, namespace: str, task_queue: str
+    ) -> dict[m.TaskQueueType, m.TaskQueueTypeInfo]:
+        """``DescribeTaskQueue`` of ``task_queue`` in ``namespace`` with ``report_stats``,
+        once per task-queue type: each type's stats and pollers, Temporal metadata only (the
+        Workers view, :mod:`kontra.workers`). The default mode lists pollers in every answer;
+        ``report_pollers`` belongs to the deprecated enhanced mode. A task queue nobody has
+        used is described all the same, with zeros.
+
+        ``DescribeTaskQueue`` names no poller's SDK; when anything polls, ``ListWorkers``
+        is asked for the workers' heartbeats on ``task_queue`` (:meth:`_worker_sdks`)."""
+        answers: dict[m.TaskQueueType, DescribeTaskQueueResponse] = {}
+        for kind, value in _TASK_QUEUE_TYPES.items():
+            answers[kind] = await self._rpc(
+                f"describe the {kind} task queue {task_queue} in {namespace}",
+                self._wf.describe_task_queue,
+                DescribeTaskQueueRequest(
+                    namespace=namespace,
+                    task_queue=TaskQueue(name=task_queue),
+                    task_queue_type=value,
+                    report_stats=True,
+                ),
+            )
+        polled = any(resp.pollers for resp in answers.values())
+        sdks = await self._worker_sdks(namespace, task_queue) if polled else {}
+        return {kind: _type_info(resp, sdks) for kind, resp in answers.items()}
+
+    async def _worker_sdks(self, namespace: str, task_queue: str) -> _Sdks:
+        """What the workers of ``task_queue`` said they run in their last heartbeat
+        (``ListWorkers``, Temporal's ``WorkerHeartbeat.sdk_name`` and ``sdk_version``), by
+        identity: one page of workers. Empty for a task queue the query cannot name as it is,
+        and from a server without ``ListWorkers`` (``UNIMPLEMENTED``): the SDK is then not
+        known, and the rest of the description stands."""
+        if _QUOTABLE_TASK_QUEUE.fullmatch(task_queue) is None:
+            return {}
+        try:
+            resp: ListWorkersResponse = await self._wf.list_workers(
+                ListWorkersRequest(
+                    namespace=namespace,
+                    query=f"TaskQueue = '{task_queue}'",
+                    page_size=_WORKERS_PAGE,
+                ),
+                retry=True,
+                timeout=_RPC_TIMEOUT,
+            )
+        except RPCError as e:
+            if e.status == RPCStatusCode.UNIMPLEMENTED:
+                return {}
+            raise TemporalError(
+                f"list the workers of {task_queue} in {namespace}: {e.status.name}: {e.message}"
+            ) from e
+        return _sdks(task_queue, resp.workers)
 
     # ------------------------------------------------------------------ observation
 

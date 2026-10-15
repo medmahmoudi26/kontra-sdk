@@ -7,6 +7,7 @@ kontra keys create|list|revoke                 API keys for programs (KONTRA_API
 kontra init <name> [--party P]                 scaffold an offering (§6.1)
 kontra dev [up|down|status|logs]               the local stack (compose.yaml)
 kontra publish | serve | contract [--dir D]    sell worker.py's offerings (§11.4, §6.5)
+kontra status [--workers] [<offering>...]      whether your workers keep up (Temporal's stats)
 kontra pull <offering> --lang go|python|typescript|java
 kontra quote|hire <offering> -f in.json        buy (§7.1)
 kontra jobs | job <id> [--accept|--reject R|--cancel|--progress|--result DIR]
@@ -38,6 +39,7 @@ from kontra.cli._keys import keys
 from kontra.cli._pull import pull
 from kontra.cli._recipients import recipients
 from kontra.cli._seller import contract, init, publish, serve
+from kontra.cli._status import status
 
 __all__ = ["cli", "main"]
 
@@ -67,6 +69,7 @@ for _command in (
     publish,
     serve,
     contract,
+    status,
     pull,
     quote,
     hire,

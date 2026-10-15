@@ -1,0 +1,12 @@
+# The Prometheus of `kontra dev up --observability`, Grafana's default data source: the
+# server dashboard names none and reads the default.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

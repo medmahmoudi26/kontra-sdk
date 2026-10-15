@@ -3,7 +3,8 @@
 :class:`FakeGate` serves every row of :data:`kontra.gate_client.routes.ROUTES` from memory:
 identity (dev login, the device flow, magic links to an allowlist, API keys, rotating
 refresh tokens, ES256 tokens and a JWKS), parties with Temporal namespaces, the catalog (contract validation, opaque endpoint names,
-the endpoint created through the control plane), the quote relay, hire with a signed hold
+the endpoint created through the control plane), the Workers view (Temporal's task-queue
+stats of a seller's own version), the quote relay, hire with a signed hold
 token, the escrow lifecycle, progress over SSE, artifacts and claim-check blobs behind
 signed URLs, balances and disputes. Its rules are the platform's: the job rules are
 :mod:`kontra.escrow` (shared with the real gate), money is a
@@ -139,6 +140,7 @@ from kontra.ledger import (
     UnknownHold,
 )
 from kontra.testing.ledger import InMemoryLedger
+from kontra.workers import offline, workers_view
 
 __all__ = [
     "AUD_API",
@@ -1697,16 +1699,7 @@ class FakeGate:
     def resolve_path(self, party: str, name: str, version: str) -> _Offering:
         """The catalog path ``/{party}/{name}/{version}``, each segment validated on its own
         and the reference built from the parts (never joined and re-parsed)."""
-        nums: list[int | None] = []
-        ok = is_handle(party) and is_handle(name) and len(version) <= _PATH_VERSION_MAX
-        if ok and version != "latest":
-            pieces = version.split(".")
-            ok = 1 <= len(pieces) <= 3 and all(_is_number(p) for p in pieces)
-            nums = [int(p) for p in pieces] if ok else []
-        if not ok:
-            raise GateHTTPError(404, "offering_not_found", "no such offering")
-        nums += [None] * (3 - len(nums))
-        found = self.resolve_ref(OfferingRef(party, name, nums[0], nums[1], nums[2]))
+        found = self.resolve_ref(_path_ref(party, name, version))
         if found is None:
             raise GateHTTPError(404, "offering_not_found", "no such offering")
         return found
@@ -1757,6 +1750,40 @@ class FakeGate:
             else None
         )
         return m.CatalogList(items=items, next_cursor=nxt)
+
+    # ------------------------------------------------------------------ workers
+
+    async def workers(self, who: Principal, party: str, name: str, version: str) -> m.WorkersView:
+        """The Workers view of one of the caller's own versions (kontra-cloud#6). The path
+        resolves as the catalog's does, among every version the caller published -- a
+        retired one too, whose workers may still be finishing its jobs -- and another
+        party's version is 404 like a missing one. Temporal is asked in the caller's
+        namespace through the control plane; with none, every seller is offline and Temporal
+        reports nothing (:func:`kontra.workers.offline`)."""
+        ref = _path_ref(party, name, version)
+        mine = [
+            o
+            for o in self.offerings.values()
+            if o.id.party == who.party == ref.party
+            and o.id.name == ref.name
+            and ref.matches(o.id.version)
+        ]
+        if not mine:
+            raise GateHTTPError(404, "offering_not_found", "no such offering")
+        row = max(mine, key=lambda o: o.id.version)
+        task_queue = row.id.task_queue
+        if self.control is None:
+            return workers_view(row.key, task_queue, offline())
+        try:
+            described = await self.control.describe_task_queue(
+                self._party(who.party).namespace, task_queue
+            )
+        except TemporalError:
+            log.exception("describing task queue %s failed", task_queue)
+            raise GateHTTPError(
+                503, "temporal_unavailable", "could not ask Temporal yet; try again shortly"
+            ) from None
+        return workers_view(row.key, task_queue, described)
 
     # ------------------------------------------------------------------ quotes
 
@@ -2943,6 +2970,22 @@ def _is_number(text: str) -> bool:
     return text.isascii() and text.isdigit() and len(text) <= 9 and (text == "0" or text[0] != "0")
 
 
+def _path_ref(party: str, name: str, version: str) -> OfferingRef:
+    """The reference a catalog-shaped path names (``{party}/{name}/{version}``, the version
+    ``latest`` or one to three numbers), each segment validated on its own and the reference
+    built from the parts, never joined and re-parsed; 404 for a path no offering can have."""
+    nums: list[int | None] = []
+    ok = is_handle(party) and is_handle(name) and len(version) <= _PATH_VERSION_MAX
+    if ok and version != "latest":
+        pieces = version.split(".")
+        ok = 1 <= len(pieces) <= 3 and all(_is_number(p) for p in pieces)
+        nums = [int(p) for p in pieces] if ok else []
+    if not ok:
+        raise GateHTTPError(404, "offering_not_found", "no such offering")
+    nums += [None] * (3 - len(nums))
+    return OfferingRef(party, name, nums[0], nums[1], nums[2])
+
+
 def _decode_wire_payload(wire: m.WirePayload) -> Payload:
     """The ``Payload`` a :class:`~kontra.gate_client.models.WirePayload` carries. Relayed,
     never interpreted: only what is not a payload at all, or too big, is refused."""
@@ -3213,11 +3256,15 @@ def _build_app(gate: FakeGate) -> FastAPI:
     async def by_endpoint(endpoint: str) -> m.CatalogEntry:
         return gate.by_endpoint(endpoint)
 
+    async def workers(who: PartyOrWorker, party: str, name: str, version: str) -> m.WorkersView:
+        return await gate.workers(who, party, name, version)
+
     add("publish", publish)
     add("search", search)
     add("get_offering", get_offering)
     add("card", card)
     add("by_endpoint", by_endpoint)
+    add("workers", workers)
 
     # ---------------------------------------------------------------- quotes & jobs
 

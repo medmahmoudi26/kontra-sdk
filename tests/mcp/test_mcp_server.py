@@ -55,7 +55,8 @@ from kontra.testing.ledger_contract import assert_invariants
 pytestmark = [pytest.mark.temporal, pytest.mark.asyncio(loop_scope="module")]
 
 _T = TypeVar("_T")
-TOOLS = {"search", "describe", "quote", "hire", "status", "result", "accept", "reject"}
+#: PRD §7.3's eight, and a seller's ``workers`` (kontra-cloud#6, decisions I21).
+TOOLS = {"search", "describe", "quote", "hire", "status", "result", "accept", "reject", "workers"}
 START = 10_000  # every buyer starts with 100.00 USD
 TEXT = "word " * 20  # 100 characters: 1.00 USD, a 0.05 fee
 EXAMPLE = {"text": "the quick brown fox jumps over the lazy dog the end"}
@@ -158,7 +159,7 @@ async def until(
 # --------------------------------------------------------------------------- the tools
 
 
-async def test_exactly_the_eight_tools_described_for_an_llm(world: World) -> None:
+async def test_exactly_the_tools_described_for_an_llm(world: World) -> None:
     buyer = await world.buyer()
     app = server(world.kontra(buyer))
     assert app.instructions is not None
@@ -185,10 +186,27 @@ async def test_exactly_the_eight_tools_described_for_an_llm(world: World) -> Non
         hints = listed[name].annotations
         assert hints is not None
         assert (hints.read_only_hint, hints.destructive_hint) == (False, True)
-    for name in ("search", "describe", "quote", "status"):
+    for name in ("search", "describe", "quote", "status", "workers"):
         hints = listed[name].annotations
         assert hints is not None
         assert hints.read_only_hint is True
+
+
+async def test_a_seller_reads_its_own_workers_and_nobody_else_does(world: World) -> None:
+    """``workers`` is the gate's Workers view of the caller's own version (kontra-cloud#6):
+    acme's worker polls ``acme/words``; to a buyer that version is not found."""
+    async with connect(world.kontra(world.seller)) as client:
+        answer = await until(
+            lambda: ok(client, "workers", offering=world.key),
+            lambda a: all(info["pollers"] for info in a["types_info"].values()),
+        )
+    view = m.WorkersView.model_validate(answer)
+    assert (view.offering, view.task_queue, view.stale) == (world.key, world.key, False)
+    assert view.verdict.endswith(", 1 poller"), view.verdict
+    buyer = await world.buyer()
+    async with connect(world.kontra(buyer)) as client:
+        error = await refused(client, "workers", offering=world.key)
+    assert error["code"] == "offering_not_found"
 
 
 async def test_search_quote_hire_result_accept_completes_and_moves_money(world: World) -> None:

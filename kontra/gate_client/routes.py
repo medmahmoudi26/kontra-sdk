@@ -115,6 +115,16 @@ ROUTES: tuple[Route, ...] = (
     ),
     Route("card", "GET", f"{P}/catalog/{{party}}/{{name}}/{{version}}/card", "none", None, None),
     Route("by_endpoint", "GET", f"{P}/endpoints/{{endpoint}}", "none", None, m.CatalogEntry),
+    # The seller's own versions only (another party's is 404): Temporal's DescribeTaskQueue
+    # on the version's task queue, and what it means (kontra.workers).
+    Route(
+        "workers",
+        "GET",
+        f"{P}/offerings/{{party}}/{{name}}/versions/{{version}}/workers",
+        "party|worker",
+        None,
+        m.WorkersView,
+    ),
     # quotes & jobs
     Route("quote", "POST", f"{P}/quotes", "party", m.QuoteRequest, m.QuoteView),
     Route("hire", "POST", f"{P}/jobs", "party", m.HireRequest, m.HireView),

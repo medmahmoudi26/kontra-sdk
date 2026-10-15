@@ -1,0 +1,30 @@
+# What the Prometheus of `kontra dev up --observability` scrapes (compose.yaml).
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  # Kontra's Temporal server. `kontra dev up --observability` turns its metrics listener on
+  # (KONTRA_TEMPORAL_METRICS_ADDR=0.0.0.0:8000); Prometheus reaches it on `temporal-db`.
+  - job_name: temporal
+    static_configs:
+      - targets: ["temporal:8000"]
+
+  # Every `kontra serve --metrics` on this machine, on ports 9464 to 9473, at
+  # host.docker.internal: Docker Desktop's name for this machine. On a Linux host it is the
+  # host's Docker gateway, where a worker on 127.0.0.1 does not listen and a host firewall
+  # may drop the connection: there prometheus-agent scrapes 127.0.0.1 and writes the samples
+  # here (compose.yaml). A port no worker serves is a target that is down.
+  - job_name: kontra-serve
+    static_configs:
+      - targets:
+          - host.docker.internal:9464
+          - host.docker.internal:9465
+          - host.docker.internal:9466
+          - host.docker.internal:9467
+          - host.docker.internal:9468
+          - host.docker.internal:9469
+          - host.docker.internal:9470
+          - host.docker.internal:9471
+          - host.docker.internal:9472
+          - host.docker.internal:9473

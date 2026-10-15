@@ -51,7 +51,9 @@ def _docker_compose() -> bool:
 needs_compose = pytest.mark.skipif(not _docker_compose(), reason="needs docker compose")
 
 
-def _config(tmp_path: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _config(
+    tmp_path: Path, env: dict[str, str], profiles: tuple[str, ...] = ()
+) -> subprocess.CompletedProcess[str]:
     env_file = tmp_path / "test.env"
     env_file.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
     # Nothing from the developer's shell may override the file under test.
@@ -59,7 +61,9 @@ def _config(tmp_path: Path, env: dict[str, str]) -> subprocess.CompletedProcess[
     return subprocess.run(
         [
             *("docker", "compose", "-p", "kontra-config-test", "-f", str(COMPOSE)),
-            *("--env-file", str(env_file), "config", "--format", "json"),
+            *("--env-file", str(env_file)),
+            *(arg for profile in profiles for arg in ("--profile", profile)),
+            *("config", "--format", "json"),
         ],
         capture_output=True,
         text=True,
@@ -71,6 +75,13 @@ def _config(tmp_path: Path, env: dict[str, str]) -> subprocess.CompletedProcess[
 
 def _resolved(tmp_path: Path, **extra: str) -> dict[str, Any]:
     proc = _config(tmp_path, {**REQUIRED, **extra})
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _with_profiles(tmp_path: Path, **extra: str) -> dict[str, Any]:
+    """The configuration with both profiles enabled (`kontra dev up --ui --observability`)."""
+    proc = _config(tmp_path, {**REQUIRED, **extra}, dev_module.PROFILES)
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)
 
@@ -636,7 +647,15 @@ def test_third_party_images_are_pinned_by_digest() -> None:
 
     raw = yaml.safe_load(COMPOSE.read_text())
     pinned = re.compile(r"[a-z0-9./-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}")
-    for name in ("postgres", "postgres-relay", "s3"):
+    for name in (
+        "postgres",
+        "postgres-relay",
+        "s3",
+        "ui",
+        "prometheus",
+        "prometheus-agent",
+        "grafana",
+    ):
         image = raw["services"][name]["image"]
         assert pinned.fullmatch(image), f"{name}: {image}"
     for name in ("temporal", "migrate", "gate"):
@@ -657,10 +676,195 @@ def test_compose_lists_every_host_port_it_reads() -> None:
     listed = raw.pop("x-kontra-dev-settings")
     read = set(re.findall(r"\$\{(KONTRA_DEV_[A-Z0-9_]+)", json.dumps(raw)))
     ports = {name for name in read if name.endswith("_PORT")}
-    assert len(ports) == 4
+    assert len(ports) == 8  # the stack's four, the UI, its codec server, Prometheus, Grafana
     assert read - ports == {"KONTRA_DEV_BIND", "KONTRA_DEV_PG_BIND"}
     assert set(listed) == ports
     assert all(value == f"${{{name}:-}}" for name, value in listed.items())
+
+
+_PROFILED = {"ui", "prometheus", "prometheus-agent", "grafana"}
+
+
+@needs_compose
+def test_the_profiles_add_four_services_on_loopback_and_nothing_by_default(
+    tmp_path: Path,
+) -> None:
+    """`kontra dev up` is today's stack: the profiles' services are absent and Temporal
+    serves no metrics. `--ui --observability` adds exactly four services, three published on
+    the host's loopback whatever KONTRA_DEV_BIND says (the UI controls every namespace, and
+    none of the three has an authentication of its own worth the name) and Prometheus's
+    agent, which publishes nothing."""
+    default = _resolved(tmp_path, KONTRA_DEV_BIND="0.0.0.0")
+    assert not _PROFILED & set(default["services"])
+    assert default["services"]["temporal"]["environment"]["KONTRA_METRICS_ADDR"] == ""
+    full = _with_profiles(tmp_path, KONTRA_DEV_BIND="0.0.0.0")
+    services = full["services"]
+    assert set(services) - set(default["services"]) == _PROFILED
+    assert {name: services[name]["profiles"] for name in _PROFILED} == {
+        "ui": ["ui"],
+        "prometheus": ["observability"],
+        "prometheus-agent": ["observability"],
+        "grafana": ["observability"],
+    }
+    published = {
+        name: [
+            (p["host_ip"], str(p["published"]), int(p["target"]))
+            for p in services[name].get("ports", [])
+        ]
+        for name in _PROFILED
+    }
+    assert published == {
+        "ui": [("127.0.0.1", "8233", 8080)],
+        "prometheus": [("127.0.0.1", "9090", 9090)],
+        "prometheus-agent": [],
+        "grafana": [("127.0.0.1", "3000", 3000)],
+    }
+    moved = _with_profiles(
+        tmp_path,
+        KONTRA_DEV_UI_PORT="18233",
+        KONTRA_DEV_CODEC_PORT="18081",
+        KONTRA_DEV_PROMETHEUS_PORT="19090",
+        KONTRA_DEV_GRAFANA_PORT="13000",
+        KONTRA_TEMPORAL_METRICS_ADDR="0.0.0.0:8000",
+    )["services"]
+    assert [p["published"] for n in ("ui", "prometheus", "grafana") for p in moved[n]["ports"]] == [
+        "18233", "19090", "13000",
+    ]  # fmt: skip
+    ui = moved["ui"]["environment"]
+    # The browser calls the codec server; the UI names it on loopback, for its own origins.
+    assert ui["TEMPORAL_CODEC_ENDPOINT"] == "http://127.0.0.1:18081"
+    assert ui["TEMPORAL_CORS_ORIGINS"] == "http://localhost:18233,http://127.0.0.1:18233"
+    assert dev_module._codec_ports({"services": moved}) == (18081, 18233)
+    assert moved["temporal"]["environment"]["KONTRA_METRICS_ADDR"] == "0.0.0.0:8000"
+
+
+@needs_compose
+def test_the_profiles_keep_the_stack_s_walls(tmp_path: Path) -> None:
+    """The profiles' services run as every other does (no capability, no privilege, a
+    read-only root, not root), and keep its networks: the UI sits on `control` because it
+    needs the internal frontend (that is its point, and why it never runs in production);
+    Prometheus reaches Temporal's metrics on `temporal-db`, where nothing may route or forge
+    its way to the internal frontend's bind; Grafana's one peer is Prometheus. Prometheus's
+    agent alone is in the host's network namespace, the one way to a worker on the host's
+    loopback, and holds nothing but its tmpfs (its configuration comes in its environment).
+    The only host paths are the read-only `configs` of observability/ and docs/dashboards/."""
+    config = _with_profiles(tmp_path)
+    services = config["services"]
+    for name in _PROFILED:
+        svc = services[name]
+        assert svc.get("cap_drop") == ["ALL"], name
+        assert not svc.get("cap_add"), name
+        assert svc.get("security_opt") == ["no-new-privileges:true"], name
+        assert svc.get("read_only") is True, name
+        assert not svc.get("privileged"), name
+        for key in ("pid", "ipc", "uts", "userns_mode", "cgroup", "devices"):
+            assert not svc.get(key), f"{name} sets {key}"
+        assert svc.get("network_mode") == ("host" if name == "prometheus-agent" else None), name
+        assert all(v["type"] == "volume" for v in svc.get("volumes", [])), name
+        assert all(entry.split(":", 1)[1].startswith("size=") for entry in svc.get("tmpfs", []))
+        env = svc.get("environment") or {}
+        assert {var: env.get(var) for var in _PROXY_VARS} == dict.fromkeys(_PROXY_VARS, ""), name
+    assert services["prometheus"]["user"] == "65534:65534"
+    assert services["prometheus-agent"]["user"] == "65534:65534"
+    assert services["grafana"]["user"] == "472"
+    agent = services["prometheus-agent"]
+    assert "--agent" in agent["command"]  # scrapes and forwards: no database, no queries
+    assert "--web.listen-address=127.0.0.1:0" in agent["command"]
+    assert not agent.get("volumes")
+    assert not agent.get("ports")
+    assert agent["tmpfs"] == ["/prometheus:size=64m,uid=65534", "/tmp:size=1m,uid=65534"]
+    assert not agent.get("configs")
+    networks = {name: set(svc.get("networks", ())) for name, svc in services.items()}
+    assert {n: networks[n] for n in _PROFILED} == {
+        "ui": {"control"},
+        "prometheus": {"temporal-db", "observability"},
+        "prometheus-agent": set(),  # network_mode: host
+        "grafana": {"observability"},
+    }
+    assert {n for n, nets in networks.items() if "control" in nets} == {"temporal", "gate", "ui"}
+    # The control network's dynamic range (.8/29) holds every member but Temporal.
+    assert len([n for n, nets in networks.items() if "control" in nets]) - 1 <= 7
+    assert services["ui"]["environment"]["TEMPORAL_ADDRESS"] == "temporal:7236"
+    peers = {n for n, nets in networks.items() if n != "temporal" and nets & {"temporal-db"}}
+    assert peers == {"postgres-relay", "prometheus"}
+    for name in peers:
+        svc = services[name]
+        assert (svc.get("cap_drop"), svc.get("cap_add")) == (["ALL"], None), name
+        assert svc.get("user") not in (None, "", "root", "0", "0:0"), name
+    assert {n for n, nets in networks.items() if nets & networks["grafana"]} == {
+        "grafana",
+        "prometheus",
+    }
+    assert services["prometheus"].get("sysctls") == {"net.ipv4.ip_forward": "0"}
+    grafana = services["grafana"]["environment"]
+    assert grafana["GF_AUTH_ANONYMOUS_ORG_ROLE"] == "Viewer"
+    assert (grafana["GF_AUTH_DISABLE_LOGIN_FORM"], grafana["GF_AUTH_BASIC_ENABLED"]) == (
+        "true",
+        "false",
+    )
+    mounted = {
+        name: {(c["source"], c["target"]) for c in svc.get("configs", [])}
+        for name, svc in services.items()
+        if svc.get("configs")
+    }
+    assert set(mounted) == {"prometheus", "grafana"}
+    for source in config["configs"].values():
+        path = Path(source["file"]).resolve()
+        assert path.is_file(), path
+        assert path.is_relative_to(REPO / "observability") or path.is_relative_to(
+            REPO / "docs" / "dashboards"
+        ), path
+
+
+def test_prometheus_scrapes_what_the_cli_turns_on() -> None:
+    """Temporal's listener is where `kontra dev up --observability` puts it, the serve
+    ports are the documented range, and Grafana's files are where its provider looks
+    (the agent's half is test_the_agent_scrapes_the_host_s_loopback_into_prometheus)."""
+    import yaml
+
+    scrape = yaml.safe_load((REPO / "observability" / "prometheus.yml").read_text())
+    jobs = {j["job_name"]: j["static_configs"][0]["targets"] for j in scrape["scrape_configs"]}
+    port = dev_module._METRICS_ADDR.rsplit(":", 1)[1]
+    assert jobs["temporal"] == [f"temporal:{port}"]
+    assert jobs["kontra-serve"] == [f"host.docker.internal:{p}" for p in range(9464, 9474)]
+    raw = yaml.safe_load(COMPOSE.read_text())
+    assert raw["services"]["prometheus"]["extra_hosts"] == ["host.docker.internal:host-gateway"]
+    providers = yaml.safe_load((REPO / "observability" / "grafana" / "dashboards.yaml").read_text())
+    [provider] = providers["providers"]
+    targets = [c["target"] for c in raw["services"]["grafana"]["configs"]]
+    boards = [t for t in targets if t.endswith(".json")]
+    assert {str(Path(t).parent) for t in boards} == {provider["options"]["path"]}
+    boards_dir = REPO / "docs" / "dashboards"
+    assert {Path(t).name for t in boards} == {b.name for b in boards_dir.glob("*.json")}
+    for board in boards_dir.glob("*.json"):
+        assert json.loads(board.read_text())["title"]  # vendored as published: valid JSON
+    sources = yaml.safe_load((REPO / "observability" / "grafana" / "datasources.yaml").read_text())
+    [source] = sources["datasources"]
+    assert (source["url"], source["isDefault"]) == ("http://prometheus:9090", True)
+
+
+@needs_compose
+def test_the_agent_scrapes_the_host_s_loopback_into_prometheus(tmp_path: Path) -> None:
+    """Prometheus's agent scrapes the documented serve ports on 127.0.0.1 (where `kontra serve
+    --metrics 127.0.0.1:PORT` listens) and writes to Prometheus's published port, wherever
+    KONTRA_DEV_PROMETHEUS_PORT moves it; Prometheus takes those writes."""
+    import yaml
+
+    for port in ("9090", "19090"):
+        extra = {} if port == "9090" else {"KONTRA_DEV_PROMETHEUS_PORT": port}
+        config = _with_profiles(tmp_path, **extra)
+        service = config["services"]["prometheus-agent"]
+        # What its entrypoint writes to the file its command names (JSON, which is YAML).
+        agent = yaml.safe_load(service["environment"]["KONTRA_AGENT_CONFIG"])
+        assert "--config.file=/tmp/agent.yml" in service["command"]
+        assert '> /tmp/agent.yml && exec /bin/prometheus "$$@"' in service["entrypoint"][2]
+        [job] = agent["scrape_configs"]
+        assert job["job_name"] == "kontra-serve"
+        assert job["static_configs"][0]["targets"] == [f"127.0.0.1:{p}" for p in range(9464, 9474)]
+        assert agent["remote_write"] == [{"url": f"http://127.0.0.1:{port}/api/v1/write"}]
+        [published] = config["services"]["prometheus"]["ports"]
+        assert (published["host_ip"], str(published["published"])) == ("127.0.0.1", port)
+        assert "--web.enable-remote-write-receiver" in config["services"]["prometheus"]["command"]
 
 
 @needs_compose
@@ -759,23 +963,32 @@ def _healthy_at_once(url: str, timeout: float) -> None:
 
 
 def _after_options(cmd: list[str]) -> list[str]:
-    """``docker compose -p P -f F --env-file E... <verb> <args>`` -> ``[<verb>, <args>]``."""
+    """``docker compose -p P -f F --env-file E... --profile X... <verb> <args>`` ->
+    ``[<verb>, <args>]``."""
     rest = cmd[cmd.index("compose") + 1 :]
-    while rest[0] in ("-p", "-f", "--env-file"):
+    while rest[0] in ("-p", "-f", "--env-file", "--profile"):
         rest = rest[2:]
     return rest
 
 
+def _profiles(cmd: list[str]) -> list[str]:
+    """The ``--profile`` values of a ``docker compose`` command line."""
+    return [cmd[i + 1] for i, word in enumerate(cmd) if word == "--profile"]
+
+
 class Recorder:
-    """Stands in for ``docker compose``: records each call, answers ``config``/``ps``."""
+    """Stands in for ``docker compose``: records each call (and the environment it was
+    given, None for ours), answers ``config``/``ps``."""
 
     def __init__(self, config: dict[str, Any] | None = None, ps: str = "") -> None:
         self.calls: list[list[str]] = []
+        self.envs: list[dict[str, str] | None] = []
         self.config = config or {}
         self.ps = ps
 
     def __call__(self, cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         self.calls.append(cmd)
+        self.envs.append(kwargs.get("env"))
         verb = _after_options(cmd)[0]
         out = {"config": json.dumps(self.config), "ps": self.ps}.get(verb, "")
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
@@ -795,11 +1008,14 @@ def test_dev_down_and_logs_run_the_packaged_compose(
     assert result.exit_code == 0, result.output
     head = ["/usr/bin/docker", "compose", "-p", PROJECT, "-f", str(COMPOSE)]
     env_files = ["--env-file", str(tmp_path / "home" / DEV_ENV_FILE), "--env-file", str(extra)]
-    assert rec.calls == [[*head, *env_files, "down", "--remove-orphans", "--volumes"]]
+    # Every profile: compose leaves running the containers of a profile not enabled.
+    profiles = ["--profile", "ui", "--profile", "observability"]
+    assert rec.calls == [[*head, *env_files, *profiles, "down", "--remove-orphans", "--volumes"]]
 
     rec.calls.clear()
-    assert cli("dev", "logs", "--tail", "50", "gate").exit_code == 0
-    assert rec.calls[0][-5:] == ["logs", "--tail", "50", "--", "gate"]
+    assert cli("dev", "logs", "--tail", "50", "ui").exit_code == 0
+    assert rec.calls[0][-5:] == ["logs", "--tail", "50", "--", "ui"]
+    assert _profiles(rec.calls[0]) == ["ui", "observability"]  # `logs ui` finds the service
     assert cli("dev", "logs", "--tail", "50; rm -rf /").exit_code == 1
     assert cli("dev", "logs", "--tail", "\uff15\uff10").exit_code == 1  # fullwidth digits
 
@@ -807,8 +1023,8 @@ def test_dev_down_and_logs_run_the_packaged_compose(
     later = tmp_path / "later.env"
     later.write_text("KONTRA_DEV_GATE_PORT=8402\n")
     assert cli("dev", "--env-file", str(extra), "down", "--env-file", str(later)).exit_code == 0
-    assert rec.calls[0][-6:] == [
-        "--env-file", str(extra), "--env-file", str(later), "down", "--remove-orphans",
+    assert rec.calls[0][-10:] == [
+        "--env-file", str(extra), "--env-file", str(later), *profiles, "down", "--remove-orphans",
     ]  # fmt: skip
 
 
@@ -1144,3 +1360,145 @@ def test_dev_up_keeps_the_rest_of_dev_env_as_written(
     text = path.read_text(encoding="utf-8")
     assert odd in text
     assert text.endswith("KONTRA_DEV_GATE_PORT=8459\n")
+
+
+def _profiled_world(monkeypatch: pytest.MonkeyPatch) -> tuple[Recorder, list[str]]:
+    """`_up_world` whose compose file has the two profiles, with the codec server stood in
+    for: what `up` asks of compose, and ``start``/``stop`` of the codec server, in order."""
+    rec, _ = _up_world(
+        monkeypatch,
+        {"KONTRA_PUBLIC_URL": "http://localhost:8402", "KONTRA_DEV": "1"},
+    )
+
+    def ports(port: int) -> list[dict[str, Any]]:
+        return [{"host_ip": "127.0.0.1", "published": str(port)}]
+
+    rec.config["services"] |= {
+        "ui": {"profiles": ["ui"], "ports": ports(8233)},
+        "prometheus": {"profiles": ["observability"], "ports": ports(9090)},
+        "grafana": {"profiles": ["observability"], "ports": ports(3000)},
+    }
+    codec: list[str] = []
+
+    def start(home: Path, config: dict[str, Any]) -> str:
+        codec.append("start")
+        return "http://127.0.0.1:8081"
+
+    def stop(home: Path) -> bool:
+        codec.append("stop")
+        return True
+
+    monkeypatch.setattr(dev_module, "_start_codec", start)
+    monkeypatch.setattr(dev_module, "_stop_codec", stop)
+    monkeypatch.delenv("KONTRA_TEMPORAL_METRICS_ADDR", raising=False)
+    return rec, codec
+
+
+def test_dev_up_runs_exactly_the_profiles_it_is_asked_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec, codec = _profiled_world(monkeypatch)
+    cli = Cli(tmp_path / "home")
+
+    both = cli("dev", "up", "--ui", "--observability", "--handle", "carol")
+    assert both.exit_code == 0, both.output
+    [config, up] = rec.calls
+    assert (_after_options(config)[0], _profiles(config)) == ("config", ["ui", "observability"])
+    assert (_after_options(up)[0], _profiles(up)) == ("up", ["ui", "observability"])
+    # Temporal's metrics listener, for Prometheus to scrape, in compose's environment.
+    assert (rec.envs[1] or {})["KONTRA_TEMPORAL_METRICS_ADDR"] == "0.0.0.0:8000"
+    assert codec == ["start"]
+    for line in (
+        "ui        http://localhost:8233",
+        "prometheus http://localhost:9090",
+        "grafana   http://localhost:3000",
+        "workflows http://localhost:8233/namespaces/carol/workflows",
+        "codec server http://127.0.0.1:8081",
+    ):
+        assert line in both.stdout, line
+
+    rec.calls.clear()
+    rec.envs.clear()
+    codec.clear()
+    ui = cli("dev", "up", "--ui")
+    assert ui.exit_code == 0, ui.output
+    [_, rm, up] = rec.calls
+    assert _after_options(rm) == ["rm", "--stop", "--force", "prometheus", "grafana"]
+    assert _profiles(up) == ["ui"]
+    assert rec.envs[2] is None  # no metrics listener without Prometheus
+    assert codec == ["start"]
+    assert "grafana" not in ui.stdout
+
+    rec.calls.clear()
+    codec.clear()
+    plain = cli("dev", "up")  # today's stack: what the flags started stops
+    assert plain.exit_code == 0, plain.output
+    [_, rm, up] = rec.calls
+    assert _after_options(rm) == ["rm", "--stop", "--force", "ui", "prometheus", "grafana"]
+    assert (_after_options(up), _profiles(up)) == (["up", "--detach", "--remove-orphans"], [])
+    assert codec == ["stop"]
+    assert "codec" not in plain.stdout
+
+    # A metrics address the environment already names is left as it is.
+    rec.calls.clear()
+    rec.envs.clear()
+    monkeypatch.setenv("KONTRA_TEMPORAL_METRICS_ADDR", "0.0.0.0:8000")
+    assert cli("dev", "up", "--observability").exit_code == 0
+    assert rec.envs[-1] is None
+
+
+def test_dev_status_reports_the_codec_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / dev_module.CODEC_STATE).write_text(json.dumps({"pid": 1, "port": 1, "token": "t"}))
+    config = {"services": {"gate": {"environment": {"KONTRA_PUBLIC_URL": "http://127.0.0.1:9"}}}}
+    rec = Recorder(config, "")
+    monkeypatch.setattr(dev_module.subprocess, "run", rec)
+    monkeypatch.setattr(dev_module.shutil, "which", _docker_at)
+    out = json.loads(Cli(home)("dev", "status", "--json").stdout)
+    assert out["codec"] == {"url": "http://127.0.0.1:1", "running": False}
+    assert _profiles(rec.calls[0]) == ["ui", "observability"]  # every profile's containers
+    assert "codec server http://127.0.0.1:1: not answering" in Cli(home)("dev", "status").stdout
+
+
+def test_dev_up_decodes_with_a_dev_profile_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The codec server decrypts with the home's key for whoever reaches its port, so `up
+    --ui` starts it for a dev profile only. `--no-login` skips the check that keeps a real
+    login out of `up`, and a gate that is not a dev gate logs no one in: neither may turn a
+    real login's key into a decryption service on loopback."""
+    from datetime import UTC, datetime
+
+    from kontra.profile import Profile
+
+    rec, codec = _profiled_world(monkeypatch)
+    real = tmp_path / "real"
+    Profile(
+        gate_url="https://gate.example",
+        temporal_address="temporal.example:7233",
+        party="alice",
+        namespace="alice",
+        refresh_token="secret-refresh",
+        auth_time=datetime.now(UTC),
+    ).save(real)
+    for args in (("--no-login",), ("--replace-profile",)):
+        if args == ("--replace-profile",):
+            rec.config["services"]["gate"]["environment"]["KONTRA_DEV"] = "0"
+        result = Cli(real)("dev", "up", "--ui", *args)
+        assert result.exit_code == 0, result.output
+        assert codec == [], args
+        assert "codec server not started" in result.stderr, args
+        assert "alice" in result.stderr, args
+    assert Profile.load(real).refresh_token == "secret-refresh"
+    fresh = Cli(tmp_path / "fresh")("dev", "up", "--ui", "--no-login")
+    assert (codec, "no profile" in fresh.stderr) == ([], True)
+    rec.config["services"]["gate"]["environment"]["KONTRA_DEV"] = "1"
+    ours = Cli(tmp_path / "dev")("dev", "up", "--ui", "--handle", "carol")
+    assert ours.exit_code == 0, ours.output
+    assert codec == ["start"]
+    again = Cli(tmp_path / "dev")("dev", "up", "--ui", "--no-login")  # the dev profile stays
+    assert again.exit_code == 0, again.output
+    assert codec == ["start", "start"]

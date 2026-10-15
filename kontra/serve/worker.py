@@ -24,6 +24,11 @@ fetch the gate's JWKS, then the **hash lock** (§11.2): each offering's contract
 equal the catalog's, or the worker refuses to start ("republish or bump the version"). An
 unpublished version is refused too -- except on a ``kontra dev`` profile, where the worker
 publishes it (the gate creates the Nexus endpoint; the worker never needs its name).
+
+The connection takes two of ``Client.connect``'s own keywords, ``runtime`` and
+``interceptors``, as ``kontra serve --metrics`` and ``--otlp`` pass them
+(:mod:`kontra.serve.telemetry`): the runtime whose telemetry serves the SDK's metrics, and
+client interceptors, which temporalio also puts on every worker of that client.
 """
 
 from __future__ import annotations
@@ -40,6 +45,8 @@ from collections.abc import Generator, Sequence
 from pathlib import Path
 from typing import Any, Unpack
 
+import temporalio.client
+import temporalio.runtime
 import temporalio.worker
 from temporalio.client import Client, HeaderCodecBehavior
 from temporalio.converter import DataConverter
@@ -296,6 +303,8 @@ class Worker:
         client: Client | None = None,
         gate: GateClient | None = None,
         home: str | Path | None = None,
+        runtime: temporalio.runtime.Runtime | None = None,
+        interceptors: Sequence[temporalio.client.Interceptor] = (),
     ) -> None:
         """Connect, verify and build the inner workers, without polling yet.
 
@@ -304,12 +313,30 @@ class Worker:
         login, it only cannot publish). ``client``: a Temporal client to share the connection
         of (its namespace must be the profile's; the codec is added here). ``gate``: the gate
         client (default: the session's). The last three exist for tests.
+
+        ``runtime`` and ``interceptors``: ``Client.connect``'s, for the connection this
+        worker makes. They are how ``kontra serve --metrics`` / ``--otlp`` reach it, not a
+        setting of ``worker.py`` (``Worker()`` takes neither). A ``client`` given has its
+        own, so passing them with one is a ``TypeError``.
         """
         if self._stack is not None:
             raise RuntimeError("this Worker is already started")
+        if client is not None and (runtime is not None or interceptors):
+            raise TypeError(
+                "runtime and interceptors are for the connection the worker makes; a client "
+                "passed in has its own (Client.connect(runtime=..., interceptors=...))"
+            )
         stack = contextlib.AsyncExitStack()
         try:
-            await self._prepare(stack, session=session, client=client, gate=gate, home=home)
+            await self._prepare(
+                stack,
+                session=session,
+                client=client,
+                gate=gate,
+                home=home,
+                runtime=runtime,
+                interceptors=interceptors,
+            )
         except BaseException:
             await stack.aclose()
             self._inner, self._services, self._client = (), (), None
@@ -325,6 +352,8 @@ class Worker:
         client: Client | None,
         gate: GateClient | None,
         home: str | Path | None,
+        runtime: temporalio.runtime.Runtime | None,
+        interceptors: Sequence[temporalio.client.Interceptor],
     ) -> None:
         if session is None:
             session = Session.from_env(home)  # KONTRA_API_KEY, else the profile
@@ -350,7 +379,7 @@ class Worker:
 
         jobs = JobDirectory(gate)
         stack.push_async_callback(jobs.aclose)
-        runtime = _runtime.Runtime(
+        kontra_runtime = _runtime.Runtime(
             party=profile.party,
             gate=gate,
             identity=identity,
@@ -366,8 +395,8 @@ class Worker:
             jobs=jobs,
         )
         previous = _current_runtime()
-        _runtime.install(runtime)
-        stack.callback(_restore_runtime, runtime, previous)
+        _runtime.install(kontra_runtime)
+        stack.callback(_restore_runtime, kontra_runtime, previous)
 
         # Plaintext replies only for the services generated here, by their exact names.
         # Results and the seller's own copies go to the WHOLE fleet set, not just this
@@ -391,6 +420,8 @@ class Worker:
                 "worker",
                 data_converter=converter,
                 header_codec_behavior=HeaderCodecBehavior.NO_CODEC,
+                runtime=runtime,
+                interceptors=list(interceptors),
             )
             # The token refresher dies with the worker, not with a session it may share.
             stack.push_async_callback(session.release, client)
@@ -564,6 +595,8 @@ class Worker:
         client: Client | None = None,
         gate: GateClient | None = None,
         home: str | Path | None = None,
+        runtime: temporalio.runtime.Runtime | None = None,
+        interceptors: Sequence[temporalio.client.Interceptor] = (),
         handle_signals: bool = True,
     ) -> None:
         """Start (see :meth:`prepare`) and serve until :meth:`shutdown`, SIGINT or SIGTERM
@@ -579,7 +612,14 @@ class Worker:
         self._loop = asyncio.get_running_loop()
         _quiet_url_logs()
         try:
-            await self.prepare(session=session, client=client, gate=gate, home=home)
+            await self.prepare(
+                session=session,
+                client=client,
+                gate=gate,
+                home=home,
+                runtime=runtime,
+                interceptors=interceptors,
+            )
             with self._signals(handle_signals):
                 try:
                     await self._serve()
