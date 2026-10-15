@@ -1409,3 +1409,44 @@ def test_dev_status_reports_the_codec_server(
     assert out["codec"] == {"url": "http://127.0.0.1:1", "running": False}
     assert _profiles(rec.calls[0]) == ["ui", "observability"]  # every profile's containers
     assert "codec server http://127.0.0.1:1: not answering" in Cli(home)("dev", "status").stdout
+
+
+def test_dev_up_decodes_with_a_dev_profile_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The codec server decrypts with the home's key for whoever reaches its port, so `up
+    --ui` starts it for a dev profile only. `--no-login` skips the check that keeps a real
+    login out of `up`, and a gate that is not a dev gate logs no one in: neither may turn a
+    real login's key into a decryption service on loopback."""
+    from datetime import UTC, datetime
+
+    from kontra.profile import Profile
+
+    rec, codec = _profiled_world(monkeypatch)
+    real = tmp_path / "real"
+    Profile(
+        gate_url="https://gate.example",
+        temporal_address="temporal.example:7233",
+        party="alice",
+        namespace="alice",
+        refresh_token="secret-refresh",
+        auth_time=datetime.now(UTC),
+    ).save(real)
+    for args in (("--no-login",), ("--replace-profile",)):
+        if args == ("--replace-profile",):
+            rec.config["services"]["gate"]["environment"]["KONTRA_DEV"] = "0"
+        result = Cli(real)("dev", "up", "--ui", *args)
+        assert result.exit_code == 0, result.output
+        assert codec == [], args
+        assert "codec server not started" in result.stderr, args
+        assert "alice" in result.stderr, args
+    assert Profile.load(real).refresh_token == "secret-refresh"
+    fresh = Cli(tmp_path / "fresh")("dev", "up", "--ui", "--no-login")
+    assert (codec, "no profile" in fresh.stderr) == ([], True)
+    rec.config["services"]["gate"]["environment"]["KONTRA_DEV"] = "1"
+    ours = Cli(tmp_path / "dev")("dev", "up", "--ui", "--handle", "carol")
+    assert ours.exit_code == 0, ours.output
+    assert codec == ["start"]
+    again = Cli(tmp_path / "dev")("dev", "up", "--ui", "--no-login")  # the dev profile stays
+    assert again.exit_code == 0, again.output
+    assert codec == ["start", "start"]

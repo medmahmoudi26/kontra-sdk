@@ -595,11 +595,19 @@ protocol (`POST /decode` and `/encode`) answered with this machine's key and the
 under `$KONTRA_HOME`. The UI is configured to call it (`TEMPORAL_CODEC_ENDPOINT`), so you read
 your own inputs, results and failures in the UI; a payload encrypted to another party, or one
 claim-checked to the bucket, is shown as stored. `kontra dev down` stops the codec server; it
-writes to `$KONTRA_HOME/codec.log`. The UI talks to Temporal's internal frontend, which has no
+writes to `$KONTRA_HOME/codec.log`. It starts only when `$KONTRA_HOME` holds a dev profile
+(the one `kontra dev up` logs in to): with a real login there (`--no-login`, or
+`--replace-profile` against a gate that is not a dev gate) the UI shows payloads as
+ciphertext, and `up` says why. The UI talks to Temporal's internal frontend, which has no
 authentication: it sees and controls every namespace of the local stack, and so does anyone
 who reaches its port, as anyone who reaches the codec server's can have your key decrypt what
 was encrypted to it. Both answer on 127.0.0.1 alone, and the codec server to no web origin but
-the UI's; run them on a machine that is yours.
+the UI's; run them on a machine that is yours. Loopback does not keep out a web page whose
+name rebinds to 127.0.0.1: such a page is same-origin with the UI, Prometheus and Grafana,
+which (as upstream) check no `Host` and ask no sign-in, so it can use the UI's actions --
+start, signal, terminate a workflow in any namespace -- and read the metrics. The codec
+server checks `Host` and refuses it, so your payloads stay sealed. `kontra dev up` alone stops
+the profiles when you are not using them.
 
 `--observability` runs Prometheus and Grafana. Prometheus scrapes Kontra's Temporal server
 (`kontra dev up --observability` turns its metrics listener on, `KONTRA_TEMPORAL_METRICS_ADDR`)

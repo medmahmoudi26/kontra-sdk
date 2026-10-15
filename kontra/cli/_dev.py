@@ -21,8 +21,8 @@ Two compose profiles (:data:`PROFILES`) add dev tools, each started by its own f
 only then: ``up`` runs exactly the profiles it is given and stops the containers of the
 others, so ``kontra dev up`` alone is the stack it always was. ``--ui`` is
 Temporal's own UI, which shows what is encrypted to this machine's key through a codec server
-``up`` starts on 127.0.0.1 (:mod:`kontra.cli._codec_server`, in the background; ``down``
-stops it). ``--observability`` is Prometheus and Grafana, with Temporal's metrics listener
+``up`` starts on 127.0.0.1 when the home holds a dev profile (:mod:`kontra.cli._codec_server`,
+in the background; ``down`` stops it). ``--observability`` is Prometheus and Grafana, with Temporal's metrics listener
 turned on for Prometheus to scrape. ``status``, ``logs`` and ``down`` see every profile.
 """
 
@@ -274,14 +274,18 @@ def _codec_http() -> httpx.Client:
     return httpx.Client(trust_env=False, timeout=5)
 
 
-def _codec_answers(port: int) -> bool:
-    """Whether a codec server answers on 127.0.0.1:``port`` (an empty decode)."""
+def _codec_running(port: int, token: str) -> bool:
+    """Whether the codec server holding ``token`` answers on 127.0.0.1:``port``. Not just
+    any codec server: one an ``up`` from another ``KONTRA_HOME`` started there would answer
+    a decode as well, with that home's key."""
     try:
         with _codec_http() as http:
-            r = http.post(f"http://127.0.0.1:{port}/decode", json={"payloads": []})
+            r = http.get(
+                f"http://127.0.0.1:{port}/ready", headers={"Authorization": f"Bearer {token}"}
+            )
     except httpx.HTTPError:
         return False
-    return r.status_code == 200
+    return r.status_code == 204
 
 
 def _codec_state(home: Path) -> dict[str, Any] | None:
@@ -363,8 +367,8 @@ def _start_codec(home: Path, config: dict[str, Any]) -> str:
     deadline = time.monotonic() + _CODEC_START_TIMEOUT
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            break
-        if _codec_answers(port):
+            break  # it did not start: the port is taken, say, by another home's server
+        if _codec_running(port, token):
             return f"http://127.0.0.1:{port}"
         time.sleep(0.2)
     (home / CODEC_STATE).unlink(missing_ok=True)
@@ -585,8 +589,30 @@ def _dev_login(
 
 
 def _up_codec(home: Path, config: dict[str, Any]) -> None:
-    """Start the UI's codec server. A failure is said and the stack stays up: the UI then
-    shows payloads as ciphertext."""
+    """Start the UI's codec server, for a dev profile only: it decrypts with this home's key
+    for whoever reaches its port, so never with a real login's (``--no-login`` and a gate
+    that is not a dev gate skip the checks that otherwise keep one out of ``up``). A refusal
+    or a failure is said and the stack stays up: the UI then shows payloads as ciphertext."""
+    from kontra.profile import Profile, ProfileError
+
+    try:
+        profile: Profile | None = Profile.load(home)
+    except ProfileError:
+        profile = None
+    if profile is None or not profile.dev:
+        held = (
+            "no profile"
+            if profile is None
+            else f"your login to {profile.gate_url} as {profile.party}"
+        )
+        click.echo(
+            f"codec server not started: {home} holds {held}, not a dev login, and the codec "
+            "server would decrypt with its key for anyone on this machine. The UI shows "
+            "payloads as ciphertext; for decoded ones, use a home of its own for dev "
+            "(KONTRA_HOME=~/.kontra-dev kontra dev up --ui).",
+            err=True,
+        )
+        return
     try:
         where = _start_codec(home, config)
     except CliError as e:
@@ -647,7 +673,7 @@ def status(ctx: click.Context, env_files: tuple[Path, ...], as_json: bool) -> No
         if codec_state is None
         else {
             "url": f"http://127.0.0.1:{codec_state['port']}",
-            "running": _codec_answers(codec_state["port"]),
+            "running": _codec_running(codec_state["port"], str(codec_state.get("token", ""))),
         }
     )
     try:

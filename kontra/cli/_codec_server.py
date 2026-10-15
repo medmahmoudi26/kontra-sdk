@@ -21,8 +21,11 @@ its CORS headers name), or whose body is not JSON (a cross-site form). It is for
 whose loopback is its user's alone.
 
 ``kontra dev`` runs it as ``python -m kontra.cli._codec_server --port P --ui-port U`` in the
-background, handing it a token on standard input; ``POST /stop`` with that token (and no
-``Origin``) ends it, which is how ``kontra dev down`` stops it.
+background, handing it a token on standard input. Two requests take that token (as
+``Authorization: Bearer``, with no ``Origin``): ``GET /ready`` answers 204, which is how
+``kontra dev`` knows the server answering on the port is the one it started and not another
+(one started from another ``KONTRA_HOME``, decrypting with that home's key); ``POST /stop``
+ends it, which is how ``kontra dev down`` stops it.
 """
 
 from __future__ import annotations
@@ -150,6 +153,25 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _from_kontra_dev(self) -> bool:
+        """The request carries the token ``kontra dev`` handed this server, and no Origin."""
+        given = self.headers.get("Authorization", "").encode()
+        expected = f"Bearer {self.server.token}".encode()
+        return self._origin() is None and hmac.compare_digest(given, expected)
+
+    def do_GET(self) -> None:
+        if not self._allowed():
+            return
+        if self.path != "/ready":
+            self._refuse(HTTPStatus.NOT_FOUND, "GET /ready")
+            return
+        if not self._from_kontra_dev():
+            self._refuse(HTTPStatus.FORBIDDEN, "not yours")
+            return
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self) -> None:
         if not self._allowed():
             return
@@ -190,9 +212,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(answer)
 
     def _stop(self) -> None:
-        given = self.headers.get("Authorization", "")
-        expected = f"Bearer {self.server.token}"
-        if self._origin() is not None or not hmac.compare_digest(given, expected):
+        if not self._from_kontra_dev():
             self._refuse(HTTPStatus.FORBIDDEN, "not yours to stop")
             return
         self.send_response(HTTPStatus.NO_CONTENT)

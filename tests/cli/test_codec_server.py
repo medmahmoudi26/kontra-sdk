@@ -1,7 +1,8 @@
 """The codec server ``kontra dev up --ui`` runs for Temporal's UI: Temporal's codec-server
 protocol (``POST /decode`` and ``/encode`` with ``{"payloads": [...]}``) with this machine's
 key, on 127.0.0.1 only, for the UI's origin only; and its life as a background process that
-``kontra dev down`` stops."""
+``kontra dev down`` stops, which ``kontra dev`` tells from another home's server on the
+same port by the token it handed it."""
 
 from __future__ import annotations
 
@@ -177,6 +178,20 @@ def test_stop_needs_the_token_and_no_origin(server: CodecServer) -> None:
     assert ok.status_code == 204
 
 
+def test_ready_answers_its_token_holder_alone(server: CodecServer) -> None:
+    def ready(*, origin: str | None = None, **headers: str | bytes) -> int:
+        sent = {**headers, **({"Origin": origin} if origin is not None else {})}
+        with httpx.Client(trust_env=False) as http:
+            return http.get(f"http://127.0.0.1:{server.port}/ready", headers=sent).status_code
+
+    assert ready(Authorization=f"Bearer {TOKEN}") == 204
+    assert ready() == 403
+    assert ready(Authorization="Bearer nope") == 403
+    assert ready(Authorization="Bearer été".encode()) == 403  # not ASCII: refused, not a 500
+    assert ready(origin=UI, Authorization=f"Bearer {TOKEN}") == 403  # never from a page
+    assert ready(Authorization=f"Bearer {TOKEN}", Host="evil.example") == 403
+
+
 # --------------------------------------------------------------------------- the process
 
 
@@ -232,11 +247,45 @@ def test_kontra_dev_starts_and_stops_it_in_the_background(
         stopped = dev_module._stop_codec(home)
     assert stopped
     assert not (home / dev_module.CODEC_STATE).exists()
-    assert not dev_module._codec_answers(port)
+    assert not dev_module._codec_running(port, state["token"])
     assert dev_module._stop_codec(home) is False  # nothing left to stop
     log = (home / dev_module.CODEC_LOG).read_text()
     assert MARKER not in log
     assert state["token"] not in log
+
+
+def _home(path: Path) -> Path:
+    path.mkdir(mode=0o700)
+    key = path / KEY_FILE
+    key.write_text(generate_identity()[0] + "\n")
+    key.chmod(0o600)
+    return path
+
+
+def test_another_home_s_server_on_the_port_is_not_taken_for_ours(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Home ``a`` runs a codec server; ``up --ui`` from home ``b``, on the same port, cannot
+    bind it. It must say so, not report ``a``'s server (``a``'s key) as its own: the probe
+    is ``a``'s token or ``b``'s, not whether a decode answers."""
+    from click.exceptions import ClickException
+
+    monkeypatch.delenv(KEY_FILE_ENV, raising=False)
+    a, b = _home(tmp_path / "a"), _home(tmp_path / "b")
+    port = _free_port()
+    config = _ui_config(port, 8233)
+    monkeypatch.setenv("KONTRA_HOME", str(a))
+    dev_module._start_codec(a, config)
+    try:
+        theirs = json.loads((a / dev_module.CODEC_STATE).read_text())["token"]
+        monkeypatch.setenv("KONTRA_HOME", str(b))
+        with pytest.raises(ClickException, match="did not start"):
+            dev_module._start_codec(b, config)
+        assert not (b / dev_module.CODEC_STATE).exists()
+        assert dev_module._stop_codec(b) is False
+        assert dev_module._codec_running(port, theirs)  # a's still serves, untouched
+    finally:
+        assert dev_module._stop_codec(a)
 
 
 def test_without_a_key_it_says_why(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
