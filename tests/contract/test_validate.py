@@ -576,6 +576,19 @@ RULES: list[tuple[str, Mutation, str, str]] = [
         "x-kontra.pricing_hint",
         "string",
     ),
+    (
+        # false is the member left out: two spellings of one fact would be two contracts
+        "uses_hosted_model false",
+        lambda d: d["x-kontra"].__setitem__("uses_hosted_model", False),
+        "x-kontra.uses_hosted_model",
+        "True was expected",
+    ),
+    (
+        "uses_hosted_model not a boolean",
+        lambda d: d["x-kontra"].__setitem__("uses_hosted_model", "yes"),
+        "x-kontra.uses_hosted_model",
+        "True was expected",
+    ),
 ]
 
 

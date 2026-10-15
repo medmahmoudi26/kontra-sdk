@@ -1,11 +1,13 @@
-"""Plain Temporal: no kontra import anywhere in here (D1), so this runs on any Temporal.
-Kontra starts it with the id `job-<job id>` when a buyer hires the offering; any Temporal
-feature works inside (child workflows, continue-as-new, signals, local activities)."""
+"""Temporal through the kontra façade (D1): `workflow` and `RetryPolicy` are Temporal's own
+objects, so with `from temporalio import ...` this runs on any Temporal. Kontra starts it
+with the id `job-<job id>` when a buyer hires the offering; any Temporal feature works
+inside (child workflows, signals, local activities), and
+`workflow.execute_activities_in_parallel` runs one activity per item without your code ever
+continuing as new."""
 
 from datetime import timedelta
 
-from temporalio import workflow
-from temporalio.common import RetryPolicy
+from kontra import RetryPolicy, workflow
 
 with workflow.unsafe.imports_passed_through():
     from activities import count_words

@@ -71,6 +71,10 @@
       "description": "How long delivered artifacts are kept after acceptance.",
       "$ref": "#/$defs/duration"
     },
+    "uses_hosted_model": {
+      "description": "The job sends the buyer's input to a hosted model provider (an LLM API), where it is plaintext to that provider. Present only when true; absent: it does not.",
+      "const": true
+    },
     "contract_hash": {
       "description": "sha256 of the RFC 8785 canonical JSON of the whole document without this member (PRD §11.2).",
       "type": "string",

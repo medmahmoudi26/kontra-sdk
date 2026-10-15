@@ -1,5 +1,7 @@
-"""Load an offering project's ``worker.py`` (the §6.5 convention): its module-level
-``worker`` is what ``kontra serve`` runs and where ``kontra publish`` finds the offerings.
+"""Load an offering project's ``worker.py`` (the §6.5 convention): the Worker its
+``serve(...)`` call built (:func:`kontra.serve._serve.capture`), or its module-level
+``worker = Worker(...)``, is what ``kontra serve`` runs and where ``kontra publish`` finds the
+offerings. Importing it starts nothing: serve() runs only under ``python worker.py``.
 
 The project directory goes first on ``sys.path`` and ``worker`` is imported by name, so its
 own ``from workflows import ...`` resolves exactly as ``python worker.py`` would, and the
@@ -63,9 +65,11 @@ def _installed(module: ModuleType) -> bool:
 
 @contextlib.contextmanager
 def load_worker(directory: str | Path) -> Generator[Any]:
-    """``worker`` from ``<directory>/worker.py``, a :class:`kontra.serve.Worker`. The
-    project's modules stay imported while the block runs (a worker serving needs them)."""
+    """The :class:`kontra.serve.Worker` of ``<directory>/worker.py``: the one its serve()
+    built, else its module-level ``worker``. The project's modules stay imported while the
+    block runs (a worker serving needs them)."""
     from kontra.serve import Worker
+    from kontra.serve._serve import capture
 
     root = Path(directory).expanduser().resolve()
     if not (root / WORKER_FILE).is_file():
@@ -91,14 +95,23 @@ def load_worker(directory: str | Path) -> Generator[Any]:
     try:
         before = set(sys.modules)
         try:
-            module = importlib.import_module("worker")
+            with capture() as served:
+                module = importlib.import_module("worker")
         finally:
             loaded = {k for k in set(sys.modules) - before if k.split(".", 1)[0] in names}
         found = getattr(module, "worker", None)
+        if served:
+            if isinstance(found, Worker) and found is not served[0]:
+                fail(
+                    f"{root / WORKER_FILE} calls serve() and also defines another "
+                    "`worker = Worker(...)`; keep one"
+                )
+            found = served[0]
         if not isinstance(found, Worker):
             fail(
-                f"{root / WORKER_FILE} must define a module-level `worker = Worker(...)` "
-                f"(kontra.serve.Worker); found {type(found).__name__ if found is not None else 'none'}"
+                f"{root / WORKER_FILE} must call `serve(YourFlow)` or define a module-level "
+                f"`worker = Worker(...)` (kontra.serve.Worker); found "
+                f"{type(found).__name__ if found is not None else 'none'}"
             )
         yield found
     finally:

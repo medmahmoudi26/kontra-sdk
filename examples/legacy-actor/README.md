@@ -15,7 +15,7 @@ needs them.
 | `global_state` counters | gone: accounting, not output; a workflow can count for itself |
 | Session checkpoints, resume | Temporal's history and retries |
 | progress reports | `activity.heartbeat({"percent", "message"})`, for the whole job, forwarded to the buyer |
-| `actor.json` targets (container / machine sizes) | the seller's own hardware; tuning is `Worker(...)` kwargs in `worker.py` |
+| `actor.json` targets (container / machine sizes) | the seller's own hardware; tuning is `serve(ProbeFlow, ...)` kwargs in `worker.py` |
 | fleets | each batch probes 16 targets at once, and a worker runs `max_concurrent_activities` batches; run more `kontra serve` processes for more, and `max_task_queue_activities_per_second` caps them together |
 | datasets, reports | not core in v2; a buyer gets the output, an Artifact for files |
 | pricing: none | `quote.py`: a fixed price per job, from the input |

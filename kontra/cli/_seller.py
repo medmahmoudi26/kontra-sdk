@@ -118,15 +118,20 @@ def contract(
 def publish(directory: Path, only: str | None, as_json: bool) -> None:
     """Publish worker.py's offerings to the catalog (needs a recent login)."""
     from kontra.auth import Session
+    from kontra.cli._seller_code import check_project
     from kontra.contract import contract_hash
     from kontra.gate_client import models as m
 
+    root = directory.resolve()
+    refused = "\n".join("  " + f.render(root) for f in check_project(root))
     with load_worker(directory) as worker:
         chosen = _pick(worker.offerings, only)
 
         async def go() -> list[m.CatalogEntry]:
             async with Session.from_env() as session:
                 profile = await session.resolve()
+                if refused and not profile.dev:  # kontra dev is the seller's own
+                    fail("seller code must stay behind the kontra façade:\n" + refused)
                 # No key is sealed into a document any more (spec v2, decisions I7), so
                 # publishing needs none: a seller may add or revoke a recipient without
                 # republishing.

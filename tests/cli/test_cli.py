@@ -72,10 +72,13 @@ def test_init_scaffolds_the_project_layout(
         "acme/word-count@0.1.0",
         600,
     )
-    # Acceptance 1 and 3: no Kontra in workflow or activity code, no code names in the yaml.
+    # Acceptance 1 and 3: workflow and activity code reach Temporal through the façade only
+    # (never `import kontra`, never temporalio), no code names in the yaml.
     for name in ("workflows.py", "activities.py"):
         text = (root / name).read_text()
-        assert not re.search(r"^\s*(import|from)\s+kontra\b", text, re.MULTILINE), name
+        assert "import kontra" not in text, name
+        assert not re.search(r"^\s*(import|from)\s+(temporalio|nexusrpc)\b", text, re.M), name
+        assert re.search(r"^from kontra import ", text, re.MULTILINE), name
     offering_text = (root / "offering.yaml").read_text()
     for symbol in ("WordCountFlow", "count_words", "quote(", "WordCountInput"):
         assert symbol not in offering_text.split("#", 1)[0]

@@ -67,6 +67,13 @@ def test_defaults() -> None:
     assert s.max_concurrent_jobs is None
     assert s.max_output_bytes == 1_000_000_000
     assert s.artifact_retention == timedelta(days=7)
+    assert s.uses_hosted_model is False
+    assert "uses_hosted_model" not in s.canonical()  # false is absent: one spelling
+
+
+def test_uses_hosted_model_is_a_fact_only_when_true() -> None:
+    assert parse(uses_hosted_model=True).canonical()["uses_hosted_model"] is True
+    assert "uses_hosted_model" not in parse(uses_hosted_model=False).canonical()
 
 
 def test_lenient_spellings_are_accepted() -> None:
@@ -167,6 +174,9 @@ def test_name(value: Any) -> None:
         ("tags", ["Enrichment"]),
         ("tags", ["a", "a"]),
         ("tags", [f"t{i}" for i in range(17)]),
+        ("uses_hosted_model", "yes"),
+        ("uses_hosted_model", 1),
+        ("uses_hosted_model", None),
     ],
 )
 def test_bounds_and_shapes(field: str, value: Any) -> None:

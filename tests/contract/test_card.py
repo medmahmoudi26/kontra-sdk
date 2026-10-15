@@ -105,6 +105,20 @@ def test_card_without_tags_or_hint(enrich_spec: OfferingSpec) -> None:
     params = card["capabilities"]["extensions"][0]["params"]
     assert "pricingHint" not in params
     assert "maxConcurrentJobs" not in params
+    assert "usesHostedModel" not in params
+    assert "hosted model" not in parsed.skills[0].description
+
+
+def test_card_discloses_a_hosted_model(enrich_spec: OfferingSpec) -> None:
+    """The buyer's input leaves the seller's machine for the model provider, in plaintext to
+    it: the card says so, in the extension and in the skill's text."""
+    spec = enrich_spec.model_copy(update={"uses_hosted_model": True})
+    doc = derive_document(spec, EnrichInput, EnrichOutput)
+    assert doc["x-kontra"]["uses_hosted_model"] is True
+    card = agent_card(doc, url=URL)
+    parsed = _parse(card)
+    assert card["capabilities"]["extensions"][0]["params"]["usesHostedModel"] is True
+    assert "hosted model" in parsed.skills[0].description
 
 
 def test_card_only_from_a_valid_document(enrich_doc: dict[str, Any]) -> None:

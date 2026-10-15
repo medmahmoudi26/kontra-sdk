@@ -7,9 +7,9 @@ delivered as an encrypted JSONL `Artifact` plus a small inline summary.
 |---|---|
 | `offering.yaml` | name, version, limits, display text — declarative, no code names |
 | `models.py` | the In/Out types; the published contract is derived from them |
-| `workflows.py`, `activities.py` | plain Temporal; nothing from kontra |
+| `workflows.py`, `activities.py` | Temporal through the façade (`from kontra import workflow, activity`); never `temporalio` |
 | `quote.py` | the price, from the input |
-| `worker.py` | the binding of workflow + quote to the offering, and all worker tuning |
+| `worker.py` | `serve(EnrichFlow, ...)`: the binding of workflow + quote to the offering, and all worker tuning |
 | `contract.yaml` | the derived contract document, kept as a golden file (seam ③) |
 
 ```sh

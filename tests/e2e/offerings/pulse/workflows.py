@@ -1,8 +1,8 @@
-"""Plain Temporal: nothing from kontra (D1)."""
+"""Temporal through the façade: kontra.workflow and kontra.activity only (D1)."""
 
 from datetime import timedelta
 
-from temporalio import workflow
+from kontra import workflow
 
 with workflow.unsafe.imports_passed_through():
     from activities import pulse, quiet

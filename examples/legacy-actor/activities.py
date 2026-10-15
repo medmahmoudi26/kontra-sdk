@@ -32,7 +32,8 @@ import socket
 
 import httpx
 from models import Batch, Head, Target
-from temporalio import activity
+
+from kontra import activity
 
 #: Targets probed at once per batch (what a fleet of the old actor's containers gave it).
 #: Each one ends within its deadline, so a batch heartbeats at least that often.

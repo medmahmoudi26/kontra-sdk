@@ -44,6 +44,9 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp>=2.3,<3"]  # kontra.mcp is written on MCPServer (mcp 2.x)
+# Temporal's OpenAI Agents integration (temporalio.openai_agents): kontra.workflow re-exports
+# activity_as_tool and mcp_server, and serve() installs its plugin. [mcp]: serve(mcp_servers=).
+agents = ["temporalio-openai-agents[mcp]>=1.1,<2"]
 testing = ["fastapi>=0.115", "uvicorn>=0.30", "hypothesis>=6.100"]
 
 [project.scripts]

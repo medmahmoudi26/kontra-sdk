@@ -36,6 +36,7 @@ __all__ = [
     "OfferingId",
     "OfferingRef",
     "Version",
+    "batch_workflow_id",
     "is_endpoint_name",
     "is_handle",
     "is_job_id",
@@ -285,6 +286,15 @@ def job_workflow_id(job_id: str) -> str:
     if not is_job_id(job_id):
         raise NameError_(f"{job_id!r} is not a job id")
     return _JOB_WF_PREFIX + job_id
+
+
+def batch_workflow_id(parent_workflow_id: str, activity: str, token: str) -> str:
+    """The id of the ``kontra.batch.v1`` child a workflow starts for
+    ``execute_activities_in_parallel(activity, ...)``: the parent's id, the activity's
+    Temporal name, and ``token`` (one ``workflow.uuid4()`` of the parent's, so batching the
+    same activity twice in one run gets two ids). Never the shape of a job's workflow id,
+    so :func:`job_id_from_workflow_id` reads none from it."""
+    return f"{parent_workflow_id}/batch/{activity}/{token}"
 
 
 def job_id_from_workflow_id(workflow_id: object) -> str | None:

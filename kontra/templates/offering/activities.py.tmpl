@@ -1,11 +1,12 @@
-"""Plain Temporal activities: nothing from kontra is imported here (D1). Heartbeat as you
-would for Temporal anyway; Kontra's worker forwards the details to the buyer, encrypted,
-as the job's progress."""
+"""Temporal activities through the kontra façade (D1): `activity` is Temporal's, and its
+`defn` also notes the activity for `serve()` to register. Heartbeat as you would for
+Temporal anyway; Kontra's worker forwards the details to the buyer, encrypted, as the job's
+progress."""
 
 import re
 from collections import Counter
 
-from temporalio import activity
+from kontra import activity
 
 from models import {{Class}}Output
 

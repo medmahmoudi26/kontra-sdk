@@ -1,5 +1,5 @@
-"""Plain Temporal activities. Nothing from kontra is imported here (D1): progress is the
-heartbeat you would write for Temporal anyway, and the file upload goes through the
+"""Temporal activities through the kontra façade (D1): `activity` is Temporal's. Progress is
+the heartbeat you would write for Temporal anyway, and the file upload goes through the
 `Artifact` type that lives in models.py.
 
 Every URL comes from the buyer, so none is trusted: whatever one URL does (refuse, hang,
@@ -36,7 +36,8 @@ from urllib.parse import urlsplit
 
 import httpx
 from models import Artifact, Batch, Record
-from temporalio import activity
+
+from kontra import activity
 
 #: The title is found in two linear searches. The one-regex way,
 #: `<title[^>]*>(.*?)</title>`, backtracks: on 200 kB of `<title>` repeated it spends over a

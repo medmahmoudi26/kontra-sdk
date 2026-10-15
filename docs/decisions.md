@@ -555,3 +555,28 @@ below), and each has its rule here.
    account can set its key at once. Nothing about rule 2 moves: the handoff exists only
    after the right code was typed, so it goes to whoever typed it -- the person who also
    holds the screen that asked -- and the device that asked still gets its own session.
+
+## I20. Seller code imports Temporal only through `kontra` (D1, amended)
+
+The PRD's D1 said seller `workflows.py` and `activities.py` import nothing from `kontra`, so that
+deleting Kontra leaves code that runs on any Temporal. It now says the reverse of the letter and
+keeps the intent: they import Temporal **only** through the façade -- `from kontra import
+workflow, activity, RetryPolicy, ApplicationError, Page` -- and never `temporalio` or `nexusrpc`.
+
+- **Why.** A seller's dependency closure is then `kontra-sdk` alone, and `kontra-sdk` decides
+  which Temporal SDK runs under it; the publish gate can refuse `import temporalio` anywhere in
+  an offering instead of guessing which Temporal features a seller relies on; and Kontra's
+  additions (`execute_activities_in_parallel`, the agents integration, `serve()` registering
+  every `kontra.activity.defn`) sit in the namespace the seller already imports.
+- **Why it still runs on any Temporal.** The façade aliases, never wraps: `kontra.workflow` and
+  `kontra.activity` re-export Temporal's own objects (`kontra.activity.defn` returns Temporal's
+  stamped function after noting it). Replacing `from kontra import workflow` with
+  `from temporalio import workflow` gives the same program, less the additions.
+- **What stays out.** Workflow and activity code never loads the serving stack (`kontra.serve`,
+  the gate client, the codec, auth), never writes `import kontra` (the acceptance grep
+  `grep -r "import kontra" examples/*/workflows.py examples/*/activities.py` still prints
+  nothing), and never calls `continue_as_new`: the façade does not offer it, and the iteration
+  that needs it is `execute_activities_in_parallel`'s child workflow. `models.py` may still use
+  `kontra.types.Artifact` and nothing else from `kontra`.
+- **Checked by** `tests/examples/test_imports.py` (statements, dynamic imports and module names
+  in strings; what loading the code loads) over the examples and the `kontra init` scaffold.
