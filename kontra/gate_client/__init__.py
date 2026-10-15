@@ -512,6 +512,12 @@ class GateClient:
         the only way from one to the other."""
         return await self._model("by_endpoint", m.CatalogEntry, path={"endpoint": endpoint})
 
+    async def workers(self, ref: str) -> m.WorkersView:
+        """Whether the workers keep up with one of the caller's own offering versions:
+        Temporal's task-queue stats and pollers, and a verdict. ``ref`` resolves as for
+        :meth:`get_offering`, among the caller's versions."""
+        return await self._model("workers", m.WorkersView, path=_ref_path(ref))
+
     # quotes & jobs
     async def quote(self, offering: str, payload: m.WirePayload) -> m.QuoteView:
         OfferingRef.parse(offering)  # refuse a malformed reference before sending the input

@@ -89,6 +89,7 @@ Against the real marketplace:
 kontra login --email you@example.com   # or plain `kontra login` (browser); makes this machine's key
 kontra publish                         # needs a recent login, never a key; prints the hash and endpoint
 kontra serve                           # on the machine that does the work (a key will do here)
+kontra status --workers                # do the workers keep up? Temporal's backlog and pollers
 ```
 
 A published version is fixed: change a type or `offering.yaml` and bump the version, or

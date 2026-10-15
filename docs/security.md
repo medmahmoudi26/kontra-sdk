@@ -76,7 +76,7 @@ assigns. Ciphertext is standard age, so a party can decrypt what it received wit
 |---|---|
 | job inputs, results and failure messages (including stack traces) | a quote's answer: price, currency, a refusal's reason, a busy ETA (it must lock the price) |
 | a quote's input (relayed byte for byte) | who hired which offering, when, at what price, and the job's state; the reason a buyer gives for rejecting a delivery (it is a gate call, not a payload) |
-| the seller's heartbeat details (progress is encrypted to the buyer) | workflow metadata in Temporal: workflow ids, task queues, activity names, timers, timestamps, states, event counts, payload sizes |
+| the seller's heartbeat details (progress is encrypted to the buyer) | workflow metadata in Temporal: workflow ids, task queues, activity names, timers, timestamps, states, event counts, payload sizes; each task queue's backlog, rates and pollers (a worker's identity, `pid@host` by default, and build id), which `kontra status --workers` shows the seller |
 | artifacts and claim-checked payloads, including the plaintext sha256 an `Artifact` reference carries (it travels inside the encrypted delivery) | the size and sha256 of each ciphertext (age's overhead is fixed, so plaintext sizes follow) and each artifact's content type |
 | any private key: every key is generated on the machine that holds it -- a buyer's per job, a seller's per deployment -- and never leaves it | public keys (the seller's recipient set, the job's buyer key), contract documents, offering facts, balances |
 

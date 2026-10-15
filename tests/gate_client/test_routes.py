@@ -66,6 +66,10 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
         {"party": "acme", "name": "enrich", "version": "latest"},
     ),
     "by_endpoint": (lambda c: c.by_endpoint(EP), {"endpoint": EP}),
+    "workers": (
+        lambda c: c.workers("acme/enrich@1.2.0"),
+        {"party": "acme", "name": "enrich", "version": "1.2.0"},
+    ),
     "quote": (lambda c: c.quote("acme/enrich", WP), {}),
     "hire": (lambda c: c.hire("q1", buyer_key="age1job", max_price_minor=2000), {}),
     "jobs": (lambda c: c.jobs(), {}),
@@ -212,6 +216,23 @@ async def test_base_url_path_prefix_is_kept() -> None:
         assert c.base_url == "https://h.test/gate"
         await c.me()
     assert str(rec.requests[0].url) == "https://h.test/gate/v1/me"
+
+
+async def test_workers_takes_an_offering_ref_as_the_catalog_does() -> None:
+    """An offering name is two path segments (party, name), and the version resolves as
+    a catalog path's: ``latest``, partial or exact."""
+    rec = Recorder(lambda _: json_response(200, minimal(m.WorkersView)))
+    async with GateClient("http://gate.test", token=static("t"), transport=rec.transport) as c:
+        await c.workers("acme/enrich")
+        await c.workers("acme/enrich@1")
+        await c.workers("acme/enrich@1.2.0")
+        with pytest.raises(NameError_):
+            await c.workers("acme/enrich/1.2.0")
+    assert [r.url.raw_path.decode() for r in rec.requests] == [
+        "/v1/offerings/acme/enrich/versions/latest/workers",
+        "/v1/offerings/acme/enrich/versions/1/workers",
+        "/v1/offerings/acme/enrich/versions/1.2.0/workers",
+    ]
 
 
 @pytest.mark.parametrize(

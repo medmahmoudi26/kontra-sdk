@@ -662,6 +662,16 @@ background. That token can do one thing: run workers in your namespace. It canno
 create or change an endpoint, or reach another namespace (see [security.md](security.md)).
 Ctrl-C stops the worker gracefully.
 
+`kontra status --workers` says whether your workers keep up with each version `worker.py`
+binds (or the versions you name, `kontra status acme/enrich@1.2.0`): per task-queue type
+(workflow, activity, Nexus), the backlog and the age of its oldest task, the rates tasks are
+added and dispatched at, and the workers polling, as Temporal's `DescribeTaskQueue` reports
+them, with a one-line verdict such as `activity backlog growing for 5 min, 2 pollers -- scale
+up` or `idle, 1 poller`. It needs nothing on your side: the gate reads these numbers from your
+namespace (task-queue stats are metadata, see [security.md](security.md)) and shows only your
+own versions. Temporal reports zeros and no pollers for a task queue it unloaded after about
+five idle minutes, and the command says so when that is all there is.
+
 A server that runs `kontra serve` unattended should use an API key rather than your login:
 `kontra keys create --label worker-1` on your machine, then `KONTRA_API_KEY` on the server.
 The worker serves exactly as with a login. On a `kontra dev` profile a worker publishes

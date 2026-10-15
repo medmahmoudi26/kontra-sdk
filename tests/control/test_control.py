@@ -8,7 +8,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from temporalio.api.common.v1 import Payload
@@ -29,7 +29,9 @@ from kontra._control import (
 from kontra.contract.names import new_endpoint_name
 from kontra.contract.offering import MAX_DURATION_RANGE
 from kontra.escrow import DEFAULT_GRACE, ObservedStatus, Provenance
+from kontra.gate_client import models as m
 from kontra.testing.devserver import DevServer, free_port
+from kontra.workers import verdict
 
 from .flows import Job, Plan, hang, step
 from .handlers import Calls, make_handler
@@ -654,3 +656,59 @@ async def test_aclose_from_another_loop_closes_the_relay_client(
             break
         await asyncio.sleep(0.01)
     assert own.is_closed
+
+
+# --------------------------------------------------------------------------- task queues
+
+
+async def test_describe_task_queue_lists_the_worker_under_each_type(
+    control: Control, seller: Seller
+) -> None:
+    """The seller's worker polls all three types of its task queue; Temporal lists it under
+    each, with the build id its SDK sent (an unversioned Python worker's: a hash of its
+    code), and reports each type's stats."""
+    described: dict[m.TaskQueueType, m.TaskQueueTypeInfo] = {}
+    for _ in range(100):
+        described = await control.describe_task_queue(seller.namespace, seller.task_queue)
+        if all(info.pollers for info in described.values()):
+            break
+        await asyncio.sleep(0.1)
+    assert set(described) == set(m.TaskQueueType)
+    for info in described.values():
+        [poller] = info.pollers
+        assert poller.identity == seller.client.identity
+        assert poller.build_id
+        assert poller.rate_per_second > 0
+        assert abs(datetime.now(UTC) - poller.last_access_time) < timedelta(minutes=2)
+        assert info.stats.approximate_backlog_count == 0
+    assert verdict(described) == "idle, 1 poller"
+
+
+async def test_describe_task_queue_reports_a_backlog_nobody_polls(
+    control: Control, seller: Seller
+) -> None:
+    queue = unique("unpolled")
+    for _ in range(2):
+        await seller.client.start_workflow(Job.run, Plan("ok"), id=unique("job"), task_queue=queue)
+    stats = m.TaskQueueStats()
+    described: dict[m.TaskQueueType, m.TaskQueueTypeInfo] = {}
+    for _ in range(150):  # Temporal answers from a cache it refreshes every 5 s
+        described = await control.describe_task_queue(seller.namespace, queue)
+        stats = described[m.TaskQueueType.WORKFLOW].stats
+        if stats.approximate_backlog_count == 2 and stats.approximate_backlog_age > 0:
+            break
+        await asyncio.sleep(0.2)
+    assert stats.approximate_backlog_count == 2
+    assert stats.tasks_dispatch_rate == 0
+    assert stats.backlog_increase_rate == stats.tasks_add_rate
+    assert not any(info.pollers for info in described.values())
+    line = verdict(described)
+    assert line.startswith("workflow backlog of 2 for "), line
+    assert line.endswith(", no workflow pollers -- start a worker"), line
+
+
+async def test_describe_task_queue_in_a_missing_namespace_is_a_temporal_error(
+    control: Control,
+) -> None:
+    with pytest.raises(TemporalError, match="describe the workflow task queue"):
+        await control.describe_task_queue(unique("nowhere"), "q")

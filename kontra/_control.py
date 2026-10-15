@@ -65,13 +65,14 @@ from temporalio.api.operatorservice.v1 import (
     CreateNexusEndpointRequest,
     ListNexusEndpointsRequest,
 )
-from temporalio.api.taskqueue.v1 import TaskQueue
+from temporalio.api.taskqueue.v1 import PollerInfo, TaskQueue
 from temporalio.api.workflowservice.v1 import (
     DescribeNamespaceRequest,
     DescribeNamespaceResponse,
     DescribeNexusOperationExecutionRequest,
     DescribeNexusOperationExecutionResponse,
     DescribeTaskQueueRequest,
+    DescribeTaskQueueResponse,
     DescribeWorkflowExecutionRequest,
     DescribeWorkflowExecutionResponse,
     GetWorkflowExecutionHistoryRequest,
@@ -90,6 +91,7 @@ from kontra.codec import _parse_reference as _reference  # pyright: ignore[repor
 from kontra.contract.names import is_endpoint_name
 from kontra.contract.offering import MAX_DURATION_RANGE
 from kontra.escrow import Observation, ObservedStatus, Provenance
+from kontra.gate_client import models as m
 
 __all__ = [
     "CHAIN_READS",
@@ -421,6 +423,10 @@ class TemporalControl(Protocol):
 
     async def occupy_job(self, namespace: str, workflow_id: str, reason: str) -> Occupation: ...
 
+    async def describe_task_queue(
+        self, namespace: str, task_queue: str
+    ) -> dict[m.TaskQueueType, m.TaskQueueTypeInfo]: ...
+
     async def start_operation(
         self,
         namespace: str,
@@ -436,6 +442,53 @@ class TemporalControl(Protocol):
 
 def _time(ts: Timestamp, present: bool) -> datetime | None:
     return ts.ToDatetime(tzinfo=UTC) if present else None
+
+
+#: Temporal's task-queue types, by their names on the gate's wire.
+_TASK_QUEUE_TYPES: Mapping[m.TaskQueueType, TaskQueueType.ValueType] = {
+    m.TaskQueueType.WORKFLOW: TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW,
+    m.TaskQueueType.ACTIVITY: TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY,
+    m.TaskQueueType.NEXUS: TaskQueueType.TASK_QUEUE_TYPE_NEXUS,
+}
+
+
+def _at_least_zero(value: float) -> float:
+    """A rate or an age as reported, or zero for one below zero or not finite (Temporal's
+    approximations; the wire model refuses either)."""
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+def _poller(p: PollerInfo) -> m.PollerInfo:
+    """Temporal's ``PollerInfo``, with the version the worker named when it polled: its
+    deployment's, else its version capabilities' (an empty string is no version)."""
+    deployment, capabilities = p.deployment_options, p.worker_version_capabilities
+    return m.PollerInfo(
+        identity=p.identity,
+        last_access_time=p.last_access_time.ToDatetime(tzinfo=UTC),
+        rate_per_second=p.rate_per_second if math.isfinite(p.rate_per_second) else 0.0,
+        build_id=deployment.build_id or capabilities.build_id or None,
+        deployment_name=deployment.deployment_name or capabilities.deployment_series_name or None,
+    )
+
+
+def _type_info(resp: DescribeTaskQueueResponse) -> m.TaskQueueTypeInfo:
+    """One type's answer: the most recently seen pollers first, and the stats with
+    ``backlog_increase_rate`` as Temporal's SDKs derive it (add rate minus dispatch rate)."""
+    s = resp.stats
+    add, dispatch = _at_least_zero(s.tasks_add_rate), _at_least_zero(s.tasks_dispatch_rate)
+    recent = sorted(resp.pollers, key=lambda p: p.last_access_time.ToNanoseconds(), reverse=True)
+    return m.TaskQueueTypeInfo(
+        pollers=[_poller(p) for p in recent[: m.POLLERS_MAX]],
+        stats=m.TaskQueueStats(
+            approximate_backlog_count=max(0, s.approximate_backlog_count),
+            approximate_backlog_age=_at_least_zero(
+                s.approximate_backlog_age.ToTimedelta().total_seconds()
+            ),
+            tasks_add_rate=add,
+            tasks_dispatch_rate=dispatch,
+            backlog_increase_rate=add - dispatch,
+        ),
+    )
 
 
 def _event_name(event_type: int) -> str:
@@ -1001,6 +1054,31 @@ class Control:
                 NexusSyncKind.UNAVAILABLE, message=f"no worker is polling {task_queue!r}"
             )
         return NexusSyncResult(NexusSyncKind.TIMEOUT, message=message)
+
+    # ------------------------------------------------------------------ task queues
+
+    async def describe_task_queue(
+        self, namespace: str, task_queue: str
+    ) -> dict[m.TaskQueueType, m.TaskQueueTypeInfo]:
+        """``DescribeTaskQueue`` of ``task_queue`` in ``namespace`` with ``report_stats``,
+        once per task-queue type: each type's stats and pollers, Temporal metadata only (the
+        Workers view, :mod:`kontra.workers`). The default mode lists pollers in every answer;
+        ``report_pollers`` belongs to the deprecated enhanced mode. A task queue nobody has
+        used is described all the same, with zeros."""
+        described: dict[m.TaskQueueType, m.TaskQueueTypeInfo] = {}
+        for kind, value in _TASK_QUEUE_TYPES.items():
+            resp: DescribeTaskQueueResponse = await self._rpc(
+                f"describe the {kind} task queue {task_queue} in {namespace}",
+                self._wf.describe_task_queue,
+                DescribeTaskQueueRequest(
+                    namespace=namespace,
+                    task_queue=TaskQueue(name=task_queue),
+                    task_queue_type=value,
+                    report_stats=True,
+                ),
+            )
+            described[kind] = _type_info(resp)
+        return described
 
     # ------------------------------------------------------------------ observation
 
