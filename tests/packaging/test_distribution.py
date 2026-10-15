@@ -60,6 +60,13 @@ def test_the_wheel_has_what_kontra_dev_and_the_contract_read(dist: Path) -> None
         "kontra/__init__.py",
         "kontra/py.typed",
         "kontra/_dev/compose.yaml",
+        # What the compose file's profiles mount, where its relative paths name them.
+        "kontra/_dev/observability/prometheus.yml",
+        "kontra/_dev/observability/grafana/datasources.yaml",
+        "kontra/_dev/observability/grafana/dashboards.yaml",
+        "kontra/_dev/observability/dashboards/temporal-core-sdks-otel.json",
+        "kontra/_dev/observability/dashboards/server-general.json",
+        "kontra/_dev/observability/dashboards/LICENSE",
         "kontra/_spec/x-kontra.v2.json",
         "kontra/_spec/kontra-types.v1.json",
         "kontra/templates/offering/worker.py.tmpl",

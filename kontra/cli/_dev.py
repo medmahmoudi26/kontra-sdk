@@ -16,6 +16,14 @@ login, play money), so publishing beyond loopback is asked for on each ``up``. I
 accepts the party's worker token: the gate creates namespaces through Temporal's internal
 frontend, and Temporal learns the gate's signing keys by polling its JWKS, so each side comes
 up without the other and the order is settled by retries, not by ``depends_on`` alone.
+
+Two compose profiles (:data:`PROFILES`) add dev tools, each started by its own flag and
+only then: ``up`` runs exactly the profiles it is given and stops the containers of the
+others, so ``kontra dev up`` alone is the stack it always was. ``--ui`` is
+Temporal's own UI, which shows what is encrypted to this machine's key through a codec server
+``up`` starts on 127.0.0.1 (:mod:`kontra.cli._codec_server`, in the background; ``down``
+stops it). ``--observability`` is Prometheus and Grafana, with Temporal's metrics listener
+turned on for Prometheus to scrape. ``status``, ``logs`` and ``down`` see every profile.
 """
 
 from __future__ import annotations
@@ -27,8 +35,9 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -36,15 +45,36 @@ import click
 import httpx
 
 import kontra
-from kontra.cli._common import default_handle, emit_json, fail, run
+from kontra.cli._common import CliError, default_handle, emit_json, fail, run
 
 if TYPE_CHECKING:
     from kontra.profile import Profile
 
-__all__ = ["DEV_ENV_FILE", "PROJECT", "compose_file", "dev", "dev_env"]
+__all__ = [
+    "CODEC_LOG",
+    "CODEC_STATE",
+    "DEV_ENV_FILE",
+    "PROFILES",
+    "PROJECT",
+    "compose_file",
+    "dev",
+    "dev_env",
+]
 
 PROJECT = "kontra-dev"
 DEV_ENV_FILE = "dev.env"
+#: The compose profiles, by the flag of ``up`` that starts each.
+PROFILES = ("ui", "observability")
+#: Where Temporal serves its metrics while the observability profile runs; the profile's
+#: Prometheus scrapes ``temporal:8000`` (observability/prometheus.yml).
+_METRICS_SETTING = "KONTRA_TEMPORAL_METRICS_ADDR"
+_METRICS_ADDR = "0.0.0.0:8000"
+#: The background codec server's pid, port and stop token (0600), and its output.
+CODEC_STATE = "codec.json"
+CODEC_LOG = "codec.log"
+_CODEC_START_TIMEOUT = 15.0
+#: The only codec endpoint the UI may be given: the server listens on 127.0.0.1 alone.
+_CODEC_ENDPOINT = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})", re.ASCII)
 _HEALTH_TIMEOUT = 300.0
 _TEMPORAL_TIMEOUT = 180.0
 #: The compose file's list of the settings ``up`` remembers, resolved by compose itself.
@@ -145,20 +175,37 @@ def _docker() -> str:
     return found
 
 
-def _compose_cmd(env_files: tuple[Path, ...], *args: str) -> list[str]:
+def _compose_cmd(
+    env_files: tuple[Path, ...], *args: str, profiles: Sequence[str] = ()
+) -> list[str]:
     from kontra.profile import kontra_home
 
     cmd = [_docker(), "compose", "-p", PROJECT, "-f", str(compose_file())]
     for env in (dev_env(kontra_home()), *env_files):
         cmd += ["--env-file", str(env)]
+    for profile in profiles:
+        cmd += ["--profile", profile]
     return [*cmd, *args]
 
 
-def _compose(env_files: tuple[Path, ...], *args: str, capture: bool = False) -> str:
-    """Run ``docker compose`` on the dev project; its own output goes to the terminal
-    unless ``capture``. A failure ends the command with compose's message."""
-    cmd = _compose_cmd(env_files, *args)
-    proc = subprocess.run(cmd, capture_output=capture, text=True, check=False)  # noqa: S603 -- argv, no shell
+def _compose(
+    env_files: tuple[Path, ...],
+    *args: str,
+    capture: bool = False,
+    profiles: Sequence[str] = (),
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Run ``docker compose`` on the dev project, with ``profiles`` enabled and ``env`` as
+    its environment (default: ours); its own output goes to the terminal unless
+    ``capture``. A failure ends the command with compose's message."""
+    cmd = _compose_cmd(env_files, *args, profiles=profiles)
+    proc = subprocess.run(  # noqa: S603 -- argv, no shell
+        cmd,
+        capture_output=capture,
+        text=True,
+        check=False,
+        env=None if env is None else dict(env),
+    )
     if proc.returncode != 0:
         detail = (proc.stderr or "").strip() if capture else ""
         fail(
@@ -167,8 +214,14 @@ def _compose(env_files: tuple[Path, ...], *args: str, capture: bool = False) -> 
     return proc.stdout if capture else ""
 
 
-def _config(env_files: tuple[Path, ...]) -> dict[str, Any]:
-    out = _compose(env_files, "config", "--format", "json", capture=True)
+def _config(
+    env_files: tuple[Path, ...],
+    profiles: Sequence[str] = (),
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    out = _compose(
+        env_files, "config", "--format", "json", capture=True, profiles=profiles, env=env
+    )
     try:
         parsed: object = json.loads(out)
     except ValueError:
@@ -192,6 +245,133 @@ def _published(config: dict[str, Any], service: str) -> str | None:
             local = host in ("", "127.0.0.1", "0.0.0.0")  # noqa: S104 -- compares, binds nothing
             return f"{'localhost' if local else host}:{port['published']}"
     return None
+
+
+def _in_profiles(config: dict[str, Any], profiles: Sequence[str]) -> list[str]:
+    """The services of ``config`` that belong to one of ``profiles``."""
+    services: Any = config.get("services") or {}
+    return [
+        str(name)
+        for name, svc in services.items()
+        if isinstance(svc, dict) and set(svc.get("profiles") or ()) & set(profiles)  # pyright: ignore[reportUnknownArgumentType]
+    ]
+
+
+def _compose_env(observability: bool) -> dict[str, str] | None:
+    """Compose's environment for ``up``: ours, plus Temporal's metrics listener when the
+    observability profile runs (unless the environment sets where already)."""
+    if not observability or os.environ.get(_METRICS_SETTING):
+        return None
+    return {**os.environ, _METRICS_SETTING: _METRICS_ADDR}
+
+
+# --------------------------------------------------------------------------- the codec server
+
+
+def _codec_http() -> httpx.Client:
+    """A client for the codec server: never through a proxy (the stop token must not leave
+    this machine)."""
+    return httpx.Client(trust_env=False, timeout=5)
+
+
+def _codec_answers(port: int) -> bool:
+    """Whether a codec server answers on 127.0.0.1:``port`` (an empty decode)."""
+    try:
+        with _codec_http() as http:
+            r = http.post(f"http://127.0.0.1:{port}/decode", json={"payloads": []})
+    except httpx.HTTPError:
+        return False
+    return r.status_code == 200
+
+
+def _codec_state(home: Path) -> dict[str, Any] | None:
+    try:
+        raw: Any = json.loads((home / CODEC_STATE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("port"), int):
+        return None
+    return {str(k): v for k, v in raw.items()}  # pyright: ignore[reportUnknownVariableType]
+
+
+def _stop_codec(home: Path) -> bool:
+    """Stop the codec server an earlier ``up`` started from this home; whether one was
+    running. One that answers with another token is not ours, and is left alone."""
+    state = _codec_state(home)
+    if state is None:
+        return False
+    stopped = False
+    try:
+        with _codec_http() as http:
+            r = http.post(
+                f"http://127.0.0.1:{state['port']}/stop",
+                headers={"Authorization": f"Bearer {state.get('token', '')}"},
+            )
+        stopped = r.status_code == 204
+    except httpx.HTTPError:
+        pass  # not running any more
+    (home / CODEC_STATE).unlink(missing_ok=True)
+    return stopped
+
+
+def _codec_ports(config: dict[str, Any]) -> tuple[int, int]:
+    """(the codec server's port, the UI's) from the UI service the compose file defines."""
+    ui: Any = (config.get("services") or {}).get("ui") or {}
+    endpoint = str((ui.get("environment") or {}).get("TEMPORAL_CODEC_ENDPOINT") or "")
+    m = _CODEC_ENDPOINT.fullmatch(endpoint)
+    if m is None:
+        fail(
+            f"the UI's TEMPORAL_CODEC_ENDPOINT is {endpoint!r}; the codec server listens on "
+            "http://127.0.0.1:<port> only"
+        )
+    published = _published(config, "ui")
+    if published is None:
+        fail("the compose file publishes no port for the UI")
+    return int(m.group(1)), int(published.rsplit(":", 1)[1])
+
+
+def _start_codec(home: Path, config: dict[str, Any]) -> str:
+    """Start the codec server in the background for the UI of ``config`` (the one an
+    earlier ``up`` started is stopped first); its URL. Raises :class:`CliError` with the
+    server's own words if it does not come up."""
+    port, ui_port = _codec_ports(config)
+    _stop_codec(home)
+    token = secrets.token_urlsafe(32)
+    log_path = home / CODEC_LOG
+    log = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        proc = subprocess.Popen(  # noqa: S603 -- argv, no shell
+            [
+                sys.executable,
+                *("-m", "kontra.cli._codec_server"),
+                *("--port", str(port), "--ui-port", str(ui_port)),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,  # outlives this command, and its terminal's Ctrl-C
+        )
+    finally:
+        os.close(log)
+    assert proc.stdin is not None
+    proc.stdin.write(f"{token}\n".encode())
+    proc.stdin.close()
+    state = json.dumps({"pid": proc.pid, "port": port, "token": token})
+    fd = os.open(home / CODEC_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(state)
+    deadline = time.monotonic() + _CODEC_START_TIMEOUT
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        if _codec_answers(port):
+            return f"http://127.0.0.1:{port}"
+        time.sleep(0.2)
+    (home / CODEC_STATE).unlink(missing_ok=True)
+    if proc.poll() is None:
+        proc.terminate()
+    lines = log_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+    fail(f"the codec server did not start: {lines[-1] if lines else 'no output'} ({log_path})")
 
 
 def _wait_healthy(url: str, timeout: float) -> None:
@@ -292,7 +472,8 @@ def _given(ctx: click.Context, env_files: tuple[Path, ...]) -> tuple[Path, ...]:
 def dev(ctx: click.Context, handle: str | None, env_files: tuple[Path, ...]) -> None:
     """The local Kontra stack: Temporal, the gate, Postgres and a bucket, with play money.
 
-    `kontra dev` alone is `kontra dev up`."""
+    `kontra dev` alone is `kontra dev up`; `up --ui` and `up --observability` add Temporal's
+    UI and Prometheus with Grafana."""
     ctx.obj = {"env_files": env_files, "handle": handle}
     if ctx.invoked_subcommand is None:
         ctx.invoke(up)
@@ -307,6 +488,16 @@ def dev(ctx: click.Context, handle: str | None, env_files: tuple[Path, ...]) -> 
 )
 @click.option("--replace-profile", is_flag=True, help="Replace a non-dev profile with the dev one.")
 @click.option("--no-login", is_flag=True, help="Only bring the stack up.")
+@click.option(
+    "--ui",
+    is_flag=True,
+    help="Also Temporal's UI, on 127.0.0.1, decoding with this machine's key (dev only).",
+)
+@click.option(
+    "--observability",
+    is_flag=True,
+    help="Also Prometheus and Grafana with Temporal's dashboards, on 127.0.0.1.",
+)
 def up(
     ctx: click.Context,
     handle: str | None = None,
@@ -314,25 +505,37 @@ def up(
     timeout: float = _HEALTH_TIMEOUT,
     replace_profile: bool = False,
     no_login: bool = False,
+    ui: bool = False,
+    observability: bool = False,
 ) -> None:
     """Start the stack, wait for the gate, and log in to it as a dev party."""
-    from kontra.auth import login
     from kontra.contract.names import validate_handle
-    from kontra.profile import KEY_FILE, PROFILE_FILE, kontra_home
+    from kontra.profile import kontra_home
 
     env_files = _given(ctx, env_files)
     handle = handle if handle is not None else (ctx.obj or {}).get("handle")
     if handle is not None:
         validate_handle(handle)
     existing = None if no_login else _check_profile(replace_profile)
-    config = _config(env_files)
+    asked = [name for name, on in zip(PROFILES, (ui, observability), strict=True) if on]
+    env = _compose_env(observability)
+    config = _config(env_files, PROFILES, env)
     gate_env = _gate_env(config)
     url = gate_env.get("KONTRA_PUBLIC_URL", "").rstrip("/")
     if not url:
         fail("the compose file sets no KONTRA_PUBLIC_URL for the gate")
+    home = kontra_home()
     # Before the stack starts: a failed `up` is exactly when `status` and `logs` are needed.
-    _remember(kontra_home(), _settings(config))
-    _compose(env_files, "up", "--detach", "--remove-orphans")
+    _remember(home, _settings(config))
+    # Exactly the profiles asked for: what an earlier `up --ui` started stops here.
+    unasked = _in_profiles(config, [p for p in PROFILES if p not in asked])
+    if unasked:
+        _compose(
+            env_files, "rm", "--stop", "--force", *unasked, capture=True, profiles=PROFILES, env=env
+        )
+    if not ui:
+        _stop_codec(home)
+    _compose(env_files, "up", "--detach", "--remove-orphans", profiles=asked, env=env)
     _wait_healthy(url, timeout)
     click.echo(f"kontra dev is up (compose project {PROJECT})")
     click.echo(f"  gate      {url}")
@@ -340,24 +543,56 @@ def up(
     click.echo(f"  bucket    {gate_env.get('KONTRA_S3_PUBLIC_ENDPOINT', '?')}")
     if (pg := _published(config, "postgres")) is not None:
         click.echo(f"  postgres  {pg}")
-    if no_login:
-        return
+    for service, shown in (("ui", ui), ("prometheus", observability), ("grafana", observability)):
+        if shown and (where := _published(config, service)) is not None:
+            click.echo(f"  {service:<9} http://{where}")
+    profile = None if no_login else _dev_login(gate_env, url, handle, existing, home)
+    if ui:
+        if profile is not None and (where := _published(config, "ui")) is not None:
+            click.echo(f"  workflows http://{where}/namespaces/{profile.namespace}/workflows")
+        _up_codec(home, config)
+    if profile is not None:
+        click.echo("next: kontra init <name> && cd <name> && kontra serve")
+
+
+def _dev_login(
+    gate_env: dict[str, str],
+    url: str,
+    handle: str | None,
+    existing: Profile | None,
+    home: Path,
+) -> Profile | None:
+    """``up``'s login as a dev party, once the gate answers; None when the gate is not a dev
+    gate."""
+    from kontra.auth import login
+    from kontra.profile import KEY_FILE, PROFILE_FILE
+
     if gate_env.get("KONTRA_DEV") not in ("1", "true"):
         click.echo("the gate is not a dev gate (KONTRA_DEV is not 1): log in with `kontra login`")
-        return
+        return None
     if handle is not None:
         party = handle
     elif existing is not None and existing.dev and existing.gate_url == url:
         party = existing.party  # `kontra dev` again: the same dev party as last time
     else:
         party = default_handle()
-    home = kontra_home()
     profile = run(lambda: login(url, handle=party, dev=True, home=home))
     run(lambda: _wait_temporal(home, _TEMPORAL_TIMEOUT))
     click.echo(f"logged in as {profile.party} (namespace {profile.namespace}), play money")
     click.echo(f"  profile   {home / PROFILE_FILE} (dev)")
     click.echo(f"  key       {home / KEY_FILE} ({profile.public_key})")
-    click.echo("next: kontra init <name> && cd <name> && kontra serve")
+    return profile
+
+
+def _up_codec(home: Path, config: dict[str, Any]) -> None:
+    """Start the UI's codec server. A failure is said and the stack stays up: the UI then
+    shows payloads as ciphertext."""
+    try:
+        where = _start_codec(home, config)
+    except CliError as e:
+        click.echo(f"codec server not started: {e.format_message()}", err=True)
+        return
+    click.echo(f"codec server {where}: the UI decodes with this machine's key")
 
 
 @dev.command()
@@ -366,8 +601,18 @@ def up(
 @click.option("--volumes", is_flag=True, help="Also delete the stack's data (Postgres, bucket).")
 def down(ctx: click.Context, env_files: tuple[Path, ...], volumes: bool) -> None:
     """Stop the stack (its data is kept unless --volumes)."""
+    from kontra.profile import kontra_home
+
     env_files = _given(ctx, env_files)
-    _compose(env_files, "down", "--remove-orphans", *(["--volumes"] if volumes else []))
+    _stop_codec(kontra_home())
+    # Every profile: compose leaves the containers of one not enabled running.
+    _compose(
+        env_files,
+        "down",
+        "--remove-orphans",
+        *(["--volumes"] if volumes else []),
+        profiles=PROFILES,
+    )
     click.echo("kontra dev is down" + (" and its data deleted" if volumes else ""))
 
 
@@ -376,11 +621,11 @@ def down(ctx: click.Context, env_files: tuple[Path, ...], volumes: bool) -> None
 @_ENV_FILES
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 def status(ctx: click.Context, env_files: tuple[Path, ...], as_json: bool) -> None:
-    """The stack's containers, the gate's health, and the profile."""
-    from kontra.profile import Profile, ProfileError
+    """The stack's containers, the gate's health, the UI's codec server, and the profile."""
+    from kontra.profile import Profile, ProfileError, kontra_home
 
     env_files = _given(ctx, env_files)
-    raw = _compose(env_files, "ps", "--all", "--format", "json", capture=True)
+    raw = _compose(env_files, "ps", "--all", "--format", "json", capture=True, profiles=PROFILES)
     services: list[dict[str, Any]] = []
     for line in raw.splitlines():  # compose prints one JSON object per line (or one array)
         line = line.strip()
@@ -396,6 +641,15 @@ def status(ctx: click.Context, env_files: tuple[Path, ...], as_json: bool) -> No
         healthy = httpx.get(f"{url}/healthz", timeout=5).status_code == 200
     except httpx.HTTPError:
         healthy = False
+    codec_state = _codec_state(kontra_home())
+    codec = (
+        None
+        if codec_state is None
+        else {
+            "url": f"http://127.0.0.1:{codec_state['port']}",
+            "running": _codec_answers(codec_state["port"]),
+        }
+    )
     try:
         profile: Profile | None = Profile.load()
     except ProfileError:
@@ -415,6 +669,7 @@ def status(ctx: click.Context, env_files: tuple[Path, ...], as_json: bool) -> No
                 "project": PROJECT,
                 "services": rows,
                 "gate": {"url": url, "healthy": healthy},
+                "codec": codec,
                 "profile": None
                 if profile is None
                 else {"party": profile.party, "gate_url": profile.gate_url, "dev": profile.dev},
@@ -426,6 +681,10 @@ def status(ctx: click.Context, env_files: tuple[Path, ...], as_json: bool) -> No
     for r in rows:
         click.echo(f"{r['service']:<10} {r['status'] or r['state']}")
     click.echo(f"gate {url}: {'healthy' if healthy else 'not answering'}")
+    if codec is not None:
+        click.echo(
+            f"codec server {codec['url']}: {'running' if codec['running'] else 'not answering'}"
+        )
     if profile is not None:
         click.echo(
             f"profile: {profile.party} at {profile.gate_url}{' (dev)' if profile.dev else ''}"
@@ -450,4 +709,4 @@ def logs(
     if re.fullmatch(r"all|[0-9]{1,7}", tail, re.ASCII) is None:
         fail("--tail is a number of lines, or all")
     args = ["logs", "--tail", tail, *(["--follow"] if follow else []), "--", *services]
-    _compose(env_files, *args)
+    _compose(env_files, *args, profiles=PROFILES)

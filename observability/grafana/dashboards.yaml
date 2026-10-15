@@ -1,0 +1,11 @@
+# Temporal's published dashboards (../dashboards), read-only, in a "Temporal" folder.
+apiVersion: 1
+
+providers:
+  - name: temporal
+    folder: Temporal
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards
