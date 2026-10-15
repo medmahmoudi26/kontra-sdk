@@ -13,7 +13,7 @@ This repository is the public half: the `kontra` Python package (SDK, CLI, MCP s
 fakes), the Temporal Authorizer that every party's worker is subject to, the examples, and the
 `kontra dev` stack. The gate (catalog, escrow, auth) is a separate, private service.
 
-> Status: alpha (`0.1.0`). Python 3.11+.
+> Status: alpha (`0.2.0`). Python 3.11+.
 
 ## Quickstart
 
