@@ -200,6 +200,15 @@ networks whose other members may reach its other ports:
 | `temporal-db` | temporal, postgres-relay | Temporal's own database connections (the internal frontend does not listen here; a peer that could route Temporal's `control` address through it would still reach it, which takes a capability the relay does not have) |
 | `database` | postgres, postgres-relay, gate, migrate | the gate's and the migrations' database connections |
 | `bucket` | s3, gate | SeaweedFS's S3 port and its unauthenticated master, volume and filer ports |
+| `observability` | prometheus, grafana (the `observability` profile) | Grafana's queries; Grafana's one peer |
+
+Two compose profiles add dev tools that production never enables (`kontra dev up --ui`,
+`--observability`; [sellers.md](sellers.md#the-ui-and-the-dashboards)). The `ui` profile puts
+Temporal's UI on `control`: it reads every namespace through the internal frontend, which is
+the point of it locally and why it is published on 127.0.0.1 only. The `observability`
+profile puts Prometheus on `temporal-db`, to scrape the metrics listener Temporal opens there
+when asked (`KONTRA_TEMPORAL_METRICS_ADDR`), held to the relay's terms there (no
+capabilities, not root, no forwarding), and Grafana on `observability` alone.
 
 `postgres-relay` is busybox `nc` from the pinned Postgres image itself: it accepts Temporal's
 connections and opens one to Postgres for each, copying bytes, and never connects to Temporal

@@ -536,8 +536,10 @@ seller that never delivers and the refund at the deadline. Install with
 
 ```sh
 kontra dev                    # = kontra dev up
-kontra dev status             # containers, the gate's health, the profile
-kontra dev logs [gate|temporal|postgres|postgres-relay|s3|migrate] [-f] [--tail N]
+kontra dev up --ui            # + Temporal's UI, reading your payloads (below)
+kontra dev up --observability # + Prometheus and Grafana with Temporal's dashboards (below)
+kontra dev status             # containers, the gate's health, the codec server, the profile
+kontra dev logs [gate|temporal|postgres|postgres-relay|s3|migrate|ui|prometheus|grafana] [-f] [--tail N]
 kontra dev down [--volumes]   # --volumes also deletes the stack's data
 ```
 
@@ -568,6 +570,52 @@ connections (see [architecture](architecture.md#one-environment-definition)).
 
 On a dev profile, `kontra serve` publishes an unpublished version itself, so
 `kontra dev && kontra serve` is a hireable offering.
+
+### The UI and the dashboards
+
+`--ui` and `--observability` are the two compose profiles of the same `compose.yaml` (`ui`,
+`observability`); production never enables them. `kontra dev up` runs exactly the profiles
+its flags name: alone it is the stack above and nothing more, and it stops what an earlier
+`--ui` or `--observability` started. `kontra dev status`, `logs` and `down` cover every
+profile. Each tool is published on 127.0.0.1 only, whatever `KONTRA_DEV_BIND` says:
+
+| Flag | Service | Address | Port setting |
+|---|---|---|---|
+| `--ui` | Temporal's UI (`temporalio/ui`) | http://localhost:8233 | `KONTRA_DEV_UI_PORT` |
+| `--ui` | the codec server, a process of `kontra dev` on the host | http://127.0.0.1:8081 | `KONTRA_DEV_CODEC_PORT` |
+| `--observability` | Prometheus | http://localhost:9090 | `KONTRA_DEV_PROMETHEUS_PORT` |
+| `--observability` | Grafana, Temporal's dashboards, no sign-in | http://localhost:3000 | `KONTRA_DEV_GRAFANA_PORT` |
+
+The four ports are remembered in `$KONTRA_HOME/dev.env` like the stack's.
+
+`--ui` is Temporal's own UI, not a Kontra one; after the login, `kontra dev up --ui` prints
+the link to your namespace's workflows. Payloads in Kontra's Temporal are age ciphertext, so
+`kontra dev up --ui` also starts a codec server in the background: Temporal's codec-server
+protocol (`POST /decode` and `/encode`) answered with this machine's key and the job keys
+under `$KONTRA_HOME`. The UI is configured to call it (`TEMPORAL_CODEC_ENDPOINT`), so you read
+your own inputs, results and failures in the UI; a payload encrypted to another party, or one
+claim-checked to the bucket, is shown as stored. `kontra dev down` stops the codec server; it
+writes to `$KONTRA_HOME/codec.log`. The UI talks to Temporal's internal frontend, which has no
+authentication: it sees and controls every namespace of the local stack, and so does anyone
+who reaches its port, as anyone who reaches the codec server's can have your key decrypt what
+was encrypted to it. Both answer on 127.0.0.1 alone, and the codec server to no web origin but
+the UI's; run them on a machine that is yours.
+
+`--observability` runs Prometheus and Grafana. Prometheus scrapes Kontra's Temporal server
+(`kontra dev up --observability` turns its metrics listener on, `KONTRA_TEMPORAL_METRICS_ADDR`)
+and every `kontra serve --metrics` on this machine on ports 9464 to 9473. Grafana opens on
+Temporal's SDK dashboard, with its server dashboard beside it (see
+[Dashboards](#dashboards)). Prometheus runs in a container and reaches your worker through
+Docker's gateway to the host, not through the host's loopback, so bind the worker where that
+gateway arrives:
+
+```sh
+kontra serve --metrics 0.0.0.0:9464
+```
+
+A host firewall that drops traffic from Docker's networks (ufw's default policy does) hides
+the worker: http://localhost:9090/targets shows it down. Let Docker's networks reach ports
+9464 to 9473, and keep them closed to everything else.
 
 ## Publishing and serving
 
@@ -642,6 +690,72 @@ no key to copy around and no `key_mismatch` to resolve. `kontra recipients revok
 stops future deliveries reaching a lost host. It cannot reach backwards: what was already
 encrypted to that key stays encrypted to it (see [security.md](security.md#known-limits)).
 Keep the set small — at most 16 — since every recipient adds a stanza to every payload.
+
+## Scaling and observability
+
+Two flags of `kontra serve` turn on what Temporal's Python SDK already measures. Both are off
+unless given, and neither adds a metric name or an exporter of Kontra's own.
+
+```sh
+kontra serve --metrics 0.0.0.0:9464          # Prometheus text at http://<this host>:9464/metrics
+kontra serve --otlp http://collector:4317    # traces over OTLP/gRPC
+```
+
+`--metrics IP:PORT` serves the SDK's own metrics: the worker's client connects with a
+`temporalio.runtime.Runtime` whose telemetry is `PrometheusConfig(bind_address=IP:PORT)`. The
+names are Temporal's ([SDK metrics](https://docs.temporal.io/references/sdk-metrics)), labelled
+with your namespace, the version's task queue and the workflow and activity types; counters
+have no `_total` suffix and durations are in milliseconds, which is what Temporal's dashboard
+reads. What answers the usual questions:
+
+| Question | Metric |
+|---|---|
+| do I need more workers? | `temporal_activity_schedule_to_start_latency` and `temporal_workflow_task_schedule_to_start_latency` (how long a task waited for a worker) climbing, with `temporal_worker_task_slots_available` at 0 |
+| is a slot limit the bottleneck? | `temporal_worker_task_slots_used` against `max_concurrent_activities` |
+| are activities failing? | `temporal_activity_execution_failed`, by `activity_type` |
+| how long does a job take? | `temporal_workflow_endtoend_latency`, `temporal_activity_execution_latency` |
+
+The endpoint has no authentication: bind it where your Prometheus reaches it and nothing
+else does, and scrape each worker like any other target:
+
+```yaml
+scrape_configs:
+  - job_name: kontra-serve
+    static_configs:
+      - targets: ["worker-1:9464", "worker-2:9464"]
+```
+
+`--otlp URL` puts Temporal's `TracingInterceptor` (`temporalio.contrib.opentelemetry`) on the
+worker's client and exports its spans over OTLP/gRPC to the collector at `URL` (`http://` in
+plaintext, `https://` over TLS): the Nexus `quote` and `execute` handlers, `StartWorkflow`,
+`RunWorkflow`, `StartActivity`, `RunActivity`. Each carries `temporalWorkflowID` (`job-<id>` for
+a job's workflow), `temporalRunID` and `temporalTaskQueue`; `OTEL_SERVICE_NAME` names the
+service. It needs the `opentelemetry` extra, `pip install 'kontra-sdk[opentelemetry]'`; without
+it `kontra serve --otlp` says so and does not start. The interceptor's tracer provider is its
+own: spans you make with OpenTelemetry's API go wherever your own setup sends them.
+
+Neither carries what a buyer sent or received. Metrics are counts and latencies labelled with
+names. Spans carry names and IDs; the one thing Temporal's interceptor takes from a job, an
+exception's message (a failure message, encrypted everywhere else), is removed before export,
+so a failed span keeps its status and its exception's type only. The codec's leak test runs a
+job whose input, result, failure and heartbeats carry a marker through a worker with both
+flags on, and finds it in neither the metrics text nor the exported spans.
+
+### Dashboards
+
+Temporal publishes Grafana dashboards for its SDK and server metrics. Two are vendored here,
+unchanged, in [`observability/dashboards`](../observability/dashboards) (MIT, Temporal
+Technologies): `temporal-core-sdks-otel.json` reads `kontra serve --metrics` (Python's SDK is
+built on Temporal's Core), `server-general.json` a Temporal server's. Import the SDK dashboard
+into your Grafana with the Prometheus that scrapes your workers as its data source, or run both
+locally with `kontra dev up --observability` (see [Running locally](#the-ui-and-the-dashboards)).
+
+### Scaling out
+
+The metrics say a queue is waiting for workers; the version's task-queue backlog says how far
+behind it is, and is what an autoscaler should read. Your worker token may call
+`DescribeTaskQueue` in your own namespace, which is all KEDA's Temporal scaler needs: see
+[Scaling](#scaling) for the call and [KEDA](#keda) for a `ScaledObject`.
 
 ## Versions
 

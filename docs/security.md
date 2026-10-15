@@ -222,10 +222,14 @@ deadline rule.
   namespace; its isolation is the network alone: loopback by default, and in `compose.yaml`
   Temporal's fixed address on the `control` network (a pinned subnet, `KONTRA_CONTROL_NET`),
   shared only with the gate. It does not listen on `temporal-db`, whose only other member is
-  the Postgres relay; Postgres and the gate's migration job reach the database through that
+  the Postgres relay (and, with `kontra dev up --observability`, Prometheus, held to the
+  same terms); Postgres and the gate's migration job reach the database through that
   relay and cannot reach Temporal at all; the bucket's network and the published ports never
   carry it. A deployment that adds a container to `control` gives that container the
-  internal frontend. The bind is not the whole wall on `temporal-db`: Linux accepts a packet
+  internal frontend; `kontra dev up --ui` does so on purpose with Temporal's UI, a dev tool
+  published on 127.0.0.1 only that production never runs (as is the codec server it starts,
+  which decrypts with the machine's key for whoever reaches its loopback port). The bind is
+  not the whole wall on `temporal-db`: Linux accepts a packet
   for any of its addresses on any interface, so a peer there that routes Temporal's `control`
   address through Temporal's `temporal-db` address reaches it (measured); that takes
   `NET_ADMIN` (or `NET_RAW`), which the relay -- no capabilities, not root -- lacks. The host
