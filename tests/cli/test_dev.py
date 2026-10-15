@@ -17,7 +17,6 @@ import re
 import shutil
 import stat
 import subprocess
-import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -581,8 +580,10 @@ def test_the_bucket_never_sends_its_own_traffic_to_a_proxy(tmp_path: Path) -> No
 
     The second half runs the service as compose resolved it (entrypoint, command,
     environment, user, read-only root, healthcheck) on a network of its own, a tmpfs for its
-    volume, under a client configured with an unreachable proxy: it becomes healthy. The
-    same service without those four entries dials the proxy (its log names it)."""
+    volume, under a client configured with an unreachable proxy: it becomes healthy, with the
+    proxy cleared. The control, the same service without those four entries, shows the client
+    really did inject the proxy. It no longer shows SeaweedFS dialling it: since 4.x its
+    processes reach the master over a Unix socket and came up either way (measured, 4.48)."""
     s3 = _resolved(tmp_path)["services"]["s3"]
     env = s3["environment"]
     assert {var: env.get(var) for var in _PROXY_VARS} == dict.fromkeys(_PROXY_VARS, "")
@@ -621,11 +622,6 @@ def test_the_bucket_never_sends_its_own_traffic_to_a_proxy(tmp_path: Path) -> No
         assert run("exec", "-T", "fixed", "printenv", "http_proxy").stdout == "\n"
         # Control: the same service under the same client, without the four entries.
         assert run("exec", "-T", "bare", "printenv", "http_proxy").stdout.strip() == _PROXY
-        deadline, logs = time.monotonic() + 60, ""
-        while "proxy.invalid" not in logs and time.monotonic() < deadline:
-            time.sleep(1)
-            logs = run("logs", "--no-log-prefix", "bare").stdout
-        assert "proxy.invalid" in logs, logs[-2000:]
     finally:
         down = run("down", "-v", "--remove-orphans", "-t", "1")
         assert down.returncode == 0, down.stderr
