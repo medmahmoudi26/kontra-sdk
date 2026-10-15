@@ -87,7 +87,7 @@ def test_the_metadata_is_what_pypi_shows(dist: Path) -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     assert "Name: kontra-sdk\n" in meta
     assert f"Version: {project['version']}\n" in meta
-    assert "Version: 0.1.0\n" in meta
+    assert "Version: 0.2.0\n" in meta
     assert "Requires-Python: >=3.11\n" in meta
     assert "License-Expression: Apache-2.0\n" in meta
     assert "Project-URL: Homepage, https://kontra.run\n" in meta
