@@ -31,7 +31,8 @@ PYTEST_FLAGS ?= -q -ra
 #   ③ contract        tests/contract (derivation, canonical form, hash, validation)
 #                     tests/examples/test_golden.py (examples/*/contract.yaml byte for byte)
 #   ④ ledger          tests/ledger (the §9.3 suite, and its teeth)
-#   ⑤ codec           tests/codec, tests/artifacts (round trips, marker scans of history and bucket)
+#   ⑤ codec           tests/codec, tests/artifacts (round trips, marker scans of history, bucket,
+#                     and a worker's metrics and spans)
 # Seam ① is `deny-matrix` below.
 SEAM_TESTS := \
 	tests/gate_client/test_routes.py \

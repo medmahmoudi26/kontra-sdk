@@ -28,7 +28,7 @@ crosses a seam updates that seam's test **in the same PR**.
 | ② | Gate HTTP API | `kontra/gate_client/models.py` + `routes.py` | `tests/gate_client/test_routes.py`; the gate's OpenAPI snapshot in `kontra-cloud` |
 | ③ | Contract document | `kontra/contract` + `spec/` | golden `examples/*/contract.yaml` reproduced byte for byte |
 | ④ | Ledger | `kontra/ledger.py` Protocol | `kontra.testing.ledger_contract` against every adapter |
-| ⑤ | Codec | `kontra/codec` | round trips + the marker-string scan of bucket and history |
+| ⑤ | Codec | `kontra/codec` | round trips + the marker-string scan of bucket, history, a worker's metrics endpoint and its exported spans |
 
 ## Rules that keep the design honest
 
