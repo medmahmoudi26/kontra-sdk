@@ -20,7 +20,6 @@ import temporalio.api.taskqueue.v1 as taskqueue
 import temporalio.api.workflowservice.v1 as wsv1
 from temporalio.client import Client
 
-from kontra.codec.age import is_recipient
 from kontra.contract import load_offering
 from kontra.gate_client import models as m
 from kontra.hire import Kontra
@@ -34,7 +33,6 @@ REPO = Path(__file__).resolve().parents[2]
 EXAMPLES = REPO / "examples"
 #: The sellers, by directory. Their offering names start with ``acme/``.
 SELLERS = ("enrich", "legacy-actor", "hello")
-KEY_FILE = EXAMPLES / "example-public-key.txt"
 #: What a buyer is funded with, in cents.
 START = 10_000
 #: The example sellers fetch only public addresses unless told otherwise (their READMEs);
@@ -43,16 +41,6 @@ ALLOW_LOCAL_SITES = {
     "ENRICH_ALLOWED_PRIVATE_NETWORKS": "127.0.0.1/32",
     "PROBE_ALLOWED_PRIVATE_NETWORKS": "127.0.0.1/32",
 }
-
-
-def example_public_key() -> str:
-    """The one recipient in ``examples/example-public-key.txt`` (an age recipients file:
-    ``#`` comments and blank lines around it)."""
-    lines = [line.strip() for line in KEY_FILE.read_text(encoding="utf-8").splitlines()]
-    keys = [line for line in lines if line and not line.startswith("#")]
-    if len(keys) != 1 or not is_recipient(keys[0]):
-        raise AssertionError(f"{KEY_FILE} must hold exactly one age recipient, found {keys!r}")
-    return keys[0]
 
 
 async def until(
