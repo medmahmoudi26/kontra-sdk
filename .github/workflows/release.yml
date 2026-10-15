@@ -26,7 +26,7 @@ env:
 jobs:
   build:
     name: build
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -86,7 +86,7 @@ jobs:
 
   sbom:
     name: sbom
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -111,7 +111,7 @@ jobs:
   pypi:
     name: pypi
     needs: [build, sbom]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     environment:
       name: pypi
@@ -129,7 +129,7 @@ jobs:
   github-release:
     name: github-release
     needs: [pypi]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 10
     permissions:
       contents: write # create the release and upload its assets

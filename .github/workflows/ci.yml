@@ -15,6 +15,15 @@
 
 name: ci
 
+# Where these jobs run: GitHub-hosted `ubuntu-24.04` by default, or whatever the repository
+# variable KONTRA_RUNNER names, as a JSON array of labels -- set it to
+# ["self-hosted","kontra-ci"] to move every job onto the self-hosted runner, unset it to go
+# back. One variable, no job edits, reversible in a click. Both repositories are private, so
+# GitHub-hosted minutes are metered; a self-hosted runner costs none.
+#
+# A self-hosted runner must not be attached to a PUBLIC repository: a pull request from a
+# fork would run its own code on the machine.
+
 on:
   pull_request:
   push:
@@ -34,7 +43,7 @@ env:
 jobs:
   lint:
     name: lint
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -51,7 +60,7 @@ jobs:
 
   typecheck:
     name: typecheck
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -70,7 +79,7 @@ jobs:
   # `test` that branch protection requires; the others are `test (3.11)`, and so on.
   test:
     name: ${{ matrix.python == '3.12' && 'test' || format('test ({0})', matrix.python) }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 40
     permissions:
       contents: read
@@ -99,7 +108,7 @@ jobs:
   # change unseen (`test` leaves them out, so nothing runs twice).
   seams:
     name: ${{ matrix.python == '3.12' && 'seams' || format('seams ({0})', matrix.python) }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -123,7 +132,7 @@ jobs:
 
   deny-matrix:
     name: deny-matrix
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -151,7 +160,7 @@ jobs:
   gate-image:
     name: gate-image
     needs: [lint, typecheck, test, seams, deny-matrix]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 5
     permissions:
       packages: read # see the gate image when the package grants this repository access
@@ -228,7 +237,7 @@ jobs:
       && (needs.gate-image.outputs.public == 'true'
           || github.event_name != 'pull_request'
           || github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -236,6 +245,14 @@ jobs:
     env:
       GATE_IMAGE: ghcr.io/medmahmoudi26/kontra-gate:dev
       TEMPORAL_IMAGE: kontra-temporal:ci
+      # `kontra dev` publishes on loopback, and a self-hosted runner shares its host with
+      # whatever else that host runs -- here, another Postgres on 5432 and another S3 on
+      # 8333. Fixed high ports instead of the defaults, so the stack never races the host
+      # for a port. A GitHub-hosted runner has nothing on either, so this costs it nothing.
+      KONTRA_DEV_PG_PORT: "15432"
+      KONTRA_DEV_S3_PORT: "18333"
+      KONTRA_DEV_TEMPORAL_PORT: "17233"
+      KONTRA_DEV_GATE_PORT: "18080"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
