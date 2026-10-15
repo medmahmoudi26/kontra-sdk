@@ -741,51 +741,40 @@ scrape_configs:
 `--otlp URL` puts Temporal's `TracingInterceptor` (`temporalio.contrib.opentelemetry`) on the
 worker's client and exports its spans over OTLP/gRPC to the collector at `URL` (`http://` in
 plaintext, `https://` over TLS): the Nexus `quote` and `execute` handlers, `StartWorkflow`,
-`RunWorkflow`, `StartActivity`, `RunActivity`. Each carries `temporalWorkflowID` (`job-<id>` for
-a job's workflow), `temporalRunID` and `temporalTaskQueue`; `OTEL_SERVICE_NAME` names the
-service. It needs the `opentelemetry` extra, `pip install 'kontra-sdk[opentelemetry]'`; without
+`RunWorkflow`, `StartActivity`, `RunActivity`. Every span the worker starts carries
+`temporalTaskQueue`, its task queue. A workflow's spans and `RunActivity` also carry
+`temporalWorkflowID` (`job-<id>` for a job's workflow) and `temporalRunID`, `RunActivity` its
+`temporalActivityID` too; `StartWorkflow` carries the workflow ID alone, and a Nexus handler's
+span the task queue alone. `OTEL_SERVICE_NAME` names the service. It needs the `opentelemetry` extra, `pip install 'kontra-sdk[opentelemetry]'`; without
 it `kontra serve --otlp` says so and does not start. The interceptor's tracer provider is its
 own: spans you make with OpenTelemetry's API go wherever your own setup sends them.
 
 Neither carries what a buyer sent or received. Metrics are counts and latencies labelled with
-names. Spans carry names and IDs; the one thing Temporal's interceptor takes from a job, an
-exception's message (a failure message, encrypted everywhere else), is removed before export,
-so a failed span keeps its status and its exception's type only. The codec's leak test runs a
-job whose input, result, failure and heartbeats carry a marker through a worker with both
-flags on, and finds it in neither the metrics text nor the exported spans.
+names. Spans carry names and IDs. A buyer's Nexus call may carry a trace context of its own
+(`traceparent`, `tracestate`, `baggage`): the worker removes it before Temporal's interceptor
+reads it, so a handler's span starts a trace of yours, recorded whatever the buyer's sampling
+flag says, and nothing of the buyer's reaches a span or the history of the workflow it
+starts. The one thing Temporal's interceptor takes from a job, an exception's message (a
+failure message, encrypted everywhere else), is removed before export, so a failed span keeps
+its status and its exception's type only. The codec's leak test runs jobs whose input,
+result, failure, heartbeats and trace context carry a marker through a worker with both flags
+on, and finds it in neither the metrics text nor the exported spans.
 
 ### Dashboards
 
 Temporal publishes Grafana dashboards for its SDK and server metrics. Two are vendored here,
-unchanged, in [`docs/dashboards`](dashboards) (MIT, Temporal
-Technologies): `temporal-core-sdks-otel.json` reads `kontra serve --metrics` (Python's SDK is
-built on Temporal's Core), `server-general.json` a Temporal server's. Import the SDK dashboard
+unchanged, in [`docs/dashboards`](dashboards) (MIT, Temporal Technologies):
+`temporal-core-sdks-otel.json` reads `kontra serve --metrics` (Python's SDK is built on
+Temporal's Core), `server-general.json` a Temporal server's. Import the SDK dashboard
 into your Grafana with the Prometheus that scrapes your workers as its data source, or run both
 locally with `kontra dev up --observability` (see [Running locally](#the-ui-and-the-dashboards)).
 
-### Scaling out
+### Scaling
 
-The metrics say a queue is waiting for workers; the version's task-queue backlog says how far
-behind it is, and is what an autoscaler should read. Your worker token may call
-`DescribeTaskQueue` in your own namespace, which is all KEDA's Temporal scaler needs: see
-[Scaling](#scaling) for the call and [KEDA](#keda) for a `ScaledObject`.
-
-## Versions
-
-A published version is fixed. At start, `kontra serve` recomputes each offering's contract hash
-from your code and refuses to start if it differs from the catalog's: change a type or
-`offering.yaml`, then bump `version` and publish again. The hold token a buyer pays under
-carries the hash too, and the handler refuses a token for any other hash, so a buyer who paid
-for contract X is never served by code running contract Y.
-
-A new version is a new document, endpoint and task queue. Jobs hired on the old version
-finish on a worker that still serves it.
-
-## Scaling
-
-One `kontra serve` is one worker. To decide whether you need more, read the backlog of the
-version's task queue — the one `kontra publish` printed. Your worker token may call
-`DescribeTaskQueue` in your own namespace, so Temporal's own CLI works unchanged:
+One `kontra serve` is one worker. The metrics say a queue is waiting for workers; the backlog
+of the version's task queue (the one `kontra publish` printed) says how far behind it is, and
+is what an autoscaler reads. Your worker token may call `DescribeTaskQueue` in your own
+namespace, so Temporal's own CLI works unchanged:
 
 ```sh
 # A worker token (15 minutes), the namespace and the frontend address, from the gate.
@@ -862,6 +851,17 @@ same loop `kontra serve` runs internally, as a small CronJob calling the route a
 `queueTypes` to match where your work is: the activity queue if it is in activities, the
 workflow queue if it is in workflow tasks. Scaling on both against one `targetQueueSize`
 oscillates, because the two backlogs drain at different rates.
+
+## Versions
+
+A published version is fixed. At start, `kontra serve` recomputes each offering's contract hash
+from your code and refuses to start if it differs from the catalog's: change a type or
+`offering.yaml`, then bump `version` and publish again. The hold token a buyer pays under
+carries the hash too, and the handler refuses a token for any other hash, so a buyer who paid
+for contract X is never served by code running contract Y.
+
+A new version is a new document, endpoint and task queue. Jobs hired on the old version
+finish on a worker that still serves it.
 
 ## Getting paid
 
