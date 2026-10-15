@@ -36,7 +36,7 @@ jobs:
   build:
     name: build
     if: github.event_name == 'pull_request' || github.ref != 'refs/heads/dev'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -56,7 +56,7 @@ jobs:
   publish:
     name: publish
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/dev'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 60
     permissions:
       contents: read

@@ -24,7 +24,7 @@ env:
 jobs:
   gitleaks:
     name: gitleaks
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -46,7 +46,7 @@ jobs:
 
   pip-audit:
     name: pip-audit
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -74,7 +74,7 @@ jobs:
 
   trivy:
     name: trivy
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -110,7 +110,7 @@ jobs:
 
   sbom:
     name: sbom
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -131,7 +131,7 @@ jobs:
 
   zizmor:
     name: zizmor
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.KONTRA_RUNNER && fromJSON(vars.KONTRA_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 10
     permissions:
       contents: read
