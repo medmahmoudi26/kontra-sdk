@@ -12,21 +12,36 @@ beside the interceptor's own ``temporalWorkflowID``, ``temporalRunID`` and
 the Temporal context the span starts in: an activity's, a workflow's, a Nexus operation's.
 
 Nothing a buyer wrote leaves in a span (seam ⑤). The interceptor's attributes are names
-and IDs, none of them a buyer's, but it does write one thing from the job: an exception's
-message, as the description of a failed span's status and in the ``exception`` event with
-its stack trace. A failure message travels encrypted everywhere else (the codec encodes
-failures), so every span is exported through :class:`Scrubbed`: an error keeps its status
-code and its exception's type, and loses the description, the message and the stack trace.
+and IDs, none of them a buyer's, but two things from a job would reach a span through it:
+
+* The trace context of a Nexus call. A Nexus operation's headers are the caller's, and
+  the interceptor makes their W3C ``traceparent`` the parent of the handler's span, keeps
+  their ``tracestate`` in its span context (exported with the span), honours their
+  sampling flag (``00`` and nothing under the handler is recorded), and carries their
+  ``baggage`` on into the ``_tracer-data`` header of the workflow the handler starts,
+  which Temporal stores unencoded in history. So :class:`SellerTracingInterceptor` removes
+  every header the interceptor's propagator reads (``traceparent``, ``tracestate``,
+  ``baggage``) from a Nexus call before the interceptor sees it: a handler's span starts a
+  trace of its own, sampled by the seller's provider, with no link to the buyer's (a link
+  would export the IDs the buyer chose).
+* An exception's message, as the description of a failed span's status and in the
+  ``exception`` event with its stack trace. A failure message travels encrypted everywhere
+  else (the codec encodes failures), so every span is exported through :class:`Scrubbed`:
+  an error keeps its status code and its exception's type, and loses the description, the
+  message and the stack trace.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+import dataclasses
+from collections.abc import Mapping, Sequence
+from typing import Any
 
+import nexusrpc.handler
 import opentelemetry.context
 import temporalio.activity
 import temporalio.nexus
+import temporalio.worker
 import temporalio.workflow
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Event, ReadableSpan, Span, SpanProcessor, TracerProvider
@@ -34,7 +49,14 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter, Spa
 from opentelemetry.trace import Status
 from temporalio.contrib.opentelemetry import TracingInterceptor
 
-__all__ = ["TASK_QUEUE_ATTRIBUTE", "Scrubbed", "Tracing", "scrub", "tracing"]
+__all__ = [
+    "TASK_QUEUE_ATTRIBUTE",
+    "Scrubbed",
+    "SellerTracingInterceptor",
+    "Tracing",
+    "scrub",
+    "tracing",
+]
 
 #: The span attribute naming the task queue (spelled like ``temporalWorkflowID``).
 TASK_QUEUE_ATTRIBUTE = "temporalTaskQueue"
@@ -42,7 +64,7 @@ TASK_QUEUE_ATTRIBUTE = "temporalTaskQueue"
 _EXCEPTION_KEPT = frozenset({"exception.type", "exception.escaped"})
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Tracing:
     """The interceptor to connect the worker's client with, and the provider behind it."""
 
@@ -56,9 +78,10 @@ class Tracing:
 
 
 def tracing(exporter: SpanExporter) -> Tracing:
-    """``TracingInterceptor`` on a provider that stamps the task queue and exports through
-    :class:`Scrubbed` (batched) to ``exporter``. The resource is OpenTelemetry's default, so
-    ``OTEL_SERVICE_NAME`` and ``OTEL_RESOURCE_ATTRIBUTES`` apply."""
+    """:class:`SellerTracingInterceptor` on a provider that stamps the task queue and
+    exports through :class:`Scrubbed` (batched) to ``exporter``. The resource is
+    OpenTelemetry's default, so ``OTEL_SERVICE_NAME`` and ``OTEL_RESOURCE_ATTRIBUTES``
+    apply."""
     provider = TracerProvider(resource=Resource.create())
     provider.add_span_processor(_TaskQueue())
     provider.add_span_processor(BatchSpanProcessor(Scrubbed(exporter)))
@@ -66,8 +89,54 @@ def tracing(exporter: SpanExporter) -> Tracing:
     tracer = provider.get_tracer(TracingInterceptor.__module__)
     # Workflow spans are created even without a client span above them: a job's workflow
     # is started by the Nexus handler, from a buyer's call, not by a traced client of ours.
-    interceptor = TracingInterceptor(tracer, always_create_workflow_spans=True)
+    interceptor = SellerTracingInterceptor(tracer, always_create_workflow_spans=True)
     return Tracing(interceptor, provider)
+
+
+class SellerTracingInterceptor(TracingInterceptor):
+    """``TracingInterceptor`` that never reads a trace context from a Nexus call: the
+    headers its propagator reads are removed from the call first (see the module
+    docstring). Everything else is the interceptor's own."""
+
+    def intercept_nexus_operation(
+        self, next: temporalio.worker.NexusOperationInboundInterceptor
+    ) -> temporalio.worker.NexusOperationInboundInterceptor:
+        fields = frozenset(f.lower() for f in self.text_map_propagator.fields)
+        return _CallerContextRemoved(super().intercept_nexus_operation(next), fields)
+
+
+def _without(headers: Mapping[str, str], fields: frozenset[str]) -> dict[str, str]:
+    """``headers`` less ``fields``, in any ASCII case (Nexus header names arrive
+    lowercased; a name with a non-ASCII letter is never one of them)."""
+    return {k: v for k, v in headers.items() if not (k.isascii() and k.lower() in fields)}
+
+
+class _CallerContextRemoved(temporalio.worker.NexusOperationInboundInterceptor):
+    """Hands ``next`` (the tracing interceptor's) each Nexus call without ``fields``."""
+
+    def __init__(
+        self, next: temporalio.worker.NexusOperationInboundInterceptor, fields: frozenset[str]
+    ) -> None:
+        super().__init__(next)
+        self._fields = fields
+
+    async def execute_nexus_operation_start(
+        self, input: temporalio.worker.ExecuteNexusOperationStartInput
+    ) -> (
+        nexusrpc.handler.StartOperationResultSync[Any] | nexusrpc.handler.StartOperationResultAsync
+    ):
+        input.ctx = dataclasses.replace(
+            input.ctx, headers=_without(input.ctx.headers, self._fields)
+        )
+        return await self.next.execute_nexus_operation_start(input)
+
+    async def execute_nexus_operation_cancel(
+        self, input: temporalio.worker.ExecuteNexusOperationCancelInput
+    ) -> None:
+        input.ctx = dataclasses.replace(
+            input.ctx, headers=_without(input.ctx.headers, self._fields)
+        )
+        await self.next.execute_nexus_operation_cancel(input)
 
 
 def _task_queue() -> str | None:

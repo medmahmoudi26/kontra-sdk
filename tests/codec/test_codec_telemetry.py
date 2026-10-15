@@ -7,10 +7,15 @@ with the runtime and the tracing interceptor those two flags build
 (:mod:`kontra.serve.telemetry`), spans going to an in-memory exporter instead of a
 collector. A buyer hires two jobs whose input carries a marker: one delivers it upper-cased
 after an activity attempt that heartbeats it and fails with it in the message, the other
-fails its workflow with it in the message. Then the Prometheus text and the spans, encoded
-as OTLP would send them, are searched for the marker in both cases. A control proves the
+fails its workflow with it in the message. A third is hired by a buyer whose Nexus call
+carries a trace context of its choosing: unsampled, with the marker in its ``tracestate``
+and ``baggage``. Then the Prometheus text and the spans, encoded as OTLP would send them, are
+searched for the marker in every case, and so is the third job's history, where the trace
+context the handler passes on is stored unencoded (``_tracer-data``). A control proves the
 search would find it: the same spans before :class:`~kontra.serve._tracing.Scrubbed` carry
-it (the interceptor writes exception messages), so the scrub is what keeps them out.
+it (the interceptor writes exception messages), so the scrub is what keeps them out; the
+buyer's trace context is ruled out before any span starts, and its control is
+``tests/serve/test_tracing.py``.
 """
 
 from __future__ import annotations
@@ -33,6 +38,13 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
+from temporalio.client import (
+    Client,
+    Interceptor,
+    NexusOperationHandle,
+    OutboundInterceptor,
+    StartNexusOperationInput,
+)
 
 from kontra.contract.names import job_workflow_id
 from kontra.hire import JobFailed
@@ -52,6 +64,13 @@ from .serve_flows import Doc, Shout, shout
 pytestmark = [pytest.mark.temporal, pytest.mark.asyncio(loop_scope="module")]
 
 MARKER = "kontra-telemetry-marker-3c8a"
+BUYER_TRACE = "0af7651916cd43dd8448eb211c80319c"
+#: What the third job's buyer puts in its Nexus call: a trace context of its own choosing.
+BUYER_TRACE_HEADERS = {
+    "traceparent": f"00-{BUYER_TRACE}-b7ad6b7169203331-00",  # not sampled
+    "tracestate": f"buyer={MARKER}",
+    "baggage": f"buyer={MARKER}",
+}
 
 
 @pytest.fixture(scope="module")
@@ -93,6 +112,26 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+class BuyerTraceContext(Interceptor):
+    """A buyer's client that adds :data:`BUYER_TRACE_HEADERS` to every Nexus call it starts."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        root = self
+
+        class Outbound(OutboundInterceptor):
+            async def start_nexus_operation(
+                self, input: StartNexusOperationInput
+            ) -> NexusOperationHandle[object]:
+                input.headers = {**input.headers, **BUYER_TRACE_HEADERS}
+                root.calls += 1
+                return await super().start_nexus_operation(input)
+
+        return Outbound(next)
+
+
 @dataclass
 class Telemetry:
     metrics_url: str
@@ -101,7 +140,10 @@ class Telemetry:
     #: The same spans as they leave the interceptor, before the scrub: the control.
     raw: InMemorySpanExporter
     task_queue: str
-    jobs: dict[str, str]  # what each job was: "delivered" / "failed" -> job id
+    #: What each job was: "delivered" / "failed" / "traced" (hired with a buyer's trace
+    #: context) -> job id.
+    jobs: dict[str, str]
+    seller: Client
 
     def spans(self) -> tuple[list[ReadableSpan], list[ReadableSpan]]:
         assert self.tracing.provider.force_flush(10_000)
@@ -149,6 +191,14 @@ async def telemetry(
             with pytest.raises(JobFailed):
                 await failing.result(timeout=60)
             jobs["failed"] = failing.job_id
+            context = BuyerTraceContext()
+            config = mp.client(bob.namespace).config()
+            config["interceptors"] = [context]
+            tracing_buyer = bob.kontra(client=Client(**config))
+            traced_job = await tracing_buyer.hire(bound.key, text=f"traced {MARKER}")
+            assert (await traced_job.result(timeout=60)).text == f"TRACED {MARKER}".upper()
+            assert context.calls == 1  # the call carried the buyer's trace context
+            jobs["traced"] = traced_job.job_id
             yield Telemetry(
                 f"http://127.0.0.1:{port}/metrics",
                 traced,
@@ -156,6 +206,7 @@ async def telemetry(
                 raw,
                 bound.offering_id.task_queue,
                 jobs,
+                mp.client(acme.namespace),
             )
         finally:
             worker.shutdown()
@@ -227,3 +278,32 @@ async def test_spans_carry_the_task_queue_and_the_workflow_id(telemetry: Telemet
         for s in exported
         if s.name.startswith(("RunWorkflow:", "RunActivity:", "StartActivity:"))
     )
+
+
+async def test_a_buyer_s_trace_context_stays_out(telemetry: Telemetry) -> None:
+    """The third job's buyer sent an unsampled ``traceparent`` and the marker in
+    ``tracestate`` and ``baggage``: the seller's spans are recorded anyway, under a trace of
+    the seller's, and the history of the workflow the handler started holds no marker."""
+    exported, _ = telemetry.spans()
+    workflow_id = job_workflow_id(telemetry.jobs["traced"])
+    [run] = [
+        s
+        for s in exported
+        if s.name.startswith("RunWorkflow:")
+        and (s.attributes or {}).get("temporalWorkflowID") == workflow_id
+    ]
+    assert run.context is not None
+    trace = [
+        s for s in exported if s.context is not None and s.context.trace_id == run.context.trace_id
+    ]
+    [handler] = [s for s in trace if s.name.startswith("RunStartNexusOperationHandler:")]
+    assert handler.parent is None  # a root: the buyer's span is not above it
+    assert format(run.context.trace_id, "032x") != BUYER_TRACE
+    assert all(not s.context.trace_state for s in trace if s.context is not None)
+    _absent("the traced job's spans", encode_spans(trace).SerializeToString())
+    history = await telemetry.seller.get_workflow_handle(workflow_id).fetch_history()
+    started = history.events[0].workflow_execution_started_event_attributes
+    # The trace context the handler handed on is the seller's, and there is one to check.
+    carried = started.header.fields["_tracer-data"].data
+    assert format(run.context.trace_id, "032x").encode() in carried
+    _absent("the traced job's history", history.to_json().encode())
