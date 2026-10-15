@@ -233,17 +233,18 @@ async def test_ac08_no_plaintext_of_a_100mb_job_in_the_bucket_or_temporal(
 async def test_ac13_heartbeats_reach_the_buyer_in_order_and_the_gate_keeps_ciphertext(
     stack: Stack, tmp_path: Path
 ) -> None:
-    """The seller's activity (no Kontra import) heartbeats ``{percent, message}`` 100 times,
-    every 1.5 s, under the forwarder's default throttle (one event a second per job, latest
-    wins); ``job.progress()`` yields all 100 in order, decrypted. Nothing the stack stores holds a
-    message's text. A second job, whose activity never heartbeats, still shows liveness and
-    the running activity's name, from history."""
+    """The seller's activity (Temporal only through the façade) heartbeats
+    ``{percent, message}`` 100 times, every 1.5 s, under the forwarder's default throttle (one
+    event a second per job, latest wins); ``job.progress()`` yields all 100 in order,
+    decrypted. Nothing the stack stores holds a message's text. A second job, whose activity
+    never heartbeats, still shows liveness and the running activity's name, from history."""
     seller = await stack.party("ac13")
     buyer = await stack.party("ac13-buyer")
     key = f"{seller.handle}/pulse@1.0.0"
     project = own_project("pulse", tmp_path / "pulse", f"{seller.handle}/pulse")
     activities = (project / "activities.py").read_text()
-    assert re.search(r"^\s*(from|import)\s+kontra\b", activities, re.M) is None
+    assert "import kontra" not in activities
+    assert re.search(r"^\s*(from|import)\s+(temporalio|nexusrpc)\b", activities, re.M) is None
     tag = marker("ac13")
     k = buyer.kontra()
     try:
