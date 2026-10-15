@@ -71,8 +71,10 @@ jobs:
           "$RUNNER_TEMP/smoke/bin/python" -I - <<'EOF'
           from pathlib import Path
           import kontra
+          from kontra.contract.spec import KONTRA_TYPES_FILE, X_KONTRA_FILE
           root = Path(kontra.__file__).parent
-          for f in ("_dev/compose.yaml", "_spec/x-kontra.v1.json", "_spec/kontra-types.v1.json"):
+          # The spec files by the names the package loads, so a spec bump moves this check too.
+          for f in ("_dev/compose.yaml", f"_spec/{X_KONTRA_FILE}", f"_spec/{KONTRA_TYPES_FILE}"):
               assert (root / f).is_file(), f"the wheel lacks kontra/{f}"
           print("wheel contents ok")
           EOF
