@@ -36,7 +36,7 @@ async def test_publish_assigns_an_opaque_endpoint_and_creates_it(world: World) -
     assert (created.namespace, created.task_queue) == ("acme", "acme/enrich@1.0.0")
     assert entry.card["name"] == "acme/enrich"
     assert entry.card["supportedInterfaces"][0]["url"].endswith("/v1/catalog/acme/enrich/1.0.0")
-    assert entry.public_key == acme.profile.public_key
+    assert entry.recipients == [acme.profile.public_key]
 
 
 async def test_republishing_a_version_keeps_its_endpoint(world: World) -> None:
@@ -71,7 +71,7 @@ async def test_a_version_with_open_jobs_keeps_its_contract(world: World) -> None
 
 async def test_publish_refusals(world: World) -> None:
     acme, mallory = await world.party("acme"), await world.party("mallory")
-    doc = offering_doc("acme", acme.profile.public_key or "")
+    doc = offering_doc("acme")
     with pytest.raises(GateError) as e:
         await mallory.gate.publish(doc)
     assert (e.value.status, e.value.code) == (403, "not_owner")
@@ -180,7 +180,7 @@ async def test_search_lists_latest_versions_with_reputation_and_pages(world: Wor
     assert next(i.offering for i in (await anon.search("FAST")).items) == "seller0/enrich@1.1.0"
     assert (await anon.search("nothing-like-this")).items == []
     assert page.items[0].seller.party == "seller0"
-    assert page.items[0].seller.public_key == sellers[0].profile.public_key
+    assert page.items[0].seller.recipients == [sellers[0].profile.public_key]
     with pytest.raises(GateError) as e:
         await anon.search(cursor="garbage!")
     assert e.value.code == "invalid_cursor"

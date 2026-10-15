@@ -383,7 +383,7 @@ class Worker:
 
         verifier = HoldVerifier(gate, home=home_dir)
         await verifier.load()
-        hashes = await self._hash_lock(gate, profile, public_key)
+        hashes = await self._hash_lock(gate, profile)
 
         progress = ProgressForwarder(gate, jobs)
         progress.start()
@@ -426,9 +426,7 @@ class Worker:
                 s.namespace,
             )
 
-    async def _hash_lock(
-        self, gate: GateClient, profile: Profile, public_key: str
-    ) -> dict[str, str]:
+    async def _hash_lock(self, gate: GateClient, profile: Profile) -> dict[str, str]:
         """The contract hash of each offering, checked against the catalog (§11.2)."""
         hashes: dict[str, str] = {}
         problems: list[str] = []

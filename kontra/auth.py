@@ -35,7 +35,7 @@ import os
 import sys
 import time
 import webbrowser
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -777,16 +777,25 @@ async def dev_login(
         return await gate.dev_login(handle)
 
 
-def this_machine_label() -> str:
+def this_machine_label(taken: Iterable[str] = ()) -> str:
     """A label for this machine's recipient: its hostname, trimmed to what a label allows
-    and never empty. Only a human-readable name -- nothing authorizes by it."""
+    and never empty, made unique among ``taken`` (the party's live labels) with ``-2``,
+    ``-3``...: two machines with one hostname are two recipients, not a ``label_taken``.
+    Only a human-readable name -- nothing authorizes by it."""
     import socket
 
     raw = ""
     with contextlib.suppress(OSError):
         raw = socket.gethostname()
-    cleaned = "".join(c for c in raw if c.isprintable() and c != "\x7f").strip()[:64]
-    return cleaned or "this machine"
+    base = "".join(c for c in raw if c.isprintable() and c != "\x7f").strip()[:64].rstrip()
+    base = base or "this machine"
+    used = set(taken)
+    label, n = base, 1
+    while label in used:
+        n += 1
+        suffix = f"-{n}"
+        label = base[: 64 - len(suffix)].rstrip() + suffix
+    return label
 
 
 async def login(
@@ -841,7 +850,7 @@ async def login(
                 "party_mismatch", f"logged in as {tokens.party!r} but the gate says {me.party!r}"
             )
         if not any(k.public_key == public for k in me.keys):
-            me = await gate.add_recipient(this_machine_label(), public)
+            me = await gate.add_recipient(this_machine_label(k.label for k in me.keys), public)
     profile = Profile(
         gate_url=gate_url,
         temporal_address=me.temporal_address,

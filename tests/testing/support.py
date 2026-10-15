@@ -50,7 +50,7 @@ class EnrichOutput(BaseModel):
     text: str
 
 
-def offering_doc(party: str, public_key: str, **facts: Any) -> dict[str, Any]:
+def offering_doc(party: str, **facts: Any) -> dict[str, Any]:
     """A sealed contract document for ``<party>/enrich``; ``facts`` override offering.yaml."""
     spec: dict[str, Any] = {
         "name": f"{party}/enrich",

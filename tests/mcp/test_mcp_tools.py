@@ -216,7 +216,7 @@ def quote(quote_id: str | None, expires_at: datetime | None) -> QuoteResult:
         contract_hash="sha256:" + "0" * 64,
         endpoint="k" + KEY,
         service="acme.words",
-        seller_public_key="age1",
+        seller_recipients=("age1",),
         _kontra=None,  # type: ignore[arg-type]
         _input={},
     )

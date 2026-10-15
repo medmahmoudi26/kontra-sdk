@@ -190,9 +190,9 @@ class World:
         real_hire = k.gate.hire
 
         async def hire_then_forge(
-            quote_id: str, *, max_price_minor: int | None = None
+            quote_id: str, *, buyer_key: str, max_price_minor: int | None = None
         ) -> m.HireView:
-            view = await real_hire(quote_id, max_price_minor=max_price_minor)
+            view = await real_hire(quote_id, buyer_key=buyer_key, max_price_minor=max_price_minor)
             await self.forge(view.job_id, text)
             return view
 

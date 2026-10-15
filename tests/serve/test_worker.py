@@ -300,7 +300,7 @@ def _entry(
         endpoint="k" + "0" * 32,
         service="acme.upper",
         task_queue=f"{facts['name']}@{facts['version']}",
-        public_key=facts["public_key"],
+        recipients=[generate_identity()[1]],
         published_at=datetime.now(UTC),
         retired=retired,
     )
@@ -338,28 +338,25 @@ def _profile(*, dev: bool) -> Profile:
 
 
 async def test_the_hash_lock_refuses_an_unpublished_version_outside_dev(bound: Any) -> None:
-    pk = generate_identity()[1]
     gate = _CatalogGate(None)
     with pytest.raises(ServeError, match=r"acme/upper@\S+ is not published: run `kontra publish`"):
-        await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=False), pk)  # type: ignore[arg-type]
+        await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=False))  # type: ignore[arg-type]
     assert gate.published == []
 
 
 async def test_the_hash_lock_publishes_on_a_dev_profile(bound: Any) -> None:
-    pk = generate_identity()[1]
     gate = _CatalogGate(None)
-    hashes = await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=True), pk)  # type: ignore[arg-type]
+    hashes = await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=True))  # type: ignore[arg-type]
     assert gate.published == [bound.document()]
     assert hashes == {bound.key: bound.contract_hash()}
 
 
 async def test_the_hash_lock_names_both_hashes(bound: Any) -> None:
-    pk = generate_identity()[1]
     theirs = "sha256:" + "1" * 64
     gate = _CatalogGate(_entry(bound.document(), contract_hash=theirs))
     for dev in (False, True):  # a dev profile does not paper over drift either
         with pytest.raises(ServeError) as refused:
-            await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=dev), pk)  # type: ignore[arg-type]
+            await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=dev))  # type: ignore[arg-type]
         assert bound.contract_hash() in str(refused.value)
         assert theirs in str(refused.value)
     assert gate.published == []
@@ -368,30 +365,28 @@ async def test_the_hash_lock_names_both_hashes(bound: Any) -> None:
 async def test_a_retired_version_with_open_jobs_is_served_with_a_warning(
     bound: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
-    pk = generate_identity()[1]
     caplog.set_level(logging.WARNING, "kontra.serve")
     gate = _CatalogGate(
         None,
         [_job(bound.key), _job("acme/other@1.0.0")],
         hired_hash=bound.contract_hash(),
     )
-    hashes = await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=False), pk)  # type: ignore[arg-type]
+    hashes = await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=False))  # type: ignore[arg-type]
     assert hashes == {bound.key: bound.contract_hash()}
     assert "is retired but still has 1 open job(s)" in caplog.text
     caplog.clear()
     gate = _CatalogGate(_entry(bound.document(), retired=True), [_job(bound.key)])
-    await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=False), pk)  # type: ignore[arg-type]
+    await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=False))  # type: ignore[arg-type]
     assert "still has 1 open job(s); serving them" in caplog.text
 
 
 async def test_a_retired_version_with_open_jobs_is_still_hash_locked(bound: Any) -> None:
     """A retired version is gone from the catalog, but its open jobs were bought for a
     contract: code that drifted from it refuses to start, naming both hashes (§11.2)."""
-    pk = generate_identity()[1]
     theirs = "sha256:" + "2" * 64
     gate = _CatalogGate(None, [_job(bound.key)], hired_hash=theirs)
     with pytest.raises(ServeError) as refused:
-        await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=True), pk)  # type: ignore[arg-type]
+        await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=True))  # type: ignore[arg-type]
     assert bound.contract_hash() in str(refused.value)
     assert f"hired under {theirs}" in str(refused.value)
     assert gate.published == []  # a dev profile does not republish a retired version

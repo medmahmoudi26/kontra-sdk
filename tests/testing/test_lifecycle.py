@@ -27,6 +27,7 @@ from temporalio.service import RPCError, RPCStatusCode
 
 from kontra._control import OCCUPY_WORKFLOW_TYPE
 from kontra.codec import ENCODING, KontraCodec, data_converter
+from kontra.codec.age import generate_identity
 from kontra.escrow import BUYER_CANCEL_REASON
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
@@ -97,9 +98,7 @@ class Deal:
 async def deal(mp: Marketplace) -> Deal:
     seller = await mp.party(handle("seller"))
     buyer = await mp.party(handle("buyer"), balance="50.00")
-    entry = await seller.gate.publish(
-        offering_doc(seller.handle, seller.public_key, review_window="1h")
-    )
+    entry = await seller.gate.publish(offering_doc(seller.handle, review_window="1h"))
     jwks = await buyer.gate.jwks()
     return Deal(mp, seller, buyer, entry, jwks)
 
@@ -500,17 +499,23 @@ async def test_quote_refusals_from_a_real_handler(deal: Deal) -> None:
 
 async def test_payloads_stay_ciphertext_end_to_end(deal: Deal) -> None:
     """Seller and buyer codecs (seam ⑤) around the fake gate: the gate relays and stores
-    only ciphertext, and the buyer decrypts the delivery it fetched from the gate."""
+    only ciphertext, and the buyer decrypts the delivery it fetched from the gate -- with
+    the job's own key, the one its hire sent (decisions I7)."""
     buyer_keys: dict[str, str] = {}
+    job_secret, job_key = generate_identity()
     seller_codec = KontraCodec(
         deal.seller.identity,
-        deal.seller.public_key,
+        [deal.seller.public_key],
         role="seller",
         buyer_keys=_Keys(buyer_keys),
         services=[deal.entry.service],  # the replies it may send in plaintext (quote's price)
     )
     buyer_codec = KontraCodec(
-        deal.buyer.identity, deal.buyer.public_key, role="buyer", seller_keys=_Seller(deal.entry)
+        deal.buyer.identity,
+        [deal.buyer.public_key],
+        role="buyer",
+        seller_keys=_Seller(deal.entry),
+        extra_identities=lambda: [job_secret],
     )
     seller_client = await deal.seller.temporal_client(data_converter=data_converter(seller_codec))
 
@@ -528,7 +533,7 @@ async def test_payloads_stay_ciphertext_end_to_end(deal: Deal) -> None:
         assert q.amount_minor == PRICE_PER_CHAR * len(
             text
         )  # the seller read it; the gate could not
-        job = await deal.buyer.gate.hire(q.quote_id or "", buyer_key=_A_BUYER_KEY)
+        job = await deal.buyer.gate.hire(q.quote_id or "", buyer_key=job_key)
         await deal.buyer.gate.start(job.job_id, await sealed("execute", {"text": text}))
         await deal.until(job.job_id, lambda v: v.state is m.JobState.COMPLETED)
 

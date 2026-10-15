@@ -41,6 +41,7 @@ from kontra.hire import (
     SellerBusy,
     TemporalUnavailable,
 )
+from kontra.profile import Profile
 from kontra.testing.devserver import DevServer
 from kontra.testing.fake_gate import AGE_MAGIC
 from kontra.types import Artifact
@@ -234,8 +235,10 @@ async def test_a_start_whose_answer_was_lost_never_hides_the_delivery_the_gate_r
     hired: list[str] = []
     real_hire = buyer.k.gate.hire
 
-    async def remember(quote_id: str, *, max_price_minor: int | None = None) -> m.HireView:
-        view = await real_hire(quote_id, max_price_minor=max_price_minor)
+    async def remember(
+        quote_id: str, *, buyer_key: str, max_price_minor: int | None = None
+    ) -> m.HireView:
+        view = await real_hire(quote_id, buyer_key=buyer_key, max_price_minor=max_price_minor)
         hired.append(view.job_id)
         return view
 
@@ -586,28 +589,45 @@ async def test_a_used_quote_names_the_job_it_made(world: World) -> None:
         assert (await job.status()).state is m.JobState.COMPLETED
 
 
-def _answer_lost(buyer: Buyer, lost: BaseException | None, *, reached: bool = True) -> list[str]:
+def _answer_lost(
+    buyer: Buyer,
+    lost: BaseException | None,
+    *,
+    reached: bool = True,
+    keys: list[str] | None = None,
+) -> list[str]:
     """The gate's answer to this buyer's next ``hire`` goes missing: the call raises
     ``lost`` (or never returns, when ``lost`` is None) after the gate locked the hold -- or,
     unless ``reached``, without reaching the gate. Later calls (the SDK asking what the
-    quote became) reach the gate. The jobs the lost call locked."""
+    quote became) reach the gate. The jobs the lost call locked; ``keys`` gets the job key
+    it sent."""
     locked: list[str] = []
     real = buyer.k.gate.hire
     calls = 0
 
-    async def hire(quote_id: str, *, max_price_minor: int | None = None) -> m.HireView:
+    async def hire(
+        quote_id: str, *, buyer_key: str, max_price_minor: int | None = None
+    ) -> m.HireView:
         nonlocal calls
         calls += 1
         if calls > 1:
-            return await real(quote_id, max_price_minor=max_price_minor)
+            return await real(quote_id, buyer_key=buyer_key, max_price_minor=max_price_minor)
+        if keys is not None:
+            keys.append(buyer_key)
         if reached:
-            locked.append((await real(quote_id, max_price_minor=max_price_minor)).job_id)
+            hired = await real(quote_id, buyer_key=buyer_key, max_price_minor=max_price_minor)
+            locked.append(hired.job_id)
         if lost is None:
             await asyncio.Event().wait()
         raise lost or AssertionError("unreachable")
 
     buyer.k.gate.hire = hire  # type: ignore[method-assign]
     return locked
+
+
+def _job_key(buyer: Buyer, job_id: str) -> str:
+    """The public half of the key this buyer holds on disk for ``job_id``."""
+    return Profile.job_identity(job_id, buyer.k.session.identity_home)[1]
 
 
 @pytest.mark.parametrize(
@@ -628,13 +648,16 @@ async def test_a_lost_answer_to_hire_cancels_the_job_it_locked(
     knowing which job holds it. The SDK asks the gate what the quote became, cancels that
     job, and names it, with the lost answer as the cause."""
     buyer = await world.buyer()
-    locked = _answer_lost(buyer, lost)
+    sent: list[str] = []
+    locked = _answer_lost(buyer, lost, keys=sent)
     with pytest.raises(JobFailed) as failed:
         await buyer.k.hire(world.key(), text="lost")
     err = failed.value
     assert err.__cause__ is lost
     assert err.job_id == locked[0]
     assert "the gate's answer to the hire was lost" in err.reason
+    # The job was locked with the key written before the call: it is filed under the job.
+    assert _job_key(buyer, err.job_id) == sent[0]
     view = await buyer.k.gate.job(err.job_id)
     assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
     bal = await buyer.balance()
@@ -660,17 +683,20 @@ async def test_a_quote_whose_hire_answer_was_lost_is_hired_again_to_find_its_job
 ) -> None:
     """Holding the quote, the caller has a way back (as ``kontra mcp`` does): the lost
     answer's error is raised as it came, and hiring the same quote again is refused with the
-    job the lost call locked -- never a second lock."""
+    job the lost call locked -- never a second lock. The key that job was locked with
+    survives the retry and is filed under the job, so its delivery stays readable."""
     buyer = await world.buyer()
     q = await buyer.k.quote(world.key(), text="again")
     lost = httpx.ReadError("the connection dropped before the answer")
-    locked = _answer_lost(buyer, lost)
+    sent: list[str] = []
+    locked = _answer_lost(buyer, lost, keys=sent)
     with pytest.raises(httpx.ReadError) as failed:
         await q.hire()
     assert failed.value is lost
     with pytest.raises(HireRefused) as used:
         await q.hire()
     assert (used.value.code, used.value.detail) == ("quote_used", {"job_id": locked[0]})
+    assert _job_key(buyer, locked[0]) == sent[0]
     assert len(await buyer.k.jobs()) == 1  # locked once
     assert (await buyer.balance()).held_minor > 0
     assert (await buyer.k.gate.cancel(locked[0])).escrow is m.Escrow.REFUNDED
@@ -748,7 +774,7 @@ async def test_a_catalog_entry_must_agree_with_its_sealed_contract(world: World)
     entry = await buyer.k.offering(world.key())
     assert buyer.k.contract(entry).offering.key == world.key()
     for change in (
-        {"public_key": buyer.k.public_key},  # someone else's key
+        {"party": "mallory"},  # the first component of the sealed name
         {"service": "evil.text"},
         {"offering": "acme/text@9.9.9"},
         {"contract_hash": "sha256:" + "0" * 64},
@@ -758,35 +784,41 @@ async def test_a_catalog_entry_must_agree_with_its_sealed_contract(world: World)
         assert refused.value.code == "invalid_contract"
 
 
-async def test_a_seller_key_from_the_endpoint_lookup_is_checked_too(world: World) -> None:
+async def test_a_seller_entry_from_the_endpoint_lookup_is_checked_too(world: World) -> None:
     """On a cache miss (a buyer worker after a restart) the codec asks the catalog for the
-    key behind an endpoint: that answer must agree with the contract it seals, like any
-    other catalog entry, before anything is encrypted to it."""
+    recipients behind an endpoint: that entry must agree with the contract it seals, like
+    any other catalog entry, before anything is encrypted to its recipients."""
     buyer = await world.buyer()
     entry = await buyer.k.offering(world.key())  # resolving does not fill the key cache
     real_by_endpoint = buyer.k.gate.by_endpoint
 
     async def lying_by_endpoint(endpoint: str) -> m.CatalogEntry:
         found = await real_by_endpoint(endpoint)
-        return found.model_copy(update={"public_key": buyer.k.public_key})
+        return found.model_copy(update={"service": "evil.text"})
 
     buyer.k.gate.by_endpoint = lying_by_endpoint  # type: ignore[method-assign]
     with pytest.raises(HireRefused) as refused:
-        await buyer.k.seller_keys.seller_key(entry.endpoint)
+        await buyer.k.seller_keys.seller_recipients(entry.endpoint)
     assert refused.value.code == "invalid_contract"
     buyer.k.gate.by_endpoint = real_by_endpoint  # type: ignore[method-assign]
-    assert await buyer.k.seller_keys.seller_key(entry.endpoint) == entry.public_key
+    found = await buyer.k.seller_keys.seller_recipients(entry.endpoint)
+    assert list(found) == entry.recipients
 
 
-async def test_a_hold_that_names_another_key_is_cancelled_not_used(world: World) -> None:
-    """The job input is encrypted to the seller key the quoted contract seals; a hire answer
-    naming any other key is refused and its hold cancelled at once."""
+async def test_a_hold_that_names_other_seller_recipients_is_cancelled_not_used(
+    world: World,
+) -> None:
+    """The job input is encrypted to the seller recipients the quote named; a hire answer
+    naming any other set is refused and its hold cancelled at once. The contract seals no
+    key (decisions I7), so the quote is what the hire answer is held to."""
     buyer = await world.buyer()
     real_hire = buyer.k.gate.hire
 
-    async def lying_hire(quote_id: str, *, max_price_minor: int | None = None) -> m.HireView:
-        view = await real_hire(quote_id, max_price_minor=max_price_minor)
-        return view.model_copy(update={"seller_public_key": buyer.k.public_key})
+    async def lying_hire(
+        quote_id: str, *, buyer_key: str, max_price_minor: int | None = None
+    ) -> m.HireView:
+        view = await real_hire(quote_id, buyer_key=buyer_key, max_price_minor=max_price_minor)
+        return view.model_copy(update={"seller_recipients": [buyer.k.public_key]})
 
     buyer.k.gate.hire = lying_hire  # type: ignore[method-assign]
     with pytest.raises(HireRefused) as refused:
@@ -796,7 +828,8 @@ async def test_a_hold_that_names_another_key_is_cancelled_not_used(world: World)
     assert refused.value.detail == {"job_id": view.job_id}  # the hold it refused, named
     assert (view.state, view.escrow) == (m.JobState.CANCELED, m.Escrow.REFUNDED)
     entry = await buyer.k.offering(world.key())
-    assert await buyer.k.seller_keys.seller_key(entry.endpoint) == entry.public_key  # not cached
+    found = await buyer.k.seller_keys.seller_recipients(entry.endpoint)
+    assert list(found) == entry.recipients  # not cached
 
 
 async def test_a_hold_with_another_max_duration_is_cancelled_not_used(world: World) -> None:
@@ -805,8 +838,10 @@ async def test_a_hold_with_another_max_duration_is_cancelled_not_used(world: Wor
     buyer = await world.buyer()
     real_hire = buyer.k.gate.hire
 
-    async def lying_hire(quote_id: str, *, max_price_minor: int | None = None) -> m.HireView:
-        view = await real_hire(quote_id, max_price_minor=max_price_minor)
+    async def lying_hire(
+        quote_id: str, *, buyer_key: str, max_price_minor: int | None = None
+    ) -> m.HireView:
+        view = await real_hire(quote_id, buyer_key=buyer_key, max_price_minor=max_price_minor)
         return view.model_copy(update={"max_duration_seconds": view.max_duration_seconds * 10})
 
     buyer.k.gate.hire = lying_hire  # type: ignore[method-assign]

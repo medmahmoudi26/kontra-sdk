@@ -235,10 +235,10 @@ def _largest_request(model: type[BaseModel]) -> dict[str, Any]:
         m.MagicLinkRequest: {"email": EMAIL, "device_user_code": "BCDF-GHJK"},
         m.ApiKeyCreate: {"label": "l" * 64},
         m.DevLogin: {"handle": HANDLE},
-        m.SetKey: {"public_key": AGE_KEY},
+        m.AddKey: {"label": "l" * 255, "public_key": AGE_KEY},
         m.PublishRequest: {"document": CONTRACT},
         m.QuoteRequest: {"offering": REF, "input": {"b64": PAYLOAD_B64}},
-        m.HireRequest: {"quote_id": "0" * 32, "max_price_minor": 2**53},
+        m.HireRequest: {"quote_id": "0" * 32, "max_price_minor": 2**53, "buyer_key": AGE_KEY},
         m.StartRequest: {"input": {"b64": PAYLOAD_B64}},
         m.RejectRequest: {"reason": "r" * 2000},
         m.ResolveRequest: {"buyer_minor": 1, "seller_minor": 1, "note": "n" * 2000},
@@ -326,14 +326,14 @@ def test_the_largest_legitimate_responses_are_accepted() -> None:
         endpoint="k" + "0" * 32,
         service=f"{HANDLE}.{'b' * HANDLE_MAX}",
         task_queue=REF,
-        public_key=AGE_KEY,
+        recipients=[AGE_KEY] * m.RECIPIENTS_MAX,
         published_at=NOW,  # type: ignore[arg-type]
     )
     assert len(card) < 64
     summary = m.CatalogSummary.model_validate(
         {
             **entry.model_dump(include=set(m.CatalogSummary.model_fields) - {"seller"}),
-            "seller": {"party": HANDLE, "public_key": AGE_KEY},
+            "seller": {"party": HANDLE, "recipients": [AGE_KEY] * m.RECIPIENTS_MAX},
         }
     )
     m.CatalogList(items=[summary] * 200, next_cursor="c" * 200)
@@ -348,7 +348,7 @@ def test_the_largest_legitimate_responses_are_accepted() -> None:
             "contract_hash": "sha256:" + SHA,
             "endpoint": "k" + "0" * 32,
             "service": "s",
-            "seller_public_key": AGE_KEY,
+            "seller_recipients": [AGE_KEY] * m.RECIPIENTS_MAX,
         }
     )
     job = {
@@ -418,7 +418,7 @@ def test_the_largest_legitimate_responses_are_accepted() -> None:
             "amount_minor": 1,
             "currency": "USD",
             "max_duration_seconds": 30 * 86_400,
-            "seller_public_key": AGE_KEY,
+            "seller_recipients": [AGE_KEY] * m.RECIPIENTS_MAX,
             "expires_at": NOW,
         }
     )

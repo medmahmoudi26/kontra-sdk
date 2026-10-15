@@ -954,7 +954,6 @@ def test_dev_up_brings_the_stack_up_then_logs_in(
             "handle": "carol",
             "dev": True,
             "home": tmp_path / "home",
-            "replace_key": True,
         }
     ]
     for line in ("gate      http://localhost:8402", "postgres  localhost:5444", "as carol"):

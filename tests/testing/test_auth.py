@@ -13,6 +13,7 @@ import pytest
 
 from kontra._control import DEFAULT_RETENTION
 from kontra.auth import Session, login_device
+from kontra.codec.age import generate_identity
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
 from kontra.profile import NotLoggedIn
@@ -173,14 +174,34 @@ async def test_forged_and_misaddressed_tokens_are_refused(world: World) -> None:
         assert (e.value.status, e.value.code) == (401, "invalid_token"), token
 
 
-async def test_set_key_needs_a_fresh_session_and_a_real_key(world: World) -> None:
+async def test_recipients_are_added_never_replaced_and_need_a_fresh_session(
+    world: World,
+) -> None:
+    """A party's keys are a set (decisions I7): a second key joins the first, adding the
+    same one again is a no-op, a revoked key never comes back, and both routes need a
+    fresh human session -- a recipient can read every delivery made after it is added."""
     s = await world.party("jade")
+    first = s.profile.public_key or ""
+    assert [k.public_key for k in (await s.gate.me()).keys] == [first]
     with pytest.raises(GateError) as e:
-        await s.gate.set_key("age1notakey")
-    assert (e.value.status, e.value.code) == (422, "invalid_key")
+        await s.gate.add_recipient("fleet", "age1notakey")
+    assert (e.value.status, e.value.code) == (422, "invalid_public_key")
+    fleet = generate_identity()[1]
+    added = await s.gate.add_recipient("fleet", fleet)
+    assert [k.public_key for k in added.keys] == [first, fleet]
+    assert (await s.gate.add_recipient("fleet", fleet)).keys == added.keys
+    assert (await s.gate.party("jade")).recipients == [first, fleet]
+    await s.gate.revoke_recipient(fleet)
+    assert (await s.gate.party("jade")).recipients == [first]
+    with pytest.raises(GateError) as e:
+        await s.gate.add_recipient("fleet-again", fleet)
+    assert (e.value.status, e.value.code) == (409, "recipient_revoked")
     world.gate.advance(timedelta(minutes=11))
     with pytest.raises(GateError) as e:
-        await s.gate.set_key(s.profile.public_key or "")
+        await s.gate.add_recipient("other", generate_identity()[1])
+    assert (e.value.status, e.value.code) == (403, "stale_session")
+    with pytest.raises(GateError) as e:
+        await s.gate.revoke_recipient(first)
     assert (e.value.status, e.value.code) == (403, "stale_session")
 
 

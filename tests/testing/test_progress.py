@@ -63,7 +63,7 @@ async def live(tmp_path: Path) -> AsyncIterator[Live]:
     base = await gate.serve()
     seller = await logged_in(base, tmp_path / "acme", "acme")
     buyer = await logged_in(base, tmp_path / "bob", "bob")
-    await seller.gate.publish(offering_doc("acme", seller.profile.public_key or ""))
+    await seller.gate.publish(offering_doc("acme"))
     q = await buyer.gate.quote("acme/enrich", wire(json_payload({"text": "x"})))
     assert q.quote_id is not None
     job = await buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)

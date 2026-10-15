@@ -70,10 +70,7 @@ class World:
         return GateClient(self.gate.base_url, token=provider, transport=self.transport)
 
     async def publish(self, seller: Session, **facts: Any) -> m.CatalogEntry:
-        assert seller.profile.public_key is not None
-        return await seller.gate.publish(
-            offering_doc(seller.profile.party, seller.profile.public_key, **facts)
-        )
+        return await seller.gate.publish(offering_doc(seller.profile.party, **facts))
 
     async def close(self) -> None:
         for s in self.sessions:

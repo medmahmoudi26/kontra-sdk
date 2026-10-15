@@ -11,6 +11,7 @@ from datetime import timedelta
 import httpx
 import pytest
 
+from kontra.codec.age import generate_identity
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
 from kontra.gate_client.routes import ROUTES
@@ -103,7 +104,7 @@ async def test_a_key_hires_and_serves_but_never_counts_as_fresh(world: World) ->
     world.control.responder = lambda p, h: ok_quote(500)
     q = await program.quote(entry.name, wire(json_payload({"text": "hi"})))
     assert q.quote_id is not None
-    hired = await program.hire(q.quote_id, max_price_minor=500)
+    hired = await program.hire(q.quote_id, buyer_key=generate_identity()[1], max_price_minor=500)
     assert (await program.job(hired.job_id)).buyer == "buyer"
     assert (await program.balance()).held_minor == 500
     worker = await program.temporal_token()  # what `kontra serve` with a key needs
@@ -113,7 +114,8 @@ async def test_a_key_hires_and_serves_but_never_counts_as_fresh(world: World) ->
     assert (await world.publish(seller, version="1.0.1")).version == "1.0.1"  # a person can
     for call in (
         program.publish({"nexusrpc": "1.0.0"}),
-        program.set_key(buyer.profile.public_key or ""),
+        program.add_recipient("program", generate_identity()[1]),
+        program.revoke_recipient(buyer.profile.public_key or ""),
         program.create_api_key("another"),
         program.api_keys(),
         program.revoke_api_key(made.id),
@@ -122,7 +124,8 @@ async def test_a_key_hires_and_serves_but_never_counts_as_fresh(world: World) ->
     ):
         assert await _code(call) == (403, "fresh_login_required")
     assert {r.name for r in ROUTES if r.auth == "fresh"} == {
-        "set_key",
+        "add_recipient",
+        "revoke_recipient",
         "publish",
         "create_api_key",
         "api_keys",

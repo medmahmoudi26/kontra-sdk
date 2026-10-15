@@ -68,9 +68,7 @@ async def bench(tmp_path: Path) -> AsyncIterator[Bench]:
         seller = await logged_in(gate.base_url, tmp_path / "acme", "acme", t)
         buyer = await logged_in(gate.base_url, tmp_path / "bob", "bob", t)
         stranger = await logged_in(gate.base_url, tmp_path / "eve", "eve", t)
-        await seller.gate.publish(
-            offering_doc("acme", seller.profile.public_key or "", max_output_bytes="400KB")
-        )
+        await seller.gate.publish(offering_doc("acme", max_output_bytes="400KB"))
         q = await buyer.gate.quote("acme/enrich", wire(json_payload({})))
         assert q.quote_id is not None
         job = await buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)

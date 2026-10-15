@@ -17,7 +17,7 @@ from kontra.serve import BindingError, Quote, offering
 from . import seller
 from .flows import UpperFlow
 from .models import Order, Shout
-from .support import write_offering
+from .support import unique_version, write_offering
 
 HERE = Path(__file__).parent
 
@@ -52,11 +52,12 @@ def test_the_document_and_hash_do_not_depend_on_any_key(tmp_path: Path) -> None:
     """Spec v2 seals no key (decisions I7): the document is the same for every seller of
     this offering, and so is its hash. It used to be one document per key, which is what
     made adding a fleet key a republish."""
-    bound = seller.bind(write_offering(tmp_path))
+    version = unique_version()
+    bound = seller.bind(write_offering(tmp_path, version))
     assert bound.document() is bound.document()  # built once, remembered
     assert "public_key" not in bound.document()["x-kontra"]
     assert bound.contract_hash() == bound.document()["x-kontra"]["contract_hash"]
-    other = seller.bind(write_offering(tmp_path))
+    other = seller.bind(write_offering(tmp_path, version))
     assert other.contract_hash() == bound.contract_hash()
     v = bound.validator()
     v.validate({"text": "x"})
