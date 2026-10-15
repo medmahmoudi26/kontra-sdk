@@ -66,7 +66,9 @@ jobs:
           uv venv --python 3.12 "$RUNNER_TEMP/smoke"
           uv pip install --python "$RUNNER_TEMP/smoke/bin/python" dist/*.whl
           "$RUNNER_TEMP/smoke/bin/kontra" --version
-          "$RUNNER_TEMP/smoke/bin/python" - <<'EOF'
+          # -I: a script read from stdin puts the working directory -- this checkout, whose
+          # kontra/ has no _dev/ or _spec/ -- first on sys.path; isolated, it imports the wheel.
+          "$RUNNER_TEMP/smoke/bin/python" -I - <<'EOF'
           from pathlib import Path
           import kontra
           root = Path(kontra.__file__).parent
