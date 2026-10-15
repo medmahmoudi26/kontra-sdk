@@ -209,10 +209,12 @@ services:
         "secretKey": "${KONTRA_S3_SECRET_KEY:?set KONTRA_S3_SECRET_KEY}"}],
         "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
       # Never a proxy. Compose copies a Docker client's proxy settings into every container,
-      # and Go exempts only loopback from them: SeaweedFS's master, volume server, filer and
-      # S3 gateway dial one another over gRPC at the container's own address, so with a
-      # client proxy they reached nothing and the bucket never started (measured). SeaweedFS
-      # connects to nothing outside this container. An empty value wins over the injected one.
+      # and Go exempts only loopback from them: SeaweedFS 3.x's master, volume server, filer and
+      # S3 gateway dialled one another over gRPC at the container's own address, so with a
+      # client proxy they reached nothing and the bucket never started (measured). 4.x reaches
+      # its master over a Unix socket and starts either way; the entries stay for anything that
+      # still dials by address. SeaweedFS connects to nothing outside this container. An empty
+      # value wins over the injected one.
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       http_proxy: ""
