@@ -731,14 +731,19 @@ async def test_describe_task_queue_names_the_sdk_a_worker_heartbeats(
     runtime = Runtime(telemetry=TelemetryConfig(), worker_heartbeat_interval=timedelta(seconds=1))
     client = await dev_server.connect(ns, runtime=runtime)
     described: dict[m.TaskQueueType, m.TaskQueueTypeInfo] = {}
+    kinds = (m.TaskQueueType.WORKFLOW, m.TaskQueueType.ACTIVITY)
     async with Worker(client, task_queue=queue, workflows=[Job], activities=[step]):
-        for _ in range(100):
+        # Both kinds: the workflow and the activity poller start apart, and a slow machine
+        # sees one well before the other.
+        for _ in range(150):
             described = await control.describe_task_queue(ns, queue)
-            pollers = [p for info in described.values() for p in info.pollers]
-            if pollers and all(p.sdk_version for p in pollers):
+            if all(
+                described[kind].pollers and all(p.sdk_version for p in described[kind].pollers)
+                for kind in kinds
+            ):
                 break
-            await asyncio.sleep(0.1)
-    for kind in (m.TaskQueueType.WORKFLOW, m.TaskQueueType.ACTIVITY):
+            await asyncio.sleep(0.2)
+    for kind in kinds:
         [poller] = described[kind].pollers
         assert poller.identity == client.identity
         assert (poller.sdk_name, poller.sdk_version) == ("temporal-python", temporalio.__version__)
