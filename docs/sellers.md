@@ -361,10 +361,46 @@ create or change an endpoint, or reach another namespace (see [security.md](secu
 Ctrl-C stops the worker gracefully.
 
 A server that runs `kontra serve` unattended should use an API key rather than your login:
-`kontra keys create --label worker-1` on your machine, then `KONTRA_API_KEY` and your key file
-(`~/.kontra/key`, into `KONTRA_HOME`) on the server. The worker serves exactly as with a
-login. On a `kontra dev` profile a worker publishes unpublished versions itself; with a key it
-cannot, so publish from your login first (see [buyers.md](buyers.md#programs-api-keys)).
+`kontra keys create --label worker-1` on your machine, then `KONTRA_API_KEY` on the server.
+The worker serves exactly as with a login. On a `kontra dev` profile a worker publishes
+unpublished versions itself; with a key it cannot, so publish from your login first (see
+[buyers.md](buyers.md#programs-api-keys)).
+
+### Keys for a fleet
+
+Buyers encrypt an input to **every** recipient your party has registered, so any worker
+holding any of those keys can decrypt it. That is what makes a fleet work:
+
+```sh
+# Once, on your machine: make the fleet's key and register it.
+age-keygen -o fleet-prod.key                       # or: kontra recipients add   (this machine)
+kontra recipients add --label fleet-prod --public-key age1...
+kontra recipients list
+```
+
+Mount that one key into every worker and point `KONTRA_KEY_FILE` at it:
+
+```yaml
+env:
+  - name: KONTRA_KEY_FILE
+    value: /etc/kontra/key
+volumeMounts:
+  - { name: kontra-key, mountPath: /etc/kontra, readOnly: true }
+volumes:
+  - { name: kontra-key, secret: { secretName: kontra-fleet-prod, defaultMode: 0400 } }
+```
+
+**One key per fleet, never one per pod.** Pod churn then never changes the recipient set, so
+an input encrypted a minute ago is still readable by whichever worker picks the task up. It
+is the same operational shape as a TLS certificate. `kontra serve` refuses to start if the
+key it holds is not one of your registered recipients — otherwise it would poll happily and
+fail to read every input it was given.
+
+Adding never replaces, so a second machine or a second fleet is one more recipient; there is
+no key to copy around and no `key_mismatch` to resolve. `kontra recipients revoke age1...`
+stops future deliveries reaching a lost host. It cannot reach backwards: what was already
+encrypted to that key stays encrypted to it (see [security.md](security.md#known-limits)).
+Keep the set small — at most 16 — since every recipient adds a stanza to every payload.
 
 ## Versions
 

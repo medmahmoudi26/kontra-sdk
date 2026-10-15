@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 import kontra.codec.age as age
-from kontra.auth import DEVICE_GRANT, LoginError, dev_login, login, login_device
+from kontra.auth import DEVICE_GRANT, LoginError, dev_login, login, login_device, this_machine_label
 from kontra.contract.names import NameError_
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
@@ -244,7 +244,9 @@ async def test_dev_login_writes_profile_and_key(tmp_path: Path, gate: FakeGate) 
     )
     secret = Profile.identity(tmp_path)
     assert profile.public_key == age.public_key_of(secret)
-    assert gate.public_key == profile.public_key
+    assert [(k.label, k.public_key) for k in gate.keys] == [
+        (this_machine_label(), profile.public_key)
+    ]
     assert Profile.load(tmp_path) == profile
     assert (profile.party, profile.namespace, profile.temporal_address) == (
         "alice",
@@ -256,13 +258,14 @@ async def test_dev_login_writes_profile_and_key(tmp_path: Path, gate: FakeGate) 
     for name in (PROFILE_FILE, KEY_FILE):
         assert (tmp_path / name).stat().st_mode & 0o777 == 0o600
 
-    # logging in again reuses the key and does not re-register it
-    before = gate.calls("/v1/me/key")
+    # logging in again reuses the key and does not add it a second time
+    before = gate.calls("/v1/me/recipients")
     again = await login(
         "http://localhost:8400", handle="alice", dev=True, home=tmp_path, transport=gate.transport
     )
     assert again.public_key == profile.public_key
-    assert gate.calls("/v1/me/key") == before
+    assert gate.calls("/v1/me/recipients") == before
+    assert len(gate.keys) == 1
     assert Profile.identity(tmp_path) == secret
 
 
@@ -280,32 +283,49 @@ async def test_device_login_writes_a_tls_profile(tmp_path: Path, gate: FakeGate)
     assert Profile.load(tmp_path).gate_url == "https://gate.test"
 
 
-async def test_a_different_registered_key_stops_the_login(tmp_path: Path, gate: FakeGate) -> None:
-    _, elsewhere = age.generate_identity()
-    gate.public_key = elsewhere
-    with pytest.raises(LoginError) as ei:
-        await login(
-            "http://localhost:8400",
-            handle="alice",
-            dev=True,
-            home=tmp_path,
-            transport=gate.transport,
-        )
-    assert ei.value.code == "key_mismatch"
-    assert gate.public_key == elsewhere
-    assert not (tmp_path / PROFILE_FILE).exists()
-
-    profile = await login(
+async def test_a_second_machine_is_added_alongside_the_first(
+    tmp_path: Path, gate: FakeGate
+) -> None:
+    first = await login(
         "http://localhost:8400",
         handle="alice",
         dev=True,
-        home=tmp_path,
+        home=tmp_path / "first",
         transport=gate.transport,
-        replace_key=True,
     )
-    assert gate.public_key == profile.public_key != elsewhere
+    second = await login(
+        "http://localhost:8400",
+        handle="alice",
+        dev=True,
+        home=tmp_path / "second",
+        transport=gate.transport,
+    )
+    assert first.public_key != second.public_key
+    assert [k.public_key for k in gate.keys] == [first.public_key, second.public_key]
+    label = this_machine_label()  # one hostname, two recipients: the second gets a suffix
+    assert [k.label for k in gate.keys] == [label, this_machine_label([label])]
+    assert Profile.identity(tmp_path / "first") != Profile.identity(tmp_path / "second")
 
 
 async def test_dev_login_needs_a_handle(tmp_path: Path, gate: FakeGate) -> None:
     with pytest.raises(ValueError, match="handle"):
         await login("http://localhost:8400", dev=True, home=tmp_path, transport=gate.transport)
+
+
+def test_the_machine_label_is_unique_among_the_partys_and_always_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two machines with one hostname are two recipients, never a ``label_taken``; a cut
+    to 64 characters never leaves the surrounding space the gate refuses."""
+    import socket
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "build")
+    assert this_machine_label() == "build"
+    assert this_machine_label(["build"]) == "build-2"
+    assert this_machine_label(["build", "build-2"]) == "build-3"
+    monkeypatch.setattr(socket, "gethostname", lambda: "x" * 63 + " y")
+    assert this_machine_label() == "x" * 63
+    monkeypatch.setattr(socket, "gethostname", lambda: "x" * 70)
+    assert this_machine_label(["x" * 64]) == "x" * 62 + "-2"
+    monkeypatch.setattr(socket, "gethostname", lambda: "\x00 ")
+    assert this_machine_label() == "this machine"

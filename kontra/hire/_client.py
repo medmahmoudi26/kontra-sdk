@@ -32,12 +32,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import dataclasses
 import json
 import logging
 import math
 import re
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
@@ -87,7 +88,7 @@ from kontra.hire._service import (
     price_text,
 )
 from kontra.ledger import CURRENCIES, Money
-from kontra.profile import Profile
+from kontra.profile import NotLoggedIn, Profile, ProfileError
 from kontra.serve.jobs import SellerKeyCache
 from kontra.types import Artifact
 
@@ -156,7 +157,10 @@ class _BuyerArtifact(Artifact):
     as a seller and hire as a buyer at once)."""
 
     _gate: GateClient | None = PrivateAttr(default=None)
-    _identity: str | None = PrivateAttr(default=None)
+    #: Every key the client that received this may decrypt with: this machine's and the
+    #: job keys it holds. A delivery is encrypted to the JOB's key (decisions I7), which
+    #: is not a key of the party at all, so one identity is not enough here.
+    _identities: tuple[str, ...] | None = PrivateAttr(default=None)
 
     def __reduce__(self) -> tuple[Any, ...]:
         """Pickled as a plain :class:`Artifact`: the binding (a live gate client and our
@@ -170,19 +174,19 @@ class _BuyerArtifact(Artifact):
         # pydantic would deep-copy the private gate client (and fail on its locks).
         return self
 
-    def _bound(self) -> tuple[GateClient, str]:
-        if self._gate is None or self._identity is None:  # a copy made without the binding
+    def _bound(self) -> tuple[GateClient, Sequence[str]]:
+        if self._gate is None or self._identities is None:  # a copy made without the binding
             rt = _runtime.current()
-            return rt.gate, rt.identity
-        return self._gate, self._identity
+            return rt.gate, rt.all_identities()
+        return self._gate, self._identities
 
     async def download(self, path: str | Path) -> Path:
-        gate, identity = self._bound()
-        return await download(gate, self, identity, Path(path))
+        gate, identities = self._bound()
+        return await download(gate, self, identities, Path(path))
 
     async def chunks(self) -> AsyncIterator[bytes]:
-        gate, identity = self._bound()
-        async for chunk in iter_plaintext(gate, self, identity):
+        gate, identities = self._bound()
+        async for chunk in iter_plaintext(gate, self, identities):
             yield chunk
 
 
@@ -198,7 +202,7 @@ class _CheckedSellerKeys(SellerKeyCache):
         self._gate_client = gate
         self._check = check
 
-    async def seller_key(self, endpoint: str) -> str:
+    async def seller_recipients(self, endpoint: str) -> Sequence[str]:
         found = self._keys.get(endpoint)
         if found is not None:
             return found
@@ -206,8 +210,8 @@ class _CheckedSellerKeys(SellerKeyCache):
         if entry.endpoint != endpoint:
             raise LookupError("the catalog answered for another endpoint")
         self._check(entry)  # HireRefused if the entry and its sealed contract disagree
-        self.remember(endpoint, entry.public_key)
-        return entry.public_key
+        self.remember(endpoint, entry.recipients)
+        return tuple(entry.recipients)
 
 
 def _floor_minor(value: Decimal | int | float | str, currency: str) -> int:
@@ -352,7 +356,9 @@ class QuoteResult:
     contract_hash: str
     endpoint: str
     service: str
-    seller_public_key: str
+    #: Every key the seller can read with: the input is encrypted to all of them, so
+    #: whichever worker of the seller's fleet takes the task can decrypt it (I7).
+    seller_recipients: tuple[str, ...]
     _kontra: Kontra = field(repr=False)
     _input: dict[str, Any] = field(repr=False)
     #: The job a hire of this quote got the gate's answer for (a quote makes one job at
@@ -515,11 +521,20 @@ class Job:
             if close is not None:
                 await close()
 
-    async def accept(self) -> m.JobView:
+    async def accept(self, *, shred_key: bool = True) -> m.JobView:
         """Release the escrow to the seller now (otherwise automatic when the review
-        window closes)."""
+        window closes).
+
+        ``shred_key``: delete this job's key once the escrow is released. The delivery
+        has been read and accepted, so the ciphertext the gate and the bucket still hold
+        stops being readable at all -- forward secrecy by deletion (decisions I7). Pass
+        ``shred_key=False`` to keep it (to re-read the result later, or for a dispute
+        after the fact)."""
         await self._gate_saw_delivery()
-        return await self._kontra.gate.accept(self.job_id)
+        view = await self._kontra.gate.accept(self.job_id)
+        if shred_key:
+            self._kontra._shred_job_key(self.job_id)  # pyright: ignore[reportPrivateUsage]
+        return view
 
     async def reject(self, reason: str) -> m.JobView:
         """Open a dispute about the delivery (within the review window)."""
@@ -587,17 +602,29 @@ class Kontra:
         if session is None:  # KONTRA_API_KEY, else the profile, unless a profile is given
             session = Session(profile, home=home) if profile is not None else Session.from_env(home)
         self._session = session
-        identity = session.identity()
+        # A buyer needs no registered key of its own: each job gets one at hire. This
+        # machine's key is used when it has one (a seller that also buys, a developer who
+        # ran `kontra login`); otherwise an ephemeral one is made in memory, so `kontra
+        # hire` works on a machine that has never logged in (decisions I7).
+        try:
+            identity = session.identity()
+        except NotLoggedIn:
+            identity, _ = age_crypto.generate_identity()
         self.public_key = age_crypto.public_key_of(identity)
         self._identity = identity
+        #: Every job key this machine holds, plus any made during this client's life. age
+        #: tries each stanza against each identity, so one client reads any job it hired;
+        #: `kontra job <id> --accept` shreds a key and shortens the list.
+        self._job_identities: list[str] = Profile.job_identities(session.identity_home)
         self.start_timeout = start_timeout
         self._keys = _CheckedSellerKeys(session.gate, self.contract)
         self._codec = KontraCodec(
             identity,
-            self.public_key,
+            [self.public_key],
             role="buyer",
             seller_keys=self._keys,
             blobs=GateBlobStore(session.gate),
+            extra_identities=lambda: tuple(self._job_identities),
         )
         self.data_converter = buyer_data_converter(self._codec)
         self._client = self.adopt(client) if client is not None else None
@@ -612,14 +639,13 @@ class Kontra:
             self._know_party()
 
     def _know_party(self) -> None:
-        """Check the key file against the party's registered key and install the runtime:
-        what needs to know who we are."""
+        """Install the runtime: what needs to know who we are.
+
+        Nothing is checked against a "the party's key" here any more. A party has a set of
+        recipients and a buyer needs none of them -- each job brings its own key
+        (decisions I7) -- so a machine whose key file is unregistered, or absent, still
+        hires and reads its results."""
         profile = self._session.profile
-        if profile.public_key is not None and profile.public_key != self.public_key:
-            raise KontraError(
-                f"the key file is not the one {profile.party} registered "
-                f"({profile.public_key}); copy the right key, or run `kontra login`"
-            )
         try:
             _runtime.current()
         except _runtime.NoRuntime:
@@ -627,10 +653,23 @@ class Kontra:
                 party=profile.party,
                 gate=self._session.gate,
                 identity=self._identity,
+                more_identities=lambda: tuple(self._job_identities),
                 recipient=self.public_key,
             )
             _runtime.install(self._runtime)
         self._bound = True
+
+    def _shred_job_key(self, job_id: str) -> None:
+        """Forget this job's key: off disk and out of this client's identities."""
+        try:
+            secret, _ = Profile.job_identity(job_id, self._session.identity_home)
+        except (ProfileError, ValueError):
+            secret = None
+        if secret is not None:
+            with contextlib.suppress(ValueError):
+                self._job_identities.remove(secret)
+        with contextlib.suppress(OSError, ValueError):
+            Profile.shred_job_identity(job_id, self._session.identity_home)
 
     async def _ready(self) -> None:
         """Bind, once the session knows who it is (an API key's asks the gate first)."""
@@ -656,6 +695,16 @@ class Kontra:
     @property
     def party(self) -> str:
         return self.profile.party
+
+    @property
+    def identities(self) -> tuple[str, ...]:
+        """Every secret key this client can decrypt with: this machine's, then the key of
+        each job it holds (decisions I7).
+
+        An :class:`~kontra.types.Artifact` that arrived inside a delivery is already bound
+        to them and downloads itself. One rebuilt from plain JSON -- passed through a
+        workflow result, say -- is not, and :func:`kontra.artifacts.download` wants these."""
+        return (self._identity, *self._job_identities)
 
     @property
     def seller_keys(self) -> SellerKeyCache:
@@ -758,7 +807,7 @@ class Kontra:
             self._validators[info.contract_hash] = validator
         if (
             info.offering.key != entry.offering
-            or info.facts.public_key != entry.public_key
+            or info.facts.party != entry.party
             or info.offering.service_name != entry.service
         ):
             raise HireRefused(
@@ -798,7 +847,7 @@ class Kontra:
                 offering=entry.offering,
                 path=err.path,
             ) from err
-        self._keys.remember(entry.endpoint, entry.public_key)
+        self._keys.remember(entry.endpoint, entry.recipients)
         wire = await self._wire(entry.endpoint, entry.service, value, QUOTE_OPERATION)
         try:
             view = await self.gate.quote(entry.offering, wire)
@@ -810,13 +859,13 @@ class Kontra:
         if (
             view.offering,
             view.contract_hash,
-            view.seller_public_key,
+            tuple(view.seller_recipients),
             view.endpoint,
             view.service,
         ) != (
             entry.offering,
             entry.contract_hash,
-            entry.public_key,
+            tuple(entry.recipients),
             entry.endpoint,
             entry.service,
         ):
@@ -848,7 +897,7 @@ class Kontra:
             contract_hash=view.contract_hash,
             endpoint=view.endpoint,
             service=view.service,
-            seller_public_key=view.seller_public_key,
+            seller_recipients=tuple(view.seller_recipients),
             _kontra=self,
             _input=value,
         )
@@ -916,11 +965,28 @@ class Kontra:
                     max_price=price_text(max_price),
                     currency=q.currency,
                 )
+        # The job's own key, made here and sent with the hire: the gate signs THIS into
+        # the hold token, never a key of the buyer party (decisions I7). Written before
+        # the call, because a lost answer can still have locked a hold -- and a job whose
+        # key was never written is a delivery nobody can read. A quote hired here already
+        # is refused by the gate as ``quote_used``, so it gets no key to leave behind.
+        if q._job_id is None:
+            secret, buyer_key, pending = Profile.new_pending_job_identity(
+                q.quote_id, self._session.identity_home
+            )
+            if secret not in self._job_identities:
+                self._job_identities.append(secret)
+        else:
+            _, buyer_key = age_crypto.generate_identity()
+            pending = None
         try:
-            hired = await self.gate.hire(q.quote_id, max_price_minor=cap)
+            hired = await self.gate.hire(q.quote_id, buyer_key=buyer_key, max_price_minor=cap)
         except GateError as err:
             mapped = _refusal(err, q.offering, q.currency)
             if mapped is not None:
+                found = (err.detail or {}).get("job_id") if err.code == "quote_used" else None
+                if pending is not None and is_job_id(found):
+                    self._claim_quote_key(q, cast("str", found))  # a lost hire's job
                 raise mapped from err
             if recover:  # a 5xx, or a 2xx we could not read: the lock may have happened
                 await self._lost_hire(q, err)
@@ -934,8 +1000,12 @@ class Kontra:
                 await self._lost_hire_cancelled(q)
             raise
         q._job_id = hired.job_id
-        # The seller key here is what the job input is encrypted to: it must be the one the
-        # quoted contract seals, never a key the hire answer merely names.
+        if pending is not None:
+            Profile.claim_job_identity(pending, hired.job_id, self._session.identity_home)
+        # The seller keys here are what the job input is encrypted to: they must be the set
+        # the quote named, never a set the hire answer alone introduces. The contract no
+        # longer seals a key (spec v2), so this comparison -- quote against hire, both from
+        # the gate -- is what is left; see docs/security.md, "Known limits".
         if (
             hired.offering,
             hired.contract_hash,
@@ -944,7 +1014,7 @@ class Kontra:
             hired.max_duration_seconds,
             hired.endpoint,
             hired.service,
-            hired.seller_public_key,
+            tuple(hired.seller_recipients),
         ) != (
             q.offering,
             q.contract_hash,
@@ -953,7 +1023,7 @@ class Kontra:
             int(q.max_duration.total_seconds()),
             q.endpoint,
             q.service,
-            q.seller_public_key,
+            q.seller_recipients,
         ):
             abandoned = await self._abandon(hired.job_id, "the hold does not match the quote")
             raise HireRefused(
@@ -962,7 +1032,7 @@ class Kontra:
                 code="hold_mismatch",
                 detail={"job_id": hired.job_id},
             )
-        self._keys.remember(hired.endpoint, hired.seller_public_key)
+        self._keys.remember(hired.endpoint, hired.seller_recipients)
         return hired
 
     async def _start(self, hired: m.HireView, value: dict[str, Any]) -> Job:
@@ -1090,6 +1160,15 @@ class Kontra:
         if done != "unreached":  # _abandon has said so
             log.warning("job %s: %s; %s", job_id, why, _ABANDONED[done])
 
+    def _claim_quote_key(self, q: QuoteResult, job_id: str) -> None:
+        """File the key pending for ``q`` under ``job_id``, the job a hire of ``q`` whose
+        answer was lost locked with it, so ``kontra job <id> --result`` and ``--accept`` find
+        it. A job whose key is filed already keeps that key."""
+        home = self._session.identity_home
+        if q.quote_id is None or Profile.job_key_path(job_id, home).exists():
+            return
+        Profile.claim_job_identity(Profile.pending_job_key_path(q.quote_id, home), job_id, home)
+
     async def _quote_job(self, q: QuoteResult) -> str | None:
         """The job the gate made of ``q`` when no hire of it here got the gate's answer, or
         None (no job, or the gate cannot say). Hiring the quote again under a cap below any
@@ -1099,7 +1178,10 @@ class Kontra:
         if q.quote_id is None:
             return None
         try:
-            again = await self.gate.hire(q.quote_id, max_price_minor=-1)
+            # A cap below any price never locks, so no usable job key is needed here; the
+            # gate still requires one, so send a throwaway public half.
+            _, throwaway = age_crypto.generate_identity()
+            again = await self.gate.hire(q.quote_id, buyer_key=throwaway, max_price_minor=-1)
         except GateError as answer:
             found = (answer.detail or {}).get("job_id") if answer.code == "quote_used" else None
             job_id = found if is_job_id(found) else None
@@ -1126,6 +1208,7 @@ class Kontra:
             job_id = await self._quote_job(q)
             if job_id is None:
                 return
+            self._claim_quote_key(q, job_id)
             view = await self._unstarted(job_id, err, "the gate's answer to the hire was lost")
         except asyncio.CancelledError:
             await self._lost_hire_cancelled(q)
@@ -1336,14 +1419,17 @@ class Kontra:
     def _bind(self, artifact: Artifact) -> Artifact:
         bound = _BuyerArtifact.model_validate(artifact.model_dump())
         bound._gate = self.gate
-        bound._identity = self._identity
+        bound._identities = (self._identity, *self._job_identities)
         return bound
 
     def _progress(self, event: m.ProgressEvent) -> Progress:
         if event.source is m.ProgressSource.HEARTBEAT and event.ciphertext_b64 is not None:
             details: Any = None
             try:
-                plain = age_crypto.decrypt(base64.b64decode(event.ciphertext_b64), self._identity)
+                plain = age_crypto.decrypt(
+                    base64.b64decode(event.ciphertext_b64),
+                    [self._identity, *self._job_identities],
+                )
                 details = json.loads(plain)
             except (age_crypto.AgeError, binascii.Error, ValueError) as err:
                 log.warning("progress event %d does not decrypt for us: %s", event.seq, err)
@@ -1423,7 +1509,7 @@ class Kontra:
         artifact = await upload(
             self.gate,
             Path(path),
-            recipients=[entry.public_key, self.public_key],
+            recipients=[*entry.recipients, self.public_key],
             content_type=content_type,
         )
         return self._bind(artifact)

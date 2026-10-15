@@ -30,6 +30,7 @@ from kontra.contract import (
 )
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
+from kontra.profile import KEY_FILE
 
 from .support import Cli, explain
 
@@ -125,43 +126,45 @@ def test_class_prefixes() -> None:
 
 
 def test_contract_prints_the_sealed_document(cli: Cli) -> None:
-    result = cli("contract", "--dir", str(ENRICH), "--public-key", PUBLIC_KEY)
+    result = cli("contract", "--dir", str(ENRICH))
     assert result.exit_code == 0, result.output
     doc = from_yaml(result.stdout)
     info = validate_document(doc)  # the catalog's rules and the sealed hash
     assert info.offering.key == "acme/enrich@1.2.0"
-    assert info.facts.public_key == PUBLIC_KEY
+    assert "public_key" not in doc["x-kontra"]  # the contract seals no key (I7)
 
-    view = cli("contract", "--dir", str(ENRICH), "--public-key", PUBLIC_KEY, "--nexgen")
+    view = cli("contract", "--dir", str(ENRICH), "--nexgen")
     assert view.exit_code == 0, view.output
     nexgen = yaml.safe_load(view.stdout)
     assert "x-kontra" not in nexgen
     assert nexgen["services"] == doc["services"]
 
-    as_json = cli("contract", "--dir", str(ENRICH), "--public-key", PUBLIC_KEY, "--json")
+    as_json = cli("contract", "--dir", str(ENRICH), "--json")
     assert json.loads(as_json.stdout) == doc
 
 
-def test_contract_writes_a_file_and_uses_the_profile_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from kontra.profile import Profile
-
-    home = tmp_path / "home"
-    _, public = Profile.ensure_identity(home)  # a key file, no profile: still the party's key
+def test_contract_writes_a_file(cli: Cli, tmp_path: Path) -> None:
     out = tmp_path / "contract.yaml"
-    result = Cli(home)("contract", "--dir", str(ENRICH), "-o", str(out))
+    result = cli("contract", "--dir", str(ENRICH), "-o", str(out))
     assert result.exit_code == 0, result.output
-    assert validate_document(from_yaml(out.read_text())).facts.public_key == public
+    assert validate_document(from_yaml(out.read_text())).offering.key == "acme/enrich@1.2.0"
     assert result.stdout == ""
 
 
-def test_contract_without_any_key_says_what_to_do(cli: Cli) -> None:
-    result = cli("contract", "--dir", str(ENRICH))
-    assert result.exit_code == 1
-    assert "kontra login" in result.stderr
-    bad = cli("contract", "--dir", str(ENRICH), "--public-key", "age1nope")
-    assert (bad.exit_code, "not an age recipient" in bad.stderr) == (1, True)
+def test_contract_is_the_same_with_or_without_a_key(cli: Cli, tmp_path: Path) -> None:
+    """No key goes into the document, so a machine without one derives it, and the key a
+    machine holds does not change the hash."""
+    from kontra.profile import Profile
+
+    bare = cli("contract", "--dir", str(ENRICH))
+    assert bare.exit_code == 0, bare.output
+    assert not (tmp_path / "home" / KEY_FILE).exists()
+    Profile.ensure_identity(tmp_path / "home")
+    keyed = cli("contract", "--dir", str(ENRICH))
+    assert keyed.exit_code == 0, keyed.output
+    assert keyed.stdout == bare.stdout
+    gone = cli("contract", "--dir", str(ENRICH), "--public-key", PUBLIC_KEY)
+    assert (gone.exit_code, "No such option" in gone.output) == (2, True)
 
 
 def test_contract_names_the_offending_path(cli: Cli, tmp_path: Path) -> None:
@@ -172,7 +175,7 @@ def test_contract_names_the_offending_path(cli: Cli, tmp_path: Path) -> None:
     (project / "offering.yaml").write_text(
         (ENRICH / "offering.yaml").read_text().replace("max_duration: 6h", "max_duration: 6 hours")
     )
-    result = cli("contract", "--dir", str(project), "--public-key", PUBLIC_KEY)
+    result = cli("contract", "--dir", str(project))
     assert result.exit_code == 1
     assert result.stderr.startswith("error: ")
     assert "offering.yaml: max_duration:" in result.stderr
@@ -217,14 +220,14 @@ def test_load_worker_refusals(cli: Cli, tmp_path: Path) -> None:
     wrong = tmp_path / "wrong"
     wrong.mkdir()
     (wrong / "worker.py").write_text("worker = 42\n")
-    result = cli("contract", "--dir", str(wrong), "--public-key", PUBLIC_KEY)
+    result = cli("contract", "--dir", str(wrong))
     assert (result.exit_code, "module-level `worker = Worker(...)`" in result.stderr) == (1, True)
 
     shadow = tmp_path / "shadow"
     shadow.mkdir()
     (shadow / "worker.py").write_text("")
     (shadow / "json.py").write_text("")
-    result = cli("contract", "--dir", str(shadow), "--public-key", PUBLIC_KEY)
+    result = cli("contract", "--dir", str(shadow))
     assert (result.exit_code, "json" in result.stderr) == (1, True)
     assert sys.modules["json"].__file__ != str(shadow / "json.py")
 
@@ -374,7 +377,7 @@ def _entry(doc: dict[str, Any], **changes: Any) -> m.CatalogEntry:
         "endpoint": "k" + "0" * 32,
         "service": info.offering.service_name,
         "task_queue": info.offering.task_queue,
-        "public_key": info.facts.public_key,
+        "recipients": [PUBLIC_KEY],
         "published_at": "2026-10-11T00:00:00Z",
     }
     fields.update(changes)
@@ -385,7 +388,7 @@ def test_pull_verifies_the_catalog_entry() -> None:
     from click.exceptions import ClickException
 
     with load_worker(ENRICH) as worker:
-        doc = worker.offerings[0].build_document(PUBLIC_KEY)
+        doc = worker.offerings[0].build_document()
     assert verify_entry("acme/enrich@1", _entry(doc)).offering.key == "acme/enrich@1.2.0"
 
     tampered = json.loads(json.dumps(doc))
@@ -395,8 +398,11 @@ def test_pull_verifies_the_catalog_entry() -> None:
     resealed = seal(tampered)  # a consistent document the entry does not describe
     with pytest.raises(ClickException, match="hashes to"):
         verify_entry("acme/enrich", _entry(resealed, contract_hash=_entry(doc).contract_hash))
-    with pytest.raises(ClickException, match="public key"):
-        verify_entry("acme/enrich", _entry(doc, public_key=generate_identity()[1]))
+    # recipients are catalog data, not sealed: a changed set is still the same contract
+    other = _entry(doc, recipients=[PUBLIC_KEY, generate_identity()[1]])
+    assert verify_entry("acme/enrich", other).contract_hash == other.contract_hash
+    with pytest.raises(ClickException, match="the entry says mallory"):
+        verify_entry("acme/enrich", _entry(doc, party="mallory"))
     with pytest.raises(ClickException, match="asked for"):
         verify_entry("acme/enrich@2", _entry(doc))
     with pytest.raises(ClickException, match="service"):

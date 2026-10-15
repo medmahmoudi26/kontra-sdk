@@ -195,9 +195,7 @@ class Stack:
 
     async def login(self, name: str) -> Party:
         home = self.parties / name
-        profile = await login(
-            self.gate_url, handle=name, dev=True, home=home, open_browser=False, replace_key=True
-        )
+        profile = await login(self.gate_url, handle=name, dev=True, home=home, open_browser=False)
         return Party(name, home, profile, self)
 
     # ------------------------------------------------------------------ Postgres

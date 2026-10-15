@@ -78,7 +78,20 @@ ROUTES: tuple[Route, ...] = (
         m.TemporalToken,
     ),
     Route("me", "GET", f"{P}/me", "party|worker", None, m.Me),
-    Route("set_key", "PUT", f"{P}/me/key", "fresh", m.SetKey, m.Me),
+    # Encryption recipients, NOT /v1/keys (API keys, below): an API key authenticates, a
+    # recipient receives ciphertext. Adding never replaces, so a second machine is one
+    # more recipient; both need a fresh human session, because a recipient can read every
+    # delivery made after it is added (decisions I7).
+    Route("add_recipient", "POST", f"{P}/me/recipients", "fresh", m.AddKey, m.Me, status=201),
+    Route(
+        "revoke_recipient",
+        "DELETE",
+        f"{P}/me/recipients/{{public_key}}",
+        "fresh",
+        None,
+        None,
+        status=204,
+    ),
     Route("party", "GET", f"{P}/parties/{{party}}", "none", None, m.PartyView),
     # API keys for programs: minted, listed and revoked by a fresh human session only
     Route(

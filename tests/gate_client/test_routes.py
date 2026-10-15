@@ -47,7 +47,8 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     "revoke": (lambda c: c.revoke(), {}),
     "temporal_token": (lambda c: c.temporal_token(), {}),
     "me": (lambda c: c.me(), {}),
-    "set_key": (lambda c: c.set_key("age1abc"), {}),
+    "add_recipient": (lambda c: c.add_recipient("laptop", "age1abc"), {}),
+    "revoke_recipient": (lambda c: c.revoke_recipient("age1abc"), {"public_key": "age1abc"}),
     "party": (lambda c: c.party("acme"), {"party": "acme"}),
     "create_api_key": (lambda c: c.create_api_key("ci"), {}),
     "api_keys": (lambda c: c.api_keys(), {}),
@@ -66,7 +67,7 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     ),
     "by_endpoint": (lambda c: c.by_endpoint(EP), {"endpoint": EP}),
     "quote": (lambda c: c.quote("acme/enrich", WP), {}),
-    "hire": (lambda c: c.hire("q1", max_price_minor=2000), {}),
+    "hire": (lambda c: c.hire("q1", buyer_key="age1job", max_price_minor=2000), {}),
     "jobs": (lambda c: c.jobs(), {}),
     "job": (lambda c: c.job(JOB), {"job_id": JOB}),
     "seller_job": (lambda c: c.seller_job(JOB), {"job_id": JOB}),
@@ -291,13 +292,13 @@ async def test_request_bodies() -> None:
     )
     async with GateClient("http://gate.test", token=static("t"), transport=rec.transport) as c:
         await c.quote("acme/enrich@1", WP)
-        await c.hire("q1")
+        await c.hire("q1", buyer_key="age1job")
         await c.temporal_token()
     from ._support import body
 
     assert [body(r) for r in rec.requests] == [
         {"offering": "acme/enrich@1", "input": {"b64": "AAAA"}},
-        {"quote_id": "q1", "max_price_minor": None},
+        {"quote_id": "q1", "max_price_minor": None, "buyer_key": "age1job"},
         {"role": "worker"},
     ]
     assert all(r.headers["content-type"] == "application/json" for r in rec.requests)

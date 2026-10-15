@@ -16,7 +16,7 @@ from fastapi.routing import APIRoute
 
 from kontra.artifacts import download, upload
 from kontra.codec import GateBlobStore
-from kontra.codec.age import encrypt
+from kontra.codec.age import encrypt, generate_identity
 from kontra.contract.names import job_workflow_id
 from kontra.escrow import ObservedStatus
 from kontra.gate_client import GateClient, GateError
@@ -27,6 +27,12 @@ from kontra.testing.fake_gate import FakeGate
 
 from .conftest import World
 from .support import json_payload, ok_quote, wire
+
+#: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
+#: (`Profile.new_pending_job_identity`); a test that drives the route itself only needs a
+#: well-formed recipient (decisions I7).
+_A_BUYER_KEY = "age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el"
+
 
 QUERY = {
     "search": {"q", "cursor", "limit"},
@@ -132,14 +138,14 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     assert (await anon.get_offering(entry.name)).endpoint == entry.endpoint
     assert (await anon.card(entry.offering))["name"] == entry.name
     assert (await anon.by_endpoint(entry.endpoint)).offering == entry.offering
-    assert (await anon.party(seller.profile.party)).public_key == seller.profile.public_key
+    assert (await anon.party(seller.profile.party)).recipients == [seller.profile.public_key]
 
     control.responder = lambda p, h: ok_quote(500)
 
     async def hired() -> m.HireView:
         q = await buyer.gate.quote(entry.name, wire(json_payload({"text": "hi"})))
         assert q.quote_id is not None
-        return await buyer.gate.hire(q.quote_id, max_price_minor=500)
+        return await buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY, max_price_minor=500)
 
     worker = world.bearer((await seller.gate.temporal_token()).token)  # kontra serve's credential
 
@@ -176,7 +182,7 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
         buyer.gate, art, buyer.identity(), tmp_path / "got.txt"
     )  # download_artifact: the buyer's, once delivered
     assert got.read_text() == "records\n"
-    assert (await worker.seller_job(one.job_id)).buyer_public_key == buyer.profile.public_key
+    assert (await worker.seller_job(one.job_id)).buyer_public_key == _A_BUYER_KEY
     assert [j.job_id for j in (await worker.jobs(as_="seller")).items] == [one.job_id]
     events = [e async for e in buyer.gate.progress(one.job_id)]
     assert events[0].activity == "fetch"
@@ -207,6 +213,9 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     made = await buyer.gate.create_api_key("ci")  # a fresh human session mints, lists, revokes
     assert [k.id for k in (await buyer.gate.api_keys()).keys] == [made.id]
     await buyer.gate.revoke_api_key(made.id)
+    fleet = generate_identity()[1]  # one more recipient for the party, then not
+    assert fleet in [k.public_key for k in (await buyer.gate.add_recipient("fleet", fleet)).keys]
+    await buyer.gate.revoke_recipient(fleet)
     await seller.gate.revoke()
     [mine] = (await buyer.gate.sessions()).sessions  # people's sign-ins; never a key's
     assert mine.current
@@ -230,6 +239,7 @@ PATH_VALUES = {
     "sha256": "0" * 64,
     "key_id": "key_" + "0" * 16,
     "session_id": "0" * 32,
+    "public_key": "age1" + "q" * 58,
 }
 
 

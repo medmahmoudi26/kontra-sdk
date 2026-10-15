@@ -44,7 +44,6 @@ _FIRST = (
     "max_concurrent_jobs",
     "max_output_bytes",
     "artifact_retention",
-    "public_key",
     "contract_hash",
     "operations",
     "quote",

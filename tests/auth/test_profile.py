@@ -163,7 +163,7 @@ def test_ensure_identity_loses_a_race_gracefully(
 
 
 def test_missing_key_says_how_to_fix_it(tmp_path: Path) -> None:
-    with pytest.raises(NotLoggedIn, match="kontra login"):
+    with pytest.raises(NotLoggedIn, match=r"kontra recipients add.*KONTRA_KEY_FILE"):
         Profile.identity(tmp_path)
 
 

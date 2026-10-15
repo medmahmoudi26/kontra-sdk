@@ -445,8 +445,17 @@ class GateClient:
     async def me(self) -> m.Me:
         return await self._model("me", m.Me)
 
-    async def set_key(self, public_key: str) -> m.Me:
-        return await self._model("set_key", m.Me, body=m.SetKey(public_key=public_key))
+    async def add_recipient(self, label: str, public_key: str) -> m.Me:
+        """Add one age recipient to this party (needs a fresh human session). Adding never
+        replaces: a second machine is one more recipient, not a new party key."""
+        return await self._model(
+            "add_recipient", m.Me, body=m.AddKey(label=label, public_key=public_key)
+        )
+
+    async def revoke_recipient(self, public_key: str) -> None:
+        """Stop encrypting to ``public_key``. Deliveries already made to it stay readable
+        where their ciphertext and that key are; everything after it is not."""
+        await self._none("revoke_recipient", path={"public_key": public_key})
 
     async def party(self, party: str) -> m.PartyView:
         return await self._model("party", m.PartyView, path={"party": party})
@@ -510,11 +519,18 @@ class GateClient:
             "quote", m.QuoteView, body=m.QuoteRequest(offering=offering, input=payload)
         )
 
-    async def hire(self, quote_id: str, *, max_price_minor: int | None = None) -> m.HireView:
+    async def hire(
+        self, quote_id: str, *, buyer_key: str, max_price_minor: int | None = None
+    ) -> m.HireView:
+        """``buyer_key`` is the job's own age recipient, made by the caller at hire: the
+        gate signs it into the hold token and never consults the party's own keys for the
+        buyer side (decisions I7)."""
         return await self._model(
             "hire",
             m.HireView,
-            body=m.HireRequest(quote_id=quote_id, max_price_minor=max_price_minor),
+            body=m.HireRequest(
+                quote_id=quote_id, buyer_key=buyer_key, max_price_minor=max_price_minor
+            ),
         )
 
     async def jobs(

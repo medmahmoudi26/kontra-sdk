@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://kontra.run/spec/x-kontra.v1.json",
+  "$id": "https://kontra.run/spec/x-kontra.v2.json",
   "title": "x-kontra",
-  "description": "The offering facts Kontra adds to a Nexus contract document, at its root under `x-kontra` (PRD §11.1). Written by `kontra publish` from offering.yaml; never by hand. Durations and sizes appear in canonical form only (the largest unit that divides the value exactly), so equal facts hash equally. Bounds that JSON Schema cannot express on a duration string (max_duration and review_window at most 30d, artifact_retention at most 90d, max_output_bytes at most 5TiB) are enforced by kontra.contract.XKontra.",
+  "description": "The offering facts Kontra adds to a Nexus contract document, at its root under `x-kontra` (PRD §11.1). Written by `kontra publish` from offering.yaml; never by hand. Durations and sizes appear in canonical form only (the largest unit that divides the value exactly), so equal facts hash equally. Bounds that JSON Schema cannot express on a duration string (max_duration and review_window at most 30d, artifact_retention at most 90d, max_output_bytes at most 5TiB) are enforced by kontra.contract.XKontra. v2 drops public_key: a contract seals the party (the first component of `name`), never a key. Recipients are catalog data -- a party holds a set of them and adding a fleet key must not force a republish (decisions I7).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -13,8 +13,7 @@
     "max_duration",
     "review_window",
     "max_output_bytes",
-    "artifact_retention",
-    "public_key"
+    "artifact_retention"
   ],
   "properties": {
     "name": {
@@ -71,11 +70,6 @@
     "artifact_retention": {
       "description": "How long delivered artifacts are kept after acceptance.",
       "$ref": "#/$defs/duration"
-    },
-    "public_key": {
-      "description": "The seller's age X25519 recipient; inputs are encrypted to it.",
-      "type": "string",
-      "pattern": "^age1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}$"
     },
     "contract_hash": {
       "description": "sha256 of the RFC 8785 canonical JSON of the whole document without this member (PRD §11.2).",

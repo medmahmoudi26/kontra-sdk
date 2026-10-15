@@ -46,6 +46,7 @@ from kontra.hire import Kontra
 from kontra.ledger import PLATFORM_PARTY
 from kontra.mcp import KontraTools, server
 from kontra.mcp import _server as mcp_server
+from kontra.profile import Profile
 from kontra.serve.progress import INTERVAL_ENV
 from kontra.testing import Marketplace, TestParty
 from kontra.testing.devserver import DevServer
@@ -377,13 +378,18 @@ async def test_a_hire_whose_answer_was_lost_is_retried_by_its_quote_never_twice(
 ) -> None:
     """The gate locks the price, then the answer is lost. The agent must not hire again from
     a new quote (a second lock): the error names the quote, and hiring that quote again is
-    refused by the gate with the job it already made."""
+    refused by the gate with the job it already made -- whose key, the one the lost call
+    locked it with, is filed under the job."""
     buyer = await world.buyer()
     k = world.kontra(buyer)
     real_hire = k.gate.hire
+    sent: list[str] = []
 
-    async def lost(quote_id: str, *, max_price_minor: int | None = None) -> m.HireView:
-        await real_hire(quote_id, max_price_minor=max_price_minor)
+    async def lost(
+        quote_id: str, *, buyer_key: str, max_price_minor: int | None = None
+    ) -> m.HireView:
+        sent.append(buyer_key)
+        await real_hire(quote_id, buyer_key=buyer_key, max_price_minor=max_price_minor)
         raise httpx.ReadError("the connection dropped before the answer")
 
     async with connect(k) as client:
@@ -396,6 +402,7 @@ async def test_a_hire_whose_answer_was_lost_is_retried_by_its_quote_never_twice(
         error = await refused(client, "hire", quote_id=quote_id, max_price=1)
         assert error["code"] == "quote_used"
         job_id = error["detail"]["job_id"]
+        assert Profile.job_identity(job_id, k.session.identity_home)[1] == sent[0]
         status = await ok(client, "status", job_id=job_id)
         assert (status["escrow"], status["price"]) == ("held", "1.00")
         held = await buyer.balance()

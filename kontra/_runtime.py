@@ -9,6 +9,7 @@ workflow and activity code never touch it directly (D1).
 from __future__ import annotations
 
 import contextvars
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
@@ -54,13 +55,32 @@ class KeyLookup(Protocol):
 class Runtime:
     party: str
     gate: GateClient
-    #: ``AGE-SECRET-KEY-1...``
+    #: ``AGE-SECRET-KEY-1...``: this machine's key, the one thing that decrypts.
     identity: str
-    #: ``age1...``, our own public key
+    #: ``age1...``, this machine's own public key.
     recipient: str
+    #: The party's whole recipient set (``age1...``), this machine's included: what "to
+    #: ourselves" means for a seller running more than one deployment (decisions I7).
+    #: Empty means "just this machine", for a buyer that registered nothing.
+    recipients: list[str] = field(default_factory=list[str])
+    #: More secret keys to decrypt with, read at each call because the set grows: a buyer
+    #: makes one per job at hire and shreds it at accept (decisions I7). Encryption never
+    #: consults these -- only :attr:`recipients` says who may read.
+    more_identities: Callable[[], Sequence[str]] | None = None
     #: seller side: job id -> buyer key (filled by the Nexus handler, gate on miss)
     jobs: KeyLookup | None = None
     extra_recipients: list[str] = field(default_factory=list[str])
+
+    def all_identities(self) -> list[str]:
+        """Every secret key this process may decrypt with: this machine's, then the job
+        keys. Artifacts, claim-checks and heartbeats all read it, so a buyer opens a
+        delivery encrypted to the job's key and not to any key it registered."""
+        out = [self.identity]
+        if self.more_identities is not None:
+            for extra in self.more_identities():
+                if extra not in out:
+                    out.append(extra)
+        return out
 
     def current_job_id(self) -> str | None:
         ctx = _job.get()
@@ -69,7 +89,7 @@ class Runtime:
     async def recipients_for_current_job(self) -> list[str]:
         """Seller side: ourselves and the job's buyer (job directory, gate on miss).
         Outside a job: ourselves only."""
-        out = [self.recipient, *self.extra_recipients]
+        out = [self.recipient, *self.recipients, *self.extra_recipients]
         ctx = _job.get()
         if ctx is not None and self.jobs is not None:
             out.append(await self.jobs.buyer_key(ctx.job_id))

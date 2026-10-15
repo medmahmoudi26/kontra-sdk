@@ -104,8 +104,7 @@ async def world(
 
 
 async def test_the_worker_published_its_offering_on_a_dev_profile(world: World) -> None:
-    pk = world.seller.public_key
-    assert world.entry.contract_hash == world.bound.contract_hash(pk)
+    assert world.entry.contract_hash == world.bound.contract_hash()
     assert world.entry.task_queue == world.bound.offering_id.task_queue
     assert world.entry.service == "acme.upper"
     [inner] = world.worker.inner_workers
@@ -238,7 +237,7 @@ async def test_validly_signed_tokens_for_something_else_are_refused(world: World
         job = new_job_id()
         return sign({**base, "job_id": job, "sub": job, **changes}), job
 
-    served = world.bound.contract_hash(world.seller.public_key)
+    served = world.bound.contract_hash()
     other_hash = "sha256:" + "ab" * 32
     token, job = minted(contract_hash=other_hash)
     text = await _refused(world, hired, value, token, job)
@@ -603,10 +602,9 @@ async def test_an_edited_type_after_publish_refuses_to_start(world: World, tmp_p
 
     path = write_offering(tmp_path)
     published = seller.bind(path)
-    pk = world.seller.public_key
-    await world.seller.gate.publish(published.document(pk))
+    await world.seller.gate.publish(published.document())
     edited = seller.bind_v2(path)
-    ours, theirs = edited.contract_hash(pk), published.contract_hash(pk)
+    ours, theirs = edited.contract_hash(), published.contract_hash()
     assert ours != theirs
     worker = Worker(offerings=[edited], activities=[shout])
     with pytest.raises(ServeError) as refused:
@@ -631,7 +629,7 @@ async def test_wait_ready_returns_when_the_worker_refuses_to_start(
     from kontra.serve import ServeError
 
     path = write_offering(tmp_path)
-    await world.seller.gate.publish(seller.bind(path).document(world.seller.public_key))
+    await world.seller.gate.publish(seller.bind(path).document())
     worker = Worker(offerings=[seller.bind_v2(path)], activities=[shout])
     ready = asyncio.create_task(worker.wait_ready())
     await asyncio.sleep(0)  # already waiting when the worker starts

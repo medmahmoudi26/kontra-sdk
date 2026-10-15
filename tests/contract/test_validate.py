@@ -70,9 +70,8 @@ def _second_service(d: Doc) -> None:
     d["services"]["Other"] = copy.deepcopy(d["services"]["AcmeEnrich"])
 
 
-def _flip_key_checksum(d: Doc) -> None:
-    key = d["x-kontra"]["public_key"]
-    d["x-kontra"]["public_key"] = key[:-1] + ("q" if key[-1] != "q" else "p")
+#: A well-formed age recipient, for the rule that a contract may not carry one at all.
+_EXAMPLE_RECIPIENT = "age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el"
 
 
 def _prop(name: str, schema: Doc | None = None) -> Mutation:
@@ -564,16 +563,12 @@ RULES: list[tuple[str, Mutation, str, str]] = [
         "sorted",
     ),
     (
-        "public key pattern",
-        lambda d: d["x-kontra"].__setitem__("public_key", "ssh-ed25519 AAAA"),
-        "x-kontra.public_key",
-        "does not match",
-    ),
-    (
-        "public key checksum",
-        _flip_key_checksum,
-        "x-kontra.public_key",
-        "not a valid age public key",
+        # Spec v2 has no public_key member at all, so one is an unknown member rather than
+        # a malformed key: additionalProperties is false (decisions I7).
+        "a sealed key is refused outright",
+        lambda d: d["x-kontra"].__setitem__("public_key", _EXAMPLE_RECIPIENT),
+        "x-kontra",
+        "public_key",
     ),
     (
         "null member",

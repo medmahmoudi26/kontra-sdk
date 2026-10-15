@@ -23,7 +23,7 @@ from kontra.auth import (
     login,
 )
 from kontra.gate_client import models as m
-from kontra.hire import Kontra, KontraError
+from kontra.hire import Kontra
 from kontra.profile import KEY_FILE, NotLoggedIn, Profile, ProfileError
 from kontra.testing.fake_gate import FakeGate
 
@@ -92,7 +92,7 @@ async def test_from_api_key_learns_who_it_is_and_writes_nothing(
             None,
         )
         assert p.auth_time == made.created_at
-        assert p.public_key == Profile.load(tmp_path / "human").public_key
+        assert p.public_key is None  # a party has a set of recipients, not one key
         assert (s.uses_api_key, s.resolved) == (True, True)
         assert s.identity() == Profile.identity(home)
         assert (await s.gate.balance()).party == "prog"
@@ -253,8 +253,9 @@ async def test_a_gate_that_changes_the_keys_party_is_refused() -> None:
 async def test_kontra_with_a_key_binds_on_first_use(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``Kontra()`` with ``KONTRA_API_KEY``: no profile anywhere, the key file in
-    ``KONTRA_HOME``, the party learned from the gate on ``async with``."""
+    """``Kontra()`` with ``KONTRA_API_KEY``: no profile anywhere, the party learned from the
+    gate on ``async with``. A buyer's keys are made per job at hire, so a ``KONTRA_HOME``
+    with no key file, or one the party never registered, binds all the same."""
     gate = FakeGate(None, sweep_interval=0)
     url = await gate.serve()
     try:
@@ -281,12 +282,13 @@ async def test_kontra_with_a_key_binds_on_first_use(
         finally:
             await lazy.aclose()
 
-        other = tmp_path / "other"
-        other.mkdir()
-        Profile.ensure_identity(other)  # a key file that is not the party's
-        monkeypatch.setenv("KONTRA_HOME", str(other))
-        with pytest.raises(KontraError, match="not the one prog registered"):
-            async with Kontra():
-                pass
+        for name, keyed in (("empty", False), ("other", True)):
+            other = tmp_path / name
+            other.mkdir()
+            if keyed:
+                Profile.ensure_identity(other)  # a key file the party never registered
+            monkeypatch.setenv("KONTRA_HOME", str(other))
+            async with Kontra() as bound:
+                assert (await bound.balance()).party == "prog"
     finally:
         await gate.stop()

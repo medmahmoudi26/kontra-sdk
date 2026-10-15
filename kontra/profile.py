@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -40,7 +41,9 @@ from pydantic import (
 from kontra.contract.names import is_handle
 
 __all__ = [
+    "JOBS_DIR",
     "KEY_FILE",
+    "KEY_FILE_ENV",
     "PROFILE_FILE",
     "NotLoggedIn",
     "Profile",
@@ -51,6 +54,23 @@ __all__ = [
 
 PROFILE_FILE = "profile"
 KEY_FILE = "key"
+#: Where a worker's age identity comes from when it is not ``$KONTRA_HOME/key``: a fleet
+#: mounts ONE key into every pod from a secret, and pod churn never changes the party's
+#: recipient set, so an in-flight input stays decryptable by whichever worker takes the
+#: task (decisions I7). Same ops shape as a TLS certificate.
+KEY_FILE_ENV = "KONTRA_KEY_FILE"
+#: Per-job buyer keys: ``$KONTRA_HOME/jobs/<job_id>.key``, made at hire, read by
+#: ``kontra job <id> --result``, shredded by ``kontra job <id> --accept``.
+JOBS_DIR = "jobs"
+#: A job key written BEFORE the hire, when no job id exists yet. If the gate's answer is
+#: lost the hold may still have locked, and a key that was never written would make that
+#: job's delivery unreadable by anyone -- so it is written first under the quote and
+#: renamed to the job id once the gate names it. :meth:`Profile.job_identities` globs
+#: ``*.key``, so a pending file that never got renamed still decrypts.
+PENDING_PREFIX = "pending-"
+#: What may become part of a key file's name. Anchored, ASCII, no dot and no separator, so
+#: a quote id from the gate can never walk out of the jobs directory.
+_SAFE_TOKEN = re.compile(r"[A-Za-z0-9_-]{1,128}", re.ASCII)
 _LOCK_FILE = ".lock"
 _LOCK_WAIT_S = 60.0
 _LOCK_POLL_S = 0.05
@@ -141,6 +161,22 @@ def _write_private(path: Path, data: bytes, *, replace: bool) -> bool:
             os.unlink(tmp)
 
 
+def _read_job_key(path: Path) -> tuple[str, str]:
+    """The keypair in a job key file. ``FileNotFoundError`` when there is none."""
+    from kontra.codec.age import is_identity, public_key_of
+
+    try:
+        text = _read_private(path).decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ProfileError(f"the job key file {path} is not text") from e
+    found = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+    if len(found) != 1 or not is_identity(found[0]):
+        raise ProfileError(
+            f"the job key file {path} must hold exactly one AGE-SECRET-KEY-1... line"
+        )
+    return found[0], public_key_of(found[0])
+
+
 def _problems(err: ValidationError, fields: Collection[str]) -> str:
     """What is wrong with the profile, field by field, and never a value: pydantic's own
     rendering quotes the input, and this file holds a refresh token (or whatever was pasted
@@ -177,7 +213,10 @@ class Profile(BaseModel):
     #: When the human session behind ``refresh_token`` logged in (publishing needs a fresh
     #: one); for an API key, the key's creation (such a session is never fresh).
     auth_time: AwareDatetime
-    #: Our age recipient (``age1...``), as registered with the gate.
+    #: This machine's age recipient (``age1...``), as `kontra login` registered it. One of
+    #: the party's set, never "the party's key": another machine has its own, and a fleet
+    #: mounts one of its own (decisions I7). None when this machine has registered none --
+    #: a buyer that only hires, or a worker holding a key from ``$KONTRA_KEY_FILE``.
     public_key: str | None = None
     #: TLS to the Temporal frontend. Always on outside ``kontra dev`` (§10.2).
     tls: bool = True
@@ -241,17 +280,27 @@ class Profile(BaseModel):
         return path
 
     @staticmethod
+    def key_path(home: Path | str | None = None) -> Path:
+        """Where this machine's age identity lives: ``$KONTRA_KEY_FILE`` if it is set
+        (a fleet's mounted secret), else ``<home>/key``."""
+        mounted = os.environ.get(KEY_FILE_ENV)
+        if mounted:
+            return Path(mounted)
+        return _resolve(home) / KEY_FILE
+
+    @staticmethod
     def identity(home: Path | str | None = None) -> str:
-        """The party's secret age identity (``AGE-SECRET-KEY-1...``) from ``key``."""
+        """This machine's secret age identity (``AGE-SECRET-KEY-1...``)."""
         from kontra.codec.age import is_identity
 
-        path = _resolve(home) / KEY_FILE
+        path = Profile.key_path(home)
         try:
             text = _read_private(path).decode("utf-8")
         except FileNotFoundError:
             raise NotLoggedIn(
-                f"no encryption key at {path}. Run `kontra login`, or copy the key file from "
-                "the machine that registered this party's public key."
+                f"no encryption key at {path}. Run `kontra recipients add` on this machine "
+                f"to make one and register it, point {KEY_FILE_ENV} at the key a fleet "
+                "mounts, or copy a key file this party already has a recipient for."
             ) from None
         except UnicodeDecodeError as e:
             raise ProfileError(f"the key file {path} is not text") from e
@@ -270,9 +319,9 @@ class Profile(BaseModel):
         from kontra.codec.age import generate_identity, public_key_of
 
         h = _resolve(home)
-        path = h / KEY_FILE
+        path = Profile.key_path(h)
         if not path.exists():
-            _ensure_dir(h)
+            _ensure_dir(path.parent)
             secret, public = generate_identity()
             created = datetime.now(UTC).replace(microsecond=0).isoformat()
             text = f"# created: {created}\n# public key: {public}\n{secret}\n"
@@ -280,6 +329,116 @@ class Profile(BaseModel):
                 return secret, public
         secret = Profile.identity(h)
         return secret, public_key_of(secret)
+
+    # ------------------------------------------------------------------ per-job keys
+
+    @staticmethod
+    def job_key_path(job_id: str, home: Path | str | None = None) -> Path:
+        """``<home>/jobs/<job_id>.key``. ``job_id`` is checked, never joined blindly."""
+        from kontra.contract.names import is_job_id
+
+        if not is_job_id(job_id):
+            raise ValueError(f"{job_id!r} is not a job id")
+        return _resolve(home) / JOBS_DIR / f"{job_id}.key"
+
+    @staticmethod
+    def pending_job_key_path(quote_id: str, home: Path | str | None = None) -> Path:
+        """``<home>/jobs/pending-<quote_id>.key``, before the gate names the job."""
+        if not _SAFE_TOKEN.fullmatch(quote_id):
+            raise ValueError(f"{quote_id!r} is not a quote id")
+        return _resolve(home) / JOBS_DIR / f"{PENDING_PREFIX}{quote_id}.key"
+
+    @staticmethod
+    def new_pending_job_identity(
+        quote_id: str, home: Path | str | None = None
+    ) -> tuple[str, str, Path]:
+        """Make the job's keypair before the hire and write it 0600 under the quote. A key
+        already pending for the quote is returned instead: a hire whose answer was lost may
+        have locked a job with it, and hiring the quote again must not overwrite it."""
+        from kontra.codec.age import generate_identity
+
+        path = Profile.pending_job_key_path(quote_id, home)
+        _ensure_dir(path.parent)
+        secret, public = generate_identity()
+        created = datetime.now(UTC).replace(microsecond=0).isoformat()
+        text = f"# quote: {quote_id}\n# created: {created}\n# public key: {public}\n{secret}\n"
+        if not _write_private(path, text.encode(), replace=False):
+            secret, public = _read_job_key(path)
+        return secret, public, path
+
+    @staticmethod
+    def claim_job_identity(pending: Path, job_id: str, home: Path | str | None = None) -> Path:
+        """Rename a pending key to the job the gate named. Best effort: the key already
+        decrypts wherever it is (:meth:`job_identities`), so a failed rename is not fatal."""
+        target = Profile.job_key_path(job_id, home)
+        try:
+            _ensure_dir(target.parent)
+            pending.replace(target)
+        except OSError:
+            return pending
+        return target
+
+    @staticmethod
+    def new_job_identity(job_id: str, home: Path | str | None = None) -> tuple[str, str]:
+        """Make this job's keypair and write it 0600. The buyer sends the public half to
+        the gate at hire, which signs THAT into the hold token; nothing registers it as a
+        party recipient, so no setup is needed and a compromise reaches open jobs only."""
+        from kontra.codec.age import generate_identity
+
+        path = Profile.job_key_path(job_id, home)
+        _ensure_dir(path.parent)
+        secret, public = generate_identity()
+        created = datetime.now(UTC).replace(microsecond=0).isoformat()
+        text = f"# job: {job_id}\n# created: {created}\n# public key: {public}\n{secret}\n"
+        if not _write_private(path, text.encode(), replace=False):
+            return Profile.job_identity(job_id, home)
+        return secret, public
+
+    @staticmethod
+    def job_identity(job_id: str, home: Path | str | None = None) -> tuple[str, str]:
+        """This job's keypair from disk."""
+        path = Profile.job_key_path(job_id, home)
+        try:
+            return _read_job_key(path)
+        except FileNotFoundError:
+            raise ProfileError(
+                f"no key for job {job_id} at {path}: it is written by `kontra hire` on the "
+                "machine that hired, and `kontra job <id> --accept` shreds it. Without "
+                "it this "
+                "delivery cannot be read -- by anyone."
+            ) from None
+
+    @staticmethod
+    def job_identities(home: Path | str | None = None) -> list[str]:
+        """Every job key on this machine. age tries each stanza against each identity, so
+        handing the codec the whole list lets one client read any job it hired; accepting
+        a job shreds its key and shortens the list."""
+        from kontra.codec.age import is_identity
+
+        found: list[str] = []
+        directory = _resolve(home) / JOBS_DIR
+        if not directory.is_dir():
+            return found
+        for path in sorted(directory.glob("*.key")):
+            try:
+                text = _read_private(path).decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+            if len(lines) == 1 and is_identity(lines[0]):
+                found.append(lines[0])
+        return found
+
+    @staticmethod
+    def shred_job_identity(job_id: str, home: Path | str | None = None) -> bool:
+        """Delete this job's key. True if a key was there. Forward secrecy is the point:
+        once the buyer has accepted, the stored ciphertext stops being readable at all."""
+        path = Profile.job_key_path(job_id, home)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        return True
 
 
 @contextlib.asynccontextmanager

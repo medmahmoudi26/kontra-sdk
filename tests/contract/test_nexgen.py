@@ -18,7 +18,6 @@ import pytest
 
 from kontra.contract import OfferingSpec, derive_document, merge_document, nexgen_view, to_yaml
 
-from .conftest import PUBLIC_KEY
 from .test_derive import Rich
 from .test_patterns import PORTABLE
 
@@ -102,7 +101,7 @@ def test_nexgen_accepts_every_lowering(
 ) -> None:
     """Optional, enums, tagged unions, typed maps, datetimes, scalar defaults: everything
     the derivation lowers is something nexgen generates for."""
-    doc = derive_document(enrich_spec, Rich, Rich, PUBLIC_KEY)
+    doc = derive_document(enrich_spec, Rich, Rich)
     proc, _ = _run(nexgen, tmp_path, lang, doc)
     assert proc.returncode == 0, proc.stderr + proc.stdout
 
@@ -147,7 +146,7 @@ def _edge_document(spec: OfferingSpec) -> dict[str, Any]:
         },
         "$defs": {"Edge": {"type": "object", "additionalProperties": False, "properties": props}},
     }
-    return merge_document(spec, nexus, PUBLIC_KEY)
+    return merge_document(spec, nexus)
 
 
 @pytest.mark.parametrize("lang", LANGS)

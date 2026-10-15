@@ -59,7 +59,7 @@ class _Refusal:
 
 async def _published(acme: TestParty, tmp_path: Path) -> Worker:
     bound = seller.bind(write_offering(tmp_path))
-    await acme.gate.publish(bound.document(acme.public_key))  # a key never publishes
+    await acme.gate.publish(bound.document())  # a key never publishes
     return Worker(offerings=[bound], activities=[shout])
 
 

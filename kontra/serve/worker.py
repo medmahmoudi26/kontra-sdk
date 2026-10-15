@@ -48,7 +48,7 @@ from kontra.codec import GateBlobStore, KontraCodec, data_converter
 from kontra.codec.age import public_key_of
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
-from kontra.profile import NotLoggedIn, Profile, kontra_home
+from kontra.profile import KEY_FILE_ENV, NotLoggedIn, Profile, kontra_home
 from kontra.serve.handler import OfferingService, service_handler
 from kontra.serve.hold import HoldVerifier
 from kontra.serve.interceptors import KontraInterceptor
@@ -311,27 +311,48 @@ class Worker:
         self._session = session
         gate = gate or session.gate
         home_dir = _home_dir(profile, home)
+        # This machine's key: $KONTRA_KEY_FILE when a fleet mounts one from a secret,
+        # else <home>/key (decisions I7).
         identity = session.identity()
         public_key = public_key_of(identity)
-        if profile.public_key is not None and profile.public_key != public_key:
+        me = await gate.me()
+        recipients = [k.public_key for k in me.keys]
+        if public_key not in recipients:
             raise ServeError(
-                f"the key in {home_dir} is not the one {profile.party} registered "
-                f"({profile.public_key}); copy the right key file there, or run `kontra login`"
+                f"the key this worker holds ({public_key}) is not one of {profile.party}'s "
+                f"recipients. Buyers encrypt to the registered set, so this worker could "
+                f"not read a single input. Register it with `kontra recipients add`, or "
+                f"point {KEY_FILE_ENV} at a key that is registered "
+                f"(looked for in {Profile.key_path(home_dir)})."
             )
 
         jobs = JobDirectory(gate)
         stack.push_async_callback(jobs.aclose)
         runtime = _runtime.Runtime(
-            party=profile.party, gate=gate, identity=identity, recipient=public_key, jobs=jobs
+            party=profile.party,
+            gate=gate,
+            identity=identity,
+            recipient=public_key,
+            recipients=recipients,
+            # A seller whose workflow hires another offering is a buyer there, and that
+            # sub-job's delivery is encrypted to the JOB's key, which `kontra.hire` wrote
+            # under this home (decisions I7). Read from disk so a delivery decoded outside
+            # the hiring client -- a bound artifact, a later activity -- still opens.
+            # Local to this host: a fleet that hires needs the shared-key work the issue
+            # defers (`kontra hire --share`).
+            more_identities=lambda: tuple(Profile.job_identities(home_dir)),
+            jobs=jobs,
         )
         previous = _current_runtime()
         _runtime.install(runtime)
         stack.callback(_restore_runtime, runtime, previous)
 
         # Plaintext replies only for the services generated here, by their exact names.
+        # Results and the seller's own copies go to the WHOLE fleet set, not just this
+        # pod's key: another worker, and the seller's laptop, must be able to read them.
         codec = KontraCodec(
             identity,
-            public_key,
+            recipients,
             role="seller",
             buyer_keys=jobs,
             seller_keys=SellerKeyCache(gate),
@@ -362,7 +383,7 @@ class Worker:
 
         verifier = HoldVerifier(gate, home=home_dir)
         await verifier.load()
-        hashes = await self._hash_lock(gate, profile, public_key)
+        hashes = await self._hash_lock(gate, profile)
 
         progress = ProgressForwarder(gate, jobs)
         progress.start()
@@ -377,7 +398,7 @@ class Worker:
                 namespace=client.namespace,
                 party=profile.party,
                 contract_hash=hashes[b.key],
-                validator=b.validator(public_key),
+                validator=b.validator(),
                 verifier=verifier,
                 jobs=jobs,
                 open_deferred=codec.open_deferred,
@@ -405,14 +426,12 @@ class Worker:
                 s.namespace,
             )
 
-    async def _hash_lock(
-        self, gate: GateClient, profile: Profile, public_key: str
-    ) -> dict[str, str]:
+    async def _hash_lock(self, gate: GateClient, profile: Profile) -> dict[str, str]:
         """The contract hash of each offering, checked against the catalog (§11.2)."""
         hashes: dict[str, str] = {}
         problems: list[str] = []
         for b in self._offerings:
-            ours = b.contract_hash(public_key)
+            ours = b.contract_hash()
             hashes[b.key] = ours
             try:
                 entry: m.CatalogEntry | None = await gate.get_offering(b.key)
@@ -444,7 +463,7 @@ class Worker:
                     )
                 elif profile.dev:
                     try:
-                        entry = await gate.publish(b.document(public_key))
+                        entry = await gate.publish(b.document())
                     except GateError as e:
                         problems.append(
                             f"{b.key} is not published and publishing it failed ({e.message}); "

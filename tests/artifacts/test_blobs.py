@@ -23,7 +23,7 @@ def _big() -> Payload:
 
 def _codec(party: tuple[str, str], gate: Any) -> KontraCodec:
     return KontraCodec(
-        party[0], party[1], role="seller", blobs=GateBlobStore(gate), claim_check_threshold=1024
+        party[0], [party[1]], role="seller", blobs=GateBlobStore(gate), claim_check_threshold=1024
     )
 
 

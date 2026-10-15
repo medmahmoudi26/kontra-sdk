@@ -85,8 +85,10 @@ async def test_recon_composes_probe_and_enrich(door: Door, tmp_path: Path) -> No
 
     # The workflow returns the artifact as JSON; the buyer downloads it with its own key.
     records = Artifact.model_validate(out["enrich"]["records"])
-    k, identity = door.buyer.k, door.buyer.party.identity
-    path = await download(k.gate, records, identity, tmp_path / "records.jsonl")
+    # The delivery is encrypted to the JOB's key, not to any key the buyer party
+    # registered (decisions I7), so the client's identities are what opens it.
+    k = door.buyer.k
+    path = await download(k.gate, records, k.identities, tmp_path / "records.jsonl")
     lines = [json.loads(line) for line in path.read_text().splitlines()]
     assert [(r["url"], r["status"], r["title"], r["error"]) for r in lines] == [
         (apex, 200, "Home", None),

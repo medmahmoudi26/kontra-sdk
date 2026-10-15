@@ -123,23 +123,74 @@ The handler starts `job-<id>` with `execution_timeout = max_duration` and
 
 * Format: [age](https://age-encryption.org/v1) with X25519 recipients (`pyrage`), so a
   party can decrypt a delivery with the `age` CLI during a dispute. Public keys are
-  `age1...`, as in the PRD's example.
+  `age1...`, as in the PRD's example. age encrypts to N recipients natively, one ~100-byte
+  stanza each, which is what makes everything below cheap.
+
+**A key does one job: encryption.** It is not an identity, not a login, and not a property
+of a party. The first version welded all three together — one key per party, created inside
+`kontra login`, on one machine — and every complaint fell out of that single edge: a second
+machine answered `key_mismatch`; `--replace-key` bricked the first one and every in-flight
+delivery to it; a lost laptop lost every past delivery and every open job; CI could not hire
+without a human device-flow login on that box; a seller copied the key to each worker host by
+hand; and a compromised host could not be revoked without rotating the party. Keys are now
+split by role, because buyers and sellers have different key lifetimes:
+
+```
+buyer   : key per JOB     -- ephemeral, next to the job record, dies with it
+seller  : keys per FLEET  -- a set; one per deployment, registered like authorized_keys
+login   : auth only       -- it adds a recipient; it never decides one
+```
+
+* **Buyer, per job.** `kontra hire` generates an x25519 keypair, writes the secret half to
+  `~/.kontra/jobs/<job_id>.key` (0600) and sends the public half as `buyer_key` in the hire
+  request; the gate signs **that** into the hold token and never consults the buyer party's
+  own keys. So hiring needs no key setup at all — a fresh machine, CI with `KONTRA_API_KEY`,
+  `kontra mcp` — and a compromise reaches open jobs, not years of deliveries. `kontra job <id>
+  --result` decrypts with the job key; `kontra job <id> --accept` shreds it, which makes the ciphertext the gate
+  and the bucket still hold unreadable by anyone. The key is written *before* the hire call,
+  under the quote id, because a lost answer can still have locked a hold: a job whose key was
+  never written would be a delivery nobody can read. The seller side is unchanged — it
+  encrypts to whatever `buyer_key` the signed token names, and caches it per job.
+* **Seller, per fleet.** A party holds a *set* of recipients, each with a label and the time
+  it was added (`kontra recipients add`, `list` and `revoke`; `POST`/`DELETE /v1/me/recipients`). Both
+  need a fresh human login: a recipient can read every delivery made after it. Adding never
+  replaces, so `kontra login` on a second machine adds that machine — `key_mismatch` and
+  `--replace-key` no longer exist. Revoking stops future deliveries reaching that key and
+  keeps the row: an in-flight job encrypted to it is still the seller's to decrypt, and a
+  dispute may need the public key on record. The set is capped (16) so header overhead stays
+  bounded.
+* **One key per fleet, never one per pod.** A k8s secret mounted into every worker
+  (`KONTRA_KEY_FILE`). Pod churn then never changes the set, so an input encrypted a minute
+  ago is still decryptable by whichever worker picks the task up. Same ops shape as a TLS
+  certificate. `kontra serve` refuses to start if the key it holds is not one of the party's
+  recipients — otherwise it would poll happily and fail to read every input.
+* **The contract seals no key** (spec `x-kontra.v2.json`). It already seals the party, as the
+  first component of `name`; sealing a key as well would make "mount the key on one more
+  worker host" a republish, and a republish is a new version, a new endpoint and a new task
+  queue. Recipients are catalog data: the buyer reads the seller's current set where it read
+  the single key before (the quote and hire answers, `GET /v1/endpoints/{e}`) and encrypts
+  the Nexus input to all of them.
 * `KontraCodec` encrypts every payload. Recipients come from the serialization context
   (temporalio 1.34): payloads of the root handler workflow `job-<id>` (input, result,
-  failures) go to the seller *and* the job's buyer; everything else on the seller side
-  (activities, children) goes to the seller only. On the buyer side, Nexus inputs go to
-  the seller (the key of the offering behind the endpoint: from the hire response, or the
-  catalog's `GET /v1/endpoints/{endpoint}` — never derived from the name) and the buyer. The quote operation's
-  *output* passes through in plaintext (I4).
-* The buyer's key travels in the signed hold token (`buyer_key`), so a seller cannot be
-  tricked into encrypting a delivery to someone else. A worker caches it per job; on a
-  miss (another process, a restart) it asks the gate (`GET /v1/jobs/{id}/seller`).
+  failures) go to the seller's recipients *and* the job's buyer key; everything else on the
+  seller side (activities, children) goes to the seller's recipients only. On the buyer side,
+  Nexus inputs go to the seller's set (from the hire answer, or the catalog's
+  `GET /v1/endpoints/{endpoint}` — never derived from the name) and to the job's own key. The
+  quote operation's *output* passes through in plaintext (I4).
+* A worker caches the job's buyer key per job; on a miss (another process, a restart) it asks
+  the gate (`GET /v1/jobs/{id}/seller`).
 * Failure messages and stack traces are encoded too (`encode_common_attributes`).
 * Above 256 KiB of ciphertext a payload is claim-checked: uploaded to the bucket,
   content-addressed by the ciphertext's sha256, and replaced by a reference.
 * Artifacts use the same age format, streamed in 64 KiB chunks, uploaded in parts, so
   memory stays flat regardless of size. `Artifact.sha256` is of the plaintext; the gate
   records the ciphertext's.
+* **What this does not fix.** Kontra is still the directory for seller recipients, so a gate
+  that substituted a key could read a seller's inputs; the contract no longer binds the key,
+  so that caveat is no longer narrowed by the sealed document (`docs/security.md`, "Known
+  limits"). Closing it needs signed recipient sets — the first seller key as an ed25519
+  identity, each `recipients add` signed by an existing key — which the set makes a clean
+  upgrade rather than a redesign.
 
 ## I8. Distribution name
 

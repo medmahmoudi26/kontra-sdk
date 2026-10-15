@@ -8,6 +8,7 @@ import itertools
 import json
 import os
 import uuid
+from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -71,12 +72,13 @@ class CountingTransport(httpx.AsyncBaseTransport):
 
 
 class Keys:
-    """The buyer codec's ``SellerKeys``: endpoint -> seller key, as the hire answer says."""
+    """The buyer codec's ``SellerKeys``: endpoint -> the seller's recipients, as the hire
+    answer says."""
 
     def __init__(self) -> None:
-        self.keys: dict[str, str] = {}
+        self.keys: dict[str, list[str]] = {}
 
-    async def seller_key(self, endpoint: str) -> str:
+    async def seller_recipients(self, endpoint: str) -> Sequence[str]:
         return self.keys[endpoint]
 
 
@@ -94,7 +96,7 @@ class Buyer:
         self.keys = Keys()
         self.codec = KontraCodec(
             party.identity,
-            party.public_key,
+            [party.public_key],
             role="buyer",
             seller_keys=self.keys,
             blobs=GateBlobStore(party.gate) if claim_check_threshold is not None else None,
@@ -106,7 +108,7 @@ class Buyer:
 
     async def wire(self, entry: m.CatalogEntry, value: Any) -> m.WirePayload:
         """``value`` as the gate relays it to ``quote``: encrypted to the seller and us."""
-        self.keys.keys[entry.endpoint] = entry.public_key
+        self.keys.keys[entry.endpoint] = entry.recipients
         payload = PydanticPayloadConverter().to_payloads([value])[0]
         codec = self.codec.with_context(
             NexusSerializationContext(
@@ -123,8 +125,10 @@ class Buyer:
         q = await self.quote(entry, value)
         assert q.status == m.QuoteStatus.OK, q
         assert q.quote_id is not None
-        hired = await self.party.gate.hire(q.quote_id)
-        self.keys.keys[hired.endpoint] = hired.seller_public_key
+        # The party's own recipient stands in for the per-job key `kontra.hire` makes: the
+        # codec below holds its identity, so it reads what the seller encrypts to it.
+        hired = await self.party.gate.hire(q.quote_id, buyer_key=self.party.public_key)
+        self.keys.keys[hired.endpoint] = hired.seller_recipients
         return hired
 
     async def start(

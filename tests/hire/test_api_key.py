@@ -1,5 +1,6 @@
 """A program on an API key, end to end on a dev server (PRD §10 P3, decisions I19): it
-hires, gets the result and pays with ``KONTRA_API_KEY`` and only the key file on disk; a
+hires, gets the result and pays with ``KONTRA_API_KEY`` and only the key file on disk (and
+the job keys it makes); a
 seller's worker serves with a key; and neither can publish with one."""
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from kontra.auth import API_KEY_ENV, GATE_ENV, Session
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
 from kontra.hire import Kontra
-from kontra.profile import KEY_FILE
+from kontra.profile import JOBS_DIR, KEY_FILE
 from kontra.serve import ServeError, offering
 from kontra.testing.devserver import DevServer
 
@@ -66,7 +67,9 @@ async def test_a_program_hires_with_a_key(
         with pytest.raises(GateError) as e:  # a key never publishes
             await k.gate.publish(entry.document)
         assert (e.value.status, e.value.code) == (403, "fresh_login_required")
-    assert sorted(x.name for x in home.iterdir()) == [KEY_FILE]  # nothing written
+    # No profile or session: only the job's own key (decisions I7), shredded by accept.
+    assert sorted(x.name for x in home.iterdir()) == [JOBS_DIR, KEY_FILE]
+    assert list((home / JOBS_DIR).iterdir()) == []
 
     keys = (await party.gate.api_keys()).keys
     assert keys[0].last_used_at is not None
@@ -77,7 +80,7 @@ async def test_a_seller_serves_with_a_key_but_never_publishes(world: World, tmp_
     published = offering(
         write_offering(tmp_path, f"{seller.handle}/text"), workflow=TextFlow, quote=quote_text
     )
-    await seller.gate.publish(published.document(seller.public_key))  # a person publishes
+    await seller.gate.publish(published.document())  # a person publishes
     made = await seller.gate.create_api_key("server")
     session = await Session.from_api_key(world.mp.base_url, made.key, home=seller.home)
     try:
