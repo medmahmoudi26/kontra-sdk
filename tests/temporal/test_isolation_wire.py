@@ -43,7 +43,6 @@ from temporalio.api.workflowservice.v1 import (
     PollActivityTaskQueueRequest,
     PollWorkflowTaskQueueRequest,
     QueryWorkflowRequest,
-    RespondActivityTaskCompletedRequest,
     StartWorkflowExecutionRequest,
     UpdateWorkflowExecutionRequest,
 )
