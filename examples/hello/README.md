@@ -120,5 +120,4 @@ kontra hire acme/hello -f input.json --max-price 0.01 --wait --accept
 the hire delivers `Hi <name>`, accepting releases the cent, and a blank name is refused before
 anything is locked.
 
-`contract.yaml` is the derived contract, a golden file sealed with the example key (see
-`../enrich/README.md`).
+`contract.yaml` is the derived contract, a golden file (see `../enrich/README.md`).

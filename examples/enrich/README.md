@@ -41,7 +41,7 @@ To let buyers reach a private network on purpose (an intranet you sell access to
 `ENRICH_ALLOWED_PRIVATE_NETWORKS=10.20.0.0/16`. It is unset by default; the tests set it to
 `127.0.0.1/32` to reach their own sites. Allow only what you mean buyers to reach.
 
-`contract.yaml` is sealed with the example key in `../example-public-key.txt`, so that
-`tests/examples/test_golden.py` reproduces it byte for byte; `kontra publish` seals your key,
-so your `contract_hash` differs. After a deliberate contract change, regenerate it with
+`contract.yaml` is the derived contract, and `tests/examples/test_golden.py` reproduces it
+byte for byte. It seals no key (spec v2): the same offering derives the same document and
+`contract_hash` on every machine and for every seller key. After a deliberate contract change, regenerate it with
 `UPDATE_GOLDEN=1 pytest tests/examples/test_golden.py` and review the diff.

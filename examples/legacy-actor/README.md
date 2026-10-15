@@ -50,5 +50,4 @@ Run it like any offering:
 kontra serve        # from this directory, with a profile from `kontra login` or `kontra dev`
 ```
 
-`contract.yaml` is the derived contract, a golden file sealed with the example key (see
-`../enrich/README.md`).
+`contract.yaml` is the derived contract, a golden file (see `../enrich/README.md`).
