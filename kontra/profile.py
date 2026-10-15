@@ -60,7 +60,7 @@ KEY_FILE = "key"
 #: task (decisions I7). Same ops shape as a TLS certificate.
 KEY_FILE_ENV = "KONTRA_KEY_FILE"
 #: Per-job buyer keys: ``$KONTRA_HOME/jobs/<job_id>.key``, made at hire, read by
-#: ``kontra result``, shredded by ``kontra accept``.
+#: ``kontra job <id> --result``, shredded by ``kontra job <id> --accept``.
 JOBS_DIR = "jobs"
 #: A job key written BEFORE the hire, when no job id exists yet. If the gate's answer is
 #: lost the hold may still have locked, and a key that was never written would make that
@@ -386,7 +386,8 @@ class Profile(BaseModel):
         except FileNotFoundError:
             raise ProfileError(
                 f"no key for job {job_id} at {path}: it is written by `kontra hire` on the "
-                "machine that hired, and `kontra accept` shreds it. Without it this "
+                "machine that hired, and `kontra job <id> --accept` shreds it. Without "
+                "it this "
                 "delivery cannot be read -- by anyone."
             ) from None
         except UnicodeDecodeError as e:

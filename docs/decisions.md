@@ -145,14 +145,14 @@ login   : auth only       -- it adds a recipient; it never decides one
   `~/.kontra/jobs/<job_id>.key` (0600) and sends the public half as `buyer_key` in the hire
   request; the gate signs **that** into the hold token and never consults the buyer party's
   own keys. So hiring needs no key setup at all — a fresh machine, CI with `KONTRA_API_KEY`,
-  `kontra mcp` — and a compromise reaches open jobs, not years of deliveries. `kontra result`
-  decrypts with the job key; `kontra accept` shreds it, which makes the ciphertext the gate
+  `kontra mcp` — and a compromise reaches open jobs, not years of deliveries. `kontra job <id>
+  --result` decrypts with the job key; `kontra job <id> --accept` shreds it, which makes the ciphertext the gate
   and the bucket still hold unreadable by anyone. The key is written *before* the hire call,
   under the quote id, because a lost answer can still have locked a hold: a job whose key was
   never written would be a delivery nobody can read. The seller side is unchanged — it
   encrypts to whatever `buyer_key` the signed token names, and caches it per job.
 * **Seller, per fleet.** A party holds a *set* of recipients, each with a label and the time
-  it was added (`kontra recipients add|list|revoke`, `POST`/`DELETE /v1/me/recipients`). Both
+  it was added (`kontra recipients add`, `list` and `revoke`; `POST`/`DELETE /v1/me/recipients`). Both
   need a fresh human login: a recipient can read every delivery made after it. Adding never
   replaces, so `kontra login` on a second machine adds that machine — `key_mismatch` and
   `--replace-key` no longer exist. Revoking stops future deliveries reaching that key and
