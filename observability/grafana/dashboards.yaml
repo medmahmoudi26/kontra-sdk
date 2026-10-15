@@ -1,4 +1,4 @@
-# Temporal's published dashboards (../dashboards), read-only, in a "Temporal" folder.
+# Temporal's published dashboards (docs/dashboards), read-only, in a "Temporal" folder.
 apiVersion: 1
 
 providers:

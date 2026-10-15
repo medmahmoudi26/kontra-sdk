@@ -208,7 +208,15 @@ Temporal's UI on `control`: it reads every namespace through the internal fronte
 the point of it locally and why it is published on 127.0.0.1 only. The `observability`
 profile puts Prometheus on `temporal-db`, to scrape the metrics listener Temporal opens there
 when asked (`KONTRA_TEMPORAL_METRICS_ADDR`), held to the relay's terms there (no
-capabilities, not root, no forwarding), and Grafana on `observability` alone.
+capabilities, not root, no forwarding), and Grafana on `observability` alone. Its third
+service, Prometheus's agent (`prometheus-agent`), is on no network of the stack's: it runs in
+the host's network namespace, because a worker's `kontra serve --metrics 127.0.0.1:PORT` is
+on the host's loopback and a container on a bridge network reaches the host only through
+Docker's gateway, which a host firewall may drop (ufw's default does, measured). It scrapes
+those ports and writes the samples to Prometheus's published port; it keeps no database,
+answers no query, and has no capabilities, a read-only root and an unprivileged user. Like
+any process of the host's it can reach the stack's networks, the internal frontend among
+them: it is a dev tool, on a machine that is yours.
 
 `postgres-relay` is busybox `nc` from the pinned Postgres image itself: it accepts Temporal's
 connections and opens one to Postgres for each, copying bytes, and never connects to Temporal

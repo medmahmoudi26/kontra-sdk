@@ -539,7 +539,7 @@ kontra dev                    # = kontra dev up
 kontra dev up --ui            # + Temporal's UI, reading your payloads (below)
 kontra dev up --observability # + Prometheus and Grafana with Temporal's dashboards (below)
 kontra dev status             # containers, the gate's health, the codec server, the profile
-kontra dev logs [gate|temporal|postgres|postgres-relay|s3|migrate|ui|prometheus|grafana] [-f] [--tail N]
+kontra dev logs [gate|temporal|postgres|postgres-relay|s3|migrate|ui|prometheus|prometheus-agent|grafana] [-f] [--tail N]
 kontra dev down [--volumes]   # --volumes also deletes the stack's data
 ```
 
@@ -609,21 +609,26 @@ start, signal, terminate a workflow in any namespace -- and read the metrics. Th
 server checks `Host` and refuses it, so your payloads stay sealed. `kontra dev up` alone stops
 the profiles when you are not using them.
 
-`--observability` runs Prometheus and Grafana. Prometheus scrapes Kontra's Temporal server
-(`kontra dev up --observability` turns its metrics listener on, `KONTRA_TEMPORAL_METRICS_ADDR`)
-and every `kontra serve --metrics` on this machine on ports 9464 to 9473. Grafana opens on
-Temporal's SDK dashboard, with its server dashboard beside it (see
-[Dashboards](#dashboards)). Prometheus runs in a container and reaches your worker through
-Docker's gateway to the host, not through the host's loopback, so bind the worker where that
-gateway arrives:
+`--observability` runs Prometheus, Prometheus's agent and Grafana. Prometheus scrapes Kontra's
+Temporal server (`kontra dev up --observability` turns its metrics listener on,
+`KONTRA_TEMPORAL_METRICS_ADDR`), and receives the metrics of every `kontra serve --metrics` on
+this machine on ports 9464 to 9473. Grafana opens on Temporal's SDK dashboard, with its server
+dashboard beside it (see [Dashboards](#dashboards)). Serve the metrics on loopback, one port
+per worker:
 
 ```sh
-kontra serve --metrics 0.0.0.0:9464
+kontra serve --metrics 127.0.0.1:9464   # the next worker on 127.0.0.1:9465, and so on
 ```
 
-A host firewall that drops traffic from Docker's networks (ufw's default policy does) hides
-the worker: http://localhost:9090/targets shows it down. Let Docker's networks reach ports
-9464 to 9473, and keep them closed to everything else.
+On Linux the agent (`prometheus-agent`) scrapes them: it is the one service in the host's
+network namespace, so it reaches the host's loopback, and it writes what it scrapes to
+Prometheus. A container on Docker's own networks reaches the host only through Docker's
+gateway, and a host firewall that drops incoming traffic (ufw's default policy) drops that
+too. On Docker Desktop, Prometheus scrapes the same ports itself at `host.docker.internal`,
+Docker Desktop's name for this machine. Either way, the query `up{job="kontra-serve"}` at
+http://localhost:9090 says per port whether a worker answered: `instance` `127.0.0.1:PORT`
+through the agent, `host.docker.internal:PORT` directly (Prometheus's targets page lists only
+the direct ones).
 
 ## Publishing and serving
 
@@ -752,7 +757,7 @@ flags on, and finds it in neither the metrics text nor the exported spans.
 ### Dashboards
 
 Temporal publishes Grafana dashboards for its SDK and server metrics. Two are vendored here,
-unchanged, in [`observability/dashboards`](../observability/dashboards) (MIT, Temporal
+unchanged, in [`docs/dashboards`](dashboards) (MIT, Temporal
 Technologies): `temporal-core-sdks-otel.json` reads `kontra serve --metrics` (Python's SDK is
 built on Temporal's Core), `server-general.json` a Temporal server's. Import the SDK dashboard
 into your Grafana with the Prometheus that scrapes your workers as its data source, or run both

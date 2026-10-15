@@ -56,13 +56,18 @@
 #                  KONTRA_DEV_BIND, and never in production. Payloads are age ciphertext;
 #                  the browser decodes them through the codec server `kontra dev` runs on
 #                  this machine's loopback (KONTRA_DEV_CODEC_PORT), with this machine's key.
-#   observability  `kontra dev up --observability`: Prometheus, scraping Temporal and every
-#                  `kontra serve --metrics` on the host (observability/prometheus.yml), and
-#                  Grafana with Temporal's published server and SDK dashboards
-#                  (observability/dashboards), both published on 127.0.0.1 only.
-# Their configuration files sit beside this file in observability/ (kontra/_dev/observability
-# in the wheel) and are mounted read-only as compose `configs`: the only host paths any
-# service sees, and only these services.
+#   observability  `kontra dev up --observability`: Prometheus, scraping Temporal
+#                  (observability/prometheus.yml); Prometheus's agent, scraping every
+#                  `kontra serve --metrics` on the host's loopback and writing what it
+#                  scrapes to Prometheus (prometheus-agent, below); and Grafana with
+#                  Temporal's published server and SDK dashboards (docs/dashboards).
+#                  Prometheus and Grafana are published on 127.0.0.1 only; the agent
+#                  publishes nothing.
+# Their configuration files sit beside this file in observability/ and docs/dashboards/
+# (kontra/_dev/observability and kontra/_dev/docs/dashboards in the wheel) and are mounted
+# read-only as compose `configs`: the only host paths any service sees, and only these
+# services. The agent's configuration is in its environment instead, so compose fills in
+# Prometheus's port.
 #
 # Start-up has a cycle that ordering alone cannot break: the gate creates each party's
 # namespace through Temporal's internal frontend, and Temporal verifies tokens with the
@@ -84,6 +89,7 @@
 #   database     postgres, postgres-relay, gate, migrate
 #   bucket       s3, gate                    SeaweedFS's own unauthenticated ports
 #   observability  (prometheus, grafana)     Grafana's one peer is Prometheus
+#   the host's   (prometheus-agent)          see below
 # Temporal's other listeners (the public frontend, authenticated) answer on every network
 # it is on; the internal frontend does not listen on `temporal-db`. The bind alone does not
 # close that network, though: Linux delivers a packet for any of a host's addresses on any
@@ -101,6 +107,22 @@
 # it to 0. SeaweedFS -- third-party code serving the internet in production -- reaches
 # neither Temporal nor Postgres, and only the gate reaches SeaweedFS's master, volume and
 # filer ports.
+#
+# prometheus-agent alone shares the host's network namespace (network_mode: host), because a
+# worker on the host's loopback is reachable from nowhere else. Through Docker's gateway a
+# container reaches only what listens on the host's other addresses, and arrives from a
+# bridge network, which a host firewall dropping incoming traffic refuses (ufw's default
+# policy; measured: a listener on the gateway's own address timed out for Prometheus). So
+# the agent scrapes 127.0.0.1:9464 to 9473, where `kontra serve --metrics 127.0.0.1:PORT`
+# listens, and writes the samples to Prometheus's published port (its remote-write
+# receiver, on 127.0.0.1 like the rest of it).
+# It is the Prometheus image in agent mode: it scrapes and forwards, keeps no database,
+# answers no query, and serves its own status page on a port the kernel picks. In the host's
+# namespace it reaches what the host's own processes reach, the stack's networks (the
+# internal frontend's among them) included; it has no capability, a read-only root, and is
+# not root. On Docker Desktop the host's namespace is its VM's: there the agent finds no
+# worker, and Prometheus's own job scrapes the same ports at host.docker.internal, Docker
+# Desktop's name for the host.
 #
 # Every service runs with no capabilities at all (cap_drop ALL, none added back; the one
 # exception is s3-owner, below), cannot gain any (no-new-privileges), and has a read-only
@@ -452,12 +474,15 @@ services:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=7d
+      # What prometheus-agent scrapes on the host's loopback arrives here (see the header).
+      - --web.enable-remote-write-receiver
     configs:
       - source: prometheus
         target: /etc/prometheus/prometheus.yml
     volumes:
       - prometheus:/prometheus
-    # `kontra serve --metrics` runs on the host: reached through its Docker gateway.
+    # `kontra serve --metrics` runs on the host: on Docker Desktop, reached through
+    # host.docker.internal (on a Linux host, prometheus-agent reaches it).
     extra_hosts:
       - host.docker.internal:host-gateway
     environment:
@@ -477,6 +502,58 @@ services:
     sysctls:
       net.ipv4.ip_forward: 0 # on two networks: never a router between them (see the header)
     networks: [temporal-db, observability]
+
+  prometheus-agent:
+    # prom/prometheus:v3.15.0 (Prometheus's image in agent mode: keep it in step with the
+    # service above)
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    profiles: [observability]
+    # Its configuration, which this writes to the tmpfs before Prometheus starts. Not compose
+    # `configs`: a mounted file cannot follow KONTRA_DEV_PROMETHEUS_PORT, and compose copies
+    # an inline one into the container's root filesystem, which read_only refuses.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        printf '%s' "$$KONTRA_AGENT_CONFIG" > /tmp/agent.yml && exec /bin/prometheus "$$@"
+      - prometheus-agent
+    command:
+      - --agent
+      - --config.file=/tmp/agent.yml
+      - --storage.agent.path=/prometheus
+      # Its status page, on a loopback port the kernel picks: nothing needs it.
+      - --web.listen-address=127.0.0.1:0
+    # The host's network namespace: the one way to the host's loopback (see the header).
+    network_mode: host
+    environment:
+      # Every `kontra serve --metrics` on the host's loopback, on ports 9464 to 9473 (a port
+      # no worker serves is a target that is down), written to Prometheus's published port.
+      # JSON, which is YAML: one line.
+      KONTRA_AGENT_CONFIG: >-
+        {"global": {"scrape_interval": "10s"},
+        "scrape_configs": [{"job_name": "kontra-serve", "static_configs": [{"targets": [
+        "127.0.0.1:9464", "127.0.0.1:9465", "127.0.0.1:9466", "127.0.0.1:9467",
+        "127.0.0.1:9468", "127.0.0.1:9469", "127.0.0.1:9470", "127.0.0.1:9471",
+        "127.0.0.1:9472", "127.0.0.1:9473"]}]}],
+        "remote_write": [{"url":
+        "http://127.0.0.1:${KONTRA_DEV_PROMETHEUS_PORT:-9090}/api/v1/write"}]}
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    tmpfs:
+      # Its write-ahead log, what it scraped and has not sent yet: the image's VOLUME, as a
+      # tmpfs instead of an anonymous volume per container.
+      - /prometheus:size=64m,uid=65534
+      - /tmp:size=1m,uid=65534 # its configuration
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      prometheus:
+        condition: service_started
+    restart: unless-stopped
 
   grafana:
     # grafana/grafana:13.2.3
@@ -541,9 +618,9 @@ configs:
   grafana-dashboards:
     file: ./observability/grafana/dashboards.yaml
   temporal-sdk-dashboard:
-    file: ./observability/dashboards/temporal-core-sdks-otel.json
+    file: ./docs/dashboards/temporal-core-sdks-otel.json
   temporal-server-dashboard:
-    file: ./observability/dashboards/server-general.json
+    file: ./docs/dashboards/server-general.json
 
 networks:
   control:

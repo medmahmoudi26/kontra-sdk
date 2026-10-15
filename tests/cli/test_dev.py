@@ -647,7 +647,15 @@ def test_third_party_images_are_pinned_by_digest() -> None:
 
     raw = yaml.safe_load(COMPOSE.read_text())
     pinned = re.compile(r"[a-z0-9./-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}")
-    for name in ("postgres", "postgres-relay", "s3", "ui", "prometheus", "grafana"):
+    for name in (
+        "postgres",
+        "postgres-relay",
+        "s3",
+        "ui",
+        "prometheus",
+        "prometheus-agent",
+        "grafana",
+    ):
         image = raw["services"][name]["image"]
         assert pinned.fullmatch(image), f"{name}: {image}"
     for name in ("temporal", "migrate", "gate"):
@@ -674,17 +682,18 @@ def test_compose_lists_every_host_port_it_reads() -> None:
     assert all(value == f"${{{name}:-}}" for name, value in listed.items())
 
 
-_PROFILED = {"ui", "prometheus", "grafana"}
+_PROFILED = {"ui", "prometheus", "prometheus-agent", "grafana"}
 
 
 @needs_compose
-def test_the_profiles_add_three_services_on_loopback_and_nothing_by_default(
+def test_the_profiles_add_four_services_on_loopback_and_nothing_by_default(
     tmp_path: Path,
 ) -> None:
     """`kontra dev up` is today's stack: the profiles' services are absent and Temporal
-    serves no metrics. `--ui --observability` adds exactly three services, published on the
-    host's loopback whatever KONTRA_DEV_BIND says: the UI controls every namespace, and
-    none of the three has an authentication of its own worth the name."""
+    serves no metrics. `--ui --observability` adds exactly four services, three published on
+    the host's loopback whatever KONTRA_DEV_BIND says (the UI controls every namespace, and
+    none of the three has an authentication of its own worth the name) and Prometheus's
+    agent, which publishes nothing."""
     default = _resolved(tmp_path, KONTRA_DEV_BIND="0.0.0.0")
     assert not _PROFILED & set(default["services"])
     assert default["services"]["temporal"]["environment"]["KONTRA_METRICS_ADDR"] == ""
@@ -694,17 +703,20 @@ def test_the_profiles_add_three_services_on_loopback_and_nothing_by_default(
     assert {name: services[name]["profiles"] for name in _PROFILED} == {
         "ui": ["ui"],
         "prometheus": ["observability"],
+        "prometheus-agent": ["observability"],
         "grafana": ["observability"],
     }
     published = {
         name: [
-            (p["host_ip"], str(p["published"]), int(p["target"])) for p in services[name]["ports"]
+            (p["host_ip"], str(p["published"]), int(p["target"]))
+            for p in services[name].get("ports", [])
         ]
         for name in _PROFILED
     }
     assert published == {
         "ui": [("127.0.0.1", "8233", 8080)],
         "prometheus": [("127.0.0.1", "9090", 9090)],
+        "prometheus-agent": [],
         "grafana": [("127.0.0.1", "3000", 3000)],
     }
     moved = _with_profiles(
@@ -732,8 +744,10 @@ def test_the_profiles_keep_the_stack_s_walls(tmp_path: Path) -> None:
     read-only root, not root), and keep its networks: the UI sits on `control` because it
     needs the internal frontend (that is its point, and why it never runs in production);
     Prometheus reaches Temporal's metrics on `temporal-db`, where nothing may route or forge
-    its way to the internal frontend's bind; Grafana's one peer is Prometheus. The only host
-    paths are the read-only `configs` of observability/."""
+    its way to the internal frontend's bind; Grafana's one peer is Prometheus. Prometheus's
+    agent alone is in the host's network namespace, the one way to a worker on the host's
+    loopback, and holds nothing but its tmpfs (its configuration comes in its environment).
+    The only host paths are the read-only `configs` of observability/ and docs/dashboards/."""
     config = _with_profiles(tmp_path)
     services = config["services"]
     for name in _PROFILED:
@@ -743,18 +757,28 @@ def test_the_profiles_keep_the_stack_s_walls(tmp_path: Path) -> None:
         assert svc.get("security_opt") == ["no-new-privileges:true"], name
         assert svc.get("read_only") is True, name
         assert not svc.get("privileged"), name
-        for key in ("pid", "ipc", "uts", "userns_mode", "cgroup", "devices", "network_mode"):
+        for key in ("pid", "ipc", "uts", "userns_mode", "cgroup", "devices"):
             assert not svc.get(key), f"{name} sets {key}"
+        assert svc.get("network_mode") == ("host" if name == "prometheus-agent" else None), name
         assert all(v["type"] == "volume" for v in svc.get("volumes", [])), name
         assert all(entry.split(":", 1)[1].startswith("size=") for entry in svc.get("tmpfs", []))
         env = svc.get("environment") or {}
         assert {var: env.get(var) for var in _PROXY_VARS} == dict.fromkeys(_PROXY_VARS, ""), name
     assert services["prometheus"]["user"] == "65534:65534"
+    assert services["prometheus-agent"]["user"] == "65534:65534"
     assert services["grafana"]["user"] == "472"
+    agent = services["prometheus-agent"]
+    assert "--agent" in agent["command"]  # scrapes and forwards: no database, no queries
+    assert "--web.listen-address=127.0.0.1:0" in agent["command"]
+    assert not agent.get("volumes")
+    assert not agent.get("ports")
+    assert agent["tmpfs"] == ["/prometheus:size=64m,uid=65534", "/tmp:size=1m,uid=65534"]
+    assert not agent.get("configs")
     networks = {name: set(svc.get("networks", ())) for name, svc in services.items()}
     assert {n: networks[n] for n in _PROFILED} == {
         "ui": {"control"},
         "prometheus": {"temporal-db", "observability"},
+        "prometheus-agent": set(),  # network_mode: host
         "grafana": {"observability"},
     }
     assert {n for n, nets in networks.items() if "control" in nets} == {"temporal", "gate", "ui"}
@@ -784,16 +808,18 @@ def test_the_profiles_keep_the_stack_s_walls(tmp_path: Path) -> None:
         if svc.get("configs")
     }
     assert set(mounted) == {"prometheus", "grafana"}
-    observability = REPO / "observability"
     for source in config["configs"].values():
-        path = Path(source["file"])
+        path = Path(source["file"]).resolve()
         assert path.is_file(), path
-        assert path.resolve().is_relative_to(observability), path
+        assert path.is_relative_to(REPO / "observability") or path.is_relative_to(
+            REPO / "docs" / "dashboards"
+        ), path
 
 
 def test_prometheus_scrapes_what_the_cli_turns_on() -> None:
     """Temporal's listener is where `kontra dev up --observability` puts it, the serve
-    ports are the documented range, and Grafana's files are where its provider looks."""
+    ports are the documented range, and Grafana's files are where its provider looks
+    (the agent's half is test_the_agent_scrapes_the_host_s_loopback_into_prometheus)."""
     import yaml
 
     scrape = yaml.safe_load((REPO / "observability" / "prometheus.yml").read_text())
@@ -808,11 +834,37 @@ def test_prometheus_scrapes_what_the_cli_turns_on() -> None:
     targets = [c["target"] for c in raw["services"]["grafana"]["configs"]]
     boards = [t for t in targets if t.endswith(".json")]
     assert {str(Path(t).parent) for t in boards} == {provider["options"]["path"]}
-    for board in (REPO / "observability" / "dashboards").glob("*.json"):
+    boards_dir = REPO / "docs" / "dashboards"
+    assert {Path(t).name for t in boards} == {b.name for b in boards_dir.glob("*.json")}
+    for board in boards_dir.glob("*.json"):
         assert json.loads(board.read_text())["title"]  # vendored as published: valid JSON
     sources = yaml.safe_load((REPO / "observability" / "grafana" / "datasources.yaml").read_text())
     [source] = sources["datasources"]
     assert (source["url"], source["isDefault"]) == ("http://prometheus:9090", True)
+
+
+@needs_compose
+def test_the_agent_scrapes_the_host_s_loopback_into_prometheus(tmp_path: Path) -> None:
+    """Prometheus's agent scrapes the documented serve ports on 127.0.0.1 (where `kontra serve
+    --metrics 127.0.0.1:PORT` listens) and writes to Prometheus's published port, wherever
+    KONTRA_DEV_PROMETHEUS_PORT moves it; Prometheus takes those writes."""
+    import yaml
+
+    for port in ("9090", "19090"):
+        extra = {} if port == "9090" else {"KONTRA_DEV_PROMETHEUS_PORT": port}
+        config = _with_profiles(tmp_path, **extra)
+        service = config["services"]["prometheus-agent"]
+        # What its entrypoint writes to the file its command names (JSON, which is YAML).
+        agent = yaml.safe_load(service["environment"]["KONTRA_AGENT_CONFIG"])
+        assert "--config.file=/tmp/agent.yml" in service["command"]
+        assert '> /tmp/agent.yml && exec /bin/prometheus "$$@"' in service["entrypoint"][2]
+        [job] = agent["scrape_configs"]
+        assert job["job_name"] == "kontra-serve"
+        assert job["static_configs"][0]["targets"] == [f"127.0.0.1:{p}" for p in range(9464, 9474)]
+        assert agent["remote_write"] == [{"url": f"http://127.0.0.1:{port}/api/v1/write"}]
+        [published] = config["services"]["prometheus"]["ports"]
+        assert (published["host_ip"], str(published["published"])) == ("127.0.0.1", port)
+        assert "--web.enable-remote-write-receiver" in config["services"]["prometheus"]["command"]
 
 
 @needs_compose

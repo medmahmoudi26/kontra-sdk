@@ -10,8 +10,9 @@ Copyright (c) 2025 Temporal Technologies Inc.):
 | `server-general.json` | `server/server-general.json` | the metrics of Kontra's Temporal server |
 
 `kontra dev up --observability` provisions both into Grafana (`compose.yaml`,
-[`../grafana`](../grafana)). To move to a newer upstream commit, fetch the files again and
-change the commit above:
+[`observability/grafana`](../../observability/grafana)); with a Prometheus of your own,
+import them into your Grafana (see [sellers.md](../sellers.md#dashboards)). To move to a
+newer upstream commit, fetch the files again and change the commit above:
 
 ```sh
 commit=<upstream commit>

@@ -10,8 +10,11 @@ scrape_configs:
     static_configs:
       - targets: ["temporal:8000"]
 
-  # Every `kontra serve --metrics` on this machine, on ports 9464 to 9473, through the host's
-  # Docker gateway (host.docker.internal). A port no worker serves is a target that is down.
+  # Every `kontra serve --metrics` on this machine, on ports 9464 to 9473, at
+  # host.docker.internal: Docker Desktop's name for this machine. On a Linux host it is the
+  # host's Docker gateway, where a worker on 127.0.0.1 does not listen and a host firewall
+  # may drop the connection: there prometheus-agent scrapes 127.0.0.1 and writes the samples
+  # here (compose.yaml). A port no worker serves is a target that is down.
   - job_name: kontra-serve
     static_configs:
       - targets:
