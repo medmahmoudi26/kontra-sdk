@@ -8,10 +8,14 @@
 
 Everything else is Temporal's: every ``temporalio.worker.Worker`` keyword is forwarded
 verbatim to each inner worker (one per offering task queue), except the three that must be
-merged -- ``workflows`` (the bound workflow, then yours), ``nexus_service_handlers`` (the
-generated one, then yours) and ``interceptors`` (Kontra's first, then yours). The accepted
-keywords are read from temporalio's own signature, so a new temporalio keyword passes
-through without a Kontra release.
+merged -- ``workflows`` (the bound workflow, then yours, then ``kontra.batch.v1``, the child
+behind ``workflow.execute_activities_in_parallel``), ``nexus_service_handlers`` (the
+generated one, then yours) and ``interceptors`` (Kontra's first, then yours) -- and one
+default: without your ``workflow_runner``, workflows run in Temporal's sandbox with
+``kontra`` passed through (:func:`workflow_runner`), so ``kontra`` is imported once per
+process rather than once per run. A ``workflow_runner`` you pass is used as it is: pass
+``kontra`` through in yours too. The accepted keywords are read from temporalio's own
+signature, so a new temporalio keyword passes through without a Kontra release.
 
 Starting (:meth:`Worker.run` / :meth:`Worker.run_async`), in order: load the session
 (``KONTRA_API_KEY``, else the profile), install the process's Kontra runtime, connect to Temporal as the ``worker`` role
@@ -38,11 +42,12 @@ from typing import Any, Unpack
 
 import temporalio.worker
 from temporalio.client import Client, HeaderCodecBehavior
-from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import DataConverter
 from temporalio.worker import WorkerConfig
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
 
-from kontra import _runtime
+from kontra import _agents, _runtime
+from kontra._parallel import _Batch
 from kontra.auth import Session
 from kontra.codec import GateBlobStore, KontraCodec, data_converter
 from kontra.codec.age import public_key_of
@@ -56,7 +61,7 @@ from kontra.serve.jobs import JobDirectory, SellerKeyCache
 from kontra.serve.offering import BoundOffering
 from kontra.serve.progress import ProgressForwarder
 
-__all__ = ["ServeError", "Worker", "seller_data_converter"]
+__all__ = ["ServeError", "Worker", "seller_data_converter", "workflow_runner"]
 
 log = logging.getLogger("kontra.serve")
 
@@ -106,9 +111,25 @@ async def _refused(session: Session | None) -> str | None:
 
 def seller_data_converter(codec: KontraCodec) -> DataConverter:
     """:func:`kontra.codec.data_converter` (failures encrypted too) with the pydantic payload
-    converter, so models in workflow and activity signatures round-trip."""
+    converter, so models in workflow and activity signatures round-trip.
+
+    With the ``[agents]`` extra installed it is the agents package's ``OpenAIPayloadConverter``
+    instead: the model activities' inputs do not decode with the strict pydantic one. That
+    converter is laxer (it builds an object that fails validation rather than refusing it), so
+    it applies only to sellers who installed the extra; buyer input is checked against the
+    contract schema before either runs."""
     return dataclasses.replace(
-        data_converter(codec), payload_converter_class=PydanticPayloadConverter
+        data_converter(codec), payload_converter_class=_agents.payload_converter_class()
+    )
+
+
+def workflow_runner() -> SandboxedWorkflowRunner:
+    """Temporal's sandbox with ``kontra`` passed through: workflow code that imports
+    ``kontra.workflow`` shares the process's ``kontra`` modules instead of re-importing
+    them every run (one class identity for ``Page`` and the batch spec, no per-run import
+    cost). Safe because nothing in ``kontra`` keeps module-level state a workflow sees."""
+    return SandboxedWorkflowRunner(
+        restrictions=SandboxRestrictions.default.with_passthrough_modules("kontra")
     )
 
 
@@ -405,7 +426,8 @@ class Worker:
                 payload_converter=converter.payload_converter,
             )
             kwargs = dict(self._kwargs)
-            kwargs["workflows"] = _dedupe([b.workflow, *self._kwargs.get("workflows", ())])
+            kwargs["workflows"] = _dedupe([b.workflow, *self._kwargs.get("workflows", ()), _Batch])
+            kwargs.setdefault("workflow_runner", workflow_runner())
             kwargs["nexus_service_handlers"] = [
                 service_handler(service),
                 *self._kwargs.get("nexus_service_handlers", ()),

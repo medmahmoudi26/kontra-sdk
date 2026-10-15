@@ -35,6 +35,7 @@ from temporalio.worker import (
 )
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
+from kontra._parallel import _Batch
 from kontra.codec.age import generate_identity
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
@@ -222,7 +223,8 @@ async def test_every_keyword_reaches_the_inner_worker_unchanged(
                     seen = config[name]  # type: ignore[literal-required]
                     if name == "workflows":
                         assert seen[0] is bound.workflow
-                        assert all(a is b for a, b in zip(seen[1:], value, strict=True)), name
+                        assert seen[-1] is _Batch
+                        assert all(a is b for a, b in zip(seen[1:-1], value, strict=True)), name
                     elif name == "nexus_service_handlers":
                         assert type(seen[0]).__name__ == "KontraOffering"
                         assert all(a is b for a, b in zip(seen[1:], value, strict=True)), name
@@ -239,6 +241,28 @@ async def test_every_keyword_reaches_the_inner_worker_unchanged(
                     if isinstance(v, ThreadPoolExecutor):
                         v.shutdown()
             assert worker.inner_workers == ()
+
+
+@pytest.mark.temporal
+async def test_workflows_run_sandboxed_with_kontra_passed_through_by_default(
+    dev_server: DevServer, tmp_path: Path
+) -> None:
+    """Without a ``workflow_runner`` the inner worker gets Temporal's sandbox passing
+    ``kontra`` through, and ``kontra.batch.v1`` is registered once even when given too."""
+    async with Marketplace(dev_server=dev_server) as mp:
+        acme = await mp.party("acme")
+        bound = seller.bind(write_offering(tmp_path))
+        worker = Worker(offerings=[bound], workflows=[_Batch])
+        await worker.prepare(session=acme.session)
+        try:
+            [inner] = worker.inner_workers
+            config = inner.config()
+            runner = config["workflow_runner"]
+            assert isinstance(runner, SandboxedWorkflowRunner)
+            assert "kontra" in runner.restrictions.passthrough_modules
+            assert config["workflows"] == [bound.workflow, _Batch]
+        finally:
+            await worker.aclose()
 
 
 # --------------------------------------------------------------------------- the hash lock
