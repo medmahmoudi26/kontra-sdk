@@ -61,26 +61,30 @@ def add(label: str | None, public_key: str | None, as_json: bool) -> None:
     from kontra.gate_client import models as m
     from kontra.profile import Profile
 
-    chosen = label if label is not None else this_machine_label()
-    if not chosen or len(chosen) > 64 or not chosen.isprintable():
-        fail("--label must be 1 to 64 printable characters")
+    if label is not None and (
+        not 0 < len(label) <= 64 or not label.isprintable() or label != label.strip()
+    ):
+        fail("--label must be 1 to 64 printable characters, no surrounding spaces")
 
-    async def go() -> m.Me:
+    async def go() -> tuple[m.Me, str]:
         async with Session.from_env() as session:
             key = public_key
             if key is None:
                 _, key = Profile.ensure_identity(session.identity_home)
             elif not is_recipient(key):
                 fail("--public-key must be an age X25519 recipient (age1...)")
-            return await session.gate.add_recipient(chosen, key)
+            chosen = label
+            if chosen is None:  # this machine's name, unique among the party's labels
+                chosen = this_machine_label(k.label for k in (await session.gate.me()).keys)
+            return await session.gate.add_recipient(chosen, key), key
 
-    me = run(go)
+    me, key = run(go)
     if as_json:
         emit_json(me.model_dump(mode="json"))
         return
-    added = next((k for k in me.keys if k.label == chosen), None)
-    where = printable(added.public_key) if added is not None else "it"
-    click.echo(f"{printable(chosen)} can now read {me.party}'s deliveries: {where}")
+    added = next((k for k in me.keys if k.public_key == key), None)
+    name = printable(added.label) if added is not None else "that key"
+    click.echo(f"{name} can now read {me.party}'s deliveries: {printable(key)}")
     click.echo(f"{len(me.keys)} recipient(s); every new delivery is encrypted to all of them")
 
 

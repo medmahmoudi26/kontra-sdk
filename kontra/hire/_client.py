@@ -968,16 +968,25 @@ class Kontra:
         # The job's own key, made here and sent with the hire: the gate signs THIS into
         # the hold token, never a key of the buyer party (decisions I7). Written before
         # the call, because a lost answer can still have locked a hold -- and a job whose
-        # key was never written is a delivery nobody can read.
-        secret, buyer_key, pending = Profile.new_pending_job_identity(
-            q.quote_id, self._session.identity_home
-        )
-        self._job_identities.append(secret)
+        # key was never written is a delivery nobody can read. A quote hired here already
+        # is refused by the gate as ``quote_used``, so it gets no key to leave behind.
+        if q._job_id is None:
+            secret, buyer_key, pending = Profile.new_pending_job_identity(
+                q.quote_id, self._session.identity_home
+            )
+            if secret not in self._job_identities:
+                self._job_identities.append(secret)
+        else:
+            _, buyer_key = age_crypto.generate_identity()
+            pending = None
         try:
             hired = await self.gate.hire(q.quote_id, buyer_key=buyer_key, max_price_minor=cap)
         except GateError as err:
             mapped = _refusal(err, q.offering, q.currency)
             if mapped is not None:
+                found = (err.detail or {}).get("job_id") if err.code == "quote_used" else None
+                if pending is not None and is_job_id(found):
+                    self._claim_quote_key(q, cast("str", found))  # a lost hire's job
                 raise mapped from err
             if recover:  # a 5xx, or a 2xx we could not read: the lock may have happened
                 await self._lost_hire(q, err)
@@ -991,7 +1000,8 @@ class Kontra:
                 await self._lost_hire_cancelled(q)
             raise
         q._job_id = hired.job_id
-        Profile.claim_job_identity(pending, hired.job_id, self._session.identity_home)
+        if pending is not None:
+            Profile.claim_job_identity(pending, hired.job_id, self._session.identity_home)
         # The seller keys here are what the job input is encrypted to: they must be the set
         # the quote named, never a set the hire answer alone introduces. The contract no
         # longer seals a key (spec v2), so this comparison -- quote against hire, both from
@@ -1150,6 +1160,15 @@ class Kontra:
         if done != "unreached":  # _abandon has said so
             log.warning("job %s: %s; %s", job_id, why, _ABANDONED[done])
 
+    def _claim_quote_key(self, q: QuoteResult, job_id: str) -> None:
+        """File the key pending for ``q`` under ``job_id``, the job a hire of ``q`` whose
+        answer was lost locked with it, so ``kontra job <id> --result`` and ``--accept`` find
+        it. A job whose key is filed already keeps that key."""
+        home = self._session.identity_home
+        if q.quote_id is None or Profile.job_key_path(job_id, home).exists():
+            return
+        Profile.claim_job_identity(Profile.pending_job_key_path(q.quote_id, home), job_id, home)
+
     async def _quote_job(self, q: QuoteResult) -> str | None:
         """The job the gate made of ``q`` when no hire of it here got the gate's answer, or
         None (no job, or the gate cannot say). Hiring the quote again under a cap below any
@@ -1189,6 +1208,7 @@ class Kontra:
             job_id = await self._quote_job(q)
             if job_id is None:
                 return
+            self._claim_quote_key(q, job_id)
             view = await self._unstarted(job_id, err, "the gate's answer to the hire was lost")
         except asyncio.CancelledError:
             await self._lost_hire_cancelled(q)

@@ -23,12 +23,6 @@ from kontra.gate_client import models as m
 from kontra.serve import HOLD_HEADER, seller_data_converter
 from kontra.testing import Marketplace, TestParty
 
-#: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
-#: (`Profile.new_pending_job_identity`); a test that drives the route itself only needs a
-#: well-formed recipient (decisions I7).
-_A_BUYER_KEY = "age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el"
-
-
 HERE = Path(__file__).parent
 MARKER = "kontra-serve-marker-5f1d"
 _versions = itertools.count(1)
@@ -82,10 +76,10 @@ class Keys:
     answer says."""
 
     def __init__(self) -> None:
-        self.keys: dict[str, str] = {}
+        self.keys: dict[str, list[str]] = {}
 
     async def seller_recipients(self, endpoint: str) -> Sequence[str]:
-        return [self.keys[endpoint]]
+        return self.keys[endpoint]
 
 
 class Buyer:
@@ -114,7 +108,7 @@ class Buyer:
 
     async def wire(self, entry: m.CatalogEntry, value: Any) -> m.WirePayload:
         """``value`` as the gate relays it to ``quote``: encrypted to the seller and us."""
-        self.keys.keys[entry.endpoint] = entry.public_key
+        self.keys.keys[entry.endpoint] = entry.recipients
         payload = PydanticPayloadConverter().to_payloads([value])[0]
         codec = self.codec.with_context(
             NexusSerializationContext(
@@ -131,8 +125,10 @@ class Buyer:
         q = await self.quote(entry, value)
         assert q.status == m.QuoteStatus.OK, q
         assert q.quote_id is not None
-        hired = await self.party.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
-        self.keys.keys[hired.endpoint] = hired.seller_public_key
+        # The party's own recipient stands in for the per-job key `kontra.hire` makes: the
+        # codec below holds its identity, so it reads what the seller encrypts to it.
+        hired = await self.party.gate.hire(q.quote_id, buyer_key=self.party.public_key)
+        self.keys.keys[hired.endpoint] = hired.seller_recipients
         return hired
 
     async def start(

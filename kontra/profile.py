@@ -161,6 +161,22 @@ def _write_private(path: Path, data: bytes, *, replace: bool) -> bool:
             os.unlink(tmp)
 
 
+def _read_job_key(path: Path) -> tuple[str, str]:
+    """The keypair in a job key file. ``FileNotFoundError`` when there is none."""
+    from kontra.codec.age import is_identity, public_key_of
+
+    try:
+        text = _read_private(path).decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ProfileError(f"the job key file {path} is not text") from e
+    found = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+    if len(found) != 1 or not is_identity(found[0]):
+        raise ProfileError(
+            f"the job key file {path} must hold exactly one AGE-SECRET-KEY-1... line"
+        )
+    return found[0], public_key_of(found[0])
+
+
 def _problems(err: ValidationError, fields: Collection[str]) -> str:
     """What is wrong with the profile, field by field, and never a value: pydantic's own
     rendering quotes the input, and this file holds a refresh token (or whatever was pasted
@@ -336,7 +352,9 @@ class Profile(BaseModel):
     def new_pending_job_identity(
         quote_id: str, home: Path | str | None = None
     ) -> tuple[str, str, Path]:
-        """Make the job's keypair before the hire and write it 0600 under the quote."""
+        """Make the job's keypair before the hire and write it 0600 under the quote. A key
+        already pending for the quote is returned instead: a hire whose answer was lost may
+        have locked a job with it, and hiring the quote again must not overwrite it."""
         from kontra.codec.age import generate_identity
 
         path = Profile.pending_job_key_path(quote_id, home)
@@ -344,7 +362,8 @@ class Profile(BaseModel):
         secret, public = generate_identity()
         created = datetime.now(UTC).replace(microsecond=0).isoformat()
         text = f"# quote: {quote_id}\n# created: {created}\n# public key: {public}\n{secret}\n"
-        _write_private(path, text.encode(), replace=True)
+        if not _write_private(path, text.encode(), replace=False):
+            secret, public = _read_job_key(path)
         return secret, public, path
 
     @staticmethod
@@ -378,11 +397,9 @@ class Profile(BaseModel):
     @staticmethod
     def job_identity(job_id: str, home: Path | str | None = None) -> tuple[str, str]:
         """This job's keypair from disk."""
-        from kontra.codec.age import is_identity, public_key_of
-
         path = Profile.job_key_path(job_id, home)
         try:
-            text = _read_private(path).decode("utf-8")
+            return _read_job_key(path)
         except FileNotFoundError:
             raise ProfileError(
                 f"no key for job {job_id} at {path}: it is written by `kontra hire` on the "
@@ -390,14 +407,6 @@ class Profile(BaseModel):
                 "it this "
                 "delivery cannot be read -- by anyone."
             ) from None
-        except UnicodeDecodeError as e:
-            raise ProfileError(f"the job key file {path} is not text") from e
-        found = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
-        if len(found) != 1 or not is_identity(found[0]):
-            raise ProfileError(
-                f"the job key file {path} must hold exactly one AGE-SECRET-KEY-1... line"
-            )
-        return found[0], public_key_of(found[0])
 
     @staticmethod
     def job_identities(home: Path | str | None = None) -> list[str]:

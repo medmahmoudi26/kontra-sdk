@@ -1535,16 +1535,20 @@ class FakeGate:
         try:
             check_public_key(public_key)
         except ValueError as e:
-            raise GateHTTPError(422, "invalid_key", str(e)) from None
-        if not label or len(label) > 64 or not label.isprintable():
-            raise GateHTTPError(422, "invalid_label", "a label is 1 to 64 printable characters")
+            raise GateHTTPError(422, "invalid_public_key", str(e)) from None
+        if not 0 < len(label) <= 64 or not label.isprintable() or label != label.strip():
+            raise GateHTTPError(
+                422,
+                "invalid_label",
+                "a label is 1 to 64 printable characters, no surrounding spaces",
+            )
         p = self._party(who.party)
         for k in p.keys:
             if k.public_key == public_key:
                 if k.revoked_at is not None:
                     raise GateHTTPError(
                         409,
-                        "key_revoked",
+                        "recipient_revoked",
                         "that key was revoked for this party; make a new one",
                     )
                 return self.me(who)
@@ -1553,7 +1557,7 @@ class FakeGate:
         if len(p.recipients()) >= m.RECIPIENTS_MAX:
             raise GateHTTPError(
                 409,
-                "too_many_keys",
+                "too_many_recipients",
                 f"a party holds at most {m.RECIPIENTS_MAX} recipients; revoke one first",
             )
         p.keys.append(_PartyKey(label=label, public_key=public_key, added_at=self.now()))
@@ -1566,7 +1570,9 @@ class FakeGate:
             if k.public_key == public_key and k.revoked_at is None:
                 k.revoked_at = self.now()
                 return
-        raise GateHTTPError(404, "key_not_found", "this party has no such unrevoked recipient")
+        raise GateHTTPError(
+            404, "recipient_not_found", "this party has no such unrevoked recipient"
+        )
 
     def reputation(self, party: str) -> tuple[int, int, int]:
         """(released, refunded, disputed) of the seller's jobs: §17's raw counts. Self-hires
@@ -1957,7 +1963,7 @@ class FakeGate:
         try:
             check_public_key(req.buyer_key)
         except ValueError as e:
-            raise GateHTTPError(422, "invalid_key", str(e)) from None
+            raise GateHTTPError(422, "invalid_public_key", str(e)) from None
         row = self.offerings.get(q.offering)
         if row is None or not row.endpoint_ready or row.retired:
             raise GateHTTPError(409, "offering_unavailable", f"{q.offering} is not available")

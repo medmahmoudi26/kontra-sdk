@@ -19,7 +19,7 @@ async def test_error_body_is_decoded() -> None:
     rec = Recorder(lambda _: error(409, "price_above_max", "quote is 12.40", {"max": 1000}))
     async with GateClient("http://gate.test", token=static("t"), transport=rec.transport) as c:
         with pytest.raises(GateError) as ei:
-            await c.hire("q1", max_price_minor=1000)
+            await c.hire("q1", buyer_key="age1job", max_price_minor=1000)
     e = ei.value
     assert (e.status, e.code, e.message, e.detail) == (
         409,

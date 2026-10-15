@@ -136,7 +136,7 @@ class Endpoints:
             endpoint=endpoint if endpoint != "kliar" else "kother",
             service="acme.upper",
             task_queue="acme/upper@1.0.0",
-            public_key=BUYER,
+            recipients=[BUYER],
             published_at=datetime.now(UTC),
         )
 
@@ -144,11 +144,14 @@ class Endpoints:
 async def test_seller_keys_come_from_the_catalog_and_are_cached() -> None:
     gate = Endpoints()
     keys = SellerKeyCache(gate)
-    assert await keys.seller_recipients("k" + "1" * 32) == BUYER
-    assert await keys.seller_recipients("k" + "1" * 32) == BUYER
+    assert await keys.seller_recipients("k" + "1" * 32) == (BUYER,)
+    assert await keys.seller_recipients("k" + "1" * 32) == (BUYER,)
     assert gate.calls == 1
     with pytest.raises(LookupError):
         await keys.seller_recipients("kliar")
-    keys.remember("k" + "2" * 32, BUYER)
-    assert await keys.seller_recipients("k" + "2" * 32) == BUYER
+    keys.remember("k" + "2" * 32, [BUYER, BUYER])
+    assert await keys.seller_recipients("k" + "2" * 32) == (BUYER,)
     assert gate.calls == 2
+    # One key where a set belongs would iterate as characters: refused, not split.
+    with pytest.raises(TypeError, match="not one key"):
+        keys.remember("k" + "3" * 32, BUYER)  # type: ignore[arg-type]

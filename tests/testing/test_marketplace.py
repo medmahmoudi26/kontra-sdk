@@ -30,9 +30,9 @@ async def test_a_marketplace_without_temporal() -> None:
         assert (await judge.gate.disputes()).items == []
         assert seller.env() == {"KONTRA_HOME": str(seller.home)}
         assert seller.identity.startswith("AGE-SECRET-KEY-1")
-        assert seller.public_key == (await seller.gate.me()).public_key
+        assert [k.public_key for k in (await seller.gate.me()).keys] == [seller.public_key]
         assert (seller.home / "profile").exists()
-        entry = await seller.gate.publish(offering_doc("acme", seller.public_key))
+        entry = await seller.gate.publish(offering_doc("acme"))
         assert is_endpoint_name(entry.endpoint)
         with pytest.raises(GateError) as e:  # nobody can answer without Temporal
             await buyer.gate.quote("acme/enrich", wire(json_payload({"text": "x"})))

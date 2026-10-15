@@ -88,8 +88,7 @@ async def test_the_longest_contract_error_is_still_an_error_body(world: World) -
     """A definition name as long as the 256 KiB canonical document allows: the error names
     its path, and the answer is still a well-formed 422 the client decodes."""
     alice = await world.party()
-    assert alice.profile.public_key is not None
-    doc = offering_doc(alice.profile.party, alice.profile.public_key)
+    doc = offering_doc(alice.profile.party)
     doc["$defs"]["d" * 200_000] = {"type": "object"}
     with pytest.raises(GateError) as e:
         await alice.gate.publish(doc)

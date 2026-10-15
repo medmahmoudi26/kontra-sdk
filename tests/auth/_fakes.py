@@ -1,5 +1,6 @@
 """A just-big-enough gate for auth tests: rotating refresh tokens with reuse detection,
-expiring access tokens, Temporal tokens, /me, the device flow and dev login."""
+expiring access tokens, Temporal tokens, /me and its recipients, the device flow and dev
+login."""
 
 from __future__ import annotations
 
@@ -88,7 +89,8 @@ class FakeGate:
         #: False: hand the same refresh token back (a gate that does not rotate).
         self.rotate = True
         self.auth_time = T0 - timedelta(hours=1)
-        self.public_key: str | None = None
+        #: The party's unrevoked recipients, newest last.
+        self.keys: list[m.PartyKey] = []
         self.answer_party: str | None = None  # make the token route lie about the party
         self.access: dict[str, datetime] = {}
         self.issued = 0
@@ -132,7 +134,7 @@ class FakeGate:
         return m.Me(
             party=self.party,
             namespace=self.party,
-            public_key=self.public_key,
+            keys=list(self.keys),
             temporal_address="temporal.test:7400",
             created_at=T0,
             dev=self.dev,
@@ -172,9 +174,17 @@ class FakeGate:
             return err(401, "unauthenticated", "token rejected")
         if path == "/v1/me":
             return ok(self.me())
-        if path == "/v1/me/key":
-            self.public_key = body["public_key"]
-            return ok(self.me())
+        if path == "/v1/me/recipients" and r.method == "POST":
+            self.keys.append(
+                m.PartyKey(
+                    label=body["label"], public_key=body["public_key"], added_at=self.clock()
+                )
+            )
+            return httpx.Response(201, json=self.me().model_dump(mode="json"))
+        if path.startswith("/v1/me/recipients/") and r.method == "DELETE":
+            public_key = path.removeprefix("/v1/me/recipients/")
+            self.keys = [k for k in self.keys if k.public_key != public_key]
+            return httpx.Response(204)
         if path == "/v1/auth/temporal-token":
             if self.temporal_failures:
                 self.temporal_failures -= 1
