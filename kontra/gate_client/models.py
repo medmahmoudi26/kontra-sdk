@@ -640,15 +640,23 @@ class PollerInfo(_M):
     slots are all busy does not poll, so ``last_access_time`` says how recent a listing is.
 
     ``build_id`` and ``deployment_name`` are what the worker said of its version when it
-    polled (``WorkerDeploymentOptions``, else ``WorkerVersionCapabilities``). Temporal
-    reports no SDK name or version; the Python SDK sends a build id even for an unversioned
-    worker, a hash of its loaded code."""
+    polled (``WorkerDeploymentOptions``, else ``WorkerVersionCapabilities``); the Python SDK
+    sends a build id even for an unversioned worker, a hash of its loaded code.
+
+    ``sdk_name`` and ``sdk_version`` (``temporal-python``, ``1.34.0``) are not in
+    ``DescribeTaskQueue``'s answer: they are what the worker of this identity said of itself
+    in its last heartbeat on this task queue, as Temporal's ``ListWorkers`` reports it
+    (``WorkerHeartbeat``). A worker sends one every 60 seconds by default, so both are None
+    for a worker that has sent none yet, one that sends none, or a server that keeps none
+    (``frontend.WorkerHeartbeatsEnabled``)."""
 
     identity: _TemporalId
     last_access_time: datetime
     rate_per_second: float = Field(allow_inf_nan=False)
     build_id: _Name | None = None
     deployment_name: _TemporalId | None = None
+    sdk_name: _Name | None = None
+    sdk_version: _Name | None = None
 
 
 class TaskQueueTypeInfo(_M):

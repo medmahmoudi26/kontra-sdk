@@ -433,13 +433,16 @@ def test_the_largest_legitimate_responses_are_accepted() -> None:
     )
     m.BlobUrl.model_validate({"sha256": SHA, "url": URL, "expires_at": NOW})
     # A version's task queue at its largest: every type with a full listing of pollers,
-    # each at Temporal's default identity limit and its build id limit.
+    # each at Temporal's default identity limit and its build id limit, and an SDK name and
+    # version as long as Control lets through (kontra._control fits a heartbeat's to 255).
     poller = {
         "identity": "i" * 1000,
         "last_access_time": NOW,
         "rate_per_second": 100_000.0,
         "build_id": "b" * 255,
         "deployment_name": "d" * 1000,
+        "sdk_name": "n" * 255,
+        "sdk_version": "v" * 255,
     }
     info = {
         "pollers": [poller] * m.POLLERS_MAX,

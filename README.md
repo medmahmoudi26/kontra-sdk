@@ -160,7 +160,8 @@ plain Temporal worker whose client carries your keys and which runs the quote-an
 activities. Cancelling the workflow cancels the job and refunds the hold.
 
 From an agent: `kontra mcp` serves eight tools (`search`, `describe`, `quote`, `hire`,
-`status`, `result`, `accept`, `reject`) over stdio, on the machine that holds your key:
+`status`, `result`, `accept`, `reject`), and `workers` for a seller's own versions, over
+stdio, on the machine that holds your key:
 
 ```json
 { "mcpServers": { "kontra": { "command": "kontra", "args": ["mcp"] } } }

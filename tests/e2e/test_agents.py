@@ -20,7 +20,7 @@ from .support import Stack, scaffold, serving
 
 pytestmark = [pytest.mark.e2e]
 
-TOOLS = {"search", "describe", "quote", "hire", "status", "result", "accept", "reject"}
+TOOLS = {"search", "describe", "quote", "hire", "status", "result", "accept", "reject", "workers"}
 TEXT = "the quick brown fox jumps over the lazy dog\nthe end\n"
 
 

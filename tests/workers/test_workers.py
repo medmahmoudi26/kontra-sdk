@@ -98,6 +98,15 @@ def test_a_shrinking_backlog_is_draining() -> None:
     assert verdict(types) == "nexus backlog of 12 draining, 3 pollers"
 
 
+def test_a_backlog_dispatched_only_as_fast_as_it_grows_says_scale_up() -> None:
+    """Workers that keep pace with what is added and never catch up: the backlog is as old
+    as ever, so it is not draining and not healthy."""
+    types = served(activity=info(pollers=1, count=5000, age=1800, add=5.0, dispatch=5.0))
+    assert verdict(types) == (
+        "activity backlog of 5000 not shrinking for 30 min, 1 poller -- scale up"
+    )
+
+
 def test_the_worst_backlog_speaks_and_among_equals_the_oldest() -> None:
     growing = info(pollers=1, count=5, age=600, add=2, dispatch=1)
     unserved = info(count=1, age=5)

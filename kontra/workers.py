@@ -70,6 +70,9 @@ def _backlog(kind: TaskQueueType, info: TaskQueueTypeInfo) -> tuple[int, float, 
     if s.tasks_dispatch_rate <= 0:
         line = f"{kind} backlog of {count} not moving for {since}, {_pollers(polling)}"
         return 2, age, f"{line} -- check the workers"
+    if s.backlog_increase_rate == 0:
+        line = f"{kind} backlog of {count} not shrinking for {since}, {_pollers(polling)}"
+        return 2, age, f"{line} -- scale up"
     return 1, age, f"{kind} backlog of {count} draining, {_pollers(polling)}"
 
 
@@ -81,7 +84,9 @@ def verdict(types_info: _TypesInfo) -> str:
     * a backlog growing (``backlog_increase_rate > 0``): ``scale up``;
     * a backlog nothing is dispatched from: ``check the workers`` (every slot busy, or
       workers gone within Temporal's poller listing);
-    * a backlog shrinking: ``draining``;
+    * a backlog dispatched from only as fast as tasks are added (``backlog_increase_rate``
+      zero): ``not shrinking``, ``scale up`` -- the workers keep pace and never catch up;
+    * a backlog shrinking (``backlog_increase_rate < 0``): ``draining``;
     * no backlog: ``no pollers -- start a worker`` without any poller, else ``keeping up``
       while tasks flow, else ``idle``.
 

@@ -78,7 +78,7 @@ is what lets a ledger adapter be swapped and keeps a future split into services 
 | `kontra.profile`, `kontra.auth` | the local profile and key; the session that refreshes gate and Temporal tokens |
 | `kontra.serve` | the seller's `Worker`: generated Nexus handler, hold-token check, codec, progress forwarding |
 | `kontra.hire` | the buyer's `Kontra` client, `service()` for workflows, the hire worker |
-| `kontra.mcp` | `kontra mcp`, the eight agent tools, built on `kontra.hire` |
+| `kontra.mcp` | `kontra mcp`, the eight agent tools and a seller's `workers`, built on `kontra.hire` |
 | `kontra.cli` | the `kontra` command; no business rule lives here |
 | `kontra.ledger`, `kontra.escrow` | the `Ledger` Protocol; the job and escrow rules as pure functions |
 | `kontra._control` | the control-plane calls on Temporal's internal frontend, shared by the real and the fake gate |

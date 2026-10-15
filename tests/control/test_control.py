@@ -11,9 +11,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from temporalio.api.common.v1 import Payload
+import temporalio
+from google.protobuf.timestamp_pb2 import Timestamp
+from temporalio.api.common.v1 import Payload, WorkerVersionCapabilities
+from temporalio.api.taskqueue.v1 import PollerInfo as ApiPollerInfo
+from temporalio.api.worker.v1 import WorkerListInfo
+from temporalio.api.workflowservice.v1 import DescribeTaskQueueResponse
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.converter import DataConverter, PayloadCodec
+from temporalio.runtime import Runtime, TelemetryConfig
 from temporalio.worker import Worker
 
 from kontra._control import (
@@ -712,3 +718,92 @@ async def test_describe_task_queue_in_a_missing_namespace_is_a_temporal_error(
 ) -> None:
     with pytest.raises(TemporalError, match="describe the workflow task queue"):
         await control.describe_task_queue(unique("nowhere"), "q")
+
+
+async def test_describe_task_queue_names_the_sdk_a_worker_heartbeats(
+    dev_server: DevServer, control: Control
+) -> None:
+    """``DescribeTaskQueue`` names no SDK; the worker's heartbeat does, and ``ListWorkers``
+    reports it under the identity the worker polls with."""
+    ns = unique("sdk")
+    await control.ensure_namespace(ns)
+    queue = f"{ns}/svc@1.0.0"
+    runtime = Runtime(telemetry=TelemetryConfig(), worker_heartbeat_interval=timedelta(seconds=1))
+    client = await dev_server.connect(ns, runtime=runtime)
+    described: dict[m.TaskQueueType, m.TaskQueueTypeInfo] = {}
+    async with Worker(client, task_queue=queue, workflows=[Job], activities=[step]):
+        for _ in range(100):
+            described = await control.describe_task_queue(ns, queue)
+            pollers = [p for info in described.values() for p in info.pollers]
+            if pollers and all(p.sdk_version for p in pollers):
+                break
+            await asyncio.sleep(0.1)
+    for kind in (m.TaskQueueType.WORKFLOW, m.TaskQueueType.ACTIVITY):
+        [poller] = described[kind].pollers
+        assert poller.identity == client.identity
+        assert (poller.sdk_name, poller.sdk_version) == ("temporal-python", temporalio.__version__)
+
+
+def test_a_poller_is_fitted_to_the_wire_not_refused() -> None:
+    """What Temporal does not bound everywhere -- a deprecated deployment series name, what
+    a worker's heartbeat says -- is left out when the wire cannot carry it, and an identity
+    is cut: the seller still sees its workers counted, never a failed description."""
+    from kontra._control import _sdks, _type_info  # pyright: ignore[reportPrivateUsage]
+
+    long_identity = "i" * 1500
+    resp = DescribeTaskQueueResponse(
+        pollers=[
+            ApiPollerInfo(
+                identity=long_identity,
+                rate_per_second=float("nan"),
+                worker_version_capabilities=WorkerVersionCapabilities(
+                    build_id="b" * 255, deployment_series_name="d" * 1001
+                ),
+            ),
+            ApiPollerInfo(identity="7@host"),
+        ]
+    )
+    started = Timestamp(seconds=1_000)
+    later = Timestamp(seconds=2_000)
+    sdks = _sdks(
+        "acme/echo@1.0.0",
+        [
+            WorkerListInfo(
+                worker_identity=long_identity,
+                task_queue="acme/echo@1.0.0",
+                sdk_name="n" * 256,
+                sdk_version="1.34.0",
+            ),
+            WorkerListInfo(
+                worker_identity="7@host",
+                task_queue="acme/echo@1.0.0",
+                sdk_name="temporal-python",
+                sdk_version="1.33.0",
+                start_time=started,
+            ),
+            WorkerListInfo(
+                worker_identity="7@host",
+                task_queue="acme/echo@1.0.0",
+                sdk_name="temporal-python",
+                sdk_version="1.34.0",
+                start_time=later,
+            ),
+            WorkerListInfo(
+                worker_identity="7@host",
+                task_queue="acme/other@1.0.0",
+                sdk_name="temporal-go",
+                sdk_version="9.9.9",
+                start_time=Timestamp(seconds=3_000),
+            ),
+        ],
+    )
+    info = _type_info(resp, sdks)
+    first, second = info.pollers
+    assert first.identity == "i" * 1000
+    assert first.rate_per_second == 0.0
+    assert (first.build_id, first.deployment_name) == ("b" * 255, None)
+    assert (first.sdk_name, first.sdk_version) == (None, "1.34.0")
+    # Of two workers with one identity, the one started last; another task queue's never.
+    assert (second.sdk_name, second.sdk_version) == ("temporal-python", "1.34.0")
+    assert (second.build_id, second.deployment_name) == (None, None)
+    m.TaskQueueTypeInfo.model_validate_json(info.model_dump_json())

@@ -104,7 +104,7 @@ plaintext input and would have to decrypt the result for it, which breaks §10.1
 must be unable to read job payloads"). The MCP server is therefore `kontra.mcp` in the
 public package, started as `kontra mcp` (stdio) next to the agent, and implemented on
 `kontra.hire` with the local profile. It has the eight tools of §7.3 and calls the same
-gate with the same rules.
+gate with the same rules; a ninth, `workers`, is a seller's own Workers view (I21).
 
 ## I6. Escrow is driven by observation, not by reports
 
@@ -580,3 +580,50 @@ workflow, activity, RetryPolicy, ApplicationError, Page` -- and never `temporali
   `kontra.types.Artifact` and nothing else from `kontra`.
 - **Checked by** `tests/examples/test_imports.py` (statements, dynamic imports and module names
   in strings; what loading the code loads) over the examples and the `kontra init` scaffold.
+
+## I21. The Workers view (kontra-cloud#6)
+
+A seller sees whether its workers keep up from what Temporal already knows: the gate asks
+`DescribeTaskQueue` of an offering version's task queue in the seller's namespace, through
+its internal client (no Authorizer change), and answers
+`GET /v1/offerings/{party}/{name}/versions/{version}/workers` (`party|worker`) with a
+`WorkersView` whose verdict is `kontra.workers`'s. Where the issue and the code part ways:
+
+- **The route.** The issue's `{o}` is an offering, `party/name`: two path segments, as in the
+  catalog's other offering paths. `{version}` resolves as a catalog path does (latest, `@1`,
+  exact) among every version the caller published, retired and unconfirmed ones too (a
+  retired version's workers may still be finishing its jobs). Another party's version is
+  404 `offering_not_found`, like a missing one, and Temporal is not asked.
+- **No `report_pollers`.** The issue names `DescribeTaskQueue(report_stats=true,
+  report_pollers=true)`. `report_pollers` is deprecated in Temporal's proto and belongs to
+  the deprecated `ENHANCED` mode; the default mode lists the pollers in every answer, so the
+  gate sends `report_stats` alone, once per task-queue type (`TaskQueueType`: workflow,
+  activity, nexus).
+- **The SDK version comes from `ListWorkers`.** `PollerInfo` names no SDK; a worker's
+  heartbeat does (`WorkerHeartbeat.sdk_name`, `sdk_version`, Temporal's names, kept as
+  `PollerInfo.sdk_name` and `sdk_version` on the wire). When anything polls, the gate asks
+  `ListWorkers` once with `TaskQueue = '<task queue>'` and matches each poller by identity
+  (of two heartbeats with one identity, the worker started last). Server 1.32 keeps
+  heartbeats by default (`frontend.WorkerHeartbeatsEnabled`; `ListWorkers` is always on) and
+  the Python SDK sends one every 60 s, so a new worker shows its SDK within a minute; until
+  then, and from a server without `ListWorkers`, both are null. `build_id` and
+  `deployment_name` (what the worker polled with) are shown as well.
+- **Strings are fitted, never refused.** A heartbeat's strings are the worker's own and
+  unbounded, and a deprecated deployment series name is not bounded everywhere: a value
+  longer than the wire carries is left out (an identity is cut), so the seller still sees
+  its workers counted instead of a failed answer.
+- **The verdict reads one answer.** "Growing for 5 min" is the age of the oldest backlogged
+  task (`approximate_backlog_age`), not a history of reads. `backlog_increase_rate` is
+  `tasks_add_rate - tasks_dispatch_rate`, as Temporal's SDKs derive it; a backlog dispatched
+  from only as fast as it grows (zero) is "not shrinking -- scale up", never "draining".
+  `stale` is Temporal reporting nothing at all, which is also what it reports for a task
+  queue it unloaded after about five idle minutes.
+- **The gate paces Temporal.** This is the first authenticated GET that reaches the
+  internal frontend on every request (three RPCs, four when anything polls), which the
+  sweeper's observations share: one answer per task queue serves every request for it for
+  a few seconds, a request that arrives while one is asked waits for it, and a party may
+  cause a bounded number of descriptions a minute (429 `rate_limited` past it), per gate
+  replica.
+- **The MCP server shows it.** The issue names it next to `kontra status --workers`, so
+  `kontra mcp` has a ninth tool, `workers`, read-only, for the caller's own versions; the
+  eight of §7.3 are unchanged (I5).

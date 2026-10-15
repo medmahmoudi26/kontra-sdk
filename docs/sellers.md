@@ -667,10 +667,15 @@ binds (or the versions you name, `kontra status acme/enrich@1.2.0`): per task-qu
 (workflow, activity, Nexus), the backlog and the age of its oldest task, the rates tasks are
 added and dispatched at, and the workers polling, as Temporal's `DescribeTaskQueue` reports
 them, with a one-line verdict such as `activity backlog growing for 5 min, 2 pollers -- scale
-up` or `idle, 1 poller`. It needs nothing on your side: the gate reads these numbers from your
-namespace (task-queue stats are metadata, see [security.md](security.md)) and shows only your
-own versions. Temporal reports zeros and no pollers for a task queue it unloaded after about
-five idle minutes, and the command says so when that is all there is.
+up` or `idle, 1 poller`. A backlog dispatched from only as fast as tasks arrive is `not
+shrinking -- scale up`: those workers keep pace and never catch up. Each worker is listed with
+the build id it polls with and the SDK its heartbeat names (`temporal-python 1.34.0`; a worker
+heartbeats once a minute, so a new one shows its SDK within a minute). It needs nothing on
+your side: the gate reads these numbers from your namespace (task-queue stats are metadata,
+see [security.md](security.md)) and shows only your own versions. Temporal reports zeros and
+no pollers for a task queue it unloaded after about five idle minutes, and the command says
+so when that is all there is. The console's Workers page and the `workers` tool of `kontra
+mcp` show the same answer.
 
 A server that runs `kontra serve` unattended should use an API key rather than your login:
 `kontra keys create --label worker-1` on your machine, then `KONTRA_API_KEY` on the server.
