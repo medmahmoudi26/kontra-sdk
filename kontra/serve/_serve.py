@@ -141,6 +141,7 @@ def serve_from(
     workflows: tuple[type, ...],
     *,
     quote: QuoteFunction | None,
+    agents: bool = False,
     mcp_servers: _agents.MCPServers | None,
     options: Mapping[str, Any],
 ) -> Worker:
@@ -164,7 +165,9 @@ def serve_from(
     extra_workflows = _extend(list(workflows[1:]), options.get("workflows"))
     if extra_workflows:
         kwargs["workflows"] = extra_workflows
-    plugins = _extend(_agents.plugins(mcp_servers), options.get("plugins"))
+    plugins = _extend(
+        _agents.plugins(agents=agents, mcp_servers=mcp_servers), options.get("plugins")
+    )
     if plugins:
         kwargs["plugins"] = plugins
     worker = Worker(offerings=[bound], **kwargs)
@@ -184,19 +187,22 @@ def serve_from(
 def serve(
     *workflows: type,
     quote: QuoteFunction | None = None,
+    agents: bool = False,
     mcp_servers: _agents.MCPServers | None = None,
     **temporal_worker_options: Unpack[WorkerConfig],
 ) -> Worker:
     """Serve ``offering.yaml`` beside the calling file with ``workflows[0]`` (see the module
     docstring): runs the worker when the caller is ``__main__``, else returns it unstarted.
 
-    ``mcp_servers``: ``{"name": factory}`` for ``kontra.workflow.mcp_server("name")`` (the
-    ``[agents]`` extra). ``temporal_worker_options``: ``temporalio.worker.Worker``'s keywords.
+    ``agents``: run the OpenAI Agents plugin (the ``[agents]`` extra; the worker then needs
+    ``OPENAI_API_KEY``). ``mcp_servers``: ``{"name": factory}`` for
+    ``kontra.workflow.mcp_server("name")``; implies ``agents``. ``temporal_worker_options``: ``temporalio.worker.Worker``'s keywords.
     """
     return serve_from(
         sys._getframe(1).f_globals,
         workflows,
         quote=quote,
+        agents=agents,
         mcp_servers=mcp_servers,
         options=temporal_worker_options,
     )

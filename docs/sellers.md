@@ -1,8 +1,8 @@
 # Selling on Kontra
 
 You write a Temporal workflow. Kontra adds a price, a catalog entry, escrow and encryption around
-it, and buyers hire it through Nexus. The workflow runs on your machine as a plain Temporal
-worker; Kontra never runs your code. The smallest offering, as a five-minute tutorial from
+it, and buyers hire it through Nexus. The workflow runs on your machine as a Temporal worker;
+Kontra never runs your code. The smallest offering, as a five-minute tutorial from
 login to a paid job, is [`examples/hello`](../examples/hello).
 
 - [The project](#the-project)
@@ -12,6 +12,9 @@ login to a paid job, is [`examples/hello`](../examples/hello).
 - [The workflow and activities](#the-workflow-and-activities)
 - [Files: `Artifact`](#files-artifact)
 - [Progress](#progress)
+- [Many activities: `execute_activities_in_parallel`](#many-activities-execute_activities_in_parallel)
+- [Throughput: one heartbeating activity](#throughput-one-heartbeating-activity)
+- [Agents](#agents)
 - [The worker](#the-worker)
 - [Testing without containers](#testing-without-containers)
 - [Running locally: `kontra dev`](#running-locally-kontra-dev)
@@ -28,13 +31,13 @@ login to a paid job, is [`examples/hello`](../examples/hello).
 wordcount/
   offering.yaml           declarative facts: name, version, limits, display text
   models.py               pydantic input and output types
-  workflows.py            plain Temporal -- no kontra import
-  activities.py           plain Temporal -- no kontra import
+  workflows.py            Temporal, through `from kontra import workflow`
+  activities.py           Temporal, through `from kontra import activity`
   quote.py                the price, from the input
-  worker.py               binds workflow and quote to the offering; all worker tuning
+  worker.py               serve(Flow): binds workflow and quote to the offering; all worker tuning
   tests/test_offering.py  the lifecycle against kontra.testing, no containers
   input.json              a sample input, for `kontra quote` and `kontra hire`
-  pyproject.toml          pytest settings only
+  pyproject.toml          one dependency, kontra-sdk; pytest settings
   README.md
 ```
 
@@ -42,9 +45,15 @@ The offering is `<party>/wordcount`, where the party is your profile's handle (o
 `--party`).
 
 Each fact has one owner. The rule that matters most: **`workflows.py` and `activities.py`
-import nothing from `kontra`.** They are ordinary Temporal code, tested and run like any
-other. The only Kontra type your job code may touch is `kontra.types.Artifact`, a pydantic
-model of a file reference, and it reaches it through `models.py`.
+reach Temporal only through `kontra`** -- `from kontra import workflow, activity, RetryPolicy,
+ApplicationError` -- **and never import `temporalio`** (D1). The façade is Temporal's own
+objects re-exported, not wrappers: `kontra.workflow.defn` *is* `temporalio.workflow.defn`, so
+the code is ordinary Temporal code, tested and run like any other, and with
+`from temporalio import workflow` in place of `from kontra import workflow` it runs on any
+Temporal. Your project depends on `kontra-sdk` alone, which pins the Temporal SDK it was
+built against. The only other Kontra type your job code may touch is `kontra.types.Artifact`,
+a pydantic model of a file reference, and it reaches it through `models.py`. `kontra publish`
+refuses an offering whose code imports `temporalio` or `nexusrpc`.
 
 ## offering.yaml
 
@@ -59,6 +68,7 @@ review_window: 24h              # the buyer may reject until then; silence accep
 max_concurrent_jobs: 10         # optional; beyond this many open jobs quotes answer busy
 max_output_bytes: 5GB           # the gate refuses artifact uploads beyond this
 artifact_retention: 7d          # after accept; the buyer must download by then
+uses_hosted_model: false        # optional; true when the input goes to a model provider
 ```
 
 | Key | Range |
@@ -68,6 +78,12 @@ artifact_retention: 7d          # after accept; the buyer must download by then
 | `artifact_retention` | 1s to 90d |
 | `max_output_bytes` | up to 5 TiB (`512MB`, `5GB`, `1GiB`: SI and IEC units both work) |
 | `max_concurrent_jobs` | up to 10,000 |
+
+`uses_hosted_model: true` says the job sends the buyer's input to a hosted model (an LLM API),
+where it is plaintext to that provider: Kontra's encryption ends at your worker. It is a fact
+of the contract, shown on the offering's A2A card (`usesHostedModel`, and a sentence in the
+skill's description); `false` is the same as leaving it out, and the document carries the key
+only when it is true.
 
 Durations accept `90s`, `30m`, `6h`, `7d` and combinations such as `1h30m`. The catalog stores
 one canonical spelling, so two offerings with the same limits hash the same whatever their
@@ -142,12 +158,19 @@ plaintext (the gate must read the price to lock it); its input is encrypted.
 
 ## The workflow and activities
 
-Plain Temporal: activities, retries, timers, child workflows, `continue_as_new`, signals.
+Temporal, through the façade: activities, retries, timers, child workflows, signals, updates.
+`kontra.workflow` re-exports Temporal's workflow API (`defn`, `run`, `signal`, `query`,
+`update`, `execute_activity`, `execute_child_workflow`, `sleep`, `wait_condition`, `now`,
+`uuid4`, `unsafe`, ...) and adds [`execute_activities_in_parallel`](#many-activities-execute_activities_in_parallel);
+`kontra.activity` is Temporal's activity API (`defn`, `heartbeat`, `info`, `logger`, ...);
+`kontra` itself has `RetryPolicy` and `ApplicationError` (raise it with `non_retryable=True`
+to stop retries, as with Temporal).
 
 ```python
-# workflows.py -- no kontra import
+# workflows.py
 from datetime import timedelta
-from temporalio import workflow
+
+from kontra import workflow
 
 with workflow.unsafe.imports_passed_through():
     from activities import fetch_batch, write_records
@@ -186,8 +209,8 @@ Temporal payloads are capped at a few MB. Anything larger is an `Artifact`: a re
 file in Kontra's bucket, encrypted with age to the job's parties.
 
 ```python
-# activities.py -- still no kontra import: Artifact comes from models.py
-from temporalio import activity
+# activities.py -- Artifact comes from models.py
+from kontra import activity
 from models import Artifact, Record
 
 
@@ -218,37 +241,254 @@ as "alive, in `<activity>`, at `<time>`". Heartbeats are forwarded at most once 
 job, latest wins (`KONTRA_PROGRESS_INTERVAL` changes the interval). Forwarding is best effort:
 it never raises into, or blocks, your activity.
 
+## Many activities: `execute_activities_in_parallel`
+
+One activity per item, thousands or millions of items, with per-item retries and timeouts,
+and never a `continue_as_new` in your code:
+
+```python
+# workflows.py
+from datetime import timedelta
+
+from kontra import Page, activity, workflow
+
+
+@activity.defn
+async def next_page(cursor: str | None) -> Page[str]:
+    keys, token = ..., ...  # one page of your source: a bucket listing, an API, a table
+    return Page(items=keys, next=token)  # next=None: that was the last page
+
+
+@activity.defn
+async def probe(target: str) -> bool: ...
+
+
+def count_hits(acc: int, hit: bool) -> int:
+    return acc + hit
+
+
+@workflow.defn
+class Scan:
+    @workflow.run
+    async def run(self, scope: str) -> int:
+        return await workflow.execute_activities_in_parallel(
+            probe,
+            pages=next_page,
+            reduce=count_hits,
+            init=0,
+            max_concurrent=200,
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+```
+
+- **`pages=`** is the source: an activity `(cursor) -> Page(items, next)`, called first with
+  `None` and then with each page's `next` until one is `None`. The cursor is anything
+  serializable: an offset, a continuation token. Pages are fetched by activity, so no item
+  list ever enters your workflow's history.
+- **`items=[...]`** instead is one page held in memory. The list travels in the batch's input,
+  so it must fit one Temporal payload (a few MB); anything larger is `pages=`.
+- **`reduce=`** folds each result into an accumulator, starting from `init=`, in the order
+  results complete. It runs in the workflow, so it must be pure and deterministic, and it is a
+  module-level function (so are the activities): it crosses into the batch by name. The
+  accumulator is the only result state kept, so it stays as small as you make it. Without
+  `reduce=` the results come back as a list -- right for a small batch, a payload-size failure
+  for a large one: count, sum or keep the top N instead, or write results out from the
+  activity (an `Artifact`).
+- **`max_concurrent`** (default 100) caps the item activities open at once; the next page is
+  fetched only when there is room, so scheduled-but-unstarted work never piles up.
+- Every other keyword is a Temporal activity option (`start_to_close_timeout` or
+  `schedule_to_close_timeout` required, `retry_policy`, `heartbeat_timeout`, ...), applied to
+  every item and page activity. The task queue is your offering's, never an option.
+
+It runs as a child workflow, `kontra.batch.v1`, on your worker (`serve()` registers it). That
+child continues as new when Temporal suggests it, after letting what is in flight finish, and
+carries only the cursor, the accumulator and the current page's unstarted items into the next
+run: history is bounded by `max_concurrent`, never by the number of items, and your workflow
+just awaits one call. That is why your code never needs `continue_as_new` (the façade does not
+offer it): the iteration that would have needed it is this call. An item that fails after its
+retries fails the batch -- what is in flight is cancelled first -- and the call raises
+Temporal's `ChildWorkflowError`, with the activity's own error below it.
+
+One workflow runs a few hundred activities a second. Past that, partition the source and run
+one batch per partition as child workflows -- Temporal's own composition, in your code:
+
+```python
+import asyncio
+
+from kontra import workflow
+
+with workflow.unsafe.imports_passed_through():
+    from scanpart import ScanPart  # a workflow running execute_activities_in_parallel over part p
+
+
+@workflow.defn
+class Scan:
+    @workflow.run
+    async def run(self, parts: int) -> int:
+        runs = [workflow.execute_child_workflow(ScanPart.run, p) for p in range(parts)]
+        return sum(await asyncio.gather(*runs))
+```
+
+## Throughput: one heartbeating activity
+
+When per-item durability is noise -- "probe 500,000 hosts", where a lost probe is simply
+probed again -- the fastest shape is not one activity per item but one activity doing its own
+concurrency and heartbeating its cursor:
+
+```python
+# activities.py
+import asyncio
+
+from kontra import activity
+
+
+async def probe_host(host: str) -> bool: ...
+
+
+@activity.defn
+async def probe_all(hosts: list[str]) -> int:
+    details = activity.info().heartbeat_details
+    start, hits = details[0] if details else (0, 0)  # where the last attempt got to
+    slots = asyncio.Semaphore(1000)
+
+    async def one(host: str) -> bool:
+        async with slots:
+            return await probe_host(host)
+
+    for at in range(start, len(hosts), 1000):
+        hits += sum(await asyncio.gather(*(one(h) for h in hosts[at : at + 1000])))
+        activity.heartbeat((at + 1000, hits))  # also the buyer's progress
+    return hits
+```
+
+Three history events in all, whatever the count; a retry resumes at the last heartbeat (give
+the activity a `heartbeat_timeout`); scale by running several of them, one per slice. Nothing
+here needs Kontra beyond `activity.heartbeat` and `activity.info`. A real one reads its hosts
+from a page source rather than its input, which, like any input, must fit a payload.
+
+## Agents
+
+With the `[agents]` extra (`pip install 'kontra-sdk[agents]'`), a workflow can run an agent
+from OpenAI's [Agents SDK](https://openai.github.io/openai-agents-python/) durably, through
+Temporal's integration: the agent loop is workflow code, and every model call and tool call is
+an activity, retried and recorded like any other.
+
+```python
+# workflows.py
+from datetime import timedelta
+
+from kontra import workflow
+
+with workflow.unsafe.imports_passed_through():
+    from activities import probe
+    from agents import Agent, Runner  # OpenAI's Agents SDK: your dependency, allowed
+    from models import TriageInput, TriageOutput
+
+
+@workflow.defn
+class Triage:
+    @workflow.run
+    async def run(self, inp: TriageInput) -> TriageOutput:
+        agent = Agent(
+            name="triage",
+            instructions="Probe the hosts in scope and rank what answers.",
+            tools=[workflow.activity_as_tool(probe, start_to_close_timeout=timedelta(seconds=30))],
+            mcp_servers=[workflow.mcp_server("shodan")],
+        )
+        out = await Runner.run(agent, inp.scope)
+        return TriageOutput(report=str(out.final_output))
+```
+
+```python
+# worker.py
+from agents.mcp import MCPServerStdio
+from workflows import Triage
+
+from kontra import serve
+
+serve(Triage, mcp_servers={"shodan": lambda: MCPServerStdio(params={"command": "shodan-mcp"})})
+```
+
+| Runs as | What |
+|---|---|
+| workflow code | the agent loop, handoffs, and `@function_tool` tools: pure computation only (no I/O, no clock, no randomness) |
+| an activity | every model call, every `workflow.activity_as_tool(...)` tool, every MCP operation |
+
+- `serve(Flow, agents=True)` installs Temporal's `OpenAIAgentsPlugin` on the worker;
+  `mcp_servers={"name": factory}` does too, and serves `workflow.mcp_server("name")`. A
+  factory runs on the worker, so it holds the processes and credentials an MCP server needs.
+- The worker then needs `OPENAI_API_KEY` (or another model provider the Agents SDK is
+  configured with) to start, and uses the integration's payload converter, which validates
+  more leniently inside your workflows and activities. A buyer's input is still checked
+  against your contract before the job starts.
+- An activity tool gets a **copy** of the run context: what it changes does not come back.
+- `workflow.mcp_server(name, factory_argument=...)`: the argument is an activity input, so it
+  is recorded in history. Never put a secret there; resolve credentials in the factory.
+- A tool that wants scale calls `execute_activities_in_parallel` itself (make it a workflow
+  the agent's activity starts, or a heartbeating activity), rather than having the model issue
+  a thousand tool calls.
+- Set `uses_hosted_model: true` in `offering.yaml`: the buyer's input, decrypted on your
+  worker, goes to the model provider in plaintext to it. Model calls are activity payloads,
+  encrypted in Temporal like the rest of the job.
+
 ## The worker
 
 ```python
 # worker.py
 from datetime import timedelta
-from kontra.serve import Worker, offering
-from activities import fetch_batch, write_records
-from quote import quote
+
 from workflows import EnrichFlow
 
-worker = Worker(
-    offerings=[offering("offering.yaml", workflow=EnrichFlow, quote=quote)],
-    activities=[fetch_batch, write_records],
+from kontra import serve
+
+serve(
+    EnrichFlow,
     # every temporalio.worker.Worker keyword, passed through verbatim:
     max_concurrent_activities=40,
     max_task_queue_activities_per_second=50,
     graceful_shutdown_timeout=timedelta(seconds=60),
+)
+```
+
+`serve(Flow)` binds `offering.yaml` and the `quote` of `quote.py`, both beside `worker.py`, to
+`Flow`, and registers every activity decorated with `kontra.activity.defn` that the process
+imported -- an activity nothing imports cannot be referenced by a workflow either, so there is
+no list to keep. Further workflows (`serve(Flow, Child)`) are registered unbound, for the
+children `Flow` starts. `quote=` passes another quote function; methods decorated as
+activities need their instance (`activities=[obj.method]`).
+
+`kontra serve` and `python worker.py` run it; `kontra publish` imports `worker.py` and reads
+the offering from it without starting anything (imported, `serve()` only builds the worker
+and returns it). The worker is `kontra.serve.Worker`, which you may also write out yourself
+(several offerings on one worker, explicit lists):
+
+```python
+# worker.py
+from activities import fetch_batch, write_records
+from quote import quote
+from workflows import EnrichFlow
+
+from kontra.serve import Worker, offering
+
+worker = Worker(
+    offerings=[offering("offering.yaml", workflow=EnrichFlow, quote=quote)],
+    activities=[fetch_batch, write_records],
+    max_concurrent_activities=40,
 )
 
 if __name__ == "__main__":
     worker.run()
 ```
 
-`kontra.serve.Worker` is `temporalio.worker.Worker` plus exactly four things: a generated
+`kontra.serve.Worker` is `temporalio.worker.Worker` plus exactly five things: a generated
 Nexus service per bound offering (`quote` as a synchronous operation, `execute` as a
 workflow-run operation), the hold-token check before `execute` starts anything, the
-encryption codec, and the task queue, derived from `name@version` (passing `task_queue` is a
-`TypeError`). `workflows`, `nexus_service_handlers` and `interceptors` are merged with
-Kontra's; every other keyword reaches the inner worker unchanged. One worker can bind several
-offerings. `worker.py` must expose a module-level `worker`: `kontra serve` runs it and
-`kontra publish` imports it to find the offerings.
+encryption codec, the task queue, derived from `name@version` (passing `task_queue` is a
+`TypeError`), and the `kontra.batch.v1` workflow behind `execute_activities_in_parallel`.
+It passes `kontra` through the workflow sandbox, so the façade loads once per process.
+`workflows`, `nexus_service_handlers` and `interceptors` are merged with Kontra's; every other
+keyword reaches the inner worker unchanged. Written out, `worker.py` exposes a module-level
+`worker`: `kontra serve` runs it and `kontra publish` imports it to find the offerings.
 
 Before `execute` starts your workflow, the handler checks the hold token offline (signature
 against the gate's keys, audience, expiry, your namespace, the offering, the contract hash),
@@ -258,7 +498,8 @@ validates the input against the contract, and re-runs your quote. No gate call i
 
 `kontra.testing` has a fake for every seam. `Marketplace` wires a Temporal dev server
 (downloaded once), the fake gate (catalog, quote relay, escrow by the platform's own rules,
-play money) and logged-in parties into one process:
+play money) and logged-in parties into one process. The test serves the worker `worker.py`
+builds, so name it there -- `worker = serve(Flow, ...)`, as `kontra init` writes it:
 
 ```python
 # tests/test_offering.py -- `pytest` from the project directory
@@ -272,7 +513,7 @@ def test_lifecycle() -> None:
 
 
 async def lifecycle() -> None:
-    from worker import worker  # the module-level worker: what `kontra serve` runs
+    from worker import worker  # worker = serve(...): what `kontra serve` runs
 
     async with Marketplace() as mp:
         seller = await mp.party("acme", balance=0)  # offering.yaml: name: acme/wordcount

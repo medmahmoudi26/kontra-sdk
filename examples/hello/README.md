@@ -12,10 +12,10 @@ before you sell your own.
 |---|---|
 | `offering.yaml` | name, version, limits, display text: declarative, no code names |
 | `models.py` | `HelloInput` (`name`, 1 to 100 characters) and `HelloOutput` (`greeting`); the published contract is derived from them |
-| `workflows.py` | `HelloFlow`: runs the one activity, with a timeout and retries; plain Temporal, nothing from kontra |
-| `activities.py` | `greet`, the work itself; plain Temporal, nothing from kontra |
+| `workflows.py` | `HelloFlow`: runs the one activity, with a timeout and retries; Temporal through `from kontra import workflow` |
+| `activities.py` | `greet`, the work itself; Temporal through `from kontra import activity` |
 | `quote.py` | the price: 0.01 USD whatever the name, and a refusal for a blank one |
-| `worker.py` | the binding of workflow and quote to the offering, and all worker tuning |
+| `worker.py` | `serve(HelloFlow, ...)`: the binding of workflow and quote to the offering, and all worker tuning |
 | `input.json` | a sample input, for `kontra quote` and `kontra hire` |
 | `contract.yaml` | the derived contract document, kept as a golden file (seam ③) |
 
@@ -56,7 +56,7 @@ anything in `offering.yaml`, and bump `version` before publishing again.
 kontra serve          # on the machine that does the work; Ctrl-C stops it gracefully
 ```
 
-`kontra serve` runs the module-level `worker` of `worker.py` with your profile: an ordinary
+`kontra serve` runs the worker that `serve(HelloFlow, ...)` in `worker.py` builds, with your profile: an ordinary
 Temporal worker on your own namespace. Kontra never runs your code; while nothing serves, a
 quote finds nobody to answer it. On a server that does not hold your login, use an API key
 (`kontra keys create --label hello`, then `KONTRA_API_KEY`) and your key file (`~/.kontra/key`,

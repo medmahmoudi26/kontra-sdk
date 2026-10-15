@@ -1,15 +1,15 @@
 # {{party}}/{{name}}
 
 A Kontra offering: a durable, quoted job that buyers hire through Kontra and that runs on
-your own machine as a plain Temporal worker. Made by `kontra init`.
+your own machine as a Temporal worker. Made by `kontra init`.
 
 | File | Owner of |
 |---|---|
 | `offering.yaml` | name, version, limits, display text: declarative, no code names |
 | `models.py` | the input and output types; the published contract is derived from them |
-| `workflows.py`, `activities.py` | the job itself, in plain Temporal; nothing from kontra |
+| `workflows.py`, `activities.py` | the job itself: Temporal, imported only through `kontra` (`from kontra import workflow, activity`) |
 | `quote.py` | the price, from the input |
-| `worker.py` | the binding of workflow and quote to the offering, and all worker tuning |
+| `worker.py` | `serve({{Class}}Flow, ...)`: the binding of workflow and quote to the offering, and all worker tuning |
 | `tests/test_offering.py` | the whole lifecycle (quote, hire, deliver, accept; a refund) with no containers |
 
 ## Try it locally

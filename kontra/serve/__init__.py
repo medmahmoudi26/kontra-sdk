@@ -19,8 +19,9 @@ worker = Worker(
 worker.run()
 ```
 
-Workflows and activities import nothing from here (D1); only ``worker.py`` and
-``quote.py`` do.
+Workflows and activities import nothing from here: they reach Temporal through the façade
+(``from kontra import workflow, activity``; D1, decisions I20). Only ``worker.py`` and
+``quote.py`` import ``kontra.serve``.
 
 This package is callable: ``kontra.serve(...)`` is :func:`serve`. Python binds the attribute
 ``kontra.serve`` to this package when it is imported -- ``from kontra import serve`` imports
@@ -74,6 +75,7 @@ class _CallablePackage(types.ModuleType):
         self,
         *workflows: type,
         quote: QuoteFunction | None = None,
+        agents: bool = False,
         mcp_servers: _agents.MCPServers | None = None,
         **temporal_worker_options: Unpack[WorkerConfig],
     ) -> Worker:
@@ -81,6 +83,7 @@ class _CallablePackage(types.ModuleType):
             sys._getframe(1).f_globals,
             workflows,
             quote=quote,
+            agents=agents,
             mcp_servers=mcp_servers,
             options=temporal_worker_options,
         )

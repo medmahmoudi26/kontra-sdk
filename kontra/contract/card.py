@@ -39,6 +39,8 @@ def agent_card(
     )
     if facts.pricing_hint:
         limits = f"Pricing: {facts.pricing_hint}. " + limits
+    if facts.uses_hosted_model:
+        limits += " Uses a hosted model: the input is sent to a model provider, in plaintext to it."
     params: dict[str, Any] = {
         "offering": oid.key,
         "contractHash": info.contract_hash,
@@ -52,6 +54,8 @@ def agent_card(
         params["pricingHint"] = facts.pricing_hint
     if facts.max_concurrent_jobs is not None:
         params["maxConcurrentJobs"] = facts.max_concurrent_jobs
+    if facts.uses_hosted_model:
+        params["usesHostedModel"] = True
     return {
         "name": oid.full_name,
         "description": facts.description,

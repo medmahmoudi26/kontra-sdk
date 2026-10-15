@@ -109,17 +109,18 @@ async def _refused(session: Session | None) -> str | None:
     return None
 
 
-def seller_data_converter(codec: KontraCodec) -> DataConverter:
+def seller_data_converter(codec: KontraCodec, *, agents: bool = False) -> DataConverter:
     """:func:`kontra.codec.data_converter` (failures encrypted too) with the pydantic payload
     converter, so models in workflow and activity signatures round-trip.
 
-    With the ``[agents]`` extra installed it is the agents package's ``OpenAIPayloadConverter``
-    instead: the model activities' inputs do not decode with the strict pydantic one. That
-    converter is laxer (it builds an object that fails validation rather than refusing it), so
-    it applies only to sellers who installed the extra; buyer input is checked against the
-    contract schema before either runs."""
+    ``agents`` (the worker runs the OpenAI Agents plugin): the agents package's
+    ``OpenAIPayloadConverter`` instead, because the model activities' inputs do not decode with
+    the strict pydantic one. It is laxer (it builds an object that fails validation rather
+    than refusing it), so only a worker that runs agents gets it; buyer input is checked
+    against the contract schema before either runs."""
     return dataclasses.replace(
-        data_converter(codec), payload_converter_class=_agents.payload_converter_class()
+        data_converter(codec),
+        payload_converter_class=_agents.payload_converter_class(agents=agents),
     )
 
 
@@ -380,7 +381,9 @@ class Worker:
             blobs=GateBlobStore(gate),
             services=[b.offering_id.service_name for b in self._offerings],
         )
-        converter = seller_data_converter(codec)
+        converter = seller_data_converter(
+            codec, agents=_agents.uses_agents(self._kwargs.get("plugins"))
+        )
         # Headers stay out of the codec: the kontra-job header must be readable before any
         # payload key is known (kontra.serve.interceptors).
         if client is None:

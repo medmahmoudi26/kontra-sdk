@@ -108,7 +108,9 @@ Rules that keep the seams real:
   canonicalises, hashes or validates a contract; `publish`, `serve` and the gate all call it.
   `kontra/escrow.py` is the only statement of who gets paid when; the real and the fake gate
   both run it. `kontra._control` is the only code that talks to the internal frontend.
-- **D1.** Seller `workflows.py` and `activities.py` import nothing from `kontra`; `models.py`
+- **D1.** Seller `workflows.py` and `activities.py` import Temporal only through the `kontra`
+  façade (`from kontra import workflow, activity, ...`: Temporal's own objects, so swapping in
+  `from temporalio import ...` still runs on any Temporal; decisions I20); `models.py`
   may use `kontra.types.Artifact`. The tests check the examples.
 - **Distribution name.** The PyPI distribution is `kontra-sdk`; a bare `kontra` dependency
   installs an unrelated project.

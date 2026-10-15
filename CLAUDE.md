@@ -39,9 +39,12 @@ crosses a seam updates that seam's test **in the same PR**.
   assigned by the catalog; nothing derives an offering from one or authorizes by its shape
   (`docs/decisions.md` I1, I3). Validate typed input with anchored `fullmatch`, never `re.match`.
 - `kontra/escrow.py` holds the job rules as pure functions; both gates (real and fake) use it.
-- Seller `workflows.py` and `activities.py` import nothing from `kontra` (D1). `models.py` may use
+- Seller `workflows.py` and `activities.py` reach Temporal only through the façade (D1, `docs/decisions.md`
+  I20): `from kontra import workflow, activity, RetryPolicy, ApplicationError, Page`, never `temporalio`
+  or `nexusrpc`, never `import kontra`, never the serving stack. The façade is Temporal's own objects, so
+  `from temporalio import workflow` in its place still runs on any Temporal. `models.py` may use
   `kontra.types.Artifact`. `grep -r "import kontra" examples/*/workflows.py examples/*/activities.py`
-  must print nothing.
+  must print nothing; `tests/examples/test_imports.py` checks the rest.
 - Every seam has a fake in `kontra.testing`, so a seller tests a full lifecycle without containers.
 - The PyPI distribution is `kontra-sdk`; `kontra` on PyPI is someone else's package. Never add a bare
   `kontra` dependency anywhere.

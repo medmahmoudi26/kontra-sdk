@@ -447,8 +447,9 @@ def test_without_the_extra_there_is_no_plugin_and_mcp_servers_is_refused(
     tmp_path: Path, without_agents: None
 ) -> None:
     assert _agents.plugins() == []
-    with pytest.raises(TypeError, match=r"kontra-sdk\[agents\]"):
-        _agents.plugins({"shodan": object})
+    for asked in ({"agents": True}, {"mcp_servers": {"shodan": object}}):
+        with pytest.raises(TypeError, match=r"kontra-sdk\[agents\]"):
+            _agents.plugins(**asked)  # type: ignore[arg-type]
     root = _project(
         tmp_path / "p",
         "from kontra import serve\nfrom workflows import Flow\n"
@@ -500,6 +501,36 @@ def test_with_the_extra_serve_installs_the_plugin_with_the_mcp_servers(
     assert {"invoke_model_activity", "temporalio.mcp.shodan.call-tool"} <= names
 
 
+def test_with_the_extra_a_worker_that_does_not_ask_runs_no_agents(
+    tmp_path: Path, agents_installed: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Installed is not opted in: the plugin builds an OpenAI client when the worker starts
+    and its payload converter is laxer, so a worker that does not ask (agents=True or
+    mcp_servers=) gets neither -- and needs no OPENAI_API_KEY."""
+    from temporalio.contrib.pydantic import PydanticPayloadConverter
+    from temporalio.openai_agents import OpenAIAgentsPlugin, OpenAIPayloadConverter
+
+    monkeypatch.delenv("OPENAI_API_KEY")
+    root = _project(
+        tmp_path / "p", "from kontra import serve\nfrom workflows import Flow\nserve(Flow)\n"
+    )
+    with load_worker(root) as worker:
+        assert "plugins" not in worker.options
+    assert _agents.payload_converter_class() is PydanticPayloadConverter
+    assert not _agents.uses_agents(None)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-used")
+    root = _project(
+        tmp_path / "q",
+        "from kontra import serve\nfrom workflows import Flow\nserve(Flow, agents=True)\n",
+    )
+    with load_worker(root) as worker:
+        [plugin] = worker.options["plugins"]
+    assert isinstance(plugin, OpenAIAgentsPlugin)
+    assert _agents.uses_agents([plugin])
+    assert _agents.payload_converter_class(agents=True) is OpenAIPayloadConverter
+
+
 def test_plugins_is_a_temporal_worker_keyword() -> None:
     """serve() puts the agents plugin on the worker through temporalio's own ``plugins=``,
     which ``Worker`` passes verbatim: the client Kontra connects stays Kontra's."""
@@ -539,7 +570,7 @@ async def test_an_agent_workflow_with_an_activity_tool_runs_on_the_plugin(
     )
     base = dev_server.client.config()
     base["data_converter"] = DataConverter(
-        payload_converter_class=_agents.payload_converter_class()
+        payload_converter_class=_agents.payload_converter_class(agents=True)
     )
     client = Client(**base)
     queue = f"agents-{uuid.uuid4().hex[:8]}"

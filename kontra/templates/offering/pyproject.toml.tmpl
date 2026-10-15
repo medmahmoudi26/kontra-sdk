@@ -1,7 +1,20 @@
-# Test settings for this offering. The tests need no containers:
+# The offering's one dependency is kontra-sdk, which pins the Temporal SDK it runs on: code
+# here imports Temporal only through `kontra` (D1). Not a package: `pip install .` installs
+# the dependency and nothing else; `kontra serve` runs the modules from this directory.
+#
+# The tests need no containers:
 #
 #   pip install "kontra-sdk[testing]" pytest
 #   pytest
+[project]
+name = "{{name}}"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["kontra-sdk"]
+
+[tool.setuptools]
+py-modules = []
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

@@ -65,7 +65,7 @@ def test_quote_hire_deliver_accept(dev_server: DevServer) -> None:
 
 
 async def lifecycle(dev_server: DevServer) -> None:
-    from worker import worker  # the module-level worker: what `kontra serve` runs
+    from worker import worker  # what serve() built: what `kontra serve` runs
 
     spec = load_offering(ROOT / "offering.yaml")
     party = spec.offering_id.party

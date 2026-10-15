@@ -73,7 +73,8 @@ _CODE_KEYS = frozenset(
 
 _KEYS_HINT = (
     "offering.yaml holds name, version, description, pricing_hint, tags, max_duration, "
-    "review_window, max_concurrent_jobs, max_output_bytes and artifact_retention"
+    "review_window, max_concurrent_jobs, max_output_bytes, artifact_retention and "
+    "uses_hosted_model"
 )
 
 
@@ -208,6 +209,12 @@ def check_concurrency(value: object) -> int | None:
     return value
 
 
+def check_hosted_model(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"must be true or false, got {value!r}")
+    return value
+
+
 # --------------------------------------------------------------------------- the model
 
 
@@ -226,6 +233,7 @@ class OfferingSpec(BaseModel):
     max_concurrent_jobs: int | None = None
     max_output_bytes: int = 1000**3
     artifact_retention: timedelta = timedelta(days=7)
+    uses_hosted_model: bool = False
 
     @field_validator("name", mode="before")
     @classmethod
@@ -277,6 +285,11 @@ class OfferingSpec(BaseModel):
     def _max_concurrent_jobs(cls, v: object) -> int | None:
         return check_concurrency(v)
 
+    @field_validator("uses_hosted_model", mode="before")
+    @classmethod
+    def _uses_hosted_model(cls, v: object) -> bool:
+        return check_hosted_model(v)
+
     @property
     def offering_id(self) -> OfferingId:
         return OfferingId.from_parts(self.name, self.version)
@@ -297,6 +310,8 @@ class OfferingSpec(BaseModel):
             out["max_concurrent_jobs"] = self.max_concurrent_jobs
         out["max_output_bytes"] = format_size(self.max_output_bytes)
         out["artifact_retention"] = format_duration(self.artifact_retention)
+        if self.uses_hosted_model:  # false is absent: one spelling per fact
+            out["uses_hosted_model"] = True
         return out
 
 

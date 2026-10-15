@@ -23,6 +23,7 @@ from kontra.contract.offering import (
     check_concurrency,
     check_description,
     check_duration,
+    check_hosted_model,
     check_name,
     check_pricing_hint,
     check_size,
@@ -72,6 +73,8 @@ class XKontra(BaseModel):
     max_concurrent_jobs: int | None = None
     max_output_bytes: int
     artifact_retention: timedelta
+    #: True, or None (absent) for false: the block has one spelling per fact.
+    uses_hosted_model: bool | None = None
     contract_hash: str | None = None
 
     @field_validator("name", mode="before")
@@ -124,6 +127,15 @@ class XKontra(BaseModel):
     def _max_concurrent_jobs(cls, v: object) -> int | None:
         return check_concurrency(v)
 
+    @field_validator("uses_hosted_model", mode="before")
+    @classmethod
+    def _uses_hosted_model(cls, v: object) -> bool | None:
+        if v is None:
+            return None
+        if not check_hosted_model(v):
+            raise ValueError("false is written by leaving uses_hosted_model out")
+        return True
+
     @field_validator("contract_hash", mode="before")
     @classmethod
     def _contract_hash(cls, v: object) -> str | None:
@@ -154,6 +166,7 @@ class XKontra(BaseModel):
             max_concurrent_jobs=spec.max_concurrent_jobs,
             max_output_bytes=spec.max_output_bytes,
             artifact_retention=spec.artifact_retention,
+            uses_hosted_model=True if spec.uses_hosted_model else None,
             contract_hash=contract_hash,
         )
 

@@ -1,22 +1,16 @@
-"""Binds the code to the offering; all worker tuning lives here (D11). `kontra serve` runs
-the module-level `worker` with your profile, and `kontra publish` imports it to find the
-offerings. Every keyword after `activities` is a `temporalio.worker.Worker` argument,
-passed through verbatim."""
+"""Binds the code to the offering; all worker tuning lives here (D11). `serve()` binds
+offering.yaml and quote.py beside this file to `{{Class}}Flow` and registers every activity
+the workflow imports. `kontra serve` (or `python worker.py`) runs it with your profile, and
+`kontra publish` imports it to find the offering. Every keyword is a
+`temporalio.worker.Worker` argument, passed through verbatim. Imported, serve() starts
+nothing and returns the worker: `worker` is what the tests serve."""
 
 from datetime import timedelta
 
-from kontra.serve import Worker, offering
+from kontra import serve
 
-from activities import count_words
-from quote import quote
 from workflows import {{Class}}Flow
 
-worker = Worker(
-    offerings=[offering("offering.yaml", workflow={{Class}}Flow, quote=quote)],
-    activities=[count_words],
-    max_concurrent_activities=10,
-    graceful_shutdown_timeout=timedelta(seconds=30),
+worker = serve(
+    {{Class}}Flow, max_concurrent_activities=10, graceful_shutdown_timeout=timedelta(seconds=30)
 )
-
-if __name__ == "__main__":
-    worker.run()

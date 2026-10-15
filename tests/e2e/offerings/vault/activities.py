@@ -1,11 +1,12 @@
-"""Plain Temporal: nothing from kontra (D1). The input artifact is read and written back, with
+"""Temporal through the façade: kontra.workflow and kontra.activity only (D1). The input artifact is read and written back, with
 a trailer, as the output artifact; the note comes back as it was."""
 
 import tempfile
 from pathlib import Path
 
 from models import Artifact, VaultInput, VaultOutput
-from temporalio import activity
+
+from kontra import activity
 
 
 @activity.defn
