@@ -614,7 +614,7 @@ class Kontra:
         self._identity = identity
         #: Every job key this machine holds, plus any made during this client's life. age
         #: tries each stanza against each identity, so one client reads any job it hired;
-        #: `kontra accept` shreds a key and shortens the list.
+        #: `kontra job <id> --accept` shreds a key and shortens the list.
         self._job_identities: list[str] = Profile.job_identities(session.identity_home)
         self.start_timeout = start_timeout
         self._keys = _CheckedSellerKeys(session.gate, self.contract)

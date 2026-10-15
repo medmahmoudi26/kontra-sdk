@@ -1,4 +1,4 @@
-"""``kontra recipients add|list|revoke``: the age keys a party can be encrypted to.
+"""``kontra recipients``: the age keys a party can be encrypted to (add, list, revoke).
 
 Not ``kontra keys``, which is API keys (``kontra/cli/_keys.py``). The two are deliberately
 separate words for deliberately separate things: **an API key authenticates, a recipient

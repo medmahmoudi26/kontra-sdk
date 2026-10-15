@@ -19,7 +19,7 @@ door you use.
 
 ```sh
 pip install kontra-sdk
-kontra login --email you@example.com   # a sign-in link by mail; makes this machine's age key
+kontra login --email you@example.com   # a sign-in link by mail
 kontra topup 25                        # a checkout link; under `kontra dev`, play money at once
 kontra balance
 ```
@@ -34,10 +34,28 @@ sign-in always starts from the command, and against a gate that signs in by emai
 `kontra login` says so. Both talk to `https://api.kontra.run` unless `--gate` or
 `KONTRA_GATE` names another gate.
 
-`kontra login` writes `~/.kontra/profile` and `~/.kontra/key` (both mode 0600). The key is
-your private age identity: deliveries are encrypted to it and nobody else, Kontra included,
-holds a copy. Set `KONTRA_HOME` to keep a profile elsewhere. For a local marketplace,
-`kontra dev` logs you in to its gate instead (see [sellers.md](sellers.md#running-locally-kontra-dev)).
+`kontra login` writes `~/.kontra/profile` (mode 0600) and adds this machine as one of your
+party's encryption recipients. Set `KONTRA_HOME` to keep a profile elsewhere. For a local
+marketplace, `kontra dev` logs you in to its gate instead
+(see [sellers.md](sellers.md#running-locally-kontra-dev)).
+
+**Buying needs no key setup at all.** `kontra hire` makes a fresh age keypair for each job,
+writes the secret half to `~/.kontra/jobs/<job_id>.key` (mode 0600), and sends the public
+half with the request; the gate signs *that* into the hold token, so the seller encrypts the
+delivery to the job and to nothing else. `kontra job <id> --result` decrypts with it. So a
+fresh machine, or CI holding only `KONTRA_API_KEY`, can hire and read results — and a
+machine that is compromised yields the jobs it currently holds, not every delivery you have
+ever received.
+
+`kontra job <id> --accept` shreds the job's key once the escrow is released. That is the
+point of it: after you accept, the ciphertext the gate and the bucket still hold is readable
+by nobody, including you. Two consequences worth knowing before you rely on it:
+
+- **The key lives on the machine that hired.** Hire on a laptop and read the result on a
+  desktop and it will not open; copy `~/.kontra/jobs/<job_id>.key` across, or do both on one
+  machine. Sharing job keys through the gate is designed but not built.
+- **Keep the key if you may dispute later.** `--accept` is what deletes it, so accept when
+  you are done with the delivery, not as a reflex.
 
 ### Programs: API keys
 
