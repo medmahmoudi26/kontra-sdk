@@ -6,7 +6,10 @@
 name: security
 
 on:
+  # Pushes to dev, and every pull request: a pull request's branch is scanned once, by its
+  # pull_request run, not a second time by its push.
   push:
+    branches: [dev]
   pull_request:
   schedule:
     - cron: "23 4 * * 1"

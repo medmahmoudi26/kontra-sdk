@@ -66,9 +66,9 @@ reaches the caller's namespace as Temporal's internal principal, which the Autho
 allow. Temporal v1.32.1 compares the token's request id with the operation's **only when the
 token has one**. Without the guard, any seller hired by the same buyer workflow as acme
 could rewrite its own token to name acme's operation (event ids are small integers), drop
-the request id, and deliver any result as acme's — the wire suite did exactly that before
-the guard existed (`test_another_seller_cannot_forge_*`). The same works against a
-standalone operation whose id the forger knows.
+the request id, and deliver any result as acme's — a wire probe did exactly that before
+the guard existed (the working probe is kept private, outside this repository). The same
+works against a standalone operation whose id the forger knows.
 
 `callbackguard.Intercept` runs on both frontends after authorization. For every caller but
 the internal principal it accepts a completion callback, on any API that can carry one
