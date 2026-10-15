@@ -315,7 +315,8 @@ class Worker:
         client (default: the session's). The last three exist for tests.
 
         ``runtime`` and ``interceptors``: ``Client.connect``'s, for the connection this
-        worker makes (``kontra serve --metrics`` / ``--otlp``). A ``client`` given has its
+        worker makes. They are how ``kontra serve --metrics`` / ``--otlp`` reach it, not a
+        setting of ``worker.py`` (``Worker()`` takes neither). A ``client`` given has its
         own, so passing them with one is a ``TypeError``.
         """
         if self._stack is not None:

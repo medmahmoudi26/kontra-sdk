@@ -86,6 +86,22 @@ def test_construction_does_no_io(bound: Any) -> None:
     assert w.options == {"activities": [shout], "max_concurrent_activities": 4}
 
 
+async def test_a_client_passed_in_takes_no_runtime_or_interceptors(bound: Any) -> None:
+    """``runtime`` and ``interceptors`` (``kontra serve --metrics`` / ``--otlp``) are for the
+    connection the worker makes; a client passed in has its own, so asking for both is a
+    mistake, refused before anything starts."""
+    from temporalio.runtime import Runtime
+
+    w = Worker(offerings=[bound], activities=[shout])
+    client: Any = object()  # never used: the refusal comes first
+    with pytest.raises(TypeError, match="a client passed in has its own"):
+        await w.prepare(client=client, runtime=Runtime.default())
+    with pytest.raises(TypeError, match="a client passed in has its own"):
+        await w.run_async(client=client, interceptors=[Interceptor()], handle_signals=False)
+    assert w.client is None
+    assert w.inner_workers == ()
+
+
 # --------------------------------------------------------------------------- acceptance 10
 
 
