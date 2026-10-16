@@ -223,6 +223,59 @@ async def test_several_pending_confirmations_and_every_one_resumes(prod: Gate) -
     assert first_mail.link != second_mail.link
 
 
+# --------------------------------------------------------------------------- the operator
+
+
+async def test_the_operator_asks_sign_ins_to_confirm_again(prod: Gate) -> None:
+    """:meth:`FakeGate.require_confirmation`, as the platform's ``python -m gate.admin
+    require-confirmation``: well inside the hour, a change of an asked sign-in needs a
+    confirmation later than the request (the sign-in, or one from before, no longer counts),
+    then lands, and a second change asks nothing. Reads go on, nobody is signed out, no sign-in
+    time moves, a key's session is never asked; refusals change nothing."""
+    laptop = await prod.email_sign_in()
+    phone = await prod.email_sign_in(client="198.51.100.7")
+    created = await laptop.client.create_api_key("ci")
+    key_session = prod.gate.api_keys[created.id].session_id
+    signed_in = {sid: s.auth_time for sid, s in prod.gate.sessions.items()}
+
+    assert prod.gate.require_confirmation("ann", laptop.session_id[:12]) == [laptop.session_id[:12]]
+    assert await _need(laptop.client.create_api_key("asked")) == m.ConfirmationRequired(
+        confirm_with="email", confirm_ttl_seconds=3600
+    )
+    assert len((await laptop.client.api_keys()).keys) == 1  # reads ask for nothing
+    assert (await phone.client.create_api_key("phone")).label == "phone"  # not asked
+    start = await _confirm(prod, laptop)
+    polled = await laptop.client.confirm_status(start.confirm_id)
+    assert polled.confirmed_until is not None
+    assert (await laptop.client.create_api_key("confirmed")).label == "confirmed"
+    prod.gate.advance(timedelta(minutes=30))
+    assert (await laptop.client.create_api_key("again")).label == "again"
+
+    # The whole party, again: the laptop's confirmation came before, so it no longer counts.
+    asked = prod.gate.require_confirmation("ann")
+    assert sorted(asked) == sorted([laptop.session_id[:12], phone.session_id[:12]])
+    await _need(laptop.client.create_api_key("laptop"))
+    await _need(phone.client.create_api_key("phone"))
+    polled = await laptop.client.confirm_status(start.confirm_id)
+    assert polled.confirmed_until is None
+    sessions = prod.gate.sessions
+    assert {sid: s.auth_time for sid, s in sessions.items() if sid in signed_in} == signed_in
+    assert not any(s.revoked for s in sessions.values())
+    assert sessions[key_session].confirm_required_at is None
+
+    before = {sid: s.confirm_required_at for sid, s in sessions.items()}
+    for party, prefix, why in (
+        ("bob", None, "no party 'bob'"),
+        ("ann", laptop.session_id[:7], "8 to 32 lower-case hex"),  # too short
+        ("ann", laptop.session_id[:12].upper(), "8 to 32 lower-case hex"),
+        ("ann", "f" * 12, r"no session\(s\) of ann"),  # 2**-48 of being a real one
+        ("ann", key_session[:12], "an API key's session can never confirm"),
+    ):
+        with pytest.raises(ValueError, match=why):
+            prod.gate.require_confirmation(party, prefix)
+    assert {sid: s.confirm_required_at for sid, s in sessions.items()} == before
+
+
 # --------------------------------------------------------------------------- the link
 
 

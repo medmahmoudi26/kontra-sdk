@@ -182,6 +182,7 @@ CONFIRM_RATE_PER_SESSION = 5
 CONFIRM_RATE_WINDOW = timedelta(hours=1)
 #: Settled confirmations are forgotten this long after they expire.
 CONFIRM_PURGE_AFTER = timedelta(days=1)
+_SESSION_PREFIX = re.compile(r"[0-9a-f]{8,32}", re.ASCII)
 _CONFIRM_ID = re.compile(r"cfm_[0-9a-f]{32}", re.ASCII)
 #: How a sign-in proved who it is (``via``), in words, as the console and the mail say it.
 VIA_WORDS = {
@@ -372,6 +373,9 @@ class Principal:
     #: When the person last confirmed it's them for this session (None: never; the sign-in
     #: itself, ``auth_time``, counts as one).
     confirmed_at: datetime | None = None
+    #: When the operator asked this session to confirm again (:meth:`FakeGate.require_confirmation`;
+    #: None: never).
+    confirm_required_at: datetime | None = None
 
 
 @dataclass
@@ -408,6 +412,9 @@ class _Session:
     created_at: datetime | None = None
     #: The last completed confirmation of this session (decisions I23); never a key's.
     confirmed_at: datetime | None = None
+    #: When the operator asked it to confirm again (``gate.admin require-confirmation``):
+    #: no change until a later confirmation. Never a key's.
+    confirm_required_at: datetime | None = None
 
     @property
     def revoked(self) -> bool:
@@ -1033,6 +1040,7 @@ class FakeGate:
             api_key=session.via == "api_key",
             via=session.via,
             confirmed_at=session.confirmed_at,
+            confirm_required_at=session.confirm_required_at,
         )
 
     @property
@@ -1040,10 +1048,15 @@ class FakeGate:
         """Deprecated: :attr:`confirm_ttl`."""
         return self.confirm_ttl
 
-    def confirmed_until(self, who: Principal | _Session) -> datetime:
+    def confirmed_until(self, who: Principal | _Session) -> datetime | None:
         """Until when ``who``'s session may make changes: its sign-in or its last completed
-        confirmation, whichever is later, plus :attr:`confirm_ttl` (decisions I23)."""
-        since = max(who.auth_time, who.confirmed_at or who.auth_time)
+        confirmation, whichever is later, plus :attr:`confirm_ttl` (decisions I23). None --
+        no change at any time -- while the operator's request
+        (:meth:`require_confirmation`) is not followed by a confirmation."""
+        required, confirmed = who.confirm_required_at, who.confirmed_at
+        if required is not None and (confirmed is None or confirmed <= required):
+            return None
+        since = max(who.auth_time, confirmed or who.auth_time)
         return since + self.confirm_ttl
 
     def require_human(self, who: Principal) -> Principal:
@@ -1063,7 +1076,8 @@ class FakeGate:
         change. The API-key test comes first; the 403 says how this session can confirm, and
         comes before the route does anything, so a client confirms and sends it again."""
         self.require_human(who)
-        if self.now() < self.confirmed_until(who):
+        until = self.confirmed_until(who)
+        if until is not None and self.now() < until:
             return who
         need = m.ConfirmationRequired(
             confirm_with=self.confirm_channel(who),
@@ -1386,6 +1400,40 @@ class FakeGate:
         if session is None or session.party != who.party or session.via == "api_key":
             raise GateHTTPError(404, "not_found", "no such session")
         self.revoke_session(session_id)
+
+    def require_confirmation(self, party: str, session: str | None = None) -> list[str]:
+        """Ask ``party``'s live sign-ins -- or the one whose id starts with ``session`` (8 to
+        32 lower-case hex characters) -- to confirm it's them before their next change, as
+        ``python -m gate.admin require-confirmation`` does: until a later confirmation every
+        change answers 403 ``confirmation_required``; reads go on. Signs nobody out, never
+        moves ``auth_time`` and never touches an API key's session. Returns the 12-character
+        id prefixes asked, by sign-in time; ``ValueError`` (nothing changed) for an unknown
+        party, a malformed prefix, or one naming no session of the party, more than one, an
+        API key's or one signed out."""
+        if session is not None and _SESSION_PREFIX.fullmatch(session) is None:
+            raise ValueError("--session takes 8 to 32 lower-case hex characters of a sign-in's id")
+        if party not in self.parties:
+            raise ValueError(f"no party {party!r}")
+        mine = [s for s in self.sessions.values() if s.party == party]
+        if session is not None:
+            found = [s for s in mine if s.id.startswith(session)]
+            if len(found) != 1:
+                raise ValueError(
+                    f"{len(found) or 'no'} session(s) of {party} have an id starting {session}"
+                )
+            if found[0].via == "api_key":
+                raise ValueError("an API key's session can never confirm (revoke the key)")
+            if found[0].revoked:
+                raise ValueError("that sign-in is signed out already")
+            mine = found
+        asked = sorted(
+            (s for s in mine if not s.revoked and s.via != "api_key"),
+            key=lambda s: (s.auth_time, s.id),
+        )
+        now = self.now()
+        for s in asked:
+            s.confirm_required_at = now
+        return [s.id[:12] for s in asked]
 
     # ------------------------------------------------------------------ magic links
 
@@ -1727,7 +1775,9 @@ class FakeGate:
             status = "expired"
         until = self.confirmed_until(self.sessions[who.session_id])
         return m.ConfirmStatus(
-            confirm_id=found.id, status=status, confirmed_until=until if now < until else None
+            confirm_id=found.id,
+            status=status,
+            confirmed_until=until if until is not None and now < until else None,
         )
 
     def pending_confirm_codes(self) -> list[str]:
