@@ -274,6 +274,26 @@ async def test_job_result_progress_and_reject(shop: Shop) -> None:
     assert view["escrow"] == "disputed"
 
 
+async def test_job_result_still_reads_once_the_version_is_retired(shop: Shop) -> None:
+    """A job outlives its version (decisions I22): retired after the delivery, the version
+    still answers its exact lookup, so `kontra job --result` reads the job; nobody can quote
+    it again."""
+    buyer = await shop.buyer()
+    job_id = (await buyer.json("hire", shop.key, "-f", str(shop.input_file)))["job_id"]
+    await buyer.ok("job", job_id, "--result", str(shop.root / f"result-{job_id}"))
+    row = shop.mp.gate.offerings[shop.key]
+    row.retired = True
+    try:
+        out = shop.root / f"retired-{job_id}"
+        await buyer.ok("job", job_id, "--result", str(out))
+        assert json.loads((out / "result.json").read_text())["words"] == 11
+        refused = await buyer.run("quote", shop.key, "-f", str(shop.input_file))
+        assert refused.exit_code == 1, explain(refused)
+        assert f"{shop.key} is retired" in refused.stderr
+    finally:
+        row.retired = False
+
+
 async def test_job_cancel_refunds(shop: Shop) -> None:
     """A slow version of the shop (a timer before the work): cancel before delivery."""
     slow = shop.root / "slow"

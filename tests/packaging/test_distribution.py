@@ -68,6 +68,7 @@ def test_the_wheel_has_what_kontra_dev_and_the_contract_read(dist: Path) -> None
         "kontra/_dev/docs/dashboards/server-general.json",
         "kontra/_dev/docs/dashboards/LICENSE",
         "kontra/_spec/x-kontra.v2.json",
+        "kontra/_spec/x-kontra.v1.json",  # read-only, for the jobs hired under it
         "kontra/_spec/kontra-types.v1.json",
         "kontra/templates/offering/worker.py.tmpl",
         "kontra/testing/fake_gate.py",
@@ -87,7 +88,7 @@ def test_the_metadata_is_what_pypi_shows(dist: Path) -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     assert "Name: kontra-sdk\n" in meta
     assert f"Version: {project['version']}\n" in meta
-    assert "Version: 0.2.0\n" in meta
+    assert "Version: 0.2.1\n" in meta
     assert "Requires-Python: >=3.11\n" in meta
     assert "License-Expression: Apache-2.0\n" in meta
     assert "Project-URL: Homepage, https://kontra.run\n" in meta

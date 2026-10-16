@@ -501,7 +501,9 @@ class GateClient:
 
     async def get_offering(self, ref: str) -> m.CatalogEntry:
         """``ref`` is ``acme/enrich``, ``acme/enrich@1``, ``@1.2`` or exact; the gate resolves
-        partial versions to the latest match (path version ``latest``, ``1``, ``1.2``, ``1.2.0``)."""
+        partial versions to the latest match (path version ``latest``, ``1``, ``1.2``, ``1.2.0``)
+        among the visible versions. An exact version is answered retired too
+        (``entry.retired``): the jobs hired under it name it (decisions I22)."""
         return await self._model("get_offering", m.CatalogEntry, path=_ref_path(ref))
 
     async def card(self, ref: str) -> dict[str, Any]:

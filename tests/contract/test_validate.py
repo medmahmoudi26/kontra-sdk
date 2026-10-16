@@ -11,8 +11,10 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from jsonschema import Draft202012Validator
 
-from kontra.contract import ContractError, seal, validate_document
+from kontra.contract import ContractError, from_yaml, seal, validate_document
 from kontra.contract.validate import MAX_CANONICAL_BYTES
+
+from .conftest import HERE, PUBLIC_KEY
 
 Doc = dict[str, Any]
 Mutation = Callable[[Doc], Any]
@@ -670,6 +672,81 @@ def test_x_kontra_must_be_an_object(enrich_doc: Doc) -> None:
     with pytest.raises(ContractError) as info:
         validate_document(doc)
     assert info.value.path == "x-kontra"
+
+
+# --------------------------------------------------------------------------- spec v1, read-only
+
+
+#: A valid key other than PUBLIC_KEY (the example key kontra 0.1.0 sealed hello with).
+_ANOTHER_KEY = "age1lmxatsm78mm3tnsr7syhsc5tfetvrm2aqpur9cxl8gcymp0uufes0yme79"
+
+
+def _v1(doc: Doc, **facts: Any) -> Doc:
+    """``doc`` as spec v1 sealed it before 0.2.0: the seller's key in x-kontra, under the hash."""
+    return seal({**doc, "x-kontra": {**doc["x-kontra"], "public_key": PUBLIC_KEY, **facts}})
+
+
+def test_a_v1_document_is_read_back_only_when_asked(enrich_doc: Doc) -> None:
+    """A job hired before 0.2.0 names a contract sealed under spec v1. Its buyer reads it
+    back (read_only); publishing, serving, quoting and hiring take spec v2 only."""
+    v1 = _v1(enrich_doc)
+    with pytest.raises(ContractError) as refused:
+        validate_document(v1)
+    assert refused.value.path == "x-kontra"
+    assert "public_key" in refused.value.message
+    info = validate_document(v1, read_only=True)
+    assert info.spec_version == 1
+    assert info.contract_hash == v1["x-kontra"]["contract_hash"]  # the hash the job stores
+    assert info.contract_hash != enrich_doc["x-kontra"]["contract_hash"]
+    assert info.document == v1
+    assert (info.offering.key, info.input_type) == ("acme/enrich@1.2.0", "EnrichInput")
+    assert validate_document(enrich_doc, read_only=True).spec_version == 2
+    assert validate_document(enrich_doc).spec_version == 2
+
+
+def test_a_v1_document_of_kontra_0_1_0_reads_back() -> None:
+    doc = from_yaml((HERE / "fixtures" / "hello.v1.contract.yaml").read_text())
+    with pytest.raises(ContractError):
+        validate_document(doc)
+    info = validate_document(doc, read_only=True)
+    assert (info.spec_version, info.offering.key) == (1, "acme/hello@0.1.0")
+    assert info.contract_hash == doc["x-kontra"]["contract_hash"]
+
+
+@pytest.mark.parametrize(
+    ("facts", "path"),
+    [
+        ({"signer": "acme"}, "x-kontra"),  # unknown to both specs
+        ({"uses_hosted_model": True}, "x-kontra"),  # a v2 member: v1 never had it
+        ({"public_key": "age1nope"}, "x-kontra.public_key"),
+        ({"public_key": PUBLIC_KEY[:-1] + "q"}, "x-kontra.public_key"),  # its checksum fails
+        ({"public_key": 1}, "x-kontra.public_key"),
+    ],
+)
+def test_read_only_loosens_nothing_but_the_key(
+    enrich_doc: Doc, facts: dict[str, Any], path: str
+) -> None:
+    """Read-only checks a v1 block against the v1 rules it was published under (the schema,
+    and the key's checksum): not looser ones, and not v2 minus one member."""
+    with pytest.raises(ContractError) as info:
+        validate_document(_v1(enrich_doc, **facts), read_only=True)
+    assert info.value.path == path, info.value
+
+
+def test_read_only_still_binds_the_hash(enrich_doc: Doc) -> None:
+    v1 = _v1(enrich_doc)
+    for edited in (
+        {**v1, "x-kontra": {**v1["x-kontra"], "description": "Say bye"}},
+        {**v1, "x-kontra": {**v1["x-kontra"], "public_key": _ANOTHER_KEY}},  # the key is sealed
+    ):
+        with pytest.raises(ContractError) as info:
+            validate_document(edited, read_only=True)
+        assert info.value.path == "x-kontra.contract_hash"
+    unsealed = copy.deepcopy(v1)
+    del unsealed["x-kontra"]["contract_hash"]
+    with pytest.raises(ContractError) as info:
+        validate_document(unsealed, read_only=True)
+    assert info.value.path == "x-kontra.contract_hash"
 
 
 # --------------------------------------------------------------------------- hostile input

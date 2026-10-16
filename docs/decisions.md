@@ -627,3 +627,32 @@ its internal client (no Authorizer change), and answers
 - **The MCP server shows it.** The issue names it next to `kontra status --workers`, so
   `kontra mcp` has a ninth tool, `workers`, read-only, for the caller's own versions; the
   eight of §7.3 are unchanged (I5).
+
+## I22. A job's contract stays readable
+
+A job names the exact version it was hired under (`acme/enrich@1.2.0`), and its buyer checks
+the delivery against that version's contract (§11.3). That version is a historical fact:
+neither retiring it nor a later spec may make the job unreadable. The release of 0.2.0 did
+both at once. The platform retired every version whose document spec v1 had sealed (with the
+seller's `public_key`, I7), the catalog answered visible versions only, and the SDK checked a
+document against spec v2 only, so every job hired before the release failed
+`kontra job <id> --result` with "no such offering" (2026-10-16). Nothing was lost; nothing
+could be read.
+
+* **An exact version is answered retired too.** Both gates answer
+  `GET /v1/catalog/{party}/{name}/{version}` (and its card) for an exact version with
+  `retired: true`, once its endpoint was confirmed. A partial version, `latest`, search,
+  `GET /v1/endpoints/{e}`, quotes and hires stay visible-only, so nothing points a buyer at a
+  retired version again, and the SDK refuses one itself (`HireRefused` `offering_retired`).
+* **A retired version is never rewritten.** Publishing another document under it is 409
+  `version_retired`: its document is the only copy of the contract its jobs were hired under
+  (a job stores the hash).
+* **Spec v1 is read-only.** `spec/x-kontra.v1.json` is back, byte for byte.
+  `validate_document(doc, read_only=True)` checks a block that carries `public_key` against
+  it, and the key's checksum as 0.1.0 did -- not against v2 minus one member -- and applies
+  every other rule and the hash check as before; the result says `spec_version=1`. Only a delivery is checked that way
+  (`Kontra._job_contract`, with a cache of its own): publish, serve, quote and hire take
+  spec v2 only, and the key a v1 document seals is never encrypted to.
+* A delivery made before 0.2.0 is encrypted to the buyer machine's key of then (the
+  profile's `key` file), not to a per-job key, and that is the identity the SDK decrypts
+  with first, so it needs nothing new.

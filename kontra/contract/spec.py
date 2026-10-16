@@ -19,6 +19,7 @@ __all__ = [
     "KONTRA_TYPES_FILE",
     "RESERVED_PREFIX",
     "X_KONTRA_FILE",
+    "X_KONTRA_V1_FILE",
     "find_spec_dir",
     "kontra_types",
     "reserved_def",
@@ -28,6 +29,10 @@ __all__ = [
 ]
 
 X_KONTRA_FILE = "x-kontra.v2.json"
+#: The spec every document published before 0.2.0 was sealed under (it seals the seller's
+#: ``public_key``). Read-only: such a document is read back for the jobs hired under it,
+#: never published, quoted or hired (``validate_document(..., read_only=True)``).
+X_KONTRA_V1_FILE = "x-kontra.v1.json"
 KONTRA_TYPES_FILE = "kontra-types.v1.json"
 #: Definitions whose name starts with this belong to the spec, never to a seller.
 RESERVED_PREFIX = "Kontra"
@@ -60,9 +65,12 @@ def _load(name: str) -> dict[str, Any]:
     return data
 
 
-def x_kontra_schema() -> dict[str, Any]:
-    """``spec/x-kontra.v2.json`` (a fresh copy; callers may mutate it)."""
-    return copy.deepcopy(_load(X_KONTRA_FILE))
+def x_kontra_schema(version: int = 2) -> dict[str, Any]:
+    """``spec/x-kontra.v2.json``, or ``v1`` to read an old document back (a fresh copy;
+    callers may mutate it)."""
+    if version not in (1, 2):
+        raise ValueError(f"no x-kontra spec v{version}")
+    return copy.deepcopy(_load(X_KONTRA_FILE if version == 2 else X_KONTRA_V1_FILE))
 
 
 def kontra_types() -> dict[str, Any]:

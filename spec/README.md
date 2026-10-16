@@ -7,6 +7,7 @@ here in a checkout, from `kontra/_spec` in the wheel) and never keeps a second c
 | File | What it fixes |
 |---|---|
 | `x-kontra.v2.json` | JSON Schema 2020-12 of the `x-kontra` block: the offering facts Kontra adds at the root of a contract document (PRD §11.1). |
+| `x-kontra.v1.json` | The same block before 0.2.0, which also sealed the seller's `public_key`. Read-only: a v1 document is read back for the jobs hired under it, never published, quoted or hired (decisions I22). |
 | `kontra-types.v1.json` | The canonical bodies of the reserved definitions `KontraArtifact` and `KontraQuote` (decisions I2). |
 
 ## The contract document
@@ -22,7 +23,7 @@ services:
       quote:   {fqn: quote,   input: {$ref: "#/$defs/EnrichInput"}, output: {$ref: "#/$defs/KontraQuote"}}
       execute: {fqn: execute, input: {$ref: "#/$defs/EnrichInput"}, output: {$ref: "#/$defs/EnrichOutput"}}
 $defs: {EnrichInput: ..., EnrichOutput: ..., KontraArtifact: ..., KontraQuote: ...}
-x-kontra: {name: acme/enrich, version: "1.2.0", ..., public_key: age1..., contract_hash: "sha256:..."}
+x-kontra: {name: acme/enrich, version: "1.2.0", ..., contract_hash: "sha256:..."}
 ```
 
 Operations carry an explicit `fqn` because nexgen would otherwise put `Quote` and

@@ -5,6 +5,7 @@ endpoint back to its offering."""
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from datetime import timedelta
 
 import pytest
@@ -127,6 +128,68 @@ async def test_lookups_resolve_partial_versions_to_the_latest(world: World) -> N
         with pytest.raises(GateError) as e:
             await anon.get_offering(missing)
         assert e.value.code == "offering_not_found"
+
+
+async def test_a_retired_version_is_answered_at_its_exact_version_only(world: World) -> None:
+    """As the gate's catalog.lookup: the exact version a job names is a historical fact, so
+    it is answered retired too (decisions I22); nothing points a buyer at it again."""
+    acme, buyer = await world.party("acme"), await world.party()
+    await world.publish(acme)
+    newer = await world.publish(acme, version="1.1.0")
+    world.control.responder = lambda p, h: ok_quote(100)
+    q = await buyer.gate.quote("acme/enrich@1.1.0", wire(json_payload({"text": "x"})))
+    assert q.quote_id is not None
+    world.gate.offerings["acme/enrich@1.1.0"].retired = True
+
+    anon = world.anon()
+    entry = await anon.get_offering("acme/enrich@1.1.0")
+    assert (entry.retired, entry.contract_hash, entry.document) == (
+        True,
+        newer.contract_hash,
+        newer.document,
+    )
+    assert (await anon.card("acme/enrich@1.1.0"))["version"] == "1.1.0"
+    assert (await anon.get_offering("acme/enrich")).offering == "acme/enrich@1.0.0"
+    assert (await anon.get_offering("acme/enrich@1")).offering == "acme/enrich@1.0.0"
+    assert not (await anon.get_offering("acme/enrich@1.0.0")).retired
+    assert [i.offering for i in (await anon.search("enrich")).items] == ["acme/enrich@1.0.0"]
+
+    async def refusal(call: Awaitable[object]) -> tuple[int, str]:
+        with pytest.raises(GateError) as e:
+            await call
+        return e.value.status, e.value.code
+
+    assert await refusal(anon.get_offering("acme/enrich@1.1")) == (404, "offering_not_found")
+    assert await refusal(anon.by_endpoint(newer.endpoint)) == (404, "endpoint_not_found")
+    quote = buyer.gate.quote("acme/enrich@1.1.0", wire(json_payload({"text": "x"})))
+    assert await refusal(quote) == (404, "offering_not_found")
+    hire = buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
+    assert await refusal(hire) == (409, "offering_unavailable")
+
+
+async def test_a_retired_version_is_never_rewritten(world: World) -> None:
+    """Its document is the only copy of the contract its jobs were hired under."""
+    acme = await world.party("acme")
+    entry = await world.publish(acme)
+    world.gate.offerings[entry.offering].retired = True
+    with pytest.raises(GateError) as e:
+        await world.publish(acme, description="Upper-cases text, quickly")
+    assert (e.value.status, e.value.code) == (409, "version_retired")
+    assert e.value.detail == {"contract_hash": entry.contract_hash}
+    again = await world.publish(acme)  # the same contract: nothing is rewritten
+    assert (again.contract_hash, again.retired) == (entry.contract_hash, True)
+    assert (await world.anon().get_offering(entry.offering)).contract_hash == entry.contract_hash
+
+
+async def test_an_exact_version_never_confirmed_is_not_found(world: World) -> None:
+    """A row whose endpoint was never created is an unfinished publish nobody hired."""
+    acme = await world.party("acme")
+    world.control.fail_endpoints = TemporalError("frontend down")
+    with pytest.raises(GateError):
+        await world.publish(acme)
+    with pytest.raises(GateError) as e:
+        await world.anon().get_offering("acme/enrich@1.0.0")
+    assert (e.value.status, e.value.code) == (404, "offering_not_found")
 
 
 @pytest.mark.parametrize(
