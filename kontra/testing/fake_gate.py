@@ -1658,6 +1658,15 @@ class FakeGate:
             self.offerings[oid.key] = row
             self._by_endpoint[row.endpoint] = oid.key
         elif row.info.contract_hash != info.contract_hash:
+            if row.retired:
+                # Its contract is what its jobs were hired under, and the only copy of it
+                # (a job stores the hash): a retired version is never rewritten.
+                raise GateHTTPError(
+                    409,
+                    "version_retired",
+                    f"{oid.key} is retired; publish a new version instead",
+                    {"contract_hash": row.info.contract_hash},
+                )
             open_jobs = len(self._open_jobs(oid.key))
             if open_jobs:
                 raise GateHTTPError(
@@ -1687,19 +1696,33 @@ class FakeGate:
         row.endpoint_ready = True
         return self.catalog_entry(row)
 
-    def resolve_ref(self, ref: OfferingRef) -> _Offering | None:
-        """The highest visible version ``ref`` accepts (§7.4)."""
+    def resolve_ref(self, ref: OfferingRef, *, visible_only: bool = True) -> _Offering | None:
+        """The highest visible version ``ref`` accepts (§7.4); with ``visible_only=False``,
+        the highest of every version ever published, retired and unconfirmed ones too."""
+        rows = self._visible() if visible_only else self.offerings.values()
         candidates = [
             o
-            for o in self._visible()
+            for o in rows
             if o.id.party == ref.party and o.id.name == ref.name and ref.matches(o.id.version)
         ]
         return max(candidates, key=lambda o: o.id.version) if candidates else None
 
+    def lookup(self, ref: OfferingRef) -> _Offering | None:
+        """What ``GET /v1/catalog/{party}/{name}/{version}`` (and its card) answers, as the
+        gate's ``catalog.lookup``. An exact version is a historical fact -- every job hired
+        under it names it, and its buyer and seller read its contract to open the job -- so
+        it is answered retired too (``retired: true``), once its endpoint was confirmed. A
+        partial version or ``latest`` chooses among the visible versions only, as quotes,
+        hires and search do: a retired version is never what a buyer is pointed at."""
+        if ref.exact is None:
+            return self.resolve_ref(ref)
+        found = self.resolve_ref(ref, visible_only=False)
+        return found if found is not None and found.endpoint_ready else None
+
     def resolve_path(self, party: str, name: str, version: str) -> _Offering:
         """The catalog path ``/{party}/{name}/{version}``, each segment validated on its own
         and the reference built from the parts (never joined and re-parsed)."""
-        found = self.resolve_ref(_path_ref(party, name, version))
+        found = self.lookup(_path_ref(party, name, version))
         if found is None:
             raise GateHTTPError(404, "offering_not_found", "no such offering")
         return found

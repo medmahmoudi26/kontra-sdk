@@ -33,7 +33,7 @@ from referencing.jsonschema import DRAFT202012
 from kontra.contract import spec as _spec
 from kontra.contract.canonical import canonical_json, check_json_value, contract_hash
 from kontra.contract.errors import ROOT, ContractError, join_path
-from kontra.contract.facts import XKontra
+from kontra.contract.facts import XKontra, check_public_key
 from kontra.contract.formats import FORMATS, ContractValidator, format_checker, pattern_problem
 from kontra.contract.names import OfferingId
 
@@ -165,6 +165,9 @@ class ContractInfo:
     document: dict[str, Any]
     input_type: str
     output_type: str
+    #: The x-kontra spec the document was sealed under. 1 only from
+    #: ``validate_document(..., read_only=True)``: such a contract is read, never hired.
+    spec_version: int = 2
 
 
 # --------------------------------------------------------------------------- helpers
@@ -605,11 +608,16 @@ def _check_annotations(schema: Mapping[str, Any], path: str) -> None:
 # --------------------------------------------------------------------------- the rules
 
 
-def _check_facts(doc: Mapping[str, Any]) -> XKontra:
+def _check_facts(doc: Mapping[str, Any], *, read_only: bool) -> tuple[XKontra, int]:
+    """The facts, and the spec version they were checked against."""
     block = doc["x-kontra"]
     if not isinstance(block, dict):
         raise ContractError("x-kontra", "must be an object")
-    schema = _spec.x_kontra_schema()
+    # Spec v1 sealed the seller's key, which v2 refuses. A v1 document is read back only
+    # for the jobs hired under it (read_only), and against the v1 schema it was published
+    # under -- never a looser one: any other unknown member is refused as before.
+    version = 1 if read_only and "public_key" in block else 2
+    schema = _spec.x_kontra_schema(version)
     registry: Registry[Any] = Registry(retrieve=_no_retrieval).with_resource(
         schema["$id"], DRAFT202012.create_resource(schema)
     )
@@ -619,6 +627,12 @@ def _check_facts(doc: Mapping[str, Any]) -> XKontra:
     )  # pyright: ignore[reportUnknownArgumentType]
     if error is not None:
         raise ContractError(join_path("x-kontra", *error.absolute_path), error.message)
+    if version == 1:  # the key is the only v1 member XKontra does not have
+        try:
+            check_public_key(block["public_key"])  # checksum included, as v1's model did
+        except ValueError as exc:
+            raise ContractError("x-kontra.public_key", str(exc)) from None
+        block = {k: v for k, v in block.items() if k != "public_key"}
     try:
         facts = XKontra.model_validate(block)
     except ValidationError as exc:
@@ -629,7 +643,7 @@ def _check_facts(doc: Mapping[str, Any]) -> XKontra:
         ) from None
     if facts.contract_hash is None:
         raise ContractError("x-kontra.contract_hash", "is missing: the document is not sealed")
-    return facts
+    return facts, version
 
 
 def _no_retrieval(uri: str) -> Resource[Any]:
@@ -771,9 +785,14 @@ def _check_metaschema(defs: Mapping[str, Any]) -> None:
         )
 
 
-def validate_document(doc: Mapping[str, Any]) -> ContractInfo:
+def validate_document(doc: Mapping[str, Any], *, read_only: bool = False) -> ContractInfo:
     """Apply every catalog rule; return what the document says, or raise
-    :class:`ContractError` naming the offending path."""
+    :class:`ContractError` naming the offending path.
+
+    ``read_only``: also accept a document sealed under spec v1 (``x-kontra.public_key``,
+    before 0.2.0), to read back the jobs hired under it. Every other rule and the hash
+    check are the same; the result says ``spec_version=1``, and nothing may publish, quote
+    or hire with it (decisions I22)."""
     if not isinstance(doc, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise ContractError(ROOT, "a contract document is a JSON object")
     check_json_value(doc, max_depth=MAX_DEPTH)
@@ -797,7 +816,7 @@ def validate_document(doc: Mapping[str, Any]) -> ContractInfo:
     if doc["$schema"] != DIALECT:
         raise ContractError("$schema", f"must be {DIALECT!r}")
 
-    facts = _check_facts(doc)
+    facts, spec_version = _check_facts(doc, read_only=read_only)
     offering = facts.offering_id
     defs = _check_defs(doc)
     input_type, output_type = _check_services(doc, offering, defs)
@@ -831,4 +850,5 @@ def validate_document(doc: Mapping[str, Any]) -> ContractInfo:
         document=document,
         input_type=input_type,
         output_type=output_type,
+        spec_version=spec_version,
     )

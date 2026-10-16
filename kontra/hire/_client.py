@@ -63,7 +63,7 @@ from kontra.artifacts import download, iter_plaintext, upload
 from kontra.auth import Session
 from kontra.codec import CodecError, GateBlobStore, KontraCodec, data_converter
 from kontra.codec import age as age_crypto
-from kontra.contract import ContractError, ContractInfo, InputValidator
+from kontra.contract import ContractError, ContractInfo, InputValidator, validate_document
 from kontra.contract.names import NameError_, is_job_id
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
@@ -632,6 +632,10 @@ class Kontra:
         self._entries: dict[str, m.CatalogEntry] = {}
         self._infos: dict[str, ContractInfo] = {}
         self._validators: dict[str, InputValidator] = {}
+        #: exact offering -> the contract its jobs' deliveries are checked against
+        #: (:meth:`_job_contract`). Apart from the caches above on purpose: a retired or
+        #: spec-v1 contract read here is never found by a quote or a hire.
+        self._job_contracts: dict[str, tuple[ContractInfo, InputValidator]] = {}
         self._runtime: _runtime.Runtime | None = None
         self._bound = False
         self._closed = False
@@ -767,7 +771,8 @@ class Kontra:
 
     async def offering(self, ref: str) -> m.CatalogEntry:
         """The catalog entry ``ref`` resolves to (``acme/enrich``, ``@1``, exact), with its
-        contract checked: the document's own hash, and the entry agreeing with it."""
+        contract checked: the document's own hash, and the entry agreeing with it. A retired
+        version is refused (``offering_retired``): it takes no new jobs."""
         await self._ready()
         entry = self._entries.get(ref)
         if entry is None:
@@ -780,6 +785,10 @@ class Kontra:
                 if mapped is None:
                     raise
                 raise mapped from err
+            if entry.retired:  # the gate answers an exact retired version, for its jobs
+                raise HireRefused(
+                    f"{entry.offering} is retired: it takes no new jobs", code="offering_retired"
+                )
             self.contract(entry)
             self._entries[entry.offering] = entry
         return entry
@@ -1400,13 +1409,57 @@ class Kontra:
             return TypeAdapter(output_type).validate_python(value)  # e.g. dict[str, Any]
         return wrap(value, info.output_schema, artifact=self._bind)
 
+    async def _job_contract(self, offering: str) -> tuple[ContractInfo, InputValidator]:
+        """The contract of ``offering``, the exact version a job was hired under, to check
+        its delivery against.
+
+        Unlike :meth:`offering`, a retired version is accepted -- the version a job names
+        is a historical fact its buyer must be able to read -- and so is a document sealed
+        under spec v1 (``x-kontra.public_key``, before 0.2.0; decisions I22). The checks are
+        :meth:`contract`'s otherwise: every catalog rule, the document's own hash, and the
+        entry agreeing with it. Nothing read here is used to quote, hire or encrypt."""
+        await self._ready()
+        found = self._job_contracts.get(offering)
+        if found is not None:
+            return found
+        try:
+            entry = await self.gate.get_offering(offering)
+        except NameError_ as err:
+            raise HireRefused(str(err), code="invalid_offering") from err
+        except GateError as err:
+            mapped = _refusal(err, offering)
+            if mapped is None:
+                raise
+            raise mapped from err
+        try:
+            info = validate_document(entry.document, read_only=True)
+            validator = InputValidator(info)
+        except ContractError as err:
+            raise HireRefused(
+                f"the catalog's contract for {offering} is invalid: {err}",
+                code="invalid_contract",
+            ) from err
+        if (
+            entry.offering != offering  # exact: never another version's contract
+            or info.contract_hash != entry.contract_hash
+            or info.offering.key != entry.offering
+            or info.facts.party != entry.party
+            or info.offering.service_name != entry.service
+        ):
+            raise HireRefused(
+                f"the catalog entry for {offering} does not match its contract",
+                code="invalid_contract",
+            )
+        self._job_contracts[offering] = (info, validator)
+        return info, validator
+
     async def _check_delivery(self, job_id: str, offering: str, value: Any) -> ContractInfo:
         """The contract ``value`` was checked against: a delivery is the seller's input to
-        us, and one that breaks the published output schema is :class:`InvalidDelivery`."""
-        entry = await self.offering(offering)
-        info = self.contract(entry)
+        us, and one that breaks the published output schema is :class:`InvalidDelivery`.
+        ``offering`` is the job's exact version, retired or not (:meth:`_job_contract`)."""
+        info, validator = await self._job_contract(offering)
         try:
-            self._validators[info.contract_hash].validate_output(value)
+            validator.validate_output(value)
         except ContractError as err:
             raise InvalidDelivery(
                 f"the delivery of job {job_id} does not match the contract of "

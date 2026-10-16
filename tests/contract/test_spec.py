@@ -31,7 +31,7 @@ def _without_docs(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def test_spec_files_are_json_schema_2020_12() -> None:
-    for name in (spec_mod.X_KONTRA_FILE, spec_mod.KONTRA_TYPES_FILE):
+    for name in (spec_mod.X_KONTRA_FILE, spec_mod.X_KONTRA_V1_FILE, spec_mod.KONTRA_TYPES_FILE):
         data = json.loads((ROOT / "spec" / name).read_text())
         Draft202012Validator.check_schema(data)
         assert data["$schema"] == "https://json-schema.org/draft/2020-12/schema"
