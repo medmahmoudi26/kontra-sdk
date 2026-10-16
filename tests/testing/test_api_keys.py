@@ -124,6 +124,12 @@ async def test_a_key_hires_and_serves_but_never_counts_as_fresh(world: World) ->
         program.end_session("0" * 32),
         program.confirm_start(),  # a key never confirms: there is no person behind it
         program.confirm_status("cfm_" + "0" * 32),
+        program.passkeys(),  # nor has a passkey (decisions I24)
+        program.passkey_options(),
+        program.add_passkey("wac_" + "0" * 32, "key", {"id": "x"}),
+        program.revoke_passkey("pky_" + "0" * 32),
+        program.confirm_passkey_options(),
+        program.confirm_passkey("wac_" + "0" * 32, {"id": "x"}),
     ):
         assert await _code(call) == (403, "fresh_login_required")
     assert {r.name for r in ROUTES if r.auth == "fresh"} == {
@@ -133,12 +139,18 @@ async def test_a_key_hires_and_serves_but_never_counts_as_fresh(world: World) ->
         "create_api_key",
         "revoke_api_key",
         "end_session",
+        "add_passkey",
+        "revoke_passkey",
     }
+    assert {r.name for r in ROUTES if r.auth == "recent"} == {"passkey_options"}
     assert {r.name for r in ROUTES if r.auth == "human"} == {
         "api_keys",
         "sessions",
         "confirm_start",
         "confirm_status",
+        "passkeys",
+        "confirm_passkey_options",
+        "confirm_passkey",
     }
 
 

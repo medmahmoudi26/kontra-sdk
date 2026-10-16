@@ -50,6 +50,27 @@ HEARTBEAT_B64 = base64.b64encode(b"\0" * (64 * 1024)).decode()
 #: A presigned URL with a session token runs past 2 KiB.
 URL = "https://bucket.example/" + "p" * 4096
 JWT = "e" * 4096
+#: A WebAuthn credential id at its largest (L3: 1023 bytes), as base64url.
+CREDENTIAL_ID = base64.urlsafe_b64encode(b"\0" * 1023).rstrip(b"=").decode()
+TRANSPORTS = ["usb", "nfc", "ble", "smart-card", "hybrid", "internal"]
+#: The browser's answer to a registration at its largest: the longest credential id, an RSA
+#: key, and an attestation with a certificate chain (``none`` is what the gates ask for; a
+#: browser may still send more).
+REGISTRATION = {
+    "id": CREDENTIAL_ID,
+    "rawId": CREDENTIAL_ID,
+    "type": "public-key",
+    "response": {
+        "clientDataJSON": "c" * 512,
+        "attestationObject": "a" * 12 * 1024,
+        "authenticatorData": "d" * 2048,
+        "transports": TRANSPORTS,
+        "publicKeyAlgorithm": -257,
+        "publicKey": "p" * 512,
+    },
+    "authenticatorAttachment": "cross-platform",
+    "clientExtensionResults": {"credProps": {"rk": True}},
+}
 CONTRACT = from_yaml(
     (Path(__file__).resolve().parents[2] / "examples/enrich/contract.yaml").read_text()
 )
@@ -253,6 +274,27 @@ def _largest_request(model: type[BaseModel]) -> dict[str, Any]:
         m.Topup: {"amount_minor": 10**12, "currency": "USD"},
         m.TemporalTokenRequest: {"role": "worker"},
         m.AcceptRequest: {},
+        m.PasskeyAdd: {
+            "ceremony_id": "wac_" + "0" * 32,
+            "label": "l" * 64,
+            "credential": REGISTRATION,
+        },
+        m.PasskeyConfirm: {
+            "ceremony_id": "wac_" + "0" * 32,
+            "credential": {
+                "id": CREDENTIAL_ID,
+                "rawId": CREDENTIAL_ID,
+                "type": "public-key",
+                "response": {
+                    "clientDataJSON": "c" * 512,
+                    "authenticatorData": "d" * 512,
+                    "signature": "s" * 512,
+                    "userHandle": "u" * 43,
+                },
+                "authenticatorAttachment": "platform",
+                "clientExtensionResults": {},
+            },
+        },
     }[model]
 
 
@@ -287,6 +329,8 @@ _BODY_LIMIT = {
         m.Topup,
         m.TemporalTokenRequest,
         m.AcceptRequest,
+        m.PasskeyAdd,
+        m.PasskeyConfirm,
     ],
 )
 def test_the_largest_legitimate_request_is_accepted(model: type[BaseModel]) -> None:
@@ -432,6 +476,41 @@ def test_the_largest_legitimate_responses_are_accepted() -> None:
         }
     )
     m.BlobUrl.model_validate({"sha256": SHA, "url": URL, "expires_at": NOW})
+    # Adding an eleventh passkey's options exclude ten, at the longest credential id each.
+    excluded = {"id": CREDENTIAL_ID, "type": "public-key", "transports": TRANSPORTS}
+    m.PasskeyCeremony.model_validate(
+        {
+            "ceremony_id": "wac_" + "0" * 32,
+            "rp_id": "r" * 253,
+            "options": {
+                "rp": {"name": "n" * 64, "id": "r" * 253},
+                "user": {"id": "u" * 43, "name": HANDLE, "displayName": HANDLE},
+                "challenge": "c" * 43,
+                "pubKeyCredParams": [{"type": "public-key", "alg": a} for a in (-8, -7, -257)],
+                "timeout": 300_000,
+                "excludeCredentials": [excluded] * m.MAX_PASSKEYS,
+                "authenticatorSelection": {
+                    "residentKey": "preferred",
+                    "requireResidentKey": False,
+                    "userVerification": "required",
+                },
+                "attestation": "none",
+            },
+            "expires_in": 360,
+        }
+    )
+    view = {
+        "id": "pky_" + "0" * 32,
+        "label": "l" * 64,
+        "created_at": NOW,
+        "added_by": "0" * 12,
+        "last_used_at": NOW,
+        "backed_up": True,
+        "transports": TRANSPORTS,
+        "revoked_at": NOW,
+        "revoked_by": "operator",
+    }
+    m.PasskeyList.model_validate({"rp_id": "r" * 253, "passkeys": [view] * 50})
     # A version's task queue at its largest: every type with a full listing of pollers,
     # each at Temporal's default identity limit and its build id limit, and an SDK name and
     # version as long as Control lets through (kontra._control fits a heartbeat's to 255).

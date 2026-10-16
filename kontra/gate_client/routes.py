@@ -11,15 +11,25 @@ adding a row here, in the same PR.
                    human login or from an API key.
 * ``human``     -- a party token whose session is a person's: an API key's session gets 403
                    ``fresh_login_required`` (decisions I19), a worker token 401. No age check:
-                   the reads of keys and sign-ins (decisions I23).
+                   the reads of keys, sign-ins and passkeys, and confirming, by mail or by a
+                   passkey (decisions I23, I24).
 * ``fresh``     -- ``human``, and the session is confirmed: a sign-in or a completed
                    confirmation (``POST /v1/auth/confirm``) within the gate's
                    ``KONTRA_CONFIRM_TTL`` (an hour), else 403 ``confirmation_required`` with
                    :class:`~kontra.gate_client.models.ConfirmationRequired` as its detail. The
                    API-key test comes first, so a key always gets ``fresh_login_required``.
                    The changes: making or revoking an API key or a recipient, ending a
-                   sign-in, publishing. The 403 is decided before the route does anything, so a
-                   client confirms in place and sends the same call once more (decisions I23).
+                   sign-in, publishing, revoking a passkey (and finishing adding one). The 403
+                   is decided before the route does anything, so a client confirms in place and
+                   sends the same call once more (decisions I23).
+* ``recent``    -- ``fresh``, and that sign-in or confirmation is less than
+                   ``RECENT_CONFIRMATION_SECONDS`` (five minutes) old, with no operator's or
+                   revocation's mark since: else the same 403 ``confirmation_required`` and
+                   :class:`~kontra.gate_client.models.ConfirmationRequired` detail, the API-key
+                   test first as for ``fresh``. Only starting to add a passkey: a passkey can
+                   confirm every change after it, so the hour of an old confirmation is not
+                   enough. A client that confirms in place for such a row must wait for *this*
+                   confirmation to complete, not for the session's hour (decisions I24).
 * ``worker``    -- the party's Temporal *worker* JWT, also accepted on seller routes so a
                    worker needs one credential (``kontra serve``).
 * ``resolver``  -- a party listed in the gate's ``KONTRA_RESOLVERS`` (anyone else: 403
@@ -41,7 +51,16 @@ from pydantic import BaseModel
 from kontra.gate_client import models as m
 
 Auth = Literal[
-    "none", "party", "human", "fresh", "worker", "party|worker", "resolver", "resolver_human", "dev"
+    "none",
+    "party",
+    "human",
+    "fresh",
+    "recent",
+    "worker",
+    "party|worker",
+    "resolver",
+    "resolver_human",
+    "dev",
 ]
 
 
@@ -120,6 +139,41 @@ ROUTES: tuple[Route, ...] = (
     Route("confirm_start", "POST", f"{P}/auth/confirm", "human", None, m.ConfirmStart, status=201),
     Route(
         "confirm_status", "GET", f"{P}/auth/confirm/{{confirm_id}}", "human", None, m.ConfirmStatus
+    ),
+    # Passkeys (decisions I24): a passkey confirms a person's sign-in in one step; it never
+    # signs anyone in. A person's session lists them; adding one starts with a confirmation
+    # of the last five minutes (``recent``) and finishes with a confirmed session; revoking
+    # one is a change. Confirming with one is the same step-up as the mailed link.
+    Route("passkeys", "GET", f"{P}/passkeys", "human", None, m.PasskeyList),
+    Route(
+        "passkey_options",
+        "POST",
+        f"{P}/passkeys/options",
+        "recent",
+        None,
+        m.PasskeyCeremony,
+        status=201,
+    ),
+    Route("add_passkey", "POST", f"{P}/passkeys", "fresh", m.PasskeyAdd, m.PasskeyView, status=201),
+    Route(
+        "revoke_passkey", "DELETE", f"{P}/passkeys/{{passkey_id}}", "fresh", None, None, status=204
+    ),
+    Route(
+        "confirm_passkey_options",
+        "POST",
+        f"{P}/auth/confirm/passkey/options",
+        "human",
+        None,
+        m.PasskeyCeremony,
+        status=201,
+    ),
+    Route(
+        "confirm_passkey",
+        "POST",
+        f"{P}/auth/confirm/passkey",
+        "human",
+        m.PasskeyConfirm,
+        m.PasskeyConfirmed,
     ),
     # catalog
     Route("publish", "POST", f"{P}/catalog", "fresh", m.PublishRequest, m.CatalogEntry),

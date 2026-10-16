@@ -54,6 +54,7 @@ import httpx
 from kontra.contract.names import validate_handle
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
+from kontra.gate_client.routes import BY_NAME
 from kontra.profile import NotLoggedIn, Profile, ProfileError, kontra_home, profile_lock
 
 if TYPE_CHECKING:
@@ -1071,6 +1072,15 @@ async def confirm_session(
             raise ConfirmError("expired", _CONFIRM_EXPIRED)
 
 
+def _confirm_now(route: str) -> bool:
+    """Whether a refused ``route`` needs a confirmation made now, not the session's running
+    hour: a ``recent`` row (adding a passkey, decisions I24). A confirmer then waits for its
+    own confirmation to complete (``confirm_session(extend=True)``), or the change it sends
+    once more is refused again."""
+    row = BY_NAME.get(route)
+    return row is not None and row.auth == "recent"
+
+
 def confirm_in_place(
     show: Callable[[m.ConfirmStart], None] | None = None, *, sleep: Sleep | None = None
 ) -> Confirmer:
@@ -1085,7 +1095,7 @@ def confirm_in_place(
     async def confirmer(gate: GateClient, route: str, need: m.ConfirmationRequired) -> bool:
         if need.confirm_with == "sign_in":
             raise ConfirmError("unavailable", _CONFIRM_UNAVAILABLE)
-        await confirm_session(gate, show=show, sleep=sleep)
+        await confirm_session(gate, show=show, sleep=sleep, extend=_confirm_now(route))
         return True
 
     return confirmer

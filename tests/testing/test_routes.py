@@ -22,7 +22,7 @@ from kontra.escrow import ObservedStatus
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
 from kontra.gate_client.routes import BY_NAME, ROUTES, Route
-from kontra.testing import fake_gate
+from kontra.testing import SoftAuthenticator, fake_gate
 from kontra.testing.fake_gate import FakeGate
 
 from .conftest import World
@@ -218,6 +218,17 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     assert fleet in [k.public_key for k in (await buyer.gate.add_recipient("fleet", fleet)).keys]
     await buyer.gate.revoke_recipient(fleet)
     await seller.gate.revoke()
+    # a passkey: added (the sign-in is minutes old), listed, confirming, revoked
+    device = SoftAuthenticator(origin=gate.base_url)
+    adding = await buyer.gate.passkey_options()
+    added = await buyer.gate.add_passkey(
+        adding.ceremony_id, "laptop", device.create(adding.options)
+    )
+    assert [p.id for p in (await buyer.gate.passkeys()).passkeys] == [added.id]
+    asking = await buyer.gate.confirm_passkey_options()
+    confirmed = await buyer.gate.confirm_passkey(asking.ceremony_id, device.get(asking.options))
+    assert confirmed.passkey_id == added.id
+    await buyer.gate.revoke_passkey(added.id)
     started = await buyer.gate.confirm_start()  # a dev login confirms at once
     assert (started.channel, started.status) == ("dev", "confirmed")
     polled = await buyer.gate.confirm_status(started.confirm_id)
@@ -246,6 +257,7 @@ PATH_VALUES = {
     "session_id": "0" * 32,
     "public_key": "age1" + "q" * 58,
     "confirm_id": "cfm_" + "0" * 32,
+    "passkey_id": "pky_" + "0" * 32,
 }
 
 
@@ -348,6 +360,20 @@ async def test_each_row_enforces_its_auth(world: World, tokens: dict[str, str], 
         stale = await later(tokens["party"])
         assert stale[:2] == (403, "confirmation_required"), stale
         assert m.ConfirmationRequired.model_validate(stale[2]) == need
+    elif row.auth == "recent":
+        assert with_party[0] not in denied, with_party
+        assert with_key == (403, "fresh_login_required"), with_key
+        # Within the hour (the window here is ten minutes) but past five minutes: refused,
+        # with fresh's detail, where a fresh row would go on (decisions I24).
+        gate.advance(timedelta(minutes=6))
+        try:
+            past = await answer(tokens["party"])
+        finally:
+            gate.advance(-timedelta(minutes=6))
+        assert past[:2] == (403, "confirmation_required"), past
+        assert m.ConfirmationRequired.model_validate(past[2]) == need
+        stale = await later(tokens["party"])
+        assert stale[:2] == (403, "confirmation_required"), stale
     elif row.auth in ("resolver", "resolver_human"):
         assert with_party == (403, "not_resolver")
         assert with_key == (403, "not_resolver")

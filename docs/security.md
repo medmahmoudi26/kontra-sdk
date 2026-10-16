@@ -45,6 +45,8 @@ What that means concretely, and what enforces it:
 | A malicious contract document (SSRF through `$ref`, an unbounded schema) | the catalog's document rules; patterns run on RE2 |
 | A seller's text drives a buyer's terminal or agent | the CLI strips control characters from seller text; `kontra mcp` writes deliveries only where it is safe to (below) |
 | Kontra, its database, bucket or Temporal history leaks | payloads are ciphertext end to end; the keys live only on the parties' machines |
+| A stolen session adds a passkey of its own, to confirm every change after it | adding one needs a confirmation of the last five minutes, not the hour; the party is mailed which sign-in added it; a passkey confirms only sessions its holder already has, and never signs in |
+| A copied passkey, or a page that is not the console, confirms a change | the gate checks the RP ID, the console's origin, user verification and a single-use challenge bound to the session; a use count that does not move forward revokes a passkey on one device and asks every sign-in to confirm again (a synced passkey's such answer is refused) |
 
 ## What Kontra can and cannot see
 
@@ -114,6 +116,14 @@ Two consequences worth knowing:
   it's you" -- a link mailed to the account's address whose page asks for a code only the
   asking screen shows, bound to that one session and never a sign-in itself. A stolen session
   token that asks gets a mail sent to its victim and nothing else (decisions I23).
+- In the console, a **passkey** confirms in one tap instead (decisions I24): the gate verifies
+  the browser's answer -- this console's origin and RP ID, user verification (biometric or
+  PIN), a challenge used once and bound to the session that asked -- and keeps only the public
+  key. A passkey confirms a sign-in the person already has and never signs anyone in. Adding
+  one needs a confirmation of the last five minutes; revoking one asks the party's other
+  sign-ins to confirm again; a use count that goes back (a copy of the device) revokes a
+  passkey on one device, and is only refused for a synced one. Every revocation is mailed.
+  The CLI has no passkeys; email stays everywhere.
 - `kontra serve` (and a buyer's client) exchanges the session for a **15-minute** ES256 JWT,
   `permissions: ["<namespace>:worker"]`, audience `kontra:temporal`, refreshed in the
   background and swapped into the running Temporal client. Temporal's default claim mapper
@@ -259,6 +269,13 @@ deadline rule.
 - **Revoking a recipient does not reach backwards.** Deliveries already encrypted to a lost
   machine's key stay encrypted to it. `kontra recipients revoke` closes that key's future, and
   nothing more; what closes its past is the open jobs being accepted and their keys shredded.
+- **A session stolen within five minutes of a confirmation can add a passkey** -- about
+  eleven minutes in effect: a ceremony started at the end of those five lives six more, and
+  finishing it needs only the hour. It still confirms only sessions the thief holds, the party
+  is mailed which sign-in added it, and revoking the passkey or ending that sign-in ends it;
+  but until then the thief confirms past the hour. A copy of a synced passkey (a password
+  manager's, backup eligible) is not detected: its answers behind the count are refused, never
+  treated as a clone, and its holder's own password manager is the boundary (decisions I24).
 - **Nothing signs a recipient set.** Any confirmed session of the party can add a recipient,
   so a stolen session, inside an hour its person confirmed, can add a key it controls and read
   everything delivered afterwards.

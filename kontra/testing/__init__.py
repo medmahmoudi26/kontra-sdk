@@ -8,9 +8,13 @@ unit test with no containers.
 * :func:`start_dev_server` / :class:`DevServer` -- a Temporal dev server with standalone
   Nexus operations (the seam ① stand-in).
 * :class:`Marketplace` -- the three wired together, with logged-in :class:`TestParty` s.
+* :class:`SoftAuthenticator` -- a software WebAuthn authenticator: real passkey answers for
+  either gate (decisions I24); :mod:`kontra.testing.passkey_contract` -- the passkey rules
+  both gates pass.
 
-The gate and the marketplace need the ``testing`` extra (FastAPI, uvicorn); they are
-imported on first use, so ``from kontra.testing import fake_ledger`` needs neither.
+The gate, the marketplace and the authenticator need the ``testing`` extra (FastAPI,
+uvicorn, webauthn); they are imported on first use, so ``from kontra.testing import
+fake_ledger`` needs none of it.
 """
 
 from __future__ import annotations
@@ -26,11 +30,14 @@ if TYPE_CHECKING:
     from kontra.testing.devserver import DevServer, start_dev_server
     from kontra.testing.fake_gate import FakeGate
     from kontra.testing.marketplace import Marketplace, TestParty
+    from kontra.testing.passkeys import AuthenticatorRefused, SoftAuthenticator
 
 __all__ = [
+    "AuthenticatorRefused",
     "DevServer",
     "FakeGate",
     "Marketplace",
+    "SoftAuthenticator",
     "TestParty",
     "fake_gate",
     "fake_ledger",
@@ -43,6 +50,8 @@ _LAZY = {
     "FakeGate": "kontra.testing.fake_gate",
     "Marketplace": "kontra.testing.marketplace",
     "TestParty": "kontra.testing.marketplace",
+    "AuthenticatorRefused": "kontra.testing.passkeys",
+    "SoftAuthenticator": "kontra.testing.passkeys",
 }
 
 

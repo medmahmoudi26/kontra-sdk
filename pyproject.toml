@@ -1,6 +1,6 @@
 [project]
 name = "kontra-sdk"
-version = "0.2.2"
+version = "0.2.3"
 description = "Sell and hire durable, quoted jobs: plain Temporal workers behind Nexus, with escrow and end-to-end encryption."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -53,7 +53,9 @@ opentelemetry = [
   "temporalio[opentelemetry]>=1.34,<1.35",
   "opentelemetry-exporter-otlp-proto-grpc>=1.39,<2",
 ]
-testing = ["fastapi>=0.115", "uvicorn>=0.30", "hypothesis>=6.100"]
+# webauthn (duo-labs, BSD): the fake gate verifies real passkey answers with the same code as the
+# platform (kontra._passkeys, decisions I24), and kontra.testing.SoftAuthenticator makes them.
+testing = ["fastapi>=0.115", "uvicorn>=0.30", "hypothesis>=6.100", "webauthn>=3.0.1,<4"]
 
 [project.scripts]
 kontra = "kontra.cli:main"
@@ -77,6 +79,7 @@ dev = [
   "a2a-sdk>=1.0",
   "psutil>=6",
   "boto3>=1.35",
+  "webauthn>=3.0.1,<4",
 ]
 
 [build-system]

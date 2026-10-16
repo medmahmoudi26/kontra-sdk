@@ -13,7 +13,7 @@ This repository is the public half: the `kontra` Python package (SDK, CLI, MCP s
 fakes), the Temporal Authorizer that every party's worker is subject to, the examples, and the
 `kontra dev` stack. The gate (catalog, escrow, auth) is a separate, private service.
 
-> Status: alpha (`0.2.2`). Python 3.11+.
+> Status: alpha (`0.2.3`). Python 3.11+.
 
 ## Quickstart
 
@@ -187,8 +187,10 @@ See [docs/buyers.md](docs/buyers.md).
   offering. The policy is in [`temporal/authorizer`](temporal/authorizer), public so you can
   read the rules you run under.
 - **Logins and keys.** A person signs in through a device code that only their own screen
-  shows, approved in the browser or through a mailed link whose page asks for that code. An
-  API key is for programs: it never publishes, whatever its age.
+  shows, approved in the browser or through a mailed link whose page asks for that code. A
+  change asks them to confirm it's them once an hour: by a mailed link, or in the console with
+  one tap of a passkey, which confirms a sign-in and never signs anyone in. An API key is for
+  programs: it never publishes, whatever its age.
 
 What Kontra can and cannot see, the threat model, and the limits: [docs/security.md](docs/security.md).
 

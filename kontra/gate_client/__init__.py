@@ -8,10 +8,12 @@ path and auth of a call cannot drift from the table without ``tests/gate_client`
 Presigned bucket URLs (artifacts, claim-check blobs) are fetched with :attr:`GateClient.http`,
 which shares the transport but never sends the gate credential.
 
-Confirm it's you (decisions I23): a change (a ``fresh`` or ``resolver`` row) that the gate
-answers 403 ``confirmation_required`` is handed to the client's ``confirm`` hook, when it has
-one; if the hook confirms the session, the same request is sent once more. The gate decides
-that 403 before the route does anything, so nothing happened the first time.
+Confirm it's you (decisions I23): a change (a ``fresh``, ``recent`` or ``resolver`` row) that
+the gate answers 403 ``confirmation_required`` is handed to the client's ``confirm`` hook, when
+it has one; if the hook confirms the session, the same request is sent once more. The gate
+decides that 403 before the route does anything, so nothing happened the first time. A
+``recent`` row (adding a passkey, decisions I24) needs a confirmation of the last five minutes,
+so a hook must complete a new one rather than accept the session's running hour.
 
 Errors: a non-2xx answer raises :class:`GateError` (decoded from
 :class:`~kontra.gate_client.models.ErrorBody`, or synthesised with code ``http_error`` when
@@ -63,11 +65,11 @@ _ModelT = TypeVar("_ModelT", bound=BaseModel)
 #: Route auth kinds that carry ``Authorization: Bearer``. ``none`` and ``dev`` never do: the
 #: token route itself is ``none``, so a refreshing provider can never recurse into itself.
 _AUTHENTICATED = frozenset(
-    {"party", "human", "fresh", "worker", "party|worker", "resolver", "resolver_human"}
+    {"party", "human", "fresh", "recent", "worker", "party|worker", "resolver", "resolver_human"}
 )
 #: The route auth kinds whose 403 ``confirmation_required`` a ``confirm`` hook may answer:
 #: the changes. Never a read (``human``), never another code.
-_CONFIRMABLE = frozenset({"fresh", "resolver"})
+_CONFIRMABLE = frozenset({"fresh", "recent", "resolver"})
 #: Statuses a progress stream retries (a gate restarting behind its proxy); others are final.
 _STREAM_RETRY_STATUS = frozenset({502, 503, 504})
 _ERROR_TEXT_MAX = 500
@@ -547,6 +549,45 @@ class GateClient:
     async def confirm_status(self, confirm_id: str) -> m.ConfirmStatus:
         """One poll of a confirmation this session started; another session's is 404."""
         return await self._model("confirm_status", m.ConfirmStatus, path={"confirm_id": confirm_id})
+
+    # passkeys (decisions I24): the console's; the CLI calls none of these
+    async def passkeys(self) -> m.PasskeyList:
+        """The party's passkeys, live ones newest first, then the latest revoked; ``rp_id``
+        None: this gate takes none. Needs a person's session, not a confirmation."""
+        return await self._model("passkeys", m.PasskeyList)
+
+    async def passkey_options(self) -> m.PasskeyCeremony:
+        """Start adding a passkey: creation options for ``navigator.credentials.create()``.
+        Needs a confirmation of the last five minutes (``recent``), not just the hour."""
+        return await self._model("passkey_options", m.PasskeyCeremony)
+
+    async def add_passkey(
+        self, ceremony_id: str, label: str, credential: Mapping[str, Any]
+    ) -> m.PasskeyView:
+        """Finish adding a passkey: the browser's answer (``RegistrationResponseJSON``) to
+        :meth:`passkey_options`, under ``label``. The ceremony is used up whatever the
+        gate answers."""
+        body = m.PasskeyAdd(ceremony_id=ceremony_id, label=label, credential=dict(credential))
+        return await self._model("add_passkey", m.PasskeyView, body=body)
+
+    async def revoke_passkey(self, passkey_id: str) -> None:
+        """Revoke one of the party's passkeys (a change). The party's other sign-ins must
+        confirm again before their next change; revoking a revoked one changes nothing."""
+        await self._none("revoke_passkey", path={"passkey_id": passkey_id})
+
+    async def confirm_passkey_options(self) -> m.PasskeyCeremony:
+        """Start confirming it's you with a passkey: request options for
+        ``navigator.credentials.get()``. Mails nobody and confirms nothing; 409
+        ``no_passkeys`` when the party has none."""
+        return await self._model("confirm_passkey_options", m.PasskeyCeremony)
+
+    async def confirm_passkey(
+        self, ceremony_id: str, credential: Mapping[str, Any]
+    ) -> m.PasskeyConfirmed:
+        """Confirm this session with the browser's answer (``AuthenticationResponseJSON``)
+        to :meth:`confirm_passkey_options`: the same step-up as the mailed link."""
+        body = m.PasskeyConfirm(ceremony_id=ceremony_id, credential=dict(credential))
+        return await self._model("confirm_passkey", m.PasskeyConfirmed, body=body)
 
     # catalog
     async def publish(self, document: dict[str, Any]) -> m.CatalogEntry:
