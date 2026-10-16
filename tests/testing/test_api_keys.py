@@ -1,7 +1,7 @@
-"""API keys on the fake gate, as the production contract states them (decisions I19): minted,
-listed and revoked by a fresh human session, shown once and stored as a hash, exchanged for
-the key's own session -- which hires, serves and reads but never counts as fresh -- and dead
-on the next request once revoked."""
+"""API keys on the fake gate, as the production contract states them (decisions I19, I23):
+listed by a person's session, minted and revoked by a confirmed one, shown once and stored as
+a hash, exchanged for the key's own session -- which hires, serves and reads but never makes
+a change, sees keys or sign-ins, or confirms -- and dead on the next request once revoked."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from datetime import timedelta
 import httpx
 import pytest
 
+from kontra.auth import Session
 from kontra.codec.age import generate_identity
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
@@ -121,6 +122,8 @@ async def test_a_key_hires_and_serves_but_never_counts_as_fresh(world: World) ->
         program.revoke_api_key(made.id),
         program.sessions(),
         program.end_session("0" * 32),
+        program.confirm_start(),  # a key never confirms: there is no person behind it
+        program.confirm_status("cfm_" + "0" * 32),
     ):
         assert await _code(call) == (403, "fresh_login_required")
     assert {r.name for r in ROUTES if r.auth == "fresh"} == {
@@ -128,18 +131,41 @@ async def test_a_key_hires_and_serves_but_never_counts_as_fresh(world: World) ->
         "revoke_recipient",
         "publish",
         "create_api_key",
-        "api_keys",
         "revoke_api_key",
-        "sessions",
         "end_session",
+    }
+    assert {r.name for r in ROUTES if r.auth == "human"} == {
+        "api_keys",
+        "sessions",
+        "confirm_start",
+        "confirm_status",
     }
 
 
-async def test_an_old_human_login_is_stale_not_key_shaped(world: World) -> None:
+async def _raw(world: World, session: Session) -> GateClient:
+    """A client with ``session``'s current access token and no confirm hook: what the gate
+    answers, as it answers it."""
+    await session.gate.me()  # refreshed on the gate's clock, if it moved past the token
+    return world.bearer(await session.access_token())
+
+
+async def test_an_old_human_login_reads_and_is_asked_to_confirm_its_changes(
+    world: World,
+) -> None:
     alice = await world.party("alice")
-    world.gate.advance(timedelta(minutes=11))
-    assert await _code(alice.gate.create_api_key("late")) == (403, "stale_session")
-    assert await _code(alice.gate.api_keys()) == (403, "stale_session")
+    world.gate.advance(timedelta(hours=1))
+    raw = await _raw(world, alice)
+    assert await _code(raw.api_keys()) == (200, "ok")  # reads need no confirmation
+    assert await _code(raw.sessions()) == (200, "ok")
+    with pytest.raises(GateError) as e:
+        await raw.create_api_key("late")
+    assert (e.value.status, e.value.code) == (403, "confirmation_required")
+    assert m.ConfirmationRequired.model_validate(e.value.detail) == m.ConfirmationRequired(
+        confirm_with="dev", confirm_ttl_seconds=3600
+    )
+    assert (await raw.api_keys()).keys == []  # refused before it did anything
+    # The session's own client confirms a development login at once and carries on.
+    assert (await alice.gate.create_api_key("late")).label == "late"
 
 
 async def test_unknown_and_revoked_keys_get_the_same_answer(world: World) -> None:

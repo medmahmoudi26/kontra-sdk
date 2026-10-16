@@ -21,8 +21,35 @@ CODE = "BCDF-GHJK"
         ("magic_link", "POST", "/v1/auth/magic", "none", m.MagicLinkRequest, m.MagicLinkSent, 202),
         ("token", "POST", "/v1/auth/token", "none", m.TokenRequest, m.TokenResponse, 200),
         ("create_api_key", "POST", "/v1/keys", "fresh", m.ApiKeyCreate, m.ApiKeyCreated, 201),
-        ("api_keys", "GET", "/v1/keys", "fresh", None, m.ApiKeyList, 200),
+        # Reads need a person, not a confirmation; changes need one (decisions I23).
+        ("api_keys", "GET", "/v1/keys", "human", None, m.ApiKeyList, 200),
         ("revoke_api_key", "DELETE", "/v1/keys/{key_id}", "fresh", None, None, 204),
+        ("sessions", "GET", "/v1/sessions", "human", None, m.SessionList, 200),
+        ("end_session", "DELETE", "/v1/sessions/{session_id}", "fresh", None, None, 204),
+        ("add_recipient", "POST", "/v1/me/recipients", "fresh", m.AddKey, m.Me, 201),
+        ("revoke_recipient", "DELETE", "/v1/me/recipients/{public_key}", "fresh", None, None, 204),
+        ("publish", "POST", "/v1/catalog", "fresh", m.PublishRequest, m.CatalogEntry, 200),
+        ("disputes", "GET", "/v1/admin/disputes", "resolver_human", None, m.JobList, 200),
+        (
+            "resolve",
+            "POST",
+            "/v1/admin/jobs/{job_id}/resolve",
+            "resolver",
+            m.ResolveRequest,
+            m.JobView,
+            200,
+        ),
+        ("confirm_start", "POST", "/v1/auth/confirm", "human", None, m.ConfirmStart, 201),
+        (
+            "confirm_status",
+            "GET",
+            "/v1/auth/confirm/{confirm_id}",
+            "human",
+            None,
+            m.ConfirmStatus,
+            200,
+        ),
+        ("revoke", "POST", "/v1/auth/revoke", "party", None, None, 204),
         # ``kontra serve`` with a key mints worker tokens: this one stays ``party``.
         (
             "temporal_token",
@@ -281,3 +308,120 @@ def test_key_ids_are_key_and_16_lowercase_hex(key_id: str) -> None:
         m.ApiKeyView.model_validate(
             {"id": key_id, "label": "ci", "created_at": "2026-10-13T00:00:00Z"}
         )
+
+
+# --------------------------------------------------------------------------- confirm it's you
+
+CONFIRM_ID = "cfm_" + "0123456789abcdef" * 2
+ASKED = "2026-10-16T14:03:00Z"
+
+
+def _start(**fields: object) -> m.ConfirmStart:
+    base: dict[str, object] = {
+        "confirm_id": CONFIRM_ID,
+        "channel": "email",
+        "status": "pending",
+        "user_code": CODE,
+        "asked_at": ASKED,
+        "expires_in": 600,
+        "interval": 3,
+    }
+    return m.ConfirmStart.model_validate({**base, **fields})
+
+
+def test_a_pending_confirmation_shows_a_code_and_a_dev_one_is_done() -> None:
+    pending = _start()
+    assert (pending.channel, pending.status, pending.user_code) == ("email", "pending", CODE)
+    assert CODE not in repr(pending)  # shown on the asking screen, not in a log line
+    done = _start(
+        channel="dev",
+        status="confirmed",
+        user_code=None,
+        expires_in=0,
+        confirmed_until="2026-10-16T15:03:00Z",
+    )
+    assert done.confirmed_until is not None
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"user_code": None},  # pending without a code
+        {"confirmed_until": "2026-10-16T15:03:00Z"},  # pending and confirmed at once
+        {"channel": "dev"},  # dev is never pending
+        {"status": "confirmed", "user_code": None},  # email is never confirmed at once
+        {"channel": "dev", "status": "confirmed", "confirmed_until": "2026-10-16T15:03:00Z"},
+        {"channel": "dev", "status": "confirmed", "user_code": None},  # done, but until when?
+        {"channel": "sign_in"},
+        {"interval": 0},
+        {"expires_in": -1},
+        {"mail": "ann@example.com"},  # the address is never in the answer
+    ],
+)
+def test_inconsistent_confirmations_are_refused(fields: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        _start(**fields)
+
+
+@pytest.mark.parametrize(
+    "confirm_id",
+    [
+        "cfm_" + "0" * 31,
+        "cfm_" + "0" * 33,
+        "cfm_" + "A" * 32,
+        "cfx_" + "0" * 32,
+        "cfm_" + "0" * 32 + "\n",
+        "../cfm_" + "0" * 32,
+    ],
+)
+def test_confirm_ids_are_cfm_and_32_lowercase_hex(confirm_id: str) -> None:
+    assert m.is_confirm_id(CONFIRM_ID)
+    assert not m.is_confirm_id(confirm_id)
+    with pytest.raises(ValidationError):
+        m.ConfirmStatus.model_validate({"confirm_id": confirm_id, "status": "pending"})
+    with pytest.raises(ValidationError):
+        _start(confirm_id=confirm_id)
+
+
+@pytest.mark.parametrize("code", ["bcdf-ghjk", "BCDFGHJK", "BCDF-GHJA", CODE + "\n", " " + CODE])
+def test_a_confirmation_code_is_a_user_code_exactly(code: str) -> None:
+    with pytest.raises(ValidationError):
+        _start(user_code=code)
+
+
+@pytest.mark.parametrize("status", ["pending", "confirmed", "expired", "burned"])
+def test_confirm_status_says_where_it_is(status: str) -> None:
+    view = m.ConfirmStatus.model_validate({"confirm_id": CONFIRM_ID, "status": status})
+    assert view.confirmed_until is None
+
+
+def test_confirm_status_has_no_other_states_and_no_code() -> None:
+    with pytest.raises(ValidationError):
+        m.ConfirmStatus.model_validate({"confirm_id": CONFIRM_ID, "status": "approved"})
+    with pytest.raises(ValidationError):  # a poll never says the code again
+        m.ConfirmStatus.model_validate(
+            {"confirm_id": CONFIRM_ID, "status": "pending", "user_code": CODE}
+        )
+
+
+@pytest.mark.parametrize("confirm_with", ["email", "dev", "sign_in"])
+def test_confirmation_required_says_how(confirm_with: str) -> None:
+    need = m.ConfirmationRequired.model_validate(
+        {"confirm_with": confirm_with, "confirm_ttl_seconds": 3600}
+    )
+    assert need.confirm_with == confirm_with
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        {"confirm_with": "github", "confirm_ttl_seconds": 3600},
+        {"confirm_with": "email", "confirm_ttl_seconds": 0},
+        {"confirm_with": "email"},
+        {"confirm_with": "email", "confirm_ttl_seconds": 3600, "address": "ann@example.com"},
+        {"max_age_seconds": 600},  # the retired stale_session detail
+    ],
+)
+def test_other_confirmation_details_are_refused(detail: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        m.ConfirmationRequired.model_validate(detail)

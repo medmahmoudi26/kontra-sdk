@@ -128,7 +128,7 @@ def test_publish_refuses_outside_dev_and_names_file_and_line(
     with (project / "activities.py").open("a") as f:
         f.write("\nfrom temporalio import activity as raw\n")
     lines = (project / "activities.py").read_text().count("\n")
-    monkeypatch.setattr(kontra.auth.Session, "from_env", lambda: _Session(dev=False))
+    monkeypatch.setattr(kontra.auth.Session, "from_env", lambda **_: _Session(dev=False))
     result = cli("publish", "--dir", str(project))
     assert result.exit_code == 1, result.output
     assert "seller code must stay behind the kontra façade" in result.stderr

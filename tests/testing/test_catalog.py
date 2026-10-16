@@ -85,10 +85,13 @@ async def test_publish_refusals(world: World) -> None:
     with pytest.raises(GateError) as e:
         await acme.gate.publish(outside)
     assert e.value.code == "invalid_contract"
-    world.gate.advance(timedelta(minutes=11))
+    world.gate.advance(timedelta(hours=1))  # the sign-in no longer counts as a confirmation
+    await acme.gate.me()  # a new access token, on the gate's clock
+    raw = world.bearer(await acme.access_token())  # no confirm hook: the gate's own answer
     with pytest.raises(GateError) as e:
-        await acme.gate.publish(doc)
-    assert (e.value.status, e.value.code) == (403, "stale_session")
+        await raw.publish(doc)
+    assert (e.value.status, e.value.code) == (403, "confirmation_required")
+    assert (await acme.gate.publish(doc)).offering == "acme/enrich@1.0.0"  # a dev login confirms
 
 
 async def test_a_temporal_outage_leaves_the_version_unpublished_until_retried(world: World) -> None:

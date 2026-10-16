@@ -10,7 +10,8 @@ replaces (``docs/decisions.md`` I7). So a second laptop is one more recipient ra
 conflict, and nothing anyone adds can make an in-flight delivery to another machine
 unreadable. Revoking stops future deliveries reaching that key; it cannot reach back.
 
-Managing them needs a recent human login, like publishing: a recipient added here can read
+Adding or revoking one is a change, like publishing: it needs a person's login confirmed
+within the hour (decisions I23), asked for in place, because a recipient added here can read
 every delivery made after it.
 """
 
@@ -20,7 +21,7 @@ from datetime import datetime
 
 import click
 
-from kontra.cli._common import KontraGroup, emit_json, fail, printable, run
+from kontra.cli._common import KontraGroup, cli_session, emit_json, fail, printable, run
 
 __all__ = ["recipients"]
 
@@ -31,7 +32,7 @@ def _when(value: datetime | None) -> str:
 
 @click.group(cls=KontraGroup)
 def recipients() -> None:
-    """Encryption recipients: who your deliveries can be read by (needs a recent login)."""
+    """Encryption recipients: who your deliveries can be read by (needs your login)."""
 
 
 @recipients.command("add")
@@ -56,7 +57,7 @@ def add(label: str | None, public_key: str | None, as_json: bool) -> None:
     pod churn then never changes the set, so an input encrypted a minute ago is still
     readable by whichever worker picks the task up.
     """
-    from kontra.auth import Session, this_machine_label
+    from kontra.auth import this_machine_label
     from kontra.codec.age import is_recipient
     from kontra.gate_client import models as m
     from kontra.profile import Profile
@@ -67,7 +68,7 @@ def add(label: str | None, public_key: str | None, as_json: bool) -> None:
         fail("--label must be 1 to 64 printable characters, no surrounding spaces")
 
     async def go() -> tuple[m.Me, str]:
-        async with Session.from_env() as session:
+        async with cli_session() as session:
             key = public_key
             if key is None:
                 _, key = Profile.ensure_identity(session.identity_home)
@@ -122,14 +123,13 @@ def revoke(public_key: str) -> None:
     into ciphertext that has left. Revoke a lost laptop's key and its future is closed; its
     past is only closed by the jobs it holds being accepted and shredded.
     """
-    from kontra.auth import Session
     from kontra.codec.age import is_recipient
 
     if not is_recipient(public_key):
         fail("that is not an age X25519 recipient (age1...); see `kontra recipients list`")
 
     async def go() -> None:
-        async with Session.from_env() as session:
+        async with cli_session() as session:
             await session.gate.revoke_recipient(public_key)
 
     run(go)

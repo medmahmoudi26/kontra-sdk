@@ -30,7 +30,7 @@ What that means concretely, and what enforces it:
 | Threat | Stopped by |
 |---|---|
 | A compromised seller machine reaches another party's namespace | the Authorizer: a token acts in its own namespace only, from an allowlist; cross-namespace workflow commands are off |
-| A compromised seller machine repoints its offering (or anyone's) at itself | no token reaches an Operator or Admin API; endpoints are created by the gate after a fresh human login, and their names are opaque |
+| A compromised seller machine repoints its offering (or anyone's) at itself | no token reaches an Operator or Admin API; endpoints are created by the gate for a person's confirmed login, and their names are opaque |
 | One seller forges another seller's Nexus result | the callback guard (below) |
 | A buyer reads, signals or cancels a seller's handler workflow | the Authorizer: a buyer's token has no call in the seller's namespace, including the job it paid for |
 | A buyer forges or alters a hold token (amount, seller, expiry, contract) | ES256 signature checked offline by the seller's handler, with audience, expiry, seller namespace, offering and contract hash |
@@ -106,15 +106,21 @@ Two consequences worth knowing:
   or through a mailed sign-in link whose page asks for the code only the requester's screen
   shows; opening the link consumes nothing (decisions I19).
 - A program uses an **API key** (`KONTRA_API_KEY`), stored by the gate as a hash and exchanged
-  for the same 15-minute tokens. Its session never counts as fresh: it cannot publish, set the
-  party's key or manage keys. Revoking it ends its tokens on their next request.
+  for the same 15-minute tokens. Its session is never a person's: it cannot publish, change
+  the party's recipients, see or manage keys and sign-ins, or confirm. Revoking it ends its
+  tokens on their next request.
+- A person's **changes** (publishing, API keys, recipients, ending a sign-in, resolving a
+  dispute) need the login confirmed within the hour: a sign-in counts, and so does "Confirm
+  it's you" -- a link mailed to the account's address whose page asks for a code only the
+  asking screen shows, bound to that one session and never a sign-in itself. A stolen session
+  token that asks gets a mail sent to its victim and nothing else (decisions I23).
 - `kontra serve` (and a buyer's client) exchanges the session for a **15-minute** ES256 JWT,
   `permissions: ["<namespace>:worker"]`, audience `kontra:temporal`, refreshed in the
   background and swapped into the running Temporal client. Temporal's default claim mapper
   verifies it against the gate's JWKS. Revoking a session stops the refresh; a token already
   issued stays valid until it expires.
-- Publishing is `POST /v1/catalog` with a **fresh human session**: a worker token or an API
-  key never qualifies, so a stolen worker credential or key cannot publish or repoint anything.
+- Publishing is `POST /v1/catalog` with a person's **confirmed session**: a worker token or an
+  API key never qualifies, so a stolen worker credential or key cannot publish or repoint anything.
 - In production the public Temporal frontend sits behind a TLS-terminating proxy Kontra
   controls; TLS is always on. The public frontend refuses every Operator and Admin call to
   every token (the Authorizer); only the internal frontend, which is never published, accepts
@@ -253,8 +259,9 @@ deadline rule.
 - **Revoking a recipient does not reach backwards.** Deliveries already encrypted to a lost
   machine's key stay encrypted to it. `kontra recipients revoke` closes that key's future, and
   nothing more; what closes its past is the open jobs being accepted and their keys shredded.
-- **Nothing signs a recipient set.** Any fresh human session of the party can add a recipient,
-  so a stolen session can add a key it controls and read everything delivered afterwards.
+- **Nothing signs a recipient set.** Any confirmed session of the party can add a recipient,
+  so a stolen session, inside an hour its person confirmed, can add a key it controls and read
+  everything delivered afterwards.
   Making the first seller key an ed25519 identity and requiring each addition to be signed by
   an existing one would close this; the set makes that a clean upgrade rather than a redesign.
 - **The seller sees your input.** End-to-end means buyer to seller: the seller's worker

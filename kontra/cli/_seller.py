@@ -9,7 +9,7 @@ from typing import Any
 
 import click
 
-from kontra.cli._common import default_handle, emit_json, fail, printable, run
+from kontra.cli._common import cli_session, default_handle, emit_json, fail, printable, run
 from kontra.cli._project import load_worker
 
 __all__ = ["contract", "init", "publish", "serve"]
@@ -116,8 +116,8 @@ def contract(
 @_OFFERING
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 def publish(directory: Path, only: str | None, as_json: bool) -> None:
-    """Publish worker.py's offerings to the catalog (needs a recent login)."""
-    from kontra.auth import Session
+    """Publish worker.py's offerings to the catalog (needs your login, confirmed within the
+    hour: a terminal asks in place)."""
     from kontra.cli._seller_code import check_project
     from kontra.contract import contract_hash
     from kontra.gate_client import models as m
@@ -128,7 +128,7 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
         chosen = _pick(worker.offerings, only)
 
         async def go() -> list[m.CatalogEntry]:
-            async with Session.from_env() as session:
+            async with cli_session() as session:
                 profile = await session.resolve()
                 if refused and not profile.dev:  # kontra dev is the seller's own
                     fail("seller code must stay behind the kontra façade:\n" + refused)

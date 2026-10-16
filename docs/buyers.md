@@ -74,10 +74,15 @@ command then use it instead of a profile (`KONTRA_GATE` names the gate, by defau
 file. In code, `kontra.auth.Session.from_api_key(gate_url, key)` makes the same session.
 
 A key quotes, hires, follows, accepts and disputes jobs, and runs `kontra serve`. It never
-publishes, sets your encryption key or manages keys -- those answer 403
+publishes, changes your recipients, sees or manages keys -- those answer 403
 `fresh_login_required` however new the key is -- so a leaked key cannot change what you sell
-or who can read your deliveries. Making, listing and revoking keys need a recent login of
-yours; a party holds at most 25 live keys. A revoked key stops working on its next request to
+or who can read your deliveries. Listing keys needs your login; making and revoking one are
+changes, which need your login confirmed within the hour. Signing in counts; after that,
+`kontra keys create` asks you to confirm it's you in place: it prints a code, the gate mails
+the address you sign in with a link, and once you type the code on the link's page the
+command carries on. Nothing changes until then. A script runs `kontra confirm` first (the
+same, once, for the next hour); a command without a terminal never makes the gate mail you
+(decisions I23). A party holds at most 25 live keys. A revoked key stops working on its next request to
 the gate, and its workers on Temporal within seconds.
 
 Any party can buy and sell: a buyer is a party with a namespace like a seller.

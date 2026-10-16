@@ -8,6 +8,11 @@ path and auth of a call cannot drift from the table without ``tests/gate_client`
 Presigned bucket URLs (artifacts, claim-check blobs) are fetched with :attr:`GateClient.http`,
 which shares the transport but never sends the gate credential.
 
+Confirm it's you (decisions I23): a change (a ``fresh`` or ``resolver`` row) that the gate
+answers 403 ``confirmation_required`` is handed to the client's ``confirm`` hook, when it has
+one; if the hook confirms the session, the same request is sent once more. The gate decides
+that 403 before the route does anything, so nothing happened the first time.
+
 Errors: a non-2xx answer raises :class:`GateError` (decoded from
 :class:`~kontra.gate_client.models.ErrorBody`, or synthesised with code ``http_error`` when
 something other than the gate answered). A 2xx body that does not match the route's
@@ -35,18 +40,34 @@ from kontra.contract.names import OfferingRef
 from kontra.gate_client import models as m
 from kontra.gate_client.routes import BY_NAME, Route
 
-__all__ = ["GateClient", "GateError", "SSEDecoder", "ServerSentEvent", "TokenProvider"]
+__all__ = [
+    "ConfirmHook",
+    "GateClient",
+    "GateError",
+    "SSEDecoder",
+    "ServerSentEvent",
+    "TokenProvider",
+]
 
 #: Returns a bearer token for the gate (refreshing it if needed), or None for anonymous calls.
 #: A provider that also has ``invalidate(token: str) -> None`` is told when the gate answers
 #: 401 to a token, before it is asked for another one (so it can refresh early).
 TokenProvider = Callable[[], Awaitable[str | None]]
+#: Asked when a change answers 403 ``confirmation_required``: ``(route name, what the gate
+#: needs)`` -> whether the session is confirmed now. True sends the same request once more;
+#: False leaves the call failed as the gate answered; an exception propagates as it is.
+ConfirmHook = Callable[[str, m.ConfirmationRequired], Awaitable[bool]]
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 #: Route auth kinds that carry ``Authorization: Bearer``. ``none`` and ``dev`` never do: the
 #: token route itself is ``none``, so a refreshing provider can never recurse into itself.
-_AUTHENTICATED = frozenset({"party", "fresh", "worker", "party|worker", "resolver"})
+_AUTHENTICATED = frozenset(
+    {"party", "human", "fresh", "worker", "party|worker", "resolver", "resolver_human"}
+)
+#: The route auth kinds whose 403 ``confirmation_required`` a ``confirm`` hook may answer:
+#: the changes. Never a read (``human``), never another code.
+_CONFIRMABLE = frozenset({"fresh", "resolver"})
 #: Statuses a progress stream retries (a gate restarting behind its proxy); others are final.
 _STREAM_RETRY_STATUS = frozenset({502, 503, 504})
 _ERROR_TEXT_MAX = 500
@@ -229,6 +250,10 @@ class GateClient:
     caching and refresh). On a 401 the provider is asked once more -- after
     ``invalidate(rejected)`` if it has that method -- and the call is retried once if it
     returned a different token.
+
+    ``confirm`` (:data:`ConfirmHook`) is asked when a change answers 403
+    ``confirmation_required``; if it returns True the call is sent once more, and that
+    answer stands, whatever it is.
     """
 
     #: Delays between consecutive failed reconnects of a progress stream; the stream raises
@@ -243,9 +268,11 @@ class GateClient:
         transport: httpx.AsyncBaseTransport | None = None,
         timeout: float = 30.0,
         user_agent: str | None = None,
+        confirm: ConfirmHook | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._tokens = token
+        self._confirm = confirm
         self._transport = transport
         self._timeout = timeout
         self._user_agent = user_agent or f"kontra-sdk/{__version__}"
@@ -357,9 +384,31 @@ class GateClient:
         body: BaseModel | None = None,
     ) -> httpx.Response:
         resp = await self._send(name, path=path, params=params, body=body)
+        if resp.is_success:
+            return resp
+        err = _error_from(resp)
+        need = self._confirmable(BY_NAME[name], err)
+        if need is None or self._confirm is None or not await self._confirm(name, need):
+            raise err
+        # The same request once more: the 403 came before the route did anything.
+        resp = await self._send(name, path=path, params=params, body=body)
         if not resp.is_success:
             raise _error_from(resp)
         return resp
+
+    def _confirmable(self, route: Route, err: GateError) -> m.ConfirmationRequired | None:
+        """What the gate needs to let ``route`` through, when ``err`` is a change's 403
+        ``confirmation_required`` with a detail that says it; None otherwise."""
+        if (
+            self._confirm is None
+            or route.auth not in _CONFIRMABLE
+            or (err.status, err.code) != (403, m.CONFIRMATION_REQUIRED)
+        ):
+            return None
+        try:
+            return m.ConfirmationRequired.model_validate(err.detail)
+        except ValidationError:
+            return None
 
     async def _model(
         self,
@@ -446,8 +495,9 @@ class GateClient:
         return await self._model("me", m.Me)
 
     async def add_recipient(self, label: str, public_key: str) -> m.Me:
-        """Add one age recipient to this party (needs a fresh human session). Adding never
-        replaces: a second machine is one more recipient, not a new party key."""
+        """Add one age recipient to this party (a change: needs a person's confirmed
+        session). Adding never replaces: a second machine is one more recipient, not a new
+        party key."""
         return await self._model(
             "add_recipient", m.Me, body=m.AddKey(label=label, public_key=public_key)
         )
@@ -462,8 +512,8 @@ class GateClient:
 
     # API keys
     async def create_api_key(self, label: str) -> m.ApiKeyCreated:
-        """A new API key for programs (needs a fresh human session). The key is in the
-        answer this once; the gate keeps only its hash."""
+        """A new API key for programs (a change: needs a person's confirmed session). The
+        key is in the answer this once; the gate keeps only its hash."""
         return await self._model(
             "create_api_key", m.ApiKeyCreated, body=m.ApiKeyCreate(label=label)
         )
@@ -478,13 +528,25 @@ class GateClient:
 
     async def sessions(self) -> m.SessionList:
         """The party's sign-ins (people's logins, not keys), newest first; ``current`` is
-        this one. Needs a fresh human session."""
+        this one. Needs a person's session (never a key's), not a confirmation."""
         return await self._model("sessions", m.SessionList)
 
     async def end_session(self, session_id: str) -> None:
         """End one of the party's sign-ins: its refresh tokens stop at once, its access and
-        worker tokens on their next request. Needs a fresh human session."""
+        worker tokens on their next request. A change: needs a confirmed session."""
         await self._none("end_session", path={"session_id": session_id})
+
+    async def confirm_start(self) -> m.ConfirmStart:
+        """Ask to confirm it's you, for this session (decisions I23): a ``pending``
+        confirmation whose ``user_code`` only this screen shows (the gate mails the account's
+        sign-in address a link whose page asks for it), or, on a dev gate's development
+        sign-in, one ``confirmed`` already. 409 ``confirm_unavailable``: only a new sign-in
+        confirms this session."""
+        return await self._model("confirm_start", m.ConfirmStart)
+
+    async def confirm_status(self, confirm_id: str) -> m.ConfirmStatus:
+        """One poll of a confirmation this session started; another session's is 404."""
+        return await self._model("confirm_status", m.ConfirmStatus, path={"confirm_id": confirm_id})
 
     # catalog
     async def publish(self, document: dict[str, Any]) -> m.CatalogEntry:

@@ -75,7 +75,7 @@ workflows need a worker.
 
 The PRD's `publisher` role (a token allowed to create endpoints whose name starts with its
 namespace) is gone, and with it the only rule that had to inspect a request and a name. Publishing
-is a gate call (`POST /v1/catalog`) that requires a human session younger than the freshness window
+is a gate call (`POST /v1/catalog`) that requires a person's session confirmed within the hour (I23)
 — a worker token never qualifies — and the gate then creates the Nexus endpoint itself through the
 internal frontend: target = the caller's namespace and the offering's task queue, name = a fresh
 random `k...` string. A compromised seller box therefore still cannot repoint any offering, and the
@@ -153,7 +153,7 @@ login   : auth only       -- it adds a recipient; it never decides one
   encrypts to whatever `buyer_key` the signed token names, and caches it per job.
 * **Seller, per fleet.** A party holds a *set* of recipients, each with a label and the time
   it was added (`kontra recipients add`, `list` and `revoke`; `POST`/`DELETE /v1/me/recipients`). Both
-  need a fresh human login: a recipient can read every delivery made after it. Adding never
+  are changes a person confirms (I23): a recipient can read every delivery made after it. Adding never
   replaces, so `kontra login` on a second machine adds that machine — `key_mismatch` and
   `--replace-key` no longer exist. Revoking stops future deliveries reaching that key and
   keeps the row: an in-flight job encrypted to it is still the seller's to decrypt, and a
@@ -484,16 +484,18 @@ below), and each has its rule here.
 1. **An API key never satisfies freshness.** A key owns one session whose `auth_time` is the
    key's `created_at`, so by the clock alone a key made a minute ago would pass the gate's
    freshness window. The gate therefore marks the session (`via = 'api_key'`) and every
-   `fresh` route answers it 403 `fresh_login_required`, whatever its age; an old human login
-   keeps its own 403 `stale_session`. A key hires, reads, accepts, disputes and runs `kontra
+   `fresh` route answers it 403 `fresh_login_required`, whatever its age; an unconfirmed human
+   login gets its own 403, `confirmation_required` (amended by I23: `fresh` means confirmed
+   within the hour, and the reads of keys and sign-ins are `human`, which a key never is). A
+   key hires, reads, accepts, disputes and runs `kontra
    serve` (every `party` and `party|worker` route, `/v1/auth/temporal-token` included), and
    never publishes, sets the party's encryption key, or makes, lists or revokes keys. A
    stolen key thus cannot repoint what a party sells, swap the key its deliveries are
    encrypted to, or mint itself a successor; revoking it (or its session) stops its tokens on
    their next request, because the gate checks the session id per request. The `resolver`
-   rows (list disputes, split an escrow) need a fresh human session as well, checked after
-   the resolver list: a key a resolver party made for its CI once split escrow like its
-   owner (F4). The key is
+   rows (list disputes, split an escrow) need a person's session as well, checked after
+   the resolver list, and splitting escrow a confirmed one (I23): a key a resolver party
+   made for its CI once split escrow like its owner (F4). The key is
    `kontra_sk_` plus 32 random bytes, shown once and stored as its sha256; its id (`key_` plus
    16 random hex) is never derived from it, and an unknown key and a revoked one get the same
    400 `invalid_grant`. The SDK keeps nothing on disk for a key (`Session.from_api_key`,
@@ -656,3 +658,66 @@ could be read.
 * A delivery made before 0.2.0 is encrypted to the buyer machine's key of then (the
   profile's `key` file), not to a per-job key, and that is the identity the SDK decrypts
   with first, so it needs nothing new.
+
+## I23. Confirm it's you
+
+Every change to who a party is and what it sells took a sign-in younger than ten minutes
+(403 `stale_session`), so a person who had signed in an hour earlier was told, mid-click, to
+sign in again -- which read like being signed out, and in the console was: its "Sign in
+again" card ended the session. Reading keys and sign-ins took the same. The owner's decisions
+(2026-10-16): reads need no step-up; a change asks the person to confirm it's them, in place,
+once an hour per sign-in; and the confirmation must give nothing to someone who holds a
+stolen session token.
+
+* **Reads need a person, changes a confirmation.** Seam ② gains two auth kinds. `human` is a
+  person's session of any age: `GET /v1/keys`, `GET /v1/sessions`, and starting and polling
+  a confirmation; an API key's session gets 403 `fresh_login_required`, a worker token 401.
+  `fresh` now means *confirmed*: the later of the session's sign-in (`auth_time`) and its
+  last completed confirmation is less than the gate's `KONTRA_CONFIRM_TTL` (an hour) ago.
+  That covers making and revoking an API key or a recipient, ending a sign-in, and
+  publishing; `resolver` (splitting escrow) is the resolver list, then `fresh`, and the
+  disputes queue is `resolver_human`, so a resolver reads it without confirming. An
+  unconfirmed change is 403 `confirmation_required` (it replaces `stale_session`), whose
+  detail, `ConfirmationRequired`, says how this session can confirm: `email`, `dev`, or
+  `sign_in` (nothing here can; a new sign-in, which counts as a confirmation, will). The
+  gate decides the 403 before the route does anything, so a client confirms and sends the
+  same request once more, and only for a change (`fresh`, `resolver`), never a read.
+* **A confirmation is a mailed link plus the code the asking screen shows** -- I19.2's
+  device pattern, so a thief who starts one with a stolen session token gains nothing from
+  the mail that lands in the victim's inbox. `POST /v1/auth/confirm` answers a `ConfirmStart`:
+  an opaque id (`cfm_` + 32 random hex), the user code (for the asking screen only), when it
+  was asked, how long the link lives (ten minutes) and how often to poll. The gate mails the
+  party's own sign-in address, never one from the request: a link, never the code, and which
+  sign-in it confirms (how it signed in, when, the first 12 hex of its id), so a person who
+  did not ask knows which one to end. The link's page asks for the code; a GET consumes
+  nothing; the POST consumes the link once; three wrong codes burn it (a submit that is not
+  a code at all costs no attempt). `GET /v1/auth/confirm/{id}` answers only the session that
+  asked (any other: 404), with the confirmation's status and the *session's*
+  `confirmed_until`, so every tab waiting on that session resumes when any of its
+  confirmations completes. Several may be pending; none cancels another.
+* **Bound to its session, never a sign-in.** Completing a confirmation confirms the session
+  that asked and no other, not even another sign-in of the same person. Its page never
+  redirects, never hands a browser a session and never opens one: a confirmation is weaker
+  than a sign-in and stays so. A copy of the same session rides that session's hour; that is
+  what binding to the session means, bounded by refresh-token reuse detection and the
+  15-minute access token.
+* **A key never confirms.** There is no person behind it: an API key's session is refused
+  every `human` and `fresh` route, starting a confirmation included, and the platform's
+  `sessions` table cannot hold a confirmed key session (`ck_sessions_key_unconfirmed`).
+* **Sign-in mail's limits.** A confirmation link is a magic link (one table on the platform),
+  so its mail counts against every sign-in mail limit -- per address and requesting network,
+  per client, and the per-address and global ceilings -- and one sign-in asks at most five
+  times an hour. Only a live session can cause one; a stranger cannot.
+* **The dev channel.** On a `KONTRA_DEV=1` gate a development sign-in (`dev-login`,
+  `device:dev`) confirms at once, with no mail: dev login already signs in as anyone. An email
+  sign-in on a dev gate still confirms by mail.
+* **Only a person is asked.** The console opens a "Confirm it's you" panel over the page and
+  finishes the click once the code is typed elsewhere. The CLI (`kontra publish`, `kontra
+  keys create|revoke`, `kontra recipients add|revoke`) prints the code and waits when stderr
+  is a terminal, then sends its request again; without one it fails with a hint to run
+  `kontra confirm` first, so a cron job never makes the gate mail a person. `kontra confirm`
+  asks on purpose, and starts a new hour. In code, `Session.confirm()` and
+  `kontra.auth.confirm_session` do the same; a `Session` confirms by itself only on the dev
+  channel (`confirm_if_instant`, so `kontra serve` on `kontra dev` publishes past the hour)
+  unless it is given another `Confirmer` (`confirm_in_place` asks the person). The CLI keeps
+  its hint for `stale_session` while gates without this decision remain.

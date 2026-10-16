@@ -3,19 +3,25 @@ input files, the one-line errors, the default handle, and the nexgen plumbing.""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import signal
 import stat
 import sys
 from pathlib import Path
 from typing import Any
 
+import click
 import pytest
 import yaml
 
 from kontra import __version__
-from kontra.cli._common import default_handle, describe, read_input
+from kontra.auth import ConfirmError
+from kontra.cli import cli as cli_group
+from kontra.cli._common import default_handle, describe, interruptible, read_input, run
+from kontra.cli._confirm import interactive
 from kontra.cli._nexgen import SHA256, release_target
 from kontra.cli._project import load_worker
 from kontra.cli._pull import _default_output, verify_entry
@@ -247,15 +253,58 @@ def test_a_command_without_a_profile_prints_one_line(cli: Cli) -> None:
 
 
 def test_describe_known_failures() -> None:
-    err = GateError(403, "stale_session", "this needs a recent login")
+    err = GateError(403, "stale_session", "this needs a recent login")  # a gate before I23
     line = describe(err)
     assert line is not None
     assert "stale_session" in line
     assert "kontra login" in line
+    need = {"confirm_with": "email", "confirm_ttl_seconds": 3600}
+    line = describe(GateError(403, "confirmation_required", "confirm it's you", need))
+    assert line is not None
+    assert line.startswith("the gate answered 403 confirmation_required: confirm it's you")
+    assert "run `kontra confirm` in a terminal, then this command again" in line
+    line = describe(GateError(409, "confirm_unavailable", "no address"))
+    assert line is not None
+    assert "run `kontra login`, then the command again" in line
+    line = describe(GateError(403, "fresh_login_required", "an API key cannot do this"))
+    assert line is not None
+    assert "unset KONTRA_API_KEY" in line
+    assert describe(ConfirmError("burned", "the link took three wrong codes")) == (
+        "the link took three wrong codes"
+    )
     assert describe(ContractError("$defs.A.properties.x", "is wrong")) == (
         "contract: $defs.A.properties.x: is wrong"
     )
     assert describe(RuntimeError("a bug")) is None  # unexpected: the traceback is shown
+
+
+def test_ctrl_c_while_waiting_for_a_person_says_nothing_changed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Ctrl-C during a confirmation ends the command with exit status 130 and one line, not
+    a traceback: the change was refused before the gate did anything."""
+
+    async def waiting() -> None:
+        with interruptible("stopped: nothing was changed"):
+            signal.raise_signal(signal.SIGINT)  # what asyncio.run makes a cancellation
+            await asyncio.sleep(10)
+
+    with pytest.raises(click.exceptions.Exit) as e:
+        run(waiting)
+    assert e.value.exit_code == 130
+    assert capsys.readouterr().err == "stopped: nothing was changed\n"
+
+    async def elsewhere() -> None:
+        signal.raise_signal(signal.SIGINT)
+        await asyncio.sleep(10)
+
+    with pytest.raises(KeyboardInterrupt):  # anywhere else, as before
+        run(elsewhere)
+
+
+def test_the_cli_confirms_only_at_a_terminal() -> None:
+    assert interactive() is False  # pytest's stderr is not a person
+    assert "confirm" in cli_group.commands
 
 
 def test_describe_names_a_transport_failure_that_has_no_message() -> None:

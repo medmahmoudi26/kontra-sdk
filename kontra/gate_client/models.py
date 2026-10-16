@@ -40,6 +40,8 @@ __all__ = [
     "API_KEY_PATTERN",
     "API_KEY_PREFIX",
     "API_VERSION",
+    "CONFIRMATION_REQUIRED",
+    "CONFIRM_ID_PATTERN",
     "DEVICE_GRANT",
     "EMAIL_MAX",
     "HANDOFF_PATTERN",
@@ -66,6 +68,10 @@ __all__ = [
     "CatalogEntry",
     "CatalogList",
     "CatalogSummary",
+    "ConfirmStart",
+    "ConfirmStatus",
+    "ConfirmWith",
+    "ConfirmationRequired",
     "DeliveryView",
     "DevLogin",
     "DeviceStart",
@@ -114,6 +120,7 @@ __all__ = [
     "WorkersView",
     "is_api_key",
     "is_api_key_id",
+    "is_confirm_id",
     "is_email",
     "is_user_code",
 ]
@@ -374,7 +381,8 @@ class TokenResponse(_M):
     refresh_token: _Long | None = Field(default=None, repr=False)
     party: _Name
     #: The ``auth_time`` of the human session this refresh token descends from; for an API
-    #: key, the key's ``created_at`` (an API-key session is never fresh, whatever its age).
+    #: key, the key's ``created_at`` (an API-key session never makes changes, whatever its
+    #: age, and can never be confirmed: decisions I19, I23).
     auth_time: datetime
 
 
@@ -409,7 +417,7 @@ class MagicLinkSent(_M):
 
 
 class ApiKeyCreate(_M):
-    """``POST /v1/keys`` (fresh human session): an API key for a program."""
+    """``POST /v1/keys`` (a person's confirmed session): an API key for a program."""
 
     label: _KeyLabel
 
@@ -440,7 +448,7 @@ class ApiKeyList(_M):
 class TemporalTokenRequest(_M):
     """``POST /v1/auth/temporal-token``. There is one Temporal role, ``worker`` (a buyer is a
     worker of its own namespace too). No token can reach Temporal's Operator API: endpoints
-    are created by the platform when a fresh human session publishes (decisions I3)."""
+    are created by the platform when a person's confirmed session publishes (decisions I3)."""
 
     role: Literal["worker"] = "worker"
 
@@ -508,6 +516,84 @@ class GateInfo(_M):
     github_sign_in: bool
 
 
+# --------------------------------------------------------------------------- confirm it's you
+
+#: ``ErrorBody.code`` of a change whose session is not confirmed (403, decisions I23): the
+#: client confirms in place (``POST /v1/auth/confirm``), then sends the same call again.
+CONFIRMATION_REQUIRED = "confirmation_required"
+#: A confirmation's id: ``cfm_`` + 32 random hex. Opaque, never derived from anything; not a
+#: secret (only the session that asked can read it: any other gets 404).
+CONFIRM_ID_PATTERN = r"^cfm_[0-9a-f]{32}$"
+_CONFIRM_ID = re.compile(CONFIRM_ID_PATTERN, re.ASCII)
+_ConfirmId = Annotated[str, StringConstraints(max_length=36, pattern=CONFIRM_ID_PATTERN)]
+
+#: How a session can confirm it's the person: ``email`` (a link mailed to the account's
+#: sign-in address; the page asks for the code the asking screen shows), ``dev`` (a
+#: ``KONTRA_DEV=1`` gate confirms a development sign-in at once), ``sign_in`` (nothing here
+#: can confirm it: a new sign-in, which counts as a confirmation, is the only way).
+ConfirmWith = Literal["email", "dev", "sign_in"]
+
+
+def is_confirm_id(text: str) -> bool:
+    """``text`` is a confirmation id exactly as the gate issues it (``cfm_`` + 32 hex)."""
+    return _CONFIRM_ID.fullmatch(text) is not None
+
+
+class ConfirmationRequired(_M):
+    """``ErrorBody.detail`` of 403 ``confirmation_required``: what a client needs to confirm
+    in place (``POST /v1/auth/confirm``, then the same call again)."""
+
+    confirm_with: ConfirmWith
+    #: How long a confirmation lasts on this gate (``KONTRA_CONFIRM_TTL``), for the copy.
+    confirm_ttl_seconds: int = Field(ge=1)
+
+
+class ConfirmStart(_M):
+    """``POST /v1/auth/confirm`` (201): a confirmation for the session that asked.
+
+    ``channel="email"``, ``status="pending"``: show ``user_code`` on this screen only (the
+    mail never carries it) and poll ``GET /v1/auth/confirm/{confirm_id}`` every ``interval``
+    seconds for at most ``expires_in``. ``channel="dev"``, ``status="confirmed"``: done
+    already (``confirmed_until``), no code, no mail."""
+
+    confirm_id: _ConfirmId
+    channel: Literal["email", "dev"]
+    status: Literal["pending", "confirmed"]
+    #: Shown on the asking screen only; never in the mail, never in a poll's answer.
+    user_code: _UserCode | None = Field(default=None, repr=False)
+    #: The gate's time of the request; the mail says the same, so a person can match them.
+    asked_at: datetime
+    expires_in: int = Field(ge=0)
+    interval: int = Field(ge=1)
+    confirmed_until: datetime | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> ConfirmStart:
+        pending = self.status == "pending"
+        if (
+            pending != (self.user_code is not None)
+            or pending == (self.confirmed_until is not None)
+            or (self.channel == "dev") == pending
+        ):
+            raise ValueError(
+                "a pending confirmation (email) carries a user_code; a confirmed one (dev "
+                "only) carries confirmed_until"
+            )
+        return self
+
+
+class ConfirmStatus(_M):
+    """``GET /v1/auth/confirm/{confirm_id}``. ``status`` is this confirmation's:
+    ``pending``, ``confirmed``, ``expired`` (not confirmed in time) or ``burned`` (its link
+    took three wrong codes). ``confirmed_until`` is the asking session's: set while that
+    session may make changes (by this confirmation, another one, or a recent sign-in), None
+    otherwise. A client resumes as soon as ``confirmed_until`` is set."""
+
+    confirm_id: _ConfirmId
+    status: Literal["pending", "confirmed", "expired", "burned"]
+    confirmed_until: datetime | None = None
+
+
 #: The most recipients one party may hold (decisions I7). age writes one ~100-byte stanza
 #: per recipient into every header, so the set is capped to keep that overhead bounded;
 #: one key per fleet, never one per pod, keeps a real deployment far below it.
@@ -536,8 +622,9 @@ class Me(_M):
 
 class AddKey(_M):
     """``POST /v1/me/recipients``: one more age X25519 recipient (``age1...``) for this
-    party, under a label that says which machine or fleet holds it. Needs a fresh human
-    session: a recipient can read every delivery made after it is added.
+    party, under a label that says which machine or fleet holds it. A change: it needs a
+    person's session confirmed within the hour (decisions I23), because a recipient can read
+    every delivery made after it is added.
 
     Adding never replaces: ``kontra login`` on a second machine adds that machine. The
     party is capped at :data:`RECIPIENTS_MAX`."""
@@ -560,10 +647,11 @@ class PartyView(_M):
 
 
 class PublishRequest(_M):
-    """``POST /v1/catalog``: the full contract document (with ``x-kontra``), as JSON. Needs a
-    human session younger than the gate's freshness window (§10.4); the gate then creates
-    the Nexus endpoint itself, targeting the caller's namespace and the offering's task
-    queue, under a fresh random name (decisions I1)."""
+    """``POST /v1/catalog``: the full contract document (with ``x-kontra``), as JSON. A
+    change: it needs a person's session confirmed within the gate's ``KONTRA_CONFIRM_TTL``
+    (a sign-in counts; §10.4, decisions I23); the gate then creates the Nexus endpoint
+    itself, targeting the caller's namespace and the offering's task queue, under a fresh
+    random name (decisions I1)."""
 
     document: dict[str, Any] = Field(max_length=_MEMBERS_MAX)
 

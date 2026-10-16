@@ -251,8 +251,9 @@ async def test_three_wrong_codes_burn_the_link(invite: Invite) -> None:
     start, req = await invite.device("ann")
     await invite.anon.magic_link("ann@example.com", start.user_code)
     link = gate.outbox[0].link
-    for typed in ("BCDF-GHJK", "not a code", "x" * 10_000):
-        assert await gate.use_magic_link(link, typed) == "wrong_code"
+    wrong = "BCDF-GHJK" if start.user_code != "BCDF-GHJK" else "BCDF-GHJL"
+    for typed in (wrong, "not a code", "x" * 10_000, "", wrong.lower(), wrong):
+        assert await gate.use_magic_link(link, typed) == "wrong_code"  # non-codes cost nothing
     assert await gate.use_magic_link(link, start.user_code) == "gone"
     assert await invite.poll(req) == "authorization_pending"
 

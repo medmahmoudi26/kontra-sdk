@@ -1,6 +1,6 @@
 """Identity on the fake gate behaves like the platform's (PRD §10.3, decisions I3): dev
 login, the device flow, rotating refresh tokens with reuse detection, ES256 tokens in a
-JWKS, the one Temporal role, freshness, revocation, all on the gate's own clock."""
+JWKS, the one Temporal role, confirmations, revocation, all on the gate's own clock."""
 
 from __future__ import annotations
 
@@ -174,12 +174,12 @@ async def test_forged_and_misaddressed_tokens_are_refused(world: World) -> None:
         assert (e.value.status, e.value.code) == (401, "invalid_token"), token
 
 
-async def test_recipients_are_added_never_replaced_and_need_a_fresh_session(
+async def test_recipients_are_added_never_replaced_and_need_a_confirmed_session(
     world: World,
 ) -> None:
     """A party's keys are a set (decisions I7): a second key joins the first, adding the
-    same one again is a no-op, a revoked key never comes back, and both routes need a
-    fresh human session -- a recipient can read every delivery made after it is added."""
+    same one again is a no-op, a revoked key never comes back, and both routes are changes a
+    person confirms -- a recipient can read every delivery made after it is added."""
     s = await world.party("jade")
     first = s.profile.public_key or ""
     assert [k.public_key for k in (await s.gate.me()).keys] == [first]
@@ -196,13 +196,16 @@ async def test_recipients_are_added_never_replaced_and_need_a_fresh_session(
     with pytest.raises(GateError) as e:
         await s.gate.add_recipient("fleet-again", fleet)
     assert (e.value.status, e.value.code) == (409, "recipient_revoked")
-    world.gate.advance(timedelta(minutes=11))
+    world.gate.advance(timedelta(hours=1))  # the sign-in no longer counts as a confirmation
+    await s.gate.me()  # a new access token, on the gate's clock
+    raw = world.bearer(await s.access_token())  # no confirm hook: the gate's own answer
     with pytest.raises(GateError) as e:
-        await s.gate.add_recipient("other", generate_identity()[1])
-    assert (e.value.status, e.value.code) == (403, "stale_session")
+        await raw.add_recipient("other", generate_identity()[1])
+    assert (e.value.status, e.value.code) == (403, "confirmation_required")
     with pytest.raises(GateError) as e:
-        await s.gate.revoke_recipient(first)
-    assert (e.value.status, e.value.code) == (403, "stale_session")
+        await raw.revoke_recipient(first)
+    assert (e.value.status, e.value.code) == (403, "confirmation_required")
+    assert (await s.gate.party("jade")).recipients == [first]  # refused before anything
 
 
 # --------------------------------------------------------------------------- the device flow

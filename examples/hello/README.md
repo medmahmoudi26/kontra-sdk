@@ -42,7 +42,7 @@ It prints the party you are logged in as, and writes your profile and your encry
 
 ```sh
 cd examples/hello     # in a checkout of this repository, or a copy of this directory
-kontra publish        # needs a recent login, never an API key; prints the contract hash and the endpoint
+kontra publish        # your login, never an API key (past its first hour it asks you to confirm it's you); prints the contract hash and the endpoint
 ```
 
 `kontra publish` imports `worker.py`, derives the contract from `models.py` and

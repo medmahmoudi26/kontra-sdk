@@ -17,10 +17,10 @@ import json
 import os
 import re
 import sys
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Generator
 from decimal import Decimal
 from pathlib import Path
-from typing import IO, Any, NoReturn, TypeVar
+from typing import IO, TYPE_CHECKING, Any, NoReturn, TypeVar
 
 import click
 import httpx
@@ -28,14 +28,19 @@ from pydantic import BaseModel
 
 from kontra.contract.names import HANDLE_MAX, RESERVED_HANDLES, is_handle
 
+if TYPE_CHECKING:
+    from kontra.auth import Session
+
 __all__ = [
     "DEBUG_ENV",
     "CliError",
     "KontraGroup",
+    "cli_session",
     "default_handle",
     "describe",
     "emit_json",
     "fail",
+    "interruptible",
     "printable",
     "read_input",
     "run",
@@ -50,11 +55,17 @@ DEBUG_ENV = "KONTRA_DEBUG"
 #: Temporal payload; anything bigger belongs in an ``Artifact``.
 MAX_INPUT_BYTES = 4 * 1024 * 1024
 _HINTS = {
+    # Decisions I23: a change needs the login confirmed within the hour; a command asks in
+    # place when a person is at the terminal, so this is what everyone else reads.
+    "confirmation_required": "this change needs you to confirm it's you: run `kontra "
+    "confirm` in a terminal, then this command again",
+    "confirm_unavailable": "your account cannot confirm it's you by email on this gate: run "
+    "`kontra login`, then the command again",
+    # A gate older than kontra-sdk 0.2.2 still answers this.
     "stale_session": "your login is too old for this (it needs a recent one): run "
     "`kontra login` and try again",
-    "fresh_login_required": "an API key hires and serves, but publishing, setting your key "
-    "and managing keys need a person's recent login: unset KONTRA_API_KEY and run "
-    "`kontra login`",
+    "fresh_login_required": "an API key hires and serves, but publishing, changing "
+    "recipients and seeing or managing keys need a person's login: unset KONTRA_API_KEY",
     "invalid_token": "the gate no longer accepts this session: run `kontra login`",
 }
 
@@ -163,9 +174,41 @@ class KontraGroup(click.Group):
             raise CliError(line) from exc
 
 
+#: What a Ctrl-C ended (the note of the :func:`interruptible` wait it stopped), for :func:`run`.
+_stopped: list[str] = []
+
+
+@contextlib.contextmanager
+def interruptible(note: str) -> Generator[None]:
+    """A wait for a person (a confirmation) that Ctrl-C may end: :func:`run` then prints
+    ``note`` instead of a traceback and exits 130."""
+    try:
+        yield
+    except asyncio.CancelledError:  # what Ctrl-C is inside asyncio.run
+        _stopped.append(note)
+        raise
+
+
 def run(factory: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
     """``asyncio.run`` one command's coroutine."""
-    return asyncio.run(factory())
+    _stopped.clear()
+    try:
+        return asyncio.run(factory())
+    except KeyboardInterrupt:
+        if not _stopped:
+            raise
+        click.echo(_stopped[-1], err=True)
+        raise click.exceptions.Exit(130) from None
+
+
+def cli_session() -> Session:
+    """The session of a command that makes changes (``Session.from_env``): when the gate
+    asks for a confirmation, a person at this terminal is asked in place
+    (:mod:`kontra.cli._confirm`, decisions I23)."""
+    from kontra.auth import Session
+    from kontra.cli._confirm import terminal_confirmer
+
+    return Session.from_env(confirm=terminal_confirmer)
 
 
 def to_jsonable(value: Any) -> Any:
