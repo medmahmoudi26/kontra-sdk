@@ -16,6 +16,7 @@ Conventions:
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Sequence
 from datetime import datetime
@@ -24,8 +25,10 @@ from typing import Annotated, Any, Literal, cast
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
+    JsonValue,
     SerializationInfo,
     SerializerFunctionWrapHandler,
     StringConstraints,
@@ -40,6 +43,7 @@ __all__ = [
     "API_KEY_PATTERN",
     "API_KEY_PREFIX",
     "API_VERSION",
+    "CEREMONY_ID_PATTERN",
     "CONFIRMATION_REQUIRED",
     "CONFIRM_ID_PATTERN",
     "DEVICE_GRANT",
@@ -48,10 +52,15 @@ __all__ = [
     "HANDOFF_TTL_SECONDS",
     "MAX_API_KEYS",
     "MAX_PARTS",
+    "MAX_PASSKEYS",
+    "PASSKEY_ID_PATTERN",
+    "PASSKEY_LABEL_PATTERN",
     "POLLERS_MAX",
+    "RECENT_CONFIRMATION_SECONDS",
     "REVOCATION_WINDOW_MAX",
     "USER_CODE_ALPHABET",
     "USER_CODE_PATTERN",
+    "WEBAUTHN_JSON_MAX",
     "AcceptRequest",
     "AccessToken",
     "AddKey",
@@ -90,6 +99,14 @@ __all__ = [
     "Me",
     "PartyKey",
     "PartyView",
+    "PasskeyAdd",
+    "PasskeyCeremony",
+    "PasskeyConfirm",
+    "PasskeyConfirmed",
+    "PasskeyList",
+    "PasskeyRevokedBy",
+    "PasskeyTransport",
+    "PasskeyView",
     "PollerInfo",
     "ProgressEvent",
     "ProgressPost",
@@ -120,8 +137,10 @@ __all__ = [
     "WorkersView",
     "is_api_key",
     "is_api_key_id",
+    "is_ceremony_id",
     "is_confirm_id",
     "is_email",
+    "is_passkey_id",
     "is_user_code",
 ]
 
@@ -592,6 +611,159 @@ class ConfirmStatus(_M):
     confirm_id: _ConfirmId
     status: Literal["pending", "confirmed", "expired", "burned"]
     confirmed_until: datetime | None = None
+
+
+# --------------------------------------------------------------------------- passkeys
+#
+# A passkey (a WebAuthn credential) confirms a person's sign-in in one step; it never signs
+# anyone in (decisions I24). The console runs the ceremony in the browser and relays its
+# JSON; the gate verifies it. The browser's JSON travels as an opaque object, bounded in
+# size: typing its fields here would refuse what a new browser adds, and the gate's WebAuthn
+# library is its parser.
+
+#: ``recent`` (decisions I24): a sign-in or a completed confirmation at most this many
+#: seconds old. Adding a passkey needs it, not just the hour: a passkey can confirm every
+#: change after it, so a session confirmed 50 minutes ago (perhaps stolen since) must
+#: confirm again, now, to add one.
+RECENT_CONFIRMATION_SECONDS = 300
+#: The live passkeys a party may hold at once (the 11th is ``409 too_many_passkeys``).
+MAX_PASSKEYS = 10
+#: A passkey's label: the API key label rule, 1 to 64 printable ASCII characters.
+PASSKEY_LABEL_PATTERN = API_KEY_LABEL_PATTERN
+#: ``pky_`` + 32 random hex: the API's handle of a passkey, never derived from the
+#: authenticator's credential id (which the API never shows).
+PASSKEY_ID_PATTERN = r"^pky_[0-9a-f]{32}$"
+#: ``wac_`` + 32 random hex: one WebAuthn ceremony (its challenge, bound to the session that
+#: asked and to its purpose). Opaque; not a secret.
+CEREMONY_ID_PATTERN = r"^wac_[0-9a-f]{32}$"
+#: The browser's WebAuthn JSON (``PublicKeyCredential.toJSON()``) and the options sent for
+#: it: at most this many bytes as compact ASCII JSON. A registration with a 1023-byte
+#: credential id and an RSA key is under 4 KiB; ten excluded credentials of that size are
+#: under 15 KiB.
+WEBAUTHN_JSON_MAX = 32 * 1024
+_PASSKEY_ID = re.compile(PASSKEY_ID_PATTERN, re.ASCII)
+_CEREMONY_ID = re.compile(CEREMONY_ID_PATTERN, re.ASCII)
+_PasskeyId = Annotated[str, StringConstraints(max_length=36, pattern=PASSKEY_ID_PATTERN)]
+_CeremonyId = Annotated[str, StringConstraints(max_length=36, pattern=CEREMONY_ID_PATTERN)]
+_PasskeyLabel = _KeyLabel
+#: An RP ID is a DNS name: at most 253 characters.
+_RpId = Annotated[str, StringConstraints(min_length=1, max_length=253)]
+
+#: How an authenticator reaches the browser (WebAuthn ``AuthenticatorTransport``), as the
+#: gate keeps it: ``cable`` is stored as ``hybrid``, unknown values are dropped.
+PasskeyTransport = Literal["usb", "nfc", "ble", "smart-card", "hybrid", "internal"]
+#: Who revoked a passkey: the person (``revoked``), the gate on a use count that went
+#: backwards (``counter``: a copy of the authenticator answered), or an operator.
+PasskeyRevokedBy = Literal["revoked", "counter", "operator"]
+
+
+def is_passkey_id(text: str) -> bool:
+    """``text`` is a passkey id exactly as the gate issues it (``pky_`` + 32 hex)."""
+    return _PASSKEY_ID.fullmatch(text) is not None
+
+
+def is_ceremony_id(text: str) -> bool:
+    """``text`` is a ceremony id exactly as the gate issues it (``wac_`` + 32 hex)."""
+    return _CEREMONY_ID.fullmatch(text) is not None
+
+
+def _webauthn_json(value: Any) -> Any:
+    """Refuse a WebAuthn JSON object larger than :data:`WEBAUTHN_JSON_MAX` before pydantic
+    walks it (its members are then checked to be JSON). Anything but an object is left to
+    pydantic's own single error."""
+    if isinstance(value, dict):
+        try:
+            size = len(json.dumps(value, separators=(",", ":"), allow_nan=False))
+        except (TypeError, ValueError, RecursionError):
+            raise ValueError("not a JSON object") from None
+        if size > WEBAUTHN_JSON_MAX:
+            raise ValueError(f"at most {WEBAUTHN_JSON_MAX} bytes of JSON")
+    return value
+
+
+#: A WebAuthn JSON object: ``RegistrationResponseJSON`` / ``AuthenticationResponseJSON`` from
+#: the browser, ``PublicKeyCredential{Creation,Request}OptionsJSON`` from the gate.
+#: (The member ceiling comes first: after the validator it would not reach the schema.)
+_WebAuthnJson = Annotated[
+    dict[str, JsonValue], Field(max_length=_MEMBERS_MAX), BeforeValidator(_webauthn_json)
+]
+
+
+class PasskeyCeremony(_M):
+    """``POST /v1/passkeys/options`` and ``POST /v1/auth/confirm/passkey/options`` (201): one
+    WebAuthn ceremony of the session that asked. ``options`` is
+    ``PublicKeyCredentialCreationOptionsJSON`` (adding a passkey) or
+    ``PublicKeyCredentialRequestOptionsJSON`` (confirming), for
+    ``PublicKeyCredential.parse{Creation,Request}OptionsFromJSON``; send the browser's answer
+    back with ``ceremony_id``, once, within ``expires_in`` seconds. ``rp_id``: a page whose
+    host is neither it nor under it cannot use these options."""
+
+    ceremony_id: _CeremonyId
+    rp_id: _RpId
+    options: _WebAuthnJson
+    expires_in: int = Field(ge=1)
+
+
+class PasskeyAdd(_M):
+    """``POST /v1/passkeys``: the browser's answer to ``passkey_options``
+    (``RegistrationResponseJSON``), and a name for the passkey."""
+
+    ceremony_id: _CeremonyId
+    label: _PasskeyLabel
+    credential: _WebAuthnJson = Field(repr=False)
+
+
+class PasskeyConfirm(_M):
+    """``POST /v1/auth/confirm/passkey``: the browser's answer to ``confirm_passkey_options``
+    (``AuthenticationResponseJSON``)."""
+
+    ceremony_id: _CeremonyId
+    credential: _WebAuthnJson = Field(repr=False)
+
+
+class PasskeyView(_M):
+    """One passkey of ``GET /v1/passkeys``; never its key or its credential id."""
+
+    id: _PasskeyId
+    label: _PasskeyLabel
+    created_at: datetime
+    #: The first 12 hex of the sign-in that added it (as the sign-ins list shows it); None
+    #: once that sign-in's record is gone.
+    added_by: Annotated[str, StringConstraints(max_length=12, pattern=r"^[0-9a-f]{12}$")] | None = (
+        None
+    )
+    last_used_at: datetime | None = None
+    #: The authenticator's backup state when last seen: a password manager or a cloud
+    #: keychain holds a copy (synced), else it lives on this device only.
+    backed_up: bool
+    transports: list[PasskeyTransport] = Field(max_length=6)
+    revoked_at: datetime | None = None
+    revoked_by: PasskeyRevokedBy | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> PasskeyView:
+        if (self.revoked_at is None) != (self.revoked_by is None):
+            raise ValueError(
+                "a revoked passkey carries revoked_at and revoked_by, a live one neither"
+            )
+        return self
+
+
+class PasskeyList(_M):
+    """``GET /v1/passkeys``: the party's live passkeys newest first, then its latest revoked
+    ones. ``rp_id``: where they work (the console's host); None: this gate takes no passkeys
+    (the list still shows what it holds)."""
+
+    rp_id: _RpId | None
+    passkeys: list[PasskeyView] = Field(max_length=_PAGE_MAX)
+
+
+class PasskeyConfirmed(_M):
+    """``POST /v1/auth/confirm/passkey`` (200): this session is confirmed until
+    ``confirmed_until`` (now plus the gate's ``KONTRA_CONFIRM_TTL``), by ``passkey_id``."""
+
+    confirmed_until: datetime
+    passkey_id: _PasskeyId
 
 
 #: The most recipients one party may hold (decisions I7). age writes one ~100-byte stanza

@@ -90,7 +90,7 @@ async def terminal_confirmer(gate: GateClient, route: str, need: m.ConfirmationR
     email login is asked in place when a person is at this terminal, and otherwise the
     change fails as the gate answered (no mail nobody waits for); an account that only a new
     sign-in can confirm gets that said."""
-    from kontra.auth import ConfirmError, confirm_if_instant
+    from kontra.auth import ConfirmError, _confirm_now, confirm_if_instant
 
     if need.confirm_with == "dev":
         return await confirm_if_instant(gate, route, need)
@@ -98,5 +98,5 @@ async def terminal_confirmer(gate: GateClient, route: str, need: m.ConfirmationR
         raise ConfirmError("unavailable", _FAILED["unavailable"])
     if not interactive():
         return False
-    await confirm_here(gate, ROUTE_WORDS.get(route))
+    await confirm_here(gate, ROUTE_WORDS.get(route), extend=_confirm_now(route))
     return True

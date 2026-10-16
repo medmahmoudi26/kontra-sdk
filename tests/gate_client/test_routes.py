@@ -27,12 +27,15 @@ AUTHENTICATED = {
     "party",
     "human",
     "fresh",
+    "recent",
     "worker",
     "party|worker",
     "resolver",
     "resolver_human",
 }
 CONFIRM_ID = "cfm_" + "0" * 32
+CEREMONY_ID = "wac_" + "0" * 32
+PASSKEY_ID = "pky_" + "0" * 32
 
 
 async def _drain(it: Any) -> list[Any]:
@@ -66,6 +69,12 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     "end_session": (lambda c: c.end_session(JOB), {"session_id": JOB}),
     "confirm_start": (lambda c: c.confirm_start(), {}),
     "confirm_status": (lambda c: c.confirm_status(CONFIRM_ID), {"confirm_id": CONFIRM_ID}),
+    "passkeys": (lambda c: c.passkeys(), {}),
+    "passkey_options": (lambda c: c.passkey_options(), {}),
+    "add_passkey": (lambda c: c.add_passkey(CEREMONY_ID, "laptop", {"id": "x"}), {}),
+    "revoke_passkey": (lambda c: c.revoke_passkey(PASSKEY_ID), {"passkey_id": PASSKEY_ID}),
+    "confirm_passkey_options": (lambda c: c.confirm_passkey_options(), {}),
+    "confirm_passkey": (lambda c: c.confirm_passkey(CEREMONY_ID, {"id": "x"}), {}),
     "publish": (lambda c: c.publish({"nexusrpc": "1.0.0"}), {}),
     "search": (lambda c: c.search("enrich"), {}),
     "get_offering": (

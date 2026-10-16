@@ -16,6 +16,7 @@ import pytest
 from kontra.auth import (
     ConfirmError,
     Session,
+    _confirm_now,  # pyright: ignore[reportPrivateUsage]
     confirm_if_instant,
     confirm_in_place,
     confirm_prompt,
@@ -380,6 +381,37 @@ async def test_confirm_in_place_waits_for_the_person(prod_gate: FakeGate) -> Non
         prod_gate.advance(HOUR)
         assert (await ann.gate.create_api_key("in place")).label == "in place"
     assert [await t for t in typed] == ["confirmed"]
+
+
+async def test_adding_a_passkey_waits_for_a_confirmation_made_now(prod_gate: FakeGate) -> None:
+    """``passkey_options`` is ``recent`` (decisions I24): inside a running hour a poll
+    already shows ``confirmed_until``, so the confirmer must wait for *this* confirmation,
+    or the request it sends once more is refused again."""
+    codes: list[str] = []
+    sleeps = 0
+
+    def show(start: m.ConfirmStart) -> None:
+        assert start.user_code is not None
+        codes.append(start.user_code)
+
+    async def sleep(_: float) -> None:  # the person types the code after the first poll
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 2:
+            link = prod_gate.outbox[-1].link
+            assert await prod_gate.use_magic_link(link, codes[-1]) == "confirmed"
+
+    async with await _email_session(prod_gate, confirm=confirm_in_place(show, sleep=sleep)) as ann:
+        prod_gate.advance(timedelta(minutes=10))  # inside the hour, past the five minutes
+        ceremony = await ann.gate.passkey_options()
+    assert ceremony.ceremony_id.startswith("wac_")
+    assert (len(codes), sleeps) == (1, 2)
+
+
+async def test_only_a_recent_row_needs_a_confirmation_made_now() -> None:
+    assert _confirm_now("passkey_options")
+    for route in ("add_passkey", "revoke_passkey", "create_api_key", "publish", "nope"):
+        assert not _confirm_now(route)
 
 
 async def test_confirm_in_place_says_when_only_a_sign_in_will_do() -> None:

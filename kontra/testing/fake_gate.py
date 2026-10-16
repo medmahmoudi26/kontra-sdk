@@ -2,7 +2,9 @@
 
 :class:`FakeGate` serves every row of :data:`kontra.gate_client.routes.ROUTES` from memory:
 identity (dev login, the device flow, magic links to an allowlist, API keys, rotating
-refresh tokens, ES256 tokens and a JWKS), parties with Temporal namespaces, the catalog (contract validation, opaque endpoint names,
+refresh tokens, ES256 tokens and a JWKS, "Confirm it's you" by mail or by a passkey -- whose
+answers :mod:`kontra._passkeys` verifies, as on the platform), parties with Temporal
+namespaces, the catalog (contract validation, opaque endpoint names,
 the endpoint created through the control plane), the Workers view (Temporal's task-queue
 stats of a seller's own version), the quote relay, hire with a signed hold
 token, the escrow lifecycle, progress over SSE, artifacts and claim-check blobs behind
@@ -35,6 +37,7 @@ are always instant play money (production would answer with a checkout URL); the
 flow can approve itself; mail is not sent but appended to :attr:`FakeGate.outbox`, and the
 magic link's page is :meth:`FakeGate.use_magic_link` (the human typing the code their screen
 shows: a device's, to sign in, or a confirmation's, to confirm it's them -- decisions I23).
+A passkey's answers come from :class:`kontra.testing.SoftAuthenticator` rather than a browser.
 """
 
 # No ``from __future__ import annotations`` here: FastAPI reads the route functions'
@@ -82,10 +85,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google.protobuf.message import DecodeError
 from jwt.algorithms import ECAlgorithm
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from temporalio.api.common.v1 import Payload
 
+from kontra import _passkeys as pk
 from kontra import escrow
 from kontra._control import (
     BuyerCall,
@@ -195,6 +199,21 @@ VIA_WORDS = {
 _DEV_VIA = frozenset({"dev-login", "device:dev"})
 SUBJECT_SIGN_IN = "Your Kontra sign-in link"
 SUBJECT_CONFIRM = "Confirm it's you on Kontra"
+SUBJECT_PASSKEY_ADDED = pk.SUBJECT_ADDED
+SUBJECT_PASSKEY_REVOKED = pk.SUBJECT_REVOKED
+SUBJECT_PASSKEY_REMOVED = pk.SUBJECT_REMOVED
+#: Passkeys (decisions I24), the platform's limits: one sign-in asks for at most this many
+#: ceremonies of one purpose an hour, and gets none once this many of its answers were
+#: refused in the last hour.
+PASSKEY_OPTIONS_PER_HOUR = 20
+PASSKEY_FAILURES_PER_HOUR = 10
+PASSKEY_RATE_WINDOW = timedelta(hours=1)
+#: ``GET /v1/passkeys`` lists every live passkey, then the latest revoked ones, this many in all.
+PASSKEYS_LISTED = 50
+#: Settled ceremonies are forgotten this long after they expire.
+CEREMONY_PURGE_AFTER = timedelta(days=1)
+#: The operator's ``--passkey``: 8 to 36 characters of a passkey's id.
+_PASSKEY_PREFIX = re.compile(r"pky_[0-9a-f]{4,32}", re.ASCII)
 #: ``last_used_at`` of an API key moves at most this often.
 KEY_USE_RESOLUTION = timedelta(minutes=1)
 #: ``GET /v1/keys`` lists every live key, then the latest revoked ones, this many in all.
@@ -373,8 +392,8 @@ class Principal:
     #: When the person last confirmed it's them for this session (None: never; the sign-in
     #: itself, ``auth_time``, counts as one).
     confirmed_at: datetime | None = None
-    #: When the operator asked this session to confirm again (:meth:`FakeGate.require_confirmation`;
-    #: None: never).
+    #: When this session was last asked to confirm again -- by the operator
+    #: (:meth:`FakeGate.require_confirmation`) or the revocation of a passkey (None: never).
     confirm_required_at: datetime | None = None
 
 
@@ -412,8 +431,9 @@ class _Session:
     created_at: datetime | None = None
     #: The last completed confirmation of this session (decisions I23); never a key's.
     confirmed_at: datetime | None = None
-    #: When the operator asked it to confirm again (``gate.admin require-confirmation``):
-    #: no change until a later confirmation. Never a key's.
+    #: When it was asked to confirm again -- by the operator (``gate.admin
+    #: require-confirmation``) or the revocation of a passkey (decisions I24): no change until
+    #: a later confirmation. Never a key's.
     confirm_required_at: datetime | None = None
 
     @property
@@ -492,6 +512,79 @@ class _Confirmation:
     created_at: datetime
     expires_at: datetime
     confirmed_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class _PasskeyUser:
+    """A party's WebAuthn user handle (``user.id`` of every registration): 32 random bytes,
+    never derived from the handle or an address, made by its first ceremony. One per party,
+    so an authenticator keeps one Kontra passkey per account."""
+
+    party: str
+    user_handle: bytes
+    created_at: datetime
+
+
+@dataclass
+class _Passkey:
+    """A passkey that confirms a party's sign-ins (decisions I24). ``id`` (``pky_`` + 32
+    random hex) is the API's handle, never derived from ``credential_id``, which is unique
+    across the gate, revoked ones included. ``sign_count`` is the last use count seen."""
+
+    id: str
+    party: str
+    credential_id: bytes
+    public_key: bytes
+    algorithm: int
+    sign_count: int
+    transports: tuple[pk.Transport, ...]
+    aaguid: str
+    label: str
+    backup_eligible: bool
+    backed_up: bool
+    created_at: datetime
+    created_session_id: str | None
+    last_used_at: datetime | None = None
+    revoked_at: datetime | None = None
+    revoked_reason: m.PasskeyRevokedBy | None = None
+
+    def known(self) -> pk.Known:
+        return pk.Known(
+            self.credential_id,
+            self.public_key,
+            self.sign_count,
+            self.backup_eligible,
+            self.transports,
+        )
+
+    def view(self) -> m.PasskeyView:
+        return m.PasskeyView(
+            id=self.id,
+            label=self.label,
+            created_at=self.created_at,
+            added_by=self.created_session_id[:12] if self.created_session_id else None,
+            last_used_at=self.last_used_at,
+            backed_up=self.backed_up,
+            transports=list(self.transports),
+            revoked_at=self.revoked_at,
+            revoked_by=self.revoked_reason,
+        )
+
+
+@dataclass
+class _Ceremony:
+    """One WebAuthn ceremony: its challenge, bound to the session that asked and to its
+    purpose, used once (``used_at``, with the outcome) whatever the outcome, before
+    ``expires_at``."""
+
+    id: str
+    session_id: str
+    purpose: pk.Purpose
+    challenge: bytes
+    created_at: datetime
+    expires_at: datetime
+    used_at: datetime | None = None
+    outcome: Literal["ok", "rejected", "cloned"] | None = None
 
 
 @dataclass(slots=True)
@@ -730,6 +823,14 @@ class FakeGate:
     ``confirm_ttl``: how long a sign-in or a confirmation lets a person make changes (the
     platform's ``KONTRA_CONFIRM_TTL``); ``freshness`` is its old name, deprecated.
     ``confirm_interval``: how often the asking screen is told to poll a confirmation.
+    ``passkeys``: a passkey may confirm it's you (decisions I24); False is the platform's
+    ``KONTRA_PASSKEYS=0`` (every ceremony 409 ``passkeys_unavailable``, stored passkeys
+    kept). ``passkey_rp_id`` (``KONTRA_PASSKEY_RP_ID``): the WebAuthn RP ID; by default the
+    host of :attr:`base_url`, as the platform derives it from the URL it serves its own
+    console at, and none -- passkeys off -- when that host is an IP address (as after
+    :meth:`serve`). ``passkey_rp_name`` (``KONTRA_PASSKEY_RP_NAME``): what authenticators
+    show. ``passkey_origins``: the console's origins (``KONTRA_CONSOLE_ORIGINS``; default
+    :attr:`base_url`), of which only those on the RP ID are taken (:attr:`passkey_origins`).
 
     The clock offset (:meth:`advance`) moves token ``iat``/``exp`` too: a seller's
     handler verifying a hold token issued *after* an advance on the machine's clock sees
@@ -773,9 +874,20 @@ class FakeGate:
         input_retention: timedelta = timedelta(days=7),
         orphan_upload_ttl: timedelta = timedelta(hours=24),
         keepalive: float = 5.0,
+        passkeys: bool = True,
+        passkey_rp_id: str | None = None,
+        passkey_rp_name: str = pk.DEFAULT_RP_NAME,
+        passkey_origins: Sequence[str] | None = None,
     ) -> None:
         if part_size <= 0:
             raise ValueError("part_size must be positive")
+        if passkey_rp_id is not None and not pk.is_rp_id(passkey_rp_id):
+            raise ValueError(
+                "passkey_rp_id (KONTRA_PASSKEY_RP_ID) must be a lower-case host name, not an "
+                "IP address, that is localhost or has a dot"
+            )
+        if not pk.is_rp_name(passkey_rp_name):
+            raise ValueError("passkey_rp_name is 1 to 64 printable ASCII characters")
         self.control = control
         self._offset = timedelta(0)
         self.ledger: Ledger = (
@@ -820,6 +932,10 @@ class FakeGate:
         self.input_retention = input_retention
         self.orphan_upload_ttl = orphan_upload_ttl
         self.keepalive = keepalive
+        self.passkeys = passkeys
+        self.passkey_rp_id = passkey_rp_id
+        self.passkey_rp_name = passkey_rp_name
+        self._passkey_origins = None if passkey_origins is None else tuple(passkey_origins)
 
         self.keys = _KeyRing()
         self._url_secret = secrets.token_bytes(32)
@@ -836,6 +952,9 @@ class FakeGate:
         self._magic: dict[str, _MagicLink] = {}  # by the link token's sha256
         self._confirmations: dict[str, _Confirmation] = {}  # by id
         self._handoffs: dict[str, _Handoff] = {}  # by the handoff's sha256
+        self._passkey_users: dict[str, _PasskeyUser] = {}  # by party
+        self._passkey_rows: dict[str, _Passkey] = {}  # by id
+        self._ceremonies: dict[str, _Ceremony] = {}  # by id
         #: Every handoff the link's page issued, oldest first (what the platform's page puts
         #: in the console URL's fragment).
         self.handoffs: list[str] = []
@@ -1079,19 +1198,32 @@ class FakeGate:
         until = self.confirmed_until(who)
         if until is not None and self.now() < until:
             return who
+        raise self._confirmation_required(who, _confirmation_required_message(self.confirm_ttl))
+
+    #: Deprecated: :meth:`require_confirmed`.
+    require_fresh = require_confirmed
+
+    def require_recent(self, who: Principal) -> Principal:
+        """``recent`` (decisions I24): a person's session confirmed -- by its sign-in or a
+        completed confirmation -- less than ``RECENT_CONFIRMATION_SECONDS`` (five minutes)
+        ago, with no mark since: adding a passkey, which can confirm every change after it.
+        The API-key test comes first, as for ``fresh``; the 403 is ``fresh``'s, with its own
+        message."""
+        self.require_human(who)
+        until = self.confirmed_until(who)
+        since = max(who.auth_time, who.confirmed_at or who.auth_time)
+        now = self.now()
+        recent = now - since < timedelta(seconds=m.RECENT_CONFIRMATION_SECONDS)
+        if until is not None and now < until and recent:
+            return who
+        raise self._confirmation_required(who, pk.RECENT_REQUIRED)
+
+    def _confirmation_required(self, who: Principal, message: str) -> GateHTTPError:
         need = m.ConfirmationRequired(
             confirm_with=self.confirm_channel(who),
             confirm_ttl_seconds=int(self.confirm_ttl.total_seconds()),
         )
-        raise GateHTTPError(
-            403,
-            m.CONFIRMATION_REQUIRED,
-            _confirmation_required_message(self.confirm_ttl),
-            need.model_dump(mode="json"),
-        )
-
-    #: Deprecated: :meth:`require_confirmed`.
-    require_fresh = require_confirmed
+        return GateHTTPError(403, m.CONFIRMATION_REQUIRED, message, need.model_dump(mode="json"))
 
     def require_resolver(self, who: Principal) -> Principal:
         """A resolver's confirmed human session: splitting escrow is not for an API key or an
@@ -1825,6 +1957,358 @@ class FakeGate:
         self._confirm_session(session, now)
         confirmation.status, confirmation.confirmed_at = "confirmed", now
         return "confirmed"
+
+    # ------------------------------------------------------------------ passkeys
+
+    def _rp_candidate(self) -> str | None:
+        if not self.passkeys:
+            return None
+        return self.passkey_rp_id or pk.rp_id_of(self.base_url)
+
+    @property
+    def webauthn_rp_id(self) -> str | None:
+        """The RP ID passkeys are made for and checked against (decisions I24); None:
+        this gate takes no passkeys (:attr:`passkeys` off, no host it could derive one
+        from, or no console origin on it -- as the platform)."""
+        return self._rp_candidate() if self.passkey_origins else None
+
+    @property
+    def passkey_origins(self) -> tuple[str, ...]:
+        """The origins a passkey's answer may come from: the console's on the RP ID."""
+        rp_id = self._rp_candidate()
+        if rp_id is None:
+            return ()
+        given = self._passkey_origins
+        return pk.origins_on(rp_id, (self.base_url,) if given is None else given)
+
+    def _passkeys_on(self) -> str:
+        rp_id = self.webauthn_rp_id
+        if rp_id is None:
+            raise GateHTTPError(409, "passkeys_unavailable", pk.UNAVAILABLE)
+        return rp_id
+
+    def _live_passkeys(self, party: str) -> list[_Passkey]:
+        """The party's passkeys that confirm, newest first."""
+        return sorted(
+            (p for p in self._passkey_rows.values() if p.party == party and p.revoked_at is None),
+            key=lambda p: p.created_at,
+            reverse=True,
+        )
+
+    def _ceremony_limits(self, session_id: str, purpose: pk.Purpose, now: datetime) -> None:
+        """429 past :data:`PASSKEY_OPTIONS_PER_HOUR` ceremonies of ``purpose``, or
+        :data:`PASSKEY_FAILURES_PER_HOUR` refused answers, of this sign-in in the last
+        hour (settled ceremonies are purged a day after they expire, first)."""
+        for c in [
+            c for c in self._ceremonies.values() if c.expires_at < now - CEREMONY_PURGE_AFTER
+        ]:
+            del self._ceremonies[c.id]
+        mine = [c for c in self._ceremonies.values() if c.session_id == session_id]
+        asked = sorted(
+            c.created_at
+            for c in mine
+            if c.purpose == purpose and now - c.created_at < PASSKEY_RATE_WINDOW
+        )
+        refused = sorted(
+            c.used_at
+            for c in mine
+            if c.outcome == "rejected"
+            and c.used_at is not None
+            and now - c.used_at < PASSKEY_RATE_WINDOW
+        )
+        for times, limit, message in (
+            (asked, PASSKEY_OPTIONS_PER_HOUR, pk.OPTIONS_LIMITED),
+            (refused, PASSKEY_FAILURES_PER_HOUR, pk.FAILURES_LIMITED),
+        ):
+            if len(times) >= limit:
+                ends = times[-limit] + PASSKEY_RATE_WINDOW
+                retry = max(1, math.ceil((ends - now).total_seconds()))
+                raise GateHTTPError(
+                    429,
+                    "rate_limited",
+                    message,
+                    {"retry_after_seconds": retry},
+                    headers={"Retry-After": str(retry)},
+                )
+
+    def _new_ceremony(self, who: Principal, purpose: pk.Purpose, now: datetime) -> _Ceremony:
+        ceremony_id = "wac_" + secrets.token_hex(16)
+        while ceremony_id in self._ceremonies:  # pragma: no cover - 128 random bits
+            ceremony_id = "wac_" + secrets.token_hex(16)
+        ceremony = _Ceremony(
+            ceremony_id,
+            who.session_id,
+            purpose,
+            secrets.token_bytes(pk.CHALLENGE_BYTES),
+            now,
+            now + pk.CEREMONY_TTL,
+        )
+        self._ceremonies[ceremony.id] = ceremony
+        return ceremony
+
+    @staticmethod
+    def _ceremony(
+        rp_id: str, ceremony: _Ceremony, options: dict[str, JsonValue]
+    ) -> m.PasskeyCeremony:
+        return m.PasskeyCeremony(
+            ceremony_id=ceremony.id,
+            rp_id=rp_id,
+            options=options,
+            expires_in=int(pk.CEREMONY_TTL.total_seconds()),
+        )
+
+    def _spend(self, who: Principal, ceremony_id: str, purpose: pk.Purpose) -> _Ceremony:
+        """The ceremony ``ceremony_id`` of this session and ``purpose``, used up now --
+        before its answer is looked at, whatever comes of it (``rejected`` until it is known
+        to be ``ok``) -- or 410 ``ceremony_gone``: unknown, another session's, the other
+        purpose, used or expired are one answer."""
+        now = self.now()
+        found = self._ceremonies.get(ceremony_id) if m.is_ceremony_id(ceremony_id) else None
+        if (
+            found is None
+            or found.session_id != who.session_id
+            or found.purpose != purpose
+            or found.used_at is not None
+            or now >= found.expires_at
+        ):
+            raise GateHTTPError(410, "ceremony_gone", pk.GONE)
+        found.used_at, found.outcome = now, "rejected"
+        return found
+
+    def _refused(self, who: Principal, op: str, reason: str) -> GateHTTPError:
+        log.info(
+            "passkey %s refused for %s (sign-in %s): %s", op, who.party, who.session_id[:12], reason
+        )
+        return GateHTTPError(400, "passkey_rejected", pk.REJECTED)
+
+    def _mark_sessions(self, party: str, now: datetime, *, but: str | None = None) -> None:
+        """Ask the party's live sign-ins (all, or all ``but`` one) to confirm again before
+        their next change: whoever held a revoked passkey may have confirmed one of them."""
+        for s in self.sessions.values():
+            if s.party == party and not s.revoked and s.via != "api_key" and s.id != but:
+                s.confirm_required_at = now
+
+    def _notify(self, party: str, subject: str, text: str, now: datetime) -> None:
+        """A notice to the party's sign-in address, if it has one: no link, no code."""
+        address = self._email_of(party)
+        if address is not None:
+            self.outbox.append(
+                SentMail(to=address, subject=subject, text=text, link="", sent_at=now)
+            )
+
+    def list_passkeys(self, who: Principal) -> m.PasskeyList:
+        """``GET /v1/passkeys``: live passkeys newest first, then the latest revoked ones."""
+        live = self._live_passkeys(who.party)
+        revoked = sorted(
+            (
+                p
+                for p in self._passkey_rows.values()
+                if p.party == who.party and p.revoked_at is not None
+            ),
+            key=lambda p: p.revoked_at or p.created_at,
+            reverse=True,
+        )
+        rows = [*live, *revoked][:PASSKEYS_LISTED]
+        return m.PasskeyList(rp_id=self.webauthn_rp_id, passkeys=[p.view() for p in rows])
+
+    def passkey_options(self, who: Principal) -> m.PasskeyCeremony:
+        """``POST /v1/passkeys/options`` (``recent``): creation options for a new passkey,
+        the party's live ones excluded; a party's first makes its user handle."""
+        rp_id = self._passkeys_on()
+        now = self.now()
+        self._ceremony_limits(who.session_id, "register", now)
+        live = self._live_passkeys(who.party)
+        if len(live) >= m.MAX_PASSKEYS:
+            raise _too_many_passkeys()
+        user = self._passkey_users.get(who.party)
+        if user is None:
+            user = _PasskeyUser(who.party, secrets.token_bytes(pk.USER_HANDLE_BYTES), now)
+            self._passkey_users[who.party] = user
+        ceremony = self._new_ceremony(who, "register", now)
+        options = pk.registration_options(
+            rp_id=rp_id,
+            rp_name=self.passkey_rp_name,
+            user_handle=user.user_handle,
+            user_name=who.party,
+            challenge=ceremony.challenge,
+            exclude=[p.known() for p in live],
+        )
+        return self._ceremony(rp_id, ceremony, options)
+
+    def add_passkey(self, who: Principal, req: m.PasskeyAdd) -> m.PasskeyView:
+        """``POST /v1/passkeys`` (``fresh``): verify the browser's answer to this session's
+        registration ceremony and keep the passkey; then mail the party that it was added."""
+        rp_id = self._passkeys_on()
+        ceremony = self._spend(who, req.ceremony_id, "register")
+        now = ceremony.used_at or self.now()
+        try:
+            new = pk.verify_registration(
+                req.credential,
+                challenge=ceremony.challenge,
+                rp_id=rp_id,
+                origins=self.passkey_origins,
+            )
+        except pk.PasskeyRejected as e:
+            raise self._refused(who, "register", e.reason) from None
+        if len(self._live_passkeys(who.party)) >= m.MAX_PASSKEYS:
+            raise _too_many_passkeys()
+        if any(p.credential_id == new.credential_id for p in self._passkey_rows.values()):
+            raise GateHTTPError(409, "passkey_exists", pk.EXISTS)
+        passkey_id = "pky_" + secrets.token_hex(16)
+        while passkey_id in self._passkey_rows:  # pragma: no cover - 128 random bits
+            passkey_id = "pky_" + secrets.token_hex(16)
+        row = _Passkey(
+            passkey_id,
+            who.party,
+            new.credential_id,
+            new.public_key,
+            new.algorithm,
+            new.sign_count,
+            new.transports,
+            new.aaguid,
+            req.label,
+            new.backup_eligible,
+            new.backed_up,
+            now,
+            who.session_id,
+        )
+        self._passkey_rows[row.id] = row
+        ceremony.outcome = "ok"
+        session = self.sessions[who.session_id]
+        text = pk.added_mail(
+            req.label,
+            now,
+            via=VIA_WORDS.get(session.via, session.via),
+            signed_in=session.auth_time,
+            session_prefix=session.id[:12],
+        )
+        self._notify(who.party, SUBJECT_PASSKEY_ADDED, text, now)
+        return row.view()
+
+    def revoke_passkey(self, who: Principal, passkey_id: str) -> None:
+        """``DELETE /v1/passkeys/{id}`` (``fresh``): revoke one of the party's passkeys, ask
+        its other sign-ins to confirm again, and mail the party which sign-in removed it. A
+        revoked one changes nothing; another party's, or an id that is none, is not found."""
+        row = self._passkey_rows.get(passkey_id) if m.is_passkey_id(passkey_id) else None
+        if row is None or row.party != who.party:
+            raise GateHTTPError(404, "not_found", "no such passkey")
+        if row.revoked_at is not None:
+            return
+        now = self.now()
+        row.revoked_at, row.revoked_reason = now, "revoked"
+        self._mark_sessions(who.party, now, but=who.session_id)
+        session = self.sessions[who.session_id]
+        text = pk.removed_mail(
+            row.label,
+            now,
+            via=VIA_WORDS.get(session.via, session.via),
+            signed_in=session.auth_time,
+            session_prefix=session.id[:12],
+        )
+        self._notify(who.party, SUBJECT_PASSKEY_REMOVED, text, now)
+
+    def confirm_passkey_options(self, who: Principal) -> m.PasskeyCeremony:
+        """``POST /v1/auth/confirm/passkey/options`` (``human``): request options listing
+        the party's live passkeys. Mails nobody and confirms nothing."""
+        rp_id = self._passkeys_on()
+        now = self.now()
+        self._ceremony_limits(who.session_id, "confirm", now)
+        live = self._live_passkeys(who.party)
+        if not live:
+            raise GateHTTPError(409, "no_passkeys", pk.NO_PASSKEYS)
+        ceremony = self._new_ceremony(who, "confirm", now)
+        options = pk.assertion_options(
+            rp_id=rp_id, challenge=ceremony.challenge, allow=[p.known() for p in live]
+        )
+        return self._ceremony(rp_id, ceremony, options)
+
+    def confirm_passkey(self, who: Principal, req: m.PasskeyConfirm) -> m.PasskeyConfirmed:
+        """``POST /v1/auth/confirm/passkey`` (``human``): verify the browser's answer to
+        this session's confirm ceremony with the live passkey of the party it names, then
+        judge its use count (:func:`kontra._passkeys.judge_counter`): forward (or 0 on both
+        sides) confirms this session, as the mailed link does; behind, for a synced passkey
+        (backup eligible), is refused and nothing else happens; behind otherwise is a copy of
+        the authenticator answering -- the passkey is revoked, every sign-in of the party
+        asked to confirm again, the party mailed, and nothing confirmed."""
+        rp_id = self._passkeys_on()
+        ceremony = self._spend(who, req.ceremony_id, "confirm")
+        now = ceremony.used_at or self.now()
+        raw = pk.answer_credential_id(req.credential)
+        row = next(
+            (
+                p
+                for p in self._live_passkeys(who.party)
+                if raw is not None and hmac.compare_digest(p.credential_id, raw)
+            ),
+            None,
+        )
+        user = self._passkey_users.get(who.party)
+        if row is None or user is None:
+            raise self._refused(who, "confirm", "unknown")
+        try:
+            assertion = pk.verify_assertion(
+                req.credential,
+                challenge=ceremony.challenge,
+                rp_id=rp_id,
+                origins=self.passkey_origins,
+                known=row.known(),
+                user_handle=user.user_handle,
+            )
+        except pk.PasskeyRejected as e:
+            raise self._refused(who, "confirm", e.reason) from None
+        verdict = pk.judge_counter(
+            row.sign_count, assertion.sign_count, backup_eligible=row.backup_eligible
+        )
+        if verdict == "behind":  # a synced passkey's other copy: refused, nothing revoked
+            raise self._refused(who, "confirm", "counter")
+        if verdict == "copy":
+            row.revoked_at, row.revoked_reason = now, "counter"
+            self._mark_sessions(who.party, now)
+            ceremony.outcome = "cloned"
+            self._notify(who.party, SUBJECT_PASSKEY_REVOKED, pk.revoked_mail(row.label, now), now)
+            log.warning(
+                "passkey %s of %s answered an old use count: revoked", row.id[:12], who.party
+            )
+            raise GateHTTPError(403, "passkey_cloned", pk.CLONED)
+        if not self._confirm_session(self.sessions[who.session_id], now):  # pragma: no cover
+            raise _unauthorized("invalid_token", "the session was revoked; log in again")
+        row.sign_count, row.backed_up, row.last_used_at = (
+            assertion.sign_count,
+            assertion.backed_up,
+            now,
+        )
+        ceremony.outcome = "ok"
+        return m.PasskeyConfirmed(confirmed_until=now + self.confirm_ttl, passkey_id=row.id)
+
+    def revoke_passkeys(self, party: str, passkey: str | None = None) -> list[str]:
+        """Revoke ``party``'s live passkeys -- or the one whose id starts with ``passkey``
+        (8 to 36 characters) -- ask every sign-in of the party to confirm again, and mail the
+        party each passkey removed, as ``python -m gate.admin revoke-passkeys`` does (the
+        reason is ``operator``). Returns the 12-character id prefixes revoked, oldest first;
+        ``ValueError`` (nothing changed) for an unknown party, a malformed prefix, or one
+        naming none of the party's passkeys, more than one, or a revoked one."""
+        if passkey is not None and _PASSKEY_PREFIX.fullmatch(passkey) is None:
+            raise ValueError("--passkey takes 8 to 36 characters of a passkey's id (pky_...)")
+        if party not in self.parties:
+            raise ValueError(f"no party {party!r}")
+        mine = [p for p in self._passkey_rows.values() if p.party == party]
+        if passkey is not None:
+            found = [p for p in mine if p.id.startswith(passkey)]
+            if len(found) != 1:
+                raise ValueError(
+                    f"{len(found) or 'no'} passkey(s) of {party} have an id starting {passkey}"
+                )
+            if found[0].revoked_at is not None:
+                raise ValueError("that passkey is revoked already")
+            mine = found
+        revoked = sorted((p for p in mine if p.revoked_at is None), key=lambda p: p.created_at)
+        now = self.now()
+        for p in revoked:
+            p.revoked_at, p.revoked_reason = now, "operator"
+            self._notify(party, SUBJECT_PASSKEY_REMOVED, pk.removed_mail(p.label, now), now)
+        if revoked:
+            self._mark_sessions(party, now)
+        return [p.id[:12] for p in revoked]
 
     def _new_handoff(self, party: str, auth_time: datetime, via: str) -> str:
         handoff = secrets.token_urlsafe(32)
@@ -3370,6 +3854,15 @@ def _duration_words(ttl: timedelta) -> str:
     return "a minute" if minutes == 1 else f"{minutes} minutes"
 
 
+def _too_many_passkeys() -> GateHTTPError:
+    return GateHTTPError(
+        409,
+        "too_many_passkeys",
+        f"a party holds at most {m.MAX_PASSKEYS} live passkeys; revoke one first",
+        {"max_passkeys": m.MAX_PASSKEYS},
+    )
+
+
 def _confirmation_required_message(ttl: timedelta) -> str:
     """The platform's message of 403 ``confirmation_required`` (``once an hour`` at the
     default ``confirm_ttl``)."""
@@ -3516,6 +4009,11 @@ async def _auth_fresh(request: Request) -> Principal:
     return gate.require_confirmed(gate.authenticate(request, allow_worker=False))
 
 
+async def _auth_recent(request: Request) -> Principal:
+    gate = _gate_of(request)
+    return gate.require_recent(gate.authenticate(request, allow_worker=False))
+
+
 async def _auth_resolver(request: Request) -> Principal:
     gate = _gate_of(request)
     return gate.require_resolver(gate.authenticate(request, allow_worker=False))
@@ -3535,6 +4033,7 @@ Party = Annotated[Principal, Depends(_auth_party)]
 PartyOrWorker = Annotated[Principal, Depends(_auth_party_or_worker)]
 Human = Annotated[Principal, Depends(_auth_human)]
 Fresh = Annotated[Principal, Depends(_auth_fresh)]
+Recent = Annotated[Principal, Depends(_auth_recent)]
 Resolver = Annotated[Principal, Depends(_auth_resolver)]
 ResolverHuman = Annotated[Principal, Depends(_auth_resolver_human)]
 
@@ -3711,6 +4210,41 @@ def _build_app(gate: FakeGate) -> FastAPI:
     add("end_session", end_session)
     add("confirm_start", confirm_start)
     add("confirm_status", confirm_status)
+
+    # ---------------------------------------------------------------- passkeys
+
+    async def passkeys(who: Human, response: Response) -> m.PasskeyList:
+        no_store(response)
+        return gate.list_passkeys(who)
+
+    async def passkey_options(who: Recent, response: Response) -> m.PasskeyCeremony:
+        no_store(response)
+        return gate.passkey_options(who)
+
+    async def add_passkey(who: Fresh, body: m.PasskeyAdd, response: Response) -> m.PasskeyView:
+        no_store(response)
+        return gate.add_passkey(who, body)
+
+    async def revoke_passkey(who: Fresh, passkey_id: str) -> Response:
+        gate.revoke_passkey(who, passkey_id)
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+    async def confirm_passkey_options(who: Human, response: Response) -> m.PasskeyCeremony:
+        no_store(response)
+        return gate.confirm_passkey_options(who)
+
+    async def confirm_passkey(
+        who: Human, body: m.PasskeyConfirm, response: Response
+    ) -> m.PasskeyConfirmed:
+        no_store(response)
+        return gate.confirm_passkey(who, body)
+
+    add("passkeys", passkeys)
+    add("passkey_options", passkey_options)
+    add("add_passkey", add_passkey)
+    add("revoke_passkey", revoke_passkey)
+    add("confirm_passkey_options", confirm_passkey_options)
+    add("confirm_passkey", confirm_passkey)
 
     # ---------------------------------------------------------------- catalog
 

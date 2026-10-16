@@ -38,6 +38,8 @@ PATTERNED = {
     m.API_KEY_LABEL_PATTERN: "ci",
     m.USER_CODE_PATTERN: "BCDF-GHJK",
     m.CONFIRM_ID_PATTERN: "cfm_" + "0" * 32,
+    m.CEREMONY_ID_PATTERN: "wac_" + "0" * 32,
+    m.PASSKEY_ID_PATTERN: "pky_" + "0" * 32,
 }
 
 #: Optional fields a model's validator requires given the minimal required ones: a pending

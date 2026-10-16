@@ -695,6 +695,8 @@ stolen session token.
   asked (any other: 404), with the confirmation's status and the *session's*
   `confirmed_until`, so every tab waiting on that session resumes when any of its
   confirmations completes. Several may be pending; none cancels another.
+* **A passkey is a confirmation too** (I24): in the console, one tap of a passkey the person
+  added confirms the session that asked, exactly as the mailed link does; email stays.
 * **Bound to its session, never a sign-in.** Completing a confirmation confirms the session
   that asked and no other, not even another sign-in of the same person. Its page never
   redirects, never hands a browser a session and never opens one: a confirmation is weaker
@@ -728,3 +730,91 @@ stolen session token.
   channel (`confirm_if_instant`, so `kontra serve` on `kontra dev` publishes past the hour)
   unless it is given another `Confirmer` (`confirm_in_place` asks the person). The CLI keeps
   its hint for `stale_session` while gates without this decision remain.
+
+## I24. Passkeys confirm it's you
+
+Waiting for a mail is the slow part of "Confirm it's you" (I23). The owner's decision
+(2026-10-16): a passkey -- Touch ID, Face ID, Windows Hello, a phone, a security key -- is the
+step-up, in one tap, and email stays the fallback. Passkeys never sign anyone in: that would be
+a second way into an account, and this one only shortens a way that exists.
+
+* **A passkey confirms a session; it never opens one.** Completing a passkey ceremony sets the
+  asking session's `confirmed_at`, as typing the mailed code does, and nothing else: the same
+  hour, the same `fresh` rule, the same clearing of an operator's mark. A passkey in the wrong
+  hands confirms only sessions those hands already hold, and ending them ends it. Sign-in stays
+  email (or GitHub, or dev).
+* **Seam ② gains a kind and six routes.** `recent` is `fresh` and less than
+  `RECENT_CONFIRMATION_SECONDS` (300) since the session's sign-in or last confirmation, with no
+  mark since; else the same 403 `confirmation_required` and `ConfirmationRequired`. It guards
+  one route, starting to add a passkey (`POST /v1/passkeys/options`): a passkey can confirm
+  every change after it, so a session confirmed 50 minutes ago -- perhaps stolen since -- must
+  confirm again, now, to add one. The window is about eleven minutes in effect, not five: a
+  ceremony started at 4 min 59 s lives six minutes, and finishing it is `fresh` (a finish
+  refused for a lapsed window would strand a credential the authenticator already made). A
+  client that confirms in place for a `recent` row waits for its own confirmation to complete
+  (`confirm_session(extend=True)`), not for the running hour.
+  Finishing (`POST /v1/passkeys`) and revoking (`DELETE /v1/passkeys/{id}`) are `fresh`;
+  listing (`GET /v1/passkeys`) and confirming with one (`POST /v1/auth/confirm/passkey/options`,
+  `POST /v1/auth/confirm/passkey`) are `human`. An API key's session gets 403
+  `fresh_login_required` from all six, a worker token 401. No existing response model gained
+  a field (they forbid extras, so 0.2.2 keeps parsing every answer); everything is new models.
+* **The gate verifies, the console relays.** The browser's own JSON
+  (`PublicKeyCredential.toJSON()`) travels as an opaque object of at most 32 KiB: typing its
+  fields would refuse what a new browser adds. The RP ID is the console's host per environment
+  (`app.kontra.run`, `staging-app.kontra.run`: neither under the other, so a browser never
+  offers one's passkey to the other); answers must come from the console's origins on it, and
+  never from the console framed by another site's page (`crossOrigin`, `topOrigin`: the console
+  is never framed, so no such answer is expected); user verification is required at
+  registration and at every assertion (a browser that ignores the option still fails at the
+  gate); attestation `none`; EdDSA, ES256 or RS256.
+* **Every ceremony is used once.** `wac_` + 32 random hex, bound to the session that asked and
+  to its purpose (adding, confirming), six minutes, and used up by the first answer before the
+  answer is looked at, whatever comes of it. Another session's, the other purpose's, a used or
+  an expired one are one answer: 410 `ceremony_gone`. A refused answer is 400
+  `passkey_rejected`, one answer whatever the reason (the reason is a log field).
+* **A use count that does not move forward is a copy -- of a passkey on one device.** It is
+  judged after the signature verified (`kontra._passkeys.judge_counter`), so a forgery is a
+  refusal and a clone is a clone: for a passkey that is not backup eligible, the passkey is
+  revoked (`counter`), every sign-in of the party must confirm again, the party is mailed, and
+  the answer is 403 `passkey_cloned`. A synced passkey (backup eligible) lives in copies by
+  design, every device of a password manager, and a manager that counts per device can answer
+  behind its own other copy: that answer is refused (400 `passkey_rejected`, reason `counter`;
+  the panel offers email) and nothing is revoked, marked or mailed, so a password manager's
+  counting can never cost a person their passkey and their sign-ins' hour. A copy of a synced
+  passkey is therefore not detected: the password manager is its boundary. Passkeys that count
+  nothing (0 on both sides) carry no signal either way; backup eligibility must stay what it
+  was at registration.
+* **Revoking marks the other sign-ins.** Whoever held a revoked passkey may have used it to
+  confirm one of them within the hour: revocation sets their `confirm_required_at` (I23's
+  operator mark, widened), signs nobody out, and their next confirmation clears it. The person
+  revoking is not asked again; a clone or an operator's `revoke-passkeys` marks every sign-in.
+  A mark is never earlier than a sign-in's own last confirmation, so a confirmation that
+  landed while the revocation waited for the passkey's row ends too. Known and left: the I23
+  operator mark (`require-confirmation`) is set at the command's own time, so a confirmation
+  committing in the same instant (or on a pod whose clock runs ahead) can outlive it; an email
+  confirmation needs the person's mailbox and the asking screen's code, so no stolen sign-in
+  can use that race.
+* **Limits and notices.** Ten live passkeys per party; twenty ceremonies per session and purpose
+  an hour; ten refused answers of a session in an hour stop its new ceremonies. A credential id
+  is the gate's once, revoked ones included (409 `passkey_exists`). Adding a passkey mails the
+  party's address which sign-in added it; every revocation mails it too -- by the person ("A
+  passkey was removed", naming the sign-in that removed it, and to sign that one out if it was
+  not them), by an operator's `revoke-passkeys` (the same, in the operator's words), or by the
+  gate on a copy ("A passkey of yours was revoked"). A label is quoted with its own quotes
+  escaped: whoever adds a passkey names it, and a name never speaks as Kontra. No link, nothing
+  secret. `KONTRA_PASSKEYS=0` turns every ceremony off at once (stored passkeys stay); a gate
+  whose console host cannot be an RP ID (an IP address), or with no console origin on its RP ID,
+  has passkeys off.
+* **One verifier, the same in both gates.** `kontra._passkeys` holds the ceremony's parameters
+  and wraps `webauthn` (duo-labs py_webauthn, BSD-3-Clause); the platform imports it, as it
+  imports `kontra._control`. The fake gate verifies real answers with it rather than a
+  test-only token: what passkeys get wrong lives in the verification's inputs -- the RP ID, the
+  origins, user verification, the challenge's binding, the counter and backup rules -- and a
+  shortcut would exercise none of them, the drift seam ② exists to stop.
+  `kontra.testing.SoftAuthenticator` makes those answers (real keys, real CBOR) for both
+  repositories' tests, and `kontra.testing.passkey_contract` holds the scenarios both gates
+  pass. The cost is test-only: `kontra-sdk[testing]` gains `webauthn` and its dependencies
+  (pyOpenSSL among them, which caps `cryptography` below 51 there); `import kontra` and the CLI
+  never load it.
+* **The CLI gets no passkeys.** A terminal has no WebAuthn; its email path is unchanged, and the
+  client methods are the console's (and a test's).

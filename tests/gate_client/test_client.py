@@ -232,6 +232,9 @@ _ANSWERS: dict[tuple[str, str], type[BaseModel] | None] = {
     ("GET", "/v1/me"): m.Me,
     ("POST", "/v1/catalog"): m.CatalogEntry,
     ("POST", f"/v1/admin/jobs/{JOB}/resolve"): m.JobView,
+    ("POST", "/v1/passkeys/options"): m.PasskeyCeremony,
+    ("GET", "/v1/passkeys"): m.PasskeyList,
+    ("POST", "/v1/auth/confirm/passkey/options"): m.PasskeyCeremony,
 }
 
 
@@ -277,6 +280,28 @@ async def test_a_resolver_change_is_confirmable_too() -> None:
     assert len(rec.requests) == 2
 
 
+async def test_adding_a_passkey_is_confirmable_once() -> None:
+    """``passkey_options`` is ``recent`` (decisions I24): the hook is asked, once, and the
+    request is sent once more; a second refusal is the gate's answer, never a loop."""
+    rec = _refuses_first()
+    hook = Confirms()
+    async with GateClient(
+        "http://gate.test", token=static("t"), transport=rec.transport, confirm=hook
+    ) as c:
+        assert isinstance(await c.passkey_options(), m.PasskeyCeremony)
+    assert [route for route, _ in hook.asked] == ["passkey_options"]
+    assert [(r.method, r.url.path) for r in rec.requests] == [("POST", "/v1/passkeys/options")] * 2
+
+    rec, hook = _refuses_first(times=2), Confirms()
+    async with GateClient(
+        "http://gate.test", token=static("t"), transport=rec.transport, confirm=hook
+    ) as c:
+        with pytest.raises(GateError) as ei:
+            await c.passkey_options()
+    assert ei.value.code == "confirmation_required"
+    assert (len(hook.asked), len(rec.requests)) == (1, 2)
+
+
 async def test_a_bodiless_change_is_sent_again_too() -> None:
     rec = _refuses_first()
     hook = Confirms()
@@ -293,6 +318,8 @@ async def test_a_bodiless_change_is_sent_again_too() -> None:
         # a read (human) or a party route: never confirmed, whatever the gate says
         ("api_keys", "confirmation_required", NEED),
         ("me", "confirmation_required", NEED),
+        ("passkeys", "confirmation_required", NEED),
+        ("confirm_passkey_options", "confirmation_required", NEED),
         # another code on a change
         ("create_api_key", "fresh_login_required", None),
         ("create_api_key", "stale_session", {"max_age_seconds": 600}),
