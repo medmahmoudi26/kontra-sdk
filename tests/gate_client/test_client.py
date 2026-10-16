@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from pydantic import BaseModel
 
 from kontra import __version__
 from kontra.gate_client import GateClient, GateError
@@ -201,3 +202,163 @@ async def test_user_agent() -> None:
     ) as c:
         assert await c.health() == {"ok": True}
     assert rec.requests[0].headers["user-agent"] == "kontra-cli/9"
+
+
+# --------------------------------------------------------------------------- confirm it's you
+
+NEED = {"confirm_with": "email", "confirm_ttl_seconds": 3600}
+JOB = "0123456789abcdef0123456789abcdef"
+
+
+class Confirms:
+    """A confirm hook that records what it was asked and answers ``answer``."""
+
+    def __init__(self, answer: bool = True, raises: Exception | None = None) -> None:
+        self.asked: list[tuple[str, m.ConfirmationRequired]] = []
+        self._answer, self._raises = answer, raises
+
+    async def __call__(self, route: str, need: m.ConfirmationRequired) -> bool:
+        self.asked.append((route, need))
+        if self._raises is not None:
+            raise self._raises
+        return self._answer
+
+
+#: What each route's success answers, for :func:`_refuses_first`.
+_ANSWERS: dict[tuple[str, str], type[BaseModel] | None] = {
+    ("POST", "/v1/keys"): m.ApiKeyCreated,
+    ("GET", "/v1/keys"): m.ApiKeyList,
+    ("DELETE", "/v1/keys/key_0123456789abcdef"): None,
+    ("GET", "/v1/me"): m.Me,
+    ("POST", "/v1/catalog"): m.CatalogEntry,
+    ("POST", f"/v1/admin/jobs/{JOB}/resolve"): m.JobView,
+}
+
+
+def _refuses_first(
+    code: str = "confirmation_required", detail: object = NEED, times: int = 1
+) -> Recorder:
+    """A gate that answers the first ``times`` requests 403 ``code`` and then succeeds."""
+    seen: list[httpx.Request] = []
+
+    def respond(r: httpx.Request) -> httpx.Response:
+        seen.append(r)
+        if len(seen) <= times:
+            return error(403, code, "confirm it's you", detail)
+        model = _ANSWERS[(r.method, r.url.path)]
+        return httpx.Response(204) if model is None else json_response(200, minimal(model))
+
+    return Recorder(respond)
+
+
+async def test_a_change_is_sent_once_more_after_the_hook_confirms() -> None:
+    rec = _refuses_first()
+    hook = Confirms()
+    async with GateClient(
+        "http://gate.test", token=static("t"), transport=rec.transport, confirm=hook
+    ) as c:
+        made = await c.create_api_key("ci")
+    assert isinstance(made, m.ApiKeyCreated)
+    assert [(route, need.confirm_with) for route, need in hook.asked] == [
+        ("create_api_key", "email")
+    ]
+    assert [(r.method, r.url.path) for r in rec.requests] == [("POST", "/v1/keys")] * 2
+    assert rec.requests[0].content == rec.requests[1].content == b'{"label":"ci"}'
+
+
+async def test_a_resolver_change_is_confirmable_too() -> None:
+    rec = _refuses_first()
+    hook = Confirms()
+    async with GateClient(
+        "http://gate.test", token=static("t"), transport=rec.transport, confirm=hook
+    ) as c:
+        await c.resolve(JOB, m.ResolveRequest(buyer_minor=1, seller_minor=2))
+    assert [route for route, _ in hook.asked] == ["resolve"]
+    assert len(rec.requests) == 2
+
+
+async def test_a_bodiless_change_is_sent_again_too() -> None:
+    rec = _refuses_first()
+    hook = Confirms()
+    async with GateClient(
+        "http://gate.test", token=static("t"), transport=rec.transport, confirm=hook
+    ) as c:
+        await c.revoke_api_key("key_0123456789abcdef")
+    assert [r.url.path for r in rec.requests] == ["/v1/keys/key_0123456789abcdef"] * 2
+
+
+@pytest.mark.parametrize(
+    ("call", "code", "detail"),
+    [
+        # a read (human) or a party route: never confirmed, whatever the gate says
+        ("api_keys", "confirmation_required", NEED),
+        ("me", "confirmation_required", NEED),
+        # another code on a change
+        ("create_api_key", "fresh_login_required", None),
+        ("create_api_key", "stale_session", {"max_age_seconds": 600}),
+        ("create_api_key", "not_resolver", None),
+        # a detail that does not say how to confirm
+        ("create_api_key", "confirmation_required", None),
+        ("create_api_key", "confirmation_required", {"confirm_with": "carrier pigeon"}),
+    ],
+)
+async def test_the_hook_is_asked_only_for_a_changes_confirmation(
+    call: str, code: str, detail: object
+) -> None:
+    rec = _refuses_first(code, detail)
+    hook = Confirms()
+    async with GateClient(
+        "http://gate.test", token=static("t"), transport=rec.transport, confirm=hook
+    ) as c:
+        with pytest.raises(GateError) as ei:
+            await (c.create_api_key("ci") if call == "create_api_key" else getattr(c, call)())
+    assert (ei.value.status, ei.value.code) == (403, code)
+    assert hook.asked == []
+    assert len(rec.requests) == 1
+
+
+async def test_a_hook_that_does_not_confirm_leaves_the_gates_answer() -> None:
+    rec = _refuses_first()
+    hook = Confirms(answer=False)
+    async with GateClient(
+        "http://gate.test", token=static("t"), transport=rec.transport, confirm=hook
+    ) as c:
+        with pytest.raises(GateError) as ei:
+            await c.create_api_key("ci")
+    assert ei.value.code == "confirmation_required"
+    assert ei.value.detail == NEED
+    assert len(hook.asked) == 1
+    assert len(rec.requests) == 1
+
+
+async def test_a_second_refusal_is_raised_not_looped() -> None:
+    rec = _refuses_first(times=5)
+    hook = Confirms()
+    async with GateClient(
+        "http://gate.test", token=static("t"), transport=rec.transport, confirm=hook
+    ) as c:
+        with pytest.raises(GateError) as ei:
+            await c.publish({"nexusrpc": "1.0.0"})
+    assert ei.value.code == "confirmation_required"
+    assert len(hook.asked) == 1
+    assert len(rec.requests) == 2
+
+
+async def test_what_the_hook_raises_is_what_the_call_raises() -> None:
+    rec = _refuses_first()
+    hook = Confirms(raises=RuntimeError("the person pressed Ctrl-C"))
+    async with GateClient(
+        "http://gate.test", token=static("t"), transport=rec.transport, confirm=hook
+    ) as c:
+        with pytest.raises(RuntimeError, match="Ctrl-C"):
+            await c.create_api_key("ci")
+    assert len(rec.requests) == 1
+
+
+async def test_without_a_hook_the_gates_answer_stands() -> None:
+    rec = _refuses_first()
+    async with GateClient("http://gate.test", token=static("t"), transport=rec.transport) as c:
+        with pytest.raises(GateError) as ei:
+            await c.create_api_key("ci")
+    assert ei.value.code == "confirmation_required"
+    assert len(rec.requests) == 1

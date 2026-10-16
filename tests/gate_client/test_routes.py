@@ -23,7 +23,16 @@ KEY_ID = "key_0123456789abcdef"
 EP = "k" + "a" * 32
 SHA = "0" * 64
 WP = m.WirePayload(b64="AAAA")
-AUTHENTICATED = {"party", "fresh", "worker", "party|worker", "resolver"}
+AUTHENTICATED = {
+    "party",
+    "human",
+    "fresh",
+    "worker",
+    "party|worker",
+    "resolver",
+    "resolver_human",
+}
+CONFIRM_ID = "cfm_" + "0" * 32
 
 
 async def _drain(it: Any) -> list[Any]:
@@ -55,6 +64,8 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     "revoke_api_key": (lambda c: c.revoke_api_key(KEY_ID), {"key_id": KEY_ID}),
     "sessions": (lambda c: c.sessions(), {}),
     "end_session": (lambda c: c.end_session(JOB), {"session_id": JOB}),
+    "confirm_start": (lambda c: c.confirm_start(), {}),
+    "confirm_status": (lambda c: c.confirm_status(CONFIRM_ID), {"confirm_id": CONFIRM_ID}),
     "publish": (lambda c: c.publish({"nexusrpc": "1.0.0"}), {}),
     "search": (lambda c: c.search("enrich"), {}),
     "get_offering": (

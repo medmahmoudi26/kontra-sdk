@@ -33,7 +33,8 @@ Differences from the platform gate, all deliberate: state is in memory; artifact
 are stored in memory behind the gate's own HMAC-signed ``/_blob/`` URLs (not S3); top-ups
 are always instant play money (production would answer with a checkout URL); the device
 flow can approve itself; mail is not sent but appended to :attr:`FakeGate.outbox`, and the
-magic link's page is :meth:`FakeGate.use_magic_link` (the human typing the device's code).
+magic link's page is :meth:`FakeGate.use_magic_link` (the human typing the code their screen
+shows: a device's, to sign in, or a confirmation's, to confirm it's them -- decisions I23).
 """
 
 # No ``from __future__ import annotations`` here: FastAPI reads the route functions'
@@ -56,6 +57,7 @@ import sys
 import threading
 import time
 import types
+import warnings
 from collections import deque
 from collections.abc import (
     AsyncGenerator,
@@ -172,6 +174,26 @@ DEVICE_TTL = timedelta(minutes=10)
 #: A magic link is good for this long, once, and for this many wrong user codes.
 MAGIC_LINK_TTL = timedelta(minutes=10)
 MAGIC_LINK_ATTEMPTS = 3
+#: "Confirm it's you" (decisions I23): a confirmation's link lives as long as a sign-in
+#: link; the asking screen polls this often; one sign-in may ask this many times an hour.
+CONFIRM_LINK_TTL = MAGIC_LINK_TTL
+CONFIRM_INTERVAL = 3
+CONFIRM_RATE_PER_SESSION = 5
+CONFIRM_RATE_WINDOW = timedelta(hours=1)
+#: Settled confirmations are forgotten this long after they expire.
+CONFIRM_PURGE_AFTER = timedelta(days=1)
+_CONFIRM_ID = re.compile(r"cfm_[0-9a-f]{32}", re.ASCII)
+#: How a sign-in proved who it is (``via``), in words, as the console and the mail say it.
+VIA_WORDS = {
+    "device:email": "a link by email",
+    "device:github": "GitHub",
+    "device:dev": "a development handle",
+    "dev-login": "a development handle",
+}
+#: The sign-ins a ``KONTRA_DEV=1`` gate confirms at once (development handles).
+_DEV_VIA = frozenset({"dev-login", "device:dev"})
+SUBJECT_SIGN_IN = "Your Kontra sign-in link"
+SUBJECT_CONFIRM = "Confirm it's you on Kontra"
 #: ``last_used_at`` of an API key moves at most this often.
 KEY_USE_RESOLUTION = timedelta(minutes=1)
 #: ``GET /v1/keys`` lists every live key, then the latest revoked ones, this many in all.
@@ -343,8 +365,13 @@ class Principal:
     session_id: str
     auth_time: datetime
     kind: Literal["api", "worker"]
-    #: The session is an API key's: it is never fresh (decisions I19).
+    #: The session is an API key's: it never makes changes and never confirms (I19, I23).
     api_key: bool = False
+    #: How the session's person proved who they are (``device:email``, ``dev-login``...).
+    via: str = ""
+    #: When the person last confirmed it's them for this session (None: never; the sign-in
+    #: itself, ``auth_time``, counts as one).
+    confirmed_at: datetime | None = None
 
 
 @dataclass
@@ -379,6 +406,8 @@ class _Session:
     via: str
     revoked_at: datetime | None = None
     created_at: datetime | None = None
+    #: The last completed confirmation of this session (decisions I23); never a key's.
+    confirmed_at: datetime | None = None
 
     @property
     def revoked(self) -> bool:
@@ -429,14 +458,33 @@ class _ApiKey:
 @dataclass
 class _MagicLink:
     email: str
-    device_user_code: str
+    #: A sign-in link: the device authorization it approves. None for a confirmation link.
+    device_user_code: str | None
     expires_at: datetime
     #: Who asked for it (the requester's network, :func:`_requester_network`) and when: the
-    #: mail limits count by these.
+    #: mail limits count by these, over both kinds of link.
     client: str = ""
     created_at: datetime | None = None
     consumed_at: datetime | None = None
     attempts: int = 0
+    #: A confirmation link: the confirmation it completes. None for a sign-in link.
+    confirmation_id: str | None = None
+
+
+@dataclass
+class _Confirmation:
+    """One "Confirm it's you" a person's session asked for (``POST /v1/auth/confirm``).
+    ``user_code`` is what that session's screen shows; the mail carries a link to it, never
+    the code. Completing it confirms ``session_id`` and no other session."""
+
+    id: str
+    session_id: str
+    user_code: str
+    status: Literal["pending", "confirmed", "burned"]
+    client: str
+    created_at: datetime
+    expires_at: datetime
+    confirmed_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -463,8 +511,9 @@ class SentMail:
     sent_at: datetime
 
 
-#: What the magic link's page answers the human who typed a user code into it.
-MagicOutcome = Literal["approved", "wrong_code", "gone", "handle_taken"]
+#: What the magic link's page answers the human who typed a user code into it: a sign-in
+#: link ``approved`` (or ``handle_taken``), a confirmation link ``confirmed``.
+MagicOutcome = Literal["approved", "confirmed", "wrong_code", "gone", "handle_taken"]
 
 
 @dataclass
@@ -669,7 +718,11 @@ class FakeGate:
     ``magic_link_rate_per_email``: sign-in link requests (429 past it) and mails one address
     gets from one client an hour; ``magic_link_rate_per_client``: requests one client makes
     an hour; ``magic_link_max_per_email``: mails one address gets an hour from every client
-    together (past it the request is answered as usual and no mail goes out).
+    together (past it the request is answered as usual and no mail goes out). Confirmation
+    mail (decisions I23) counts against all three, like a sign-in link.
+    ``confirm_ttl``: how long a sign-in or a confirmation lets a person make changes (the
+    platform's ``KONTRA_CONFIRM_TTL``); ``freshness`` is its old name, deprecated.
+    ``confirm_interval``: how often the asking screen is told to poll a confirmation.
 
     The clock offset (:meth:`advance`) moves token ``iat``/``exp`` too: a seller's
     handler verifying a hold token issued *after* an advance on the machine's clock sees
@@ -692,7 +745,9 @@ class FakeGate:
         observe_give_up: timedelta = timedelta(minutes=15),
         access_ttl: timedelta = timedelta(minutes=15),
         refresh_ttl: timedelta = timedelta(days=30),
-        freshness: timedelta = timedelta(minutes=10),
+        confirm_ttl: timedelta = timedelta(hours=1),
+        freshness: timedelta | None = None,
+        confirm_interval: int = CONFIRM_INTERVAL,
         quote_ttl: timedelta = timedelta(minutes=10),
         quote_rate_per_min: int = 60,
         quote_timeout: float = 10.0,
@@ -730,7 +785,16 @@ class FakeGate:
         self.observe_give_up = observe_give_up
         self.access_ttl = access_ttl
         self.refresh_ttl = refresh_ttl
-        self.freshness = freshness
+        if freshness is not None:
+            warnings.warn(
+                "FakeGate(freshness=) is deprecated: it is confirm_ttl now (how long a sign-in "
+                "or a confirmation lets a person make changes)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            confirm_ttl = freshness
+        self.confirm_ttl = confirm_ttl
+        self.confirm_interval = confirm_interval
         self.quote_ttl = quote_ttl
         self.quote_rate_per_min = quote_rate_per_min
         self.quote_timeout = quote_timeout
@@ -763,6 +827,7 @@ class FakeGate:
         #: Every mail the gate sent, oldest first.
         self.outbox: list[SentMail] = []
         self._magic: dict[str, _MagicLink] = {}  # by the link token's sha256
+        self._confirmations: dict[str, _Confirmation] = {}  # by id
         self._handoffs: dict[str, _Handoff] = {}  # by the handoff's sha256
         #: Every handoff the link's page issued, oldest first (what the platform's page puts
         #: in the console URL's fragment).
@@ -966,35 +1031,67 @@ class FakeGate:
             session.auth_time,
             "worker" if worker else "api",
             api_key=session.via == "api_key",
+            via=session.via,
+            confirmed_at=session.confirmed_at,
         )
 
-    def require_fresh(self, who: Principal) -> Principal:
-        """A human login younger than :attr:`freshness`. An API key's session never
-        qualifies, however new the key (its ``auth_time`` is the key's creation)."""
+    @property
+    def freshness(self) -> timedelta:
+        """Deprecated: :attr:`confirm_ttl`."""
+        return self.confirm_ttl
+
+    def confirmed_until(self, who: Principal | _Session) -> datetime:
+        """Until when ``who``'s session may make changes: its sign-in or its last completed
+        confirmation, whichever is later, plus :attr:`confirm_ttl` (decisions I23)."""
+        since = max(who.auth_time, who.confirmed_at or who.auth_time)
+        return since + self.confirm_ttl
+
+    def require_human(self, who: Principal) -> Principal:
+        """A person's session, of any age (the reads of keys and sign-ins). An API key's
+        session never qualifies, however new the key."""
         if who.api_key:
             raise GateHTTPError(
                 403,
                 "fresh_login_required",
-                "an API key cannot do this (publish, set a key, manage API keys, resolve "
-                "disputes); "
-                "log in as a person with `kontra login`",
-            )
-        if self.now() - who.auth_time >= self.freshness:
-            raise GateHTTPError(
-                403,
-                "stale_session",
-                "this needs a recent login; run `kontra login` again",
-                {"max_age_seconds": int(self.freshness.total_seconds())},
+                "an API key cannot do this (publish, change recipients, see or manage API "
+                "keys and sign-ins, resolve disputes); a person's sign-in can (`kontra login`)",
             )
         return who
 
+    def require_confirmed(self, who: Principal) -> Principal:
+        """A person's session confirmed within :attr:`confirm_ttl` (a sign-in counts): every
+        change. The API-key test comes first; the 403 says how this session can confirm, and
+        comes before the route does anything, so a client confirms and sends it again."""
+        self.require_human(who)
+        if self.now() < self.confirmed_until(who):
+            return who
+        need = m.ConfirmationRequired(
+            confirm_with=self.confirm_channel(who),
+            confirm_ttl_seconds=int(self.confirm_ttl.total_seconds()),
+        )
+        raise GateHTTPError(
+            403,
+            m.CONFIRMATION_REQUIRED,
+            _confirmation_required_message(self.confirm_ttl),
+            need.model_dump(mode="json"),
+        )
+
+    #: Deprecated: :meth:`require_confirmed`.
+    require_fresh = require_confirmed
+
     def require_resolver(self, who: Principal) -> Principal:
-        """A resolver's fresh human session: splitting escrow is not for an API key or an
-        old login (a stolen refresh token). The list is checked first, so anyone else gets
-        ``not_resolver`` and a resolver learns that a new sign-in is what is missing."""
+        """A resolver's confirmed human session: splitting escrow is not for an API key or an
+        unconfirmed login (a stolen refresh token). The list is checked first, so anyone else
+        gets ``not_resolver`` and a resolver learns that a confirmation is what is missing."""
         if who.party not in self.resolvers:
             raise GateHTTPError(403, "not_resolver", "only a dispute resolver may do this")
-        return self.require_fresh(who)
+        return self.require_confirmed(who)
+
+    def require_resolver_human(self, who: Principal) -> Principal:
+        """A resolver's own login, of any age: reading the queue asks no confirmation."""
+        if who.party not in self.resolvers:
+            raise GateHTTPError(403, "not_resolver", "only a dispute resolver may do this")
+        return self.require_human(who)
 
     def require_dev(self) -> None:
         if not self.dev:
@@ -1128,7 +1225,11 @@ class FakeGate:
                     "invalid_request",
                     "this gate approves a device login only for a requested handle",
                 )
-            await self.approve_device(device.user_code, wanted)
+            # On a dev gate this is a development handle signing in, as the platform records
+            # it (``device:dev``); such a sign-in confirms at once (decisions I23).
+            await self.approve_device(
+                device.user_code, wanted, via="device:dev" if self.dev else "device"
+            )
         if device.status == "approved":
             assert device.party is not None
             assert device.approved_at is not None
@@ -1199,7 +1300,7 @@ class FakeGate:
         )
 
     def create_api_key(self, who: Principal, label: str) -> m.ApiKeyCreated:
-        """A new key for ``who`` (a fresh human session, enforced by the route) and the
+        """A new key for ``who`` (a person's confirmed session, enforced by the route) and the
         session it owns, whose ``auth_time`` is the key's creation."""
         live = [k for k in self.api_keys.values() if k.party == who.party and k.revoked_at is None]
         if len(live) >= m.MAX_API_KEYS:
@@ -1324,18 +1425,9 @@ class FakeGate:
         seen.append(now)
         return len(seen) <= limit
 
-    def request_magic_link(self, req: m.MagicLinkRequest, client: str) -> m.MagicLinkSent:
-        """``POST /v1/auth/magic``. Mail goes out only for an address that may sign in and a
-        user code that is pending; every other request gets the identical answer, and every
-        request counts against the rate limits, so neither the answer nor a 429 says who is
-        invited. An address's limits are counted per requesting network (an IPv4 /24, an
-        IPv6 /48, as the platform counts them; ``client`` is the requester's address): a
-        stranger who asks for links to an address spends his own network's budget, never
-        its owner's. Past :attr:`magic_link_max_per_email` mails to one address an hour,
-        from every network together, no more go out (the answer stays the same)."""
-        now = self.now()
-        email = req.email.lower()
-        network = _requester_network(client)
+    def _count_link_request(self, email: str, network: str, client: str, now: datetime) -> None:
+        """Count one request for a link to ``email`` (a sign-in or a confirmation: one
+        budget) from ``client`` in ``network``; 429 past either limit."""
         by_email = self._count_magic_request(
             f"email:{email}:network:{network}", self.magic_link_rate_per_email, now
         )
@@ -1351,6 +1443,20 @@ class FakeGate:
                 {"retry_after_seconds": retry},
                 headers={"Retry-After": str(retry)},
             )
+
+    def request_magic_link(self, req: m.MagicLinkRequest, client: str) -> m.MagicLinkSent:
+        """``POST /v1/auth/magic``. Mail goes out only for an address that may sign in and a
+        user code that is pending; every other request gets the identical answer, and every
+        request counts against the rate limits, so neither the answer nor a 429 says who is
+        invited. An address's limits are counted per requesting network (an IPv4 /24, an
+        IPv6 /48, as the platform counts them; ``client`` is the requester's address): a
+        stranger who asks for links to an address spends his own network's budget, never
+        its owner's. Past :attr:`magic_link_max_per_email` mails to one address an hour,
+        from every network together, no more go out (the answer stays the same)."""
+        now = self.now()
+        email = req.email.lower()
+        network = _requester_network(client)
+        self._count_link_request(email, network, client, now)
         device = self._device_by_user_code(req.device_user_code)
         if (
             device is not None
@@ -1370,7 +1476,7 @@ class FakeGate:
             self.outbox.append(
                 SentMail(
                     to=email,
-                    subject="Your Kontra sign-in link",
+                    subject=SUBJECT_SIGN_IN,
                     text=(
                         f"Open this link to sign in to Kontra:\n\n{link}\n\n"
                         "The page asks for the code your terminal or browser shows. "
@@ -1393,7 +1499,8 @@ class FakeGate:
         party ``handle`` (default: the handle the device asked for). ``gone``: the link is
         unknown, used, expired or burned, the address is no longer allowed, or the device
         is no longer pending. ``handle_taken``: the handle belongs to another party; the
-        link stays usable for another handle (the page's signed grant, on the platform)."""
+        link stays usable for another handle (the page's signed grant, on the platform).
+        A confirmation link (decisions I23) answers as :meth:`_use_confirmation` says."""
         token = parse_qs(urlsplit(link).query).get("t", [link])
         rec = (
             self._magic.get(_digest(token[0]))
@@ -1406,8 +1513,15 @@ class FakeGate:
         if not self._may_sign_in(rec.email):
             rec.consumed_at = now
             return "gone"
+        if rec.confirmation_id is not None:
+            return self._use_confirmation(rec, rec.confirmation_id, user_code, now)
+        assert rec.device_user_code is not None  # a sign-in link names its device
         typed = _normalize_user_code(user_code)
-        if typed is None or not hmac.compare_digest(typed, rec.device_user_code):
+        if typed is None:
+            # Not a code at all (empty, a typo outside the alphabet, a scanner's blind
+            # submit): it cannot be a guess, so it costs no attempt -- as on the platform.
+            return "wrong_code"
+        if not hmac.compare_digest(typed, rec.device_user_code):
             rec.attempts += 1
             if rec.attempts >= MAGIC_LINK_ATTEMPTS:
                 rec.consumed_at = now
@@ -1440,6 +1554,227 @@ class FakeGate:
         if approved:
             self._new_handoff(party, now, "device:email")
         return "approved" if approved else "gone"
+
+    # ------------------------------------------------------------------ confirm it's you
+
+    def _email_of(self, party: str) -> str | None:
+        """The party's sign-in address: its oldest email identity, if it has one."""
+        return next(
+            (
+                subject
+                for (provider, subject), p in self.identities.items()
+                if provider == "email" and p == party
+            ),
+            None,
+        )
+
+    def confirm_channel(self, who: Principal) -> m.ConfirmWith:
+        """How ``who``'s session can confirm it's the person (decisions I23): ``dev`` for a
+        development sign-in on a dev gate, ``email`` when the party has an address that may
+        still sign in (the gate mails it a link), else ``sign_in`` (only a new sign-in will
+        do: a party without an email identity, or whose address was taken off the list)."""
+        if self.dev and who.via in _DEV_VIA:
+            return "dev"
+        address = self._email_of(who.party)
+        if address is not None and self._may_sign_in(address):
+            return "email"
+        return "sign_in"
+
+    def _new_confirm_id(self) -> str:
+        confirm_id = "cfm_" + secrets.token_hex(16)
+        while confirm_id in self._confirmations:  # pragma: no cover - 128 random bits
+            confirm_id = "cfm_" + secrets.token_hex(16)
+        return confirm_id
+
+    def _confirm_session(self, session: _Session, now: datetime) -> bool:
+        """Mark ``session`` confirmed at ``now``: only a person's session that is still live
+        (an API key's never is; the platform's CHECK makes it unrepresentable)."""
+        if session.revoked or session.via == "api_key":
+            return False
+        session.confirmed_at = now
+        return True
+
+    def confirm_start(self, who: Principal, client: str) -> m.ConfirmStart:
+        """``POST /v1/auth/confirm`` (a person's session; the route checks that). A dev
+        sign-in on a dev gate is confirmed at once. Otherwise: the same request limits as a
+        sign-in link (per address and requesting network, per client: one budget), at most
+        :data:`CONFIRM_RATE_PER_SESSION` an hour per session, and a mail with a link -- never
+        the code -- to the party's sign-in address, counted against the same caps as sign-in
+        mail. Pending confirmations of a session never cancel each other."""
+        session = self.sessions[who.session_id]
+        now = self.now()
+        channel = self.confirm_channel(who)
+        if channel == "sign_in":
+            raise GateHTTPError(
+                409,
+                "confirm_unavailable",
+                "this account cannot confirm it's you by email on this gate; a new sign-in "
+                "confirms it (`kontra login`)",
+                {"confirm_with": "sign_in"},
+            )
+        network = _requester_network(client)
+        if channel == "dev":
+            done = _Confirmation(
+                self._new_confirm_id(), session.id, "", "confirmed", network, now, now, now
+            )
+            self._confirmations[done.id] = done
+            self._confirm_session(session, now)
+            return m.ConfirmStart(
+                confirm_id=done.id,
+                channel="dev",
+                status="confirmed",
+                asked_at=now,
+                expires_in=0,
+                interval=self.confirm_interval,
+                confirmed_until=self.confirmed_until(session),
+            )
+        address = self._email_of(who.party)
+        assert address is not None  # the email channel has one
+        self._count_link_request(address, network, client, now)
+        self._purge_confirmations(now)
+        recent = sorted(
+            c.created_at
+            for c in self._confirmations.values()
+            if c.session_id == session.id and now - c.created_at < CONFIRM_RATE_WINDOW
+        )
+        if len(recent) >= CONFIRM_RATE_PER_SESSION:
+            retry = max(1, math.ceil((recent[0] + CONFIRM_RATE_WINDOW - now).total_seconds()))
+            raise GateHTTPError(
+                429,
+                "rate_limited",
+                "this sign-in asked to confirm it's you too often; try again later",
+                {"retry_after_seconds": retry},
+                headers={"Retry-After": str(retry)},
+            )
+        live = {c.user_code for c in self._confirmations.values() if c.status == "pending"}
+        while True:
+            raw = "".join(secrets.choice(USER_CODE_ALPHABET) for _ in range(8))
+            code = f"{raw[:4]}-{raw[4:]}"
+            if code not in live:
+                break
+        pending = _Confirmation(
+            self._new_confirm_id(),
+            session.id,
+            code,
+            "pending",
+            network,
+            now,
+            now + CONFIRM_LINK_TTL,
+        )
+        self._confirmations[pending.id] = pending
+        self._mail_confirmation(pending, session, address, now)
+        return m.ConfirmStart(
+            confirm_id=pending.id,
+            channel="email",
+            status="pending",
+            user_code=code,
+            asked_at=now,
+            expires_in=int(CONFIRM_LINK_TTL.total_seconds()),
+            interval=self.confirm_interval,
+        )
+
+    def _purge_confirmations(self, now: datetime) -> None:
+        for c in [
+            c for c in self._confirmations.values() if c.expires_at < now - CONFIRM_PURGE_AFTER
+        ]:
+            del self._confirmations[c.id]
+
+    def _mail_confirmation(
+        self, confirmation: _Confirmation, session: _Session, address: str, now: datetime
+    ) -> None:
+        """What the platform's mail sender does for a confirmation: nothing unless it is
+        still pending, its session live and the address allowed and under its caps (the
+        caps count sign-in and confirmation links together); then a link and a mail that
+        names the session, and never the code."""
+        if (
+            confirmation.status != "pending"
+            or now >= confirmation.expires_at
+            or session.revoked
+            or not self._may_sign_in(address)
+            or not self._mails_allowed(address, confirmation.client, now)
+        ):
+            return
+        token = secrets.token_urlsafe(32)
+        self._magic[_digest(token)] = _MagicLink(
+            address,
+            None,
+            min(now + CONFIRM_LINK_TTL, confirmation.expires_at),
+            client=confirmation.client,
+            created_at=now,
+            confirmation_id=confirmation.id,
+        )
+        link = f"{self.base_url}/auth/magic?t={token}"
+        self.outbox.append(
+            SentMail(
+                to=address,
+                subject=SUBJECT_CONFIRM,
+                text=_confirm_mail_text(link, confirmation.created_at, session, self.confirm_ttl),
+                link=link,
+                sent_at=now,
+            )
+        )
+
+    def confirm_status(self, who: Principal, confirm_id: str) -> m.ConfirmStatus:
+        """``GET /v1/auth/confirm/{id}``: this session's confirmation (any other id, well
+        formed or not, is 404), and until when the session may make changes -- by this
+        confirmation, another one or its sign-in -- if it may now."""
+        found = self._confirmations.get(confirm_id) if _CONFIRM_ID.fullmatch(confirm_id) else None
+        if found is None or found.session_id != who.session_id:
+            raise GateHTTPError(404, "not_found", "no such confirmation")
+        now = self.now()
+        status: Literal["pending", "confirmed", "expired", "burned"] = found.status
+        if status == "pending" and now >= found.expires_at:
+            status = "expired"
+        until = self.confirmed_until(self.sessions[who.session_id])
+        return m.ConfirmStatus(
+            confirm_id=found.id, status=status, confirmed_until=until if now < until else None
+        )
+
+    def pending_confirm_codes(self) -> list[str]:
+        """The codes of the confirmations waiting for a person, oldest first: what the
+        asking screen shows, for a test to type in for them."""
+        now = self.now()
+        return [
+            c.user_code
+            for c in self._confirmations.values()
+            if c.status == "pending" and now < c.expires_at
+        ]
+
+    def _use_confirmation(
+        self, rec: _MagicLink, confirmation_id: str, user_code: str, now: datetime
+    ) -> MagicOutcome:
+        """The confirmation link's page, on the POST that carries a typed code (the link is
+        live and its address allowed), checked in the platform's order: the confirmation
+        must still be pending (else ``gone``); a sign-in that ended since consumes the link
+        whatever was typed (``gone``: the platform's page says "nothing to confirm"); not a
+        code at all is the form again, no attempt counted; a wrong code counts one, and the
+        third consumes the link and burns the confirmation. The right one consumes the link
+        and confirms the confirmation's own session and nothing else: no session, no
+        handoff."""
+        confirmation = self._confirmations.get(confirmation_id)
+        if (
+            confirmation is None
+            or confirmation.status != "pending"
+            or now >= confirmation.expires_at
+        ):
+            return "gone"
+        session = self.sessions.get(confirmation.session_id)
+        if session is None or session.revoked or session.via == "api_key":
+            rec.consumed_at = now
+            return "gone"  # the sign-in ended since: nothing to confirm
+        typed = _normalize_user_code(user_code)
+        if typed is None:
+            return "wrong_code"
+        if not hmac.compare_digest(_digest(typed), _digest(confirmation.user_code)):
+            rec.attempts += 1
+            if rec.attempts >= MAGIC_LINK_ATTEMPTS:
+                rec.consumed_at = now
+                confirmation.status = "burned"
+            return "wrong_code"
+        rec.consumed_at = now
+        self._confirm_session(session, now)
+        confirmation.status, confirmation.confirmed_at = "confirmed", now
+        return "confirmed"
 
     def _new_handoff(self, party: str, auth_time: datetime, via: str) -> str:
         handoff = secrets.token_urlsafe(32)
@@ -2974,6 +3309,52 @@ def _requester_network(client: str) -> str:
     return str(net.supernet(new_prefix=prefix)) if net.prefixlen > prefix else str(net)
 
 
+def _duration_words(ttl: timedelta) -> str:
+    """``an hour``, ``2 hours``, ``30 minutes``, ``a minute``: the platform's words for how
+    long a confirmation lasts (``gate.auth.magic.ttl_words``)."""
+    seconds = int(ttl.total_seconds())
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return "an hour" if hours == 1 else f"{hours} hours"
+    minutes = max(1, round(seconds / 60))
+    return "a minute" if minutes == 1 else f"{minutes} minutes"
+
+
+def _confirmation_required_message(ttl: timedelta) -> str:
+    """The platform's message of 403 ``confirmation_required`` (``once an hour`` at the
+    default ``confirm_ttl``)."""
+    words = _duration_words(ttl)
+    often = f"once {words}" if words in ("an hour", "a minute") else f"once every {words}"
+    return (
+        f"this change needs you to confirm it's you ({often} per sign-in): the console asks in "
+        "place, and so does kontra-sdk 0.2.2 or later (`kontra confirm`); a new `kontra login` "
+        "also counts"
+    )
+
+
+def _confirm_mail_text(link: str, asked_at: datetime, session: _Session, ttl: timedelta) -> str:
+    """The confirmation mail: the link, never the code; when it was asked (the asking screen
+    says the same), and which sign-in it confirms, so a person who did not ask knows which
+    one to sign out (decisions I23)."""
+    via = VIA_WORDS.get(session.via, session.via)
+    signed_in = session.auth_time.astimezone(UTC).strftime("%Y-%m-%d %H:%M")
+    asked = asked_at.astimezone(UTC).strftime("%H:%M")
+    return (
+        "Open this link to confirm it's you on Kontra:\n\n"
+        f"{link}\n\n"
+        "The page asks for the code shown on the screen that asked you to confirm: the\n"
+        '"Confirm it\'s you" panel of the Kontra console, or the terminal where you ran a kontra\n'
+        f"command. It was asked at {asked} UTC. Type the code only if you asked for this "
+        "yourself, just\nnow. Kontra never sends that code by mail, chat or phone.\n\n"
+        f"It confirms one sign-in of yours ({via}, signed in {signed_in} UTC, id\n"
+        f"{session.id[:12]}) for {_duration_words(ttl)}. The link expires in 10 minutes and "
+        "works once.\n\n"
+        "If you did not ask for this, do not use the link. Only a sign-in to your account can "
+        "ask for\nthis mail, so one of your sign-ins may be in someone else's hands: in the "
+        "Kontra console, open\nAPI keys > Where you are signed in and sign out the one above.\n"
+    )
+
+
 def _digest(secret: str) -> str:
     return hashlib.sha256(secret.encode("ascii", "replace")).hexdigest()
 
@@ -3075,14 +3456,24 @@ async def _auth_party_or_worker(request: Request) -> Principal:
     return _gate_of(request).authenticate(request, allow_worker=True)
 
 
+async def _auth_human(request: Request) -> Principal:
+    gate = _gate_of(request)
+    return gate.require_human(gate.authenticate(request, allow_worker=False))
+
+
 async def _auth_fresh(request: Request) -> Principal:
     gate = _gate_of(request)
-    return gate.require_fresh(gate.authenticate(request, allow_worker=False))
+    return gate.require_confirmed(gate.authenticate(request, allow_worker=False))
 
 
 async def _auth_resolver(request: Request) -> Principal:
     gate = _gate_of(request)
     return gate.require_resolver(gate.authenticate(request, allow_worker=False))
+
+
+async def _auth_resolver_human(request: Request) -> Principal:
+    gate = _gate_of(request)
+    return gate.require_resolver_human(gate.authenticate(request, allow_worker=False))
 
 
 async def _dev_only(request: Request) -> None:
@@ -3092,8 +3483,10 @@ async def _dev_only(request: Request) -> None:
 # One per ``auth`` value of the route table (``none`` takes no dependency).
 Party = Annotated[Principal, Depends(_auth_party)]
 PartyOrWorker = Annotated[Principal, Depends(_auth_party_or_worker)]
+Human = Annotated[Principal, Depends(_auth_human)]
 Fresh = Annotated[Principal, Depends(_auth_fresh)]
 Resolver = Annotated[Principal, Depends(_auth_resolver)]
+ResolverHuman = Annotated[Principal, Depends(_auth_resolver_human)]
 
 
 def _build_app(gate: FakeGate) -> FastAPI:
@@ -3223,7 +3616,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
         no_store(response)
         return gate.create_api_key(who, body.label)
 
-    async def api_keys(who: Fresh) -> m.ApiKeyList:
+    async def api_keys(who: Human) -> m.ApiKeyList:
         return gate.list_api_keys(who)
 
     async def revoke_api_key(who: Fresh, key_id: str) -> Response:
@@ -3247,7 +3640,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
     add("api_keys", api_keys)
     add("revoke_api_key", revoke_api_key)
 
-    async def sessions(who: Fresh, response: Response) -> m.SessionList:
+    async def sessions(who: Human, response: Response) -> m.SessionList:
         no_store(response)
         return gate.list_sessions(who)
 
@@ -3255,8 +3648,19 @@ def _build_app(gate: FakeGate) -> FastAPI:
         gate.end_session(who, session_id)
         return Response(status_code=204)
 
+    async def confirm_start(who: Human, request: Request, response: Response) -> m.ConfirmStart:
+        no_store(response)
+        client = request.client.host if request.client is not None else ""
+        return gate.confirm_start(who, client)
+
+    async def confirm_status(who: Human, confirm_id: str, response: Response) -> m.ConfirmStatus:
+        no_store(response)
+        return gate.confirm_status(who, confirm_id)
+
     add("sessions", sessions)
     add("end_session", end_session)
+    add("confirm_start", confirm_start)
+    add("confirm_status", confirm_status)
 
     # ---------------------------------------------------------------- catalog
 
@@ -3387,7 +3791,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
         return await gate.topup(who.party, body)
 
     async def disputes(
-        who: Resolver,
+        who: ResolverHuman,
         cursor: str | None = None,
         limit: Annotated[int, Query(ge=1, le=LIST_LIMIT_MAX)] = 50,
     ) -> m.JobList:

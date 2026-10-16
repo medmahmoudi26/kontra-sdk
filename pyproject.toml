@@ -1,6 +1,6 @@
 [project]
 name = "kontra-sdk"
-version = "0.2.1"
+version = "0.2.2"
 description = "Sell and hire durable, quoted jobs: plain Temporal workers behind Nexus, with escrow and end-to-end encryption."
 readme = "README.md"
 requires-python = ">=3.11"

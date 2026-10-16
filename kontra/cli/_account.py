@@ -1,4 +1,5 @@
-"""``kontra login``, ``kontra balance``, ``kontra topup`` (PRD §10.3, §7.4)."""
+"""``kontra login``, ``kontra confirm``, ``kontra balance``, ``kontra topup`` (PRD §10.3,
+§7.4; decisions I23)."""
 
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ import click
 
 from kontra.cli._common import default_handle, emit_json, fail, printable, run
 
-__all__ = ["GATE_ENV", "balance", "configured_gate", "gate_url", "login", "topup"]
+__all__ = ["GATE_ENV", "balance", "configured_gate", "confirm", "gate_url", "login", "topup"]
 
 #: The gate to log in to when ``--gate`` is not given (else the profile's, else
 #: :data:`kontra.auth.DEFAULT_GATE_URL`). The same name as ``kontra.auth.GATE_ENV``, spelled
@@ -128,6 +129,25 @@ def login(
             "(unset it to publish or manage keys)",
             err=True,
         )
+
+
+@click.command()
+def confirm() -> None:
+    """Confirm it's you, for an hour of changes from this login (publish, API keys,
+    recipients): the gate mails a link to the address you sign in with, and its page asks
+    for the code printed here. A command that needs it asks by itself in a terminal; run this
+    first for a script or a batch of changes."""
+    from kontra.auth import API_KEY_ENV, Session
+    from kontra.cli._confirm import confirm_here
+
+    if os.environ.get(API_KEY_ENV):
+        fail(f"an API key cannot confirm: unset {API_KEY_ENV} to use your login")
+
+    async def go() -> None:
+        async with Session.load() as session:  # the person's login, never a key
+            await confirm_here(session.gate, extend=True)
+
+    run(go)
 
 
 def _amount(text: str, currency: str) -> Decimal:

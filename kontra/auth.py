@@ -19,6 +19,15 @@ adopts a token another process may have rotated in the meantime. An API key does
 its session refreshes by exchanging the key again, and writes nothing anywhere. Such a
 session can hire, serve and read, never publish or manage keys (decisions I19).
 
+A person's changes (publishing, API keys, recipients, ending a sign-in, resolving a dispute)
+need the login confirmed within the gate's hour (decisions I23): a sign-in counts, and so
+does "Confirm it's you" -- a link the gate mails to the account's sign-in address, whose page
+asks for a code only the asking screen shows. :func:`confirm_session` (and
+:meth:`Session.confirm`) does that; a :data:`Confirmer` decides what a :class:`Session` does
+when a change is refused for want of one. By default a session confirms only where that
+takes nothing from a person (a ``kontra dev`` login, :func:`confirm_if_instant`), so
+library code never makes the gate mail anyone.
+
 Login is the RFC 8628 device flow (:func:`login_device`; with ``email``, approved through a
 link the gate mails) or, against ``kontra dev``, :func:`dev_login`; :func:`login` runs
 either and writes the profile and key.
@@ -57,12 +66,19 @@ __all__ = [
     "DEVICE_GRANT",
     "GATE_ENV",
     "REFRESH_MARGIN",
+    "ConfirmError",
+    "Confirmer",
     "LoginError",
     "Session",
     "api_key_from_env",
+    "confirm_if_instant",
+    "confirm_in_place",
+    "confirm_prompt",
+    "confirm_session",
     "dev_login",
     "login",
     "login_device",
+    "never_confirm",
     "this_machine_label",
 ]
 
@@ -163,6 +179,40 @@ class LoginError(Exception):
         super().__init__(f"{code}: {message}")
 
 
+class ConfirmError(LoginError):
+    """A confirmation that cannot complete (decisions I23). ``code``: ``expired`` (the link
+    was not used in time), ``burned`` (it took three wrong codes), ``unavailable`` (only a
+    new sign-in confirms this session), ``rate_limited``, or ``api_key`` (a key never
+    confirms). Nothing was changed in any of these cases."""
+
+
+#: What a :class:`Session` does when a change answers 403 ``confirmation_required``:
+#: ``(the session's gate client, the route's name, what the gate needs)`` -> whether the
+#: session is confirmed now (the change is then sent once more). It may raise, e.g.
+#: :class:`ConfirmError`; the change then fails with that.
+Confirmer = Callable[[GateClient, str, m.ConfirmationRequired], Awaitable[bool]]
+
+
+async def confirm_if_instant(gate: GateClient, route: str, need: m.ConfirmationRequired) -> bool:
+    """The default :data:`Confirmer`: confirm only where the gate does it at once and asks
+    nothing of a person -- a ``kontra dev`` gate's development login -- so ``kontra serve``
+    and library code on ``kontra dev`` keep working past the hour. Never starts a
+    confirmation that would mail someone nobody is waiting for."""
+    if need.confirm_with != "dev":
+        return False
+    try:
+        start = await gate.confirm_start()
+    except GateError:
+        return False  # the change's own 403 is the clearer answer
+    return start.status == "confirmed"
+
+
+async def never_confirm(gate: GateClient, route: str, need: m.ConfirmationRequired) -> bool:
+    """A :data:`Confirmer` that never confirms: every unconfirmed change fails with the
+    gate's 403 ``confirmation_required``."""
+    return False
+
+
 class _ApiKeyHolder(Protocol):
     """What the background refresher needs of a client: ``temporalio.client.Client``
     re-sends its ``api_key`` on every call made after it is assigned."""
@@ -195,8 +245,9 @@ class Session:
     the directory the profile was loaded from (a profile built in memory is not persisted).
     With an ``api_key`` (``gate_url`` defaults to :data:`DEFAULT_GATE_URL`) nothing is ever
     written; ``home`` is only where :meth:`identity` reads the party's key, and the session
-    learns who it is from the gate on first use (:meth:`resolve`). ``clock`` and ``sleep``
-    exist for tests.
+    learns who it is from the gate on first use (:meth:`resolve`). ``confirm`` is the
+    :data:`Confirmer` asked when a change is refused for want of a confirmation (decisions
+    I23; default :func:`confirm_if_instant`). ``clock`` and ``sleep`` exist for tests.
     """
 
     def __init__(
@@ -209,6 +260,7 @@ class Session:
         home: Path | str | None = None,
         clock: Clock | None = None,
         sleep: Sleep | None = None,
+        confirm: Confirmer | None = None,
     ) -> None:
         if (profile is None) == (api_key is None):
             raise TypeError("a Session takes a profile or an api_key")
@@ -247,15 +299,26 @@ class Session:
         self._tasks: dict[asyncio.Task[None], _ApiKeyHolder] = {}
         #: Set by aclose(): no refresher may start after it, as nothing would ever stop it.
         self._closed = False
-        self._gate = GateClient(gate_url, token=_AccessTokens(self), transport=transport)
+        self._confirmer = confirm or confirm_if_instant
+        #: One confirmation at a time; changes refused meanwhile wait for it and are sent
+        #: again if it succeeded (``_confirmed`` counts the ones that did).
+        self._confirm_lock = asyncio.Lock()
+        self._confirmed = 0
+        self._gate = GateClient(
+            gate_url, token=_AccessTokens(self), transport=transport, confirm=self._on_confirm
+        )
 
     @classmethod
     def load(
-        cls, home: Path | str | None = None, *, transport: httpx.AsyncBaseTransport | None = None
+        cls,
+        home: Path | str | None = None,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        confirm: Confirmer | None = None,
     ) -> Session:
         """The person's login in ``home`` (``$KONTRA_HOME``). :meth:`from_env` also honours
         ``KONTRA_API_KEY``."""
-        return cls(Profile.load(home), transport=transport)
+        return cls(Profile.load(home), transport=transport, confirm=confirm)
 
     @classmethod
     async def from_api_key(
@@ -289,17 +352,22 @@ class Session:
 
     @classmethod
     def from_env(
-        cls, home: Path | str | None = None, *, transport: httpx.AsyncBaseTransport | None = None
+        cls,
+        home: Path | str | None = None,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        confirm: Confirmer | None = None,
     ) -> Session:
         """``$KONTRA_API_KEY`` when it is set, to ``$KONTRA_GATE`` (else
         :data:`DEFAULT_GATE_URL`; a profile's gate is not consulted, so a key never goes to
         a gate it was not made for by accident); otherwise the profile in ``home``. Does no
-        I/O: an API key's session asks the gate who it is on first use (:meth:`resolve`)."""
+        I/O: an API key's session asks the gate who it is on first use (:meth:`resolve`).
+        ``confirm`` is the person's :data:`Confirmer` (a key's session never confirms)."""
         key = api_key_from_env()
         if key is not None:
             gate_url = os.environ.get(GATE_ENV) or DEFAULT_GATE_URL
             return cls(api_key=key, gate_url=gate_url, home=home, transport=transport)
-        return cls(Profile.load(home), home=home, transport=transport)
+        return cls(Profile.load(home), home=home, transport=transport, confirm=confirm)
 
     @property
     def gate(self) -> GateClient:
@@ -364,6 +432,36 @@ class Session:
         """This machine's secret age identity, from :attr:`identity_home` (or the file
         ``$KONTRA_KEY_FILE`` names, for a fleet worker)."""
         return Profile.identity(self.identity_home)
+
+    # ------------------------------------------------------------------ confirm it's you
+
+    async def confirm(self, *, show: Callable[[m.ConfirmStart], None] | None = None) -> datetime:
+        """Confirm it's you for this login now (decisions I23), e.g. once before a batch of
+        changes: :func:`confirm_session` on this session's gate. Returns until when (the
+        gate's clock) this login may make changes. ``show`` puts the code in front of the
+        person (default: :func:`confirm_prompt` on stderr). A key's session never confirms
+        (:class:`ConfirmError` ``api_key``, without asking the gate)."""
+        if self._api_key is not None:
+            raise ConfirmError("api_key", _API_KEY_CANNOT_CONFIRM)
+        async with self._confirm_lock:
+            until = await confirm_session(self._gate, show=show, sleep=self._sleep, extend=True)
+            self._confirmed += 1
+        return until
+
+    async def _on_confirm(self, route: str, need: m.ConfirmationRequired) -> bool:
+        """The gate client's hook: one confirmation at a time per session. A change refused
+        while another confirmation ran is sent again at once if that one succeeded, without
+        asking a second time."""
+        if self._api_key is not None:
+            return False  # a key's session is refused fresh_login_required, never this
+        seen = self._confirmed
+        async with self._confirm_lock:
+            if self._confirmed != seen:
+                return True
+            confirmed = await self._confirmer(self._gate, route, need)
+            if confirmed:
+                self._confirmed += 1
+            return confirmed
 
     async def aclose(self) -> None:
         self._closed = True
@@ -864,3 +962,130 @@ async def login(
     )
     profile.save(home)
     return profile
+
+
+# --------------------------------------------------------------------------- confirm it's you
+
+_API_KEY_CANNOT_CONFIRM = "an API key cannot confirm: unset KONTRA_API_KEY to use your login"
+_CONFIRM_EXPIRED = "the confirmation link expired before the code was typed; nothing was changed"
+_CONFIRM_BURNED = "the link took three wrong codes and no longer works; nothing was changed"
+_CONFIRM_UNAVAILABLE = (
+    "your account cannot confirm it's you by email on this gate: a new sign-in counts as "
+    "one (`kontra login`)"
+)
+
+
+def confirm_prompt(start: m.ConfirmStart, what: str | None = None) -> str:
+    """What the asking screen shows for a pending confirmation: where the link went, when it
+    was asked (the mail says the same time), and the code -- which only this screen shows.
+    ``what`` names the change waiting for it (``create an API key``)."""
+    asked = start.asked_at.astimezone(UTC).strftime("%H:%M")
+    minutes = max(1, round(start.expires_in / 60))
+    purpose = f" to {what}" if what else ""
+    return (
+        f"Confirm it's you{purpose}: Kontra emailed a link to the address you sign in with\n"
+        f"(asked at {asked} UTC). Open it and, when the page asks, type this code:\n"
+        "\n"
+        f"    {start.user_code}\n"
+        "\n"
+        "  The code is only on this screen; the mail never carries it. The link works for "
+        f"{minutes} minutes."
+    )
+
+
+def _show_confirm_prompt(start: m.ConfirmStart) -> None:
+    print(
+        f"{confirm_prompt(start)}\nWaiting for the code to be typed...",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _confirm_refused(e: GateError) -> ConfirmError | None:
+    """The gate's refusal to start a confirmation, as a :class:`ConfirmError`; None for an
+    answer that is not one of these (it propagates as it is)."""
+    if e.code == "confirm_unavailable":
+        return ConfirmError("unavailable", _CONFIRM_UNAVAILABLE)
+    if e.code == "fresh_login_required":
+        return ConfirmError("api_key", _API_KEY_CANNOT_CONFIRM)
+    if e.code == "rate_limited":
+        retry = (e.detail or {}).get("retry_after_seconds")
+        later = ""
+        if isinstance(retry, int) and not isinstance(retry, bool) and retry > 0:
+            later = f"; you can ask again in {-(-retry // 60)} minute(s)"
+        return ConfirmError("rate_limited", f"{e.message}{later}")
+    return None
+
+
+async def confirm_session(
+    gate: GateClient,
+    *,
+    show: Callable[[m.ConfirmStart], None] | None = None,
+    sleep: Sleep | None = None,
+    clock: Callable[[], float] | None = None,
+    extend: bool = False,
+) -> datetime:
+    """Confirm it's you for the session ``gate`` speaks for (decisions I23), and return until
+    when (the gate's clock) it may make changes.
+
+    ``POST /v1/auth/confirm``. A dev gate's development login is confirmed at once. Otherwise
+    the gate mails the account's sign-in address a link, and ``show`` puts the code in front
+    of the person (default: :func:`confirm_prompt` on stderr): the link's page asks for it,
+    and only this screen has it, so a link someone else asked for confirms nothing. Then
+    ``GET /v1/auth/confirm/{id}`` every ``interval`` seconds until the session is confirmed;
+    a dropped connection doubles the interval. That is as soon as the session may make
+    changes, by this confirmation or another (a second tab's); with ``extend``, only once
+    this one is confirmed, so an hour that is still running starts again (an explicit
+    ``kontra confirm``). :class:`ConfirmError`: ``expired`` (also when ``expires_in`` runs out
+    here), ``burned``, ``unavailable`` (409 ``confirm_unavailable``), ``rate_limited`` (429),
+    ``api_key`` (a key's session). Nothing is ever changed by confirming alone."""
+    sleep = sleep or asyncio.sleep
+    clock = clock or time.monotonic
+    try:
+        start = await gate.confirm_start()
+    except GateError as e:
+        refused = _confirm_refused(e)
+        if refused is None:
+            raise
+        raise refused from e
+    if start.status == "confirmed":
+        assert start.confirmed_until is not None  # ConfirmStart's own rule
+        return start.confirmed_until
+    (show or _show_confirm_prompt)(start)
+    interval = max(start.interval, 1)
+    deadline = clock() + start.expires_in
+    while True:
+        await sleep(interval)
+        if clock() >= deadline:
+            raise ConfirmError("expired", _CONFIRM_EXPIRED)
+        try:
+            status = await gate.confirm_status(start.confirm_id)
+        except httpx.TransportError:
+            interval = min(interval * 2, _MAX_POLL_INTERVAL_S)
+            continue
+        if status.confirmed_until is not None and (not extend or status.status == "confirmed"):
+            return status.confirmed_until
+        if status.status == "burned":
+            raise ConfirmError("burned", _CONFIRM_BURNED)
+        if status.status != "pending":  # expired, or confirmed and already over
+            raise ConfirmError("expired", _CONFIRM_EXPIRED)
+
+
+def confirm_in_place(
+    show: Callable[[m.ConfirmStart], None] | None = None, *, sleep: Sleep | None = None
+) -> Confirmer:
+    """A :data:`Confirmer` for a program a person is watching: a change that needs a
+    confirmation asks for one (:func:`confirm_session`, ``show`` as there), waits for the
+    person to type the code on the mailed link's page, and goes ahead. Where only a new
+    sign-in can confirm, the change fails with :class:`ConfirmError` ``unavailable``.
+
+    ``Session.load(confirm=confirm_in_place())``. Not the default: a program nobody watches
+    would make the gate mail a person who never asked."""
+
+    async def confirmer(gate: GateClient, route: str, need: m.ConfirmationRequired) -> bool:
+        if need.confirm_with == "sign_in":
+            raise ConfirmError("unavailable", _CONFIRM_UNAVAILABLE)
+        await confirm_session(gate, show=show, sleep=sleep)
+        return True
+
+    return confirmer

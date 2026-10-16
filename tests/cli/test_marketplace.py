@@ -161,20 +161,22 @@ async def test_publish_refuses_an_offering_of_another_party(shop: Shop) -> None:
     assert f"names the party {shop.party!r}" in result.stderr
 
 
-async def test_publish_with_a_stale_login_says_log_in_again(
+async def test_a_stale_dev_login_confirms_at_once_and_publishes(
     dev_server: DevServer, tmp_path: Path
 ) -> None:
-    async with Marketplace(dev_server=dev_server, freshness=timedelta(seconds=2)) as mp:
+    """Past the gate's hour a change needs a confirmation (decisions I23); a `kontra dev`
+    login gets one at once, without a prompt or a mail (``tests/cli/test_confirm.py`` has
+    the email login, which is asked in place)."""
+    async with Marketplace(dev_server=dev_server, confirm_ttl=timedelta(seconds=2)) as mp:
         party = handle("stale")
         cli = Cli(tmp_path / "home", cwd=tmp_path)
         await cli.ok("login", "--dev", "--handle", party, "--gate", mp.base_url)
         await cli.ok("init", "late")
-        mp.gate.advance(5)  # the login is now older than the gate's freshness window
-        result = await cli.run("publish", "--dir", str(tmp_path / "late"))
-        assert result.exit_code == 1, explain(result)
-        lines = result.stderr.strip().splitlines()
-        assert lines[0].startswith("error: the gate answered 403 stale_session")
-        assert "run `kontra login`" in lines[1]
+        mp.gate.advance(5)  # the login is now older than the gate's hour (two seconds here)
+        result = await cli.ok("publish", "--dir", str(tmp_path / "late"))
+        assert f"published {party}/late@0.1.0" in result.stdout
+        assert "Confirm it's you" not in result.stderr
+        assert mp.gate.outbox == []
 
 
 async def test_serve_refuses_code_that_drifted_from_the_catalog(shop: Shop) -> None:

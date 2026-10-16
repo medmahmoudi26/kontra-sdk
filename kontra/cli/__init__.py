@@ -3,6 +3,7 @@
 ```
 kontra login [--gate URL] [--email ADDR] [--dev --handle H]
                                                device flow (or a mailed link); key registered
+kontra confirm                                 confirm it's you: an hour of changes (I23)
 kontra keys create|list|revoke                 API keys for programs (KONTRA_API_KEY)
 kontra init <name> [--party P]                 scaffold an offering (§6.1)
 kontra dev [up|down|status|logs]               the local stack (compose.yaml)
@@ -31,7 +32,7 @@ from typing import NoReturn
 import click
 
 from kontra import __version__
-from kontra.cli._account import balance, login, topup
+from kontra.cli._account import balance, confirm, login, topup
 from kontra.cli._buyer import hire, job, jobs, quote
 from kontra.cli._common import KontraGroup, fail
 from kontra.cli._dev import dev
@@ -62,6 +63,7 @@ def mcp() -> None:
 
 for _command in (
     login,
+    confirm,
     keys,
     recipients,
     init,

@@ -211,13 +211,17 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     assert (await buyer.gate.balance()).available_minor == topped.balance.available_minor  # type: ignore[union-attr]
     assert (await worker.me()).party == seller.profile.party
 
-    made = await buyer.gate.create_api_key("ci")  # a fresh human session mints, lists, revokes
+    made = await buyer.gate.create_api_key("ci")  # a person's session mints, lists, revokes
     assert [k.id for k in (await buyer.gate.api_keys()).keys] == [made.id]
     await buyer.gate.revoke_api_key(made.id)
     fleet = generate_identity()[1]  # one more recipient for the party, then not
     assert fleet in [k.public_key for k in (await buyer.gate.add_recipient("fleet", fleet)).keys]
     await buyer.gate.revoke_recipient(fleet)
     await seller.gate.revoke()
+    started = await buyer.gate.confirm_start()  # a dev login confirms at once
+    assert (started.channel, started.status) == ("dev", "confirmed")
+    polled = await buyer.gate.confirm_status(started.confirm_id)
+    assert (polled.status, polled.confirmed_until) == ("confirmed", started.confirmed_until)
     [mine] = (await buyer.gate.sessions()).sessions  # people's sign-ins; never a key's
     assert mine.current
     await buyer.gate.end_session(mine.id)  # the buyer signs out this way
@@ -241,6 +245,7 @@ PATH_VALUES = {
     "key_id": "key_" + "0" * 16,
     "session_id": "0" * 32,
     "public_key": "age1" + "q" * 58,
+    "confirm_id": "cfm_" + "0" * 32,
 }
 
 
@@ -284,16 +289,33 @@ async def tokens(world: World) -> dict[str, str]:
 @pytest.mark.parametrize("row", ROUTES, ids=[r.name for r in ROUTES])
 async def test_each_row_enforces_its_auth(world: World, tokens: dict[str, str], row: Route) -> None:
     gate = world.gate
+    # The rule is the window, not its length: a short one keeps the tokens of the fixture
+    # (15 minutes) alive past it.
+    gate.confirm_ttl = timedelta(minutes=10)
     denied = {401, 403}
+    need = m.ConfirmationRequired(confirm_with="dev", confirm_ttl_seconds=600)
+
+    async def answer(token: str | None) -> tuple[int, str, object]:
+        resp = await _call(gate, row, token)
+        body = (
+            resp.json()
+            if resp.headers.get("content-type", "").startswith("application/json")
+            else {}
+        )
+        if not isinstance(body, dict):
+            body = {}
+        return resp.status_code, str(body.get("code", "")), body.get("detail")
 
     async def status(token: str | None) -> tuple[int, str]:
-        resp = await _call(gate, row, token)
-        code = (
-            resp.json().get("code", "")
-            if resp.headers.get("content-type", "").startswith("application/json")
-            else ""
-        )
-        return resp.status_code, code
+        return (await answer(token))[:2]
+
+    async def later(token: str) -> tuple[int, str, object]:
+        """The answer once the sign-in is older than the window (and nothing confirmed)."""
+        gate.advance(timedelta(minutes=11))
+        try:
+            return await answer(token)
+        finally:
+            gate.advance(-timedelta(minutes=11))
 
     anonymous = await status(None)
     with_party = await status(tokens["party"])
@@ -313,29 +335,32 @@ async def test_each_row_enforces_its_auth(world: World, tokens: dict[str, str], 
     if row.auth == "party":
         assert with_party[0] not in denied, with_party
         assert with_key[0] not in denied, with_key  # a program hires with a key
+    elif row.auth == "human":
+        assert with_party[0] not in denied, with_party
+        # Keys and sign-ins are a person's to see, and a key never confirms.
+        assert with_key == (403, "fresh_login_required"), with_key
+        stale = await later(tokens["party"])
+        assert stale[0] not in denied, stale  # a read asks for no confirmation
     elif row.auth == "fresh":
         assert with_party[0] not in denied, with_party
-        # Acceptance 6: an API key's session never counts as fresh, though the key is new.
+        # Acceptance 6: an API key's session never makes a change, though the key is new.
         assert with_key == (403, "fresh_login_required"), with_key
-        gate.advance(timedelta(minutes=11))  # the login is now older than the window
-        try:
-            stale = await status(tokens["party"])
-        finally:
-            gate.advance(-timedelta(minutes=11))
-        assert stale == (403, "stale_session")
-    elif row.auth == "resolver":
+        stale = await later(tokens["party"])
+        assert stale[:2] == (403, "confirmation_required"), stale
+        assert m.ConfirmationRequired.model_validate(stale[2]) == need
+    elif row.auth in ("resolver", "resolver_human"):
         assert with_party == (403, "not_resolver")
         assert with_key == (403, "not_resolver")
         assert (await status(tokens["resolver"]))[0] not in denied
-        # Splitting escrow takes the resolver's fresh human session: never a key of theirs
-        # (the review's F4), nor a login older than the window (a stolen refresh token).
+        # The queue and its decisions are the resolver's own, never a key of theirs (the
+        # review's F4); splitting escrow is a change, confirmed (a stolen refresh token).
         assert await status(tokens["resolver_key"]) == (403, "fresh_login_required")
-        gate.advance(timedelta(minutes=11))
-        try:
-            stale = await status(tokens["resolver"])
-        finally:
-            gate.advance(-timedelta(minutes=11))
-        assert stale == (403, "stale_session")
+        stale = await later(tokens["resolver"])
+        if row.auth == "resolver_human":
+            assert stale[0] not in denied, stale
+        else:
+            assert stale[:2] == (403, "confirmation_required"), stale
+            assert m.ConfirmationRequired.model_validate(stale[2]) == need
     else:  # pragma: no cover - a new auth kind needs a rule here
         pytest.fail(f"unknown auth {row.auth}")
 

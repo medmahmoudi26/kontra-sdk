@@ -9,16 +9,25 @@ adding a row here, in the same PR.
 * ``none``      -- public.
 * ``party``     -- ``Authorization: Bearer <gate access token>`` (aud ``kontra:api``), from a
                    human login or from an API key.
-* ``fresh``     -- a party token whose human session (``auth_time``) is younger than the
-                   gate's freshness window, else 403 ``stale_session``; worker tokens never
-                   qualify (§10.4), and an API key's session never does, however new the key:
-                   403 ``fresh_login_required`` (decisions I19).
+* ``human``     -- a party token whose session is a person's: an API key's session gets 403
+                   ``fresh_login_required`` (decisions I19), a worker token 401. No age check:
+                   the reads of keys and sign-ins (decisions I23).
+* ``fresh``     -- ``human``, and the session is confirmed: a sign-in or a completed
+                   confirmation (``POST /v1/auth/confirm``) within the gate's
+                   ``KONTRA_CONFIRM_TTL`` (an hour), else 403 ``confirmation_required`` with
+                   :class:`~kontra.gate_client.models.ConfirmationRequired` as its detail. The
+                   API-key test comes first, so a key always gets ``fresh_login_required``.
+                   The changes: making or revoking an API key or a recipient, ending a
+                   sign-in, publishing. The 403 is decided before the route does anything, so a
+                   client confirms in place and sends the same call once more (decisions I23).
 * ``worker``    -- the party's Temporal *worker* JWT, also accepted on seller routes so a
                    worker needs one credential (``kontra serve``).
 * ``resolver``  -- a party listed in the gate's ``KONTRA_RESOLVERS`` (anyone else: 403
-                   ``not_resolver``), with a ``fresh`` session: a resolver splits escrow, so
-                   an API key gets 403 ``fresh_login_required`` and an old login 403
-                   ``stale_session``, checked after the resolver list.
+                   ``not_resolver``, checked first), then ``fresh``: a resolver splits escrow,
+                   so an API key gets 403 ``fresh_login_required`` and an unconfirmed login 403
+                   ``confirmation_required``.
+* ``resolver_human`` -- the resolver list, then ``human``: reading the queue needs a
+                   resolver's own login, never a confirmation.
 * ``dev``       -- only when the gate runs with ``KONTRA_DEV=1``; 404 otherwise.
 """
 
@@ -31,7 +40,9 @@ from pydantic import BaseModel
 
 from kontra.gate_client import models as m
 
-Auth = Literal["none", "party", "fresh", "worker", "party|worker", "resolver", "dev"]
+Auth = Literal[
+    "none", "party", "human", "fresh", "worker", "party|worker", "resolver", "resolver_human", "dev"
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,8 +91,8 @@ ROUTES: tuple[Route, ...] = (
     Route("me", "GET", f"{P}/me", "party|worker", None, m.Me),
     # Encryption recipients, NOT /v1/keys (API keys, below): an API key authenticates, a
     # recipient receives ciphertext. Adding never replaces, so a second machine is one
-    # more recipient; both need a fresh human session, because a recipient can read every
-    # delivery made after it is added (decisions I7).
+    # more recipient; both are changes a person confirms, because a recipient can read every
+    # delivery made after it is added (decisions I7, I23).
     Route("add_recipient", "POST", f"{P}/me/recipients", "fresh", m.AddKey, m.Me, status=201),
     Route(
         "revoke_recipient",
@@ -93,15 +104,23 @@ ROUTES: tuple[Route, ...] = (
         status=204,
     ),
     Route("party", "GET", f"{P}/parties/{{party}}", "none", None, m.PartyView),
-    # API keys for programs: minted, listed and revoked by a fresh human session only
+    # API keys for programs: listed by a person's session, minted and revoked by a confirmed
+    # one; never by a key (decisions I19, I23)
     Route(
         "create_api_key", "POST", f"{P}/keys", "fresh", m.ApiKeyCreate, m.ApiKeyCreated, status=201
     ),
-    Route("api_keys", "GET", f"{P}/keys", "fresh", None, m.ApiKeyList),
+    Route("api_keys", "GET", f"{P}/keys", "human", None, m.ApiKeyList),
     Route("revoke_api_key", "DELETE", f"{P}/keys/{{key_id}}", "fresh", None, None, status=204),
-    # The party's sign-ins (people's logins), to find and end one: a fresh human session only
-    Route("sessions", "GET", f"{P}/sessions", "fresh", None, m.SessionList),
+    # The party's sign-ins (people's logins), to find and end one: a person's session reads
+    # them, a confirmed one ends one
+    Route("sessions", "GET", f"{P}/sessions", "human", None, m.SessionList),
     Route("end_session", "DELETE", f"{P}/sessions/{{session_id}}", "fresh", None, None, status=204),
+    # Step-up for changes (decisions I23): a person's session asks; the gate mails the
+    # account's sign-in address a link whose page asks for the code this session shows.
+    Route("confirm_start", "POST", f"{P}/auth/confirm", "human", None, m.ConfirmStart, status=201),
+    Route(
+        "confirm_status", "GET", f"{P}/auth/confirm/{{confirm_id}}", "human", None, m.ConfirmStatus
+    ),
     # catalog
     Route("publish", "POST", f"{P}/catalog", "fresh", m.PublishRequest, m.CatalogEntry),
     Route("search", "GET", f"{P}/catalog", "none", None, m.CatalogList),
@@ -183,7 +202,7 @@ ROUTES: tuple[Route, ...] = (
     Route("balance", "GET", f"{P}/balance", "party", None, m.Balance),
     Route("topup", "POST", f"{P}/topup", "party", m.Topup, m.TopupResult),
     # disputes (resolver of last resort)
-    Route("disputes", "GET", f"{P}/admin/disputes", "resolver", None, m.JobList),
+    Route("disputes", "GET", f"{P}/admin/disputes", "resolver_human", None, m.JobList),
     Route(
         "resolve",
         "POST",

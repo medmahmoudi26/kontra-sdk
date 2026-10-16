@@ -646,16 +646,19 @@ printed (sign-ups are by invitation; see [buyers.md](buyers.md#setup)).
 
 1. loads `worker.py` and each bound offering's `offering.yaml`;
 2. derives the contract document and seals it with your public key and its hash;
-3. sends it to the gate, which requires a **fresh human login** (a worker token never
-   qualifies), validates it, assigns the version an opaque Nexus endpoint name and creates the
+3. sends it to the gate, which requires your login, **confirmed within the hour** (a worker
+   token never qualifies), validates it, assigns the version an opaque Nexus endpoint name and creates the
    endpoint itself, pointed at your namespace and the version's task queue;
 4. prints the contract hash, the endpoint and the task queue.
 
 The gate refuses a document with an external `$ref`, an object without
 `additionalProperties`, or a reserved `Kontra*` type that differs from the spec, naming the
-path at fault. A login older than the gate's freshness window is refused: run `kontra login`
-and publish again. An API key never publishes, however new (403 `fresh_login_required`):
-publishing is a person's act.
+path at fault. Signing in counts as a confirmation for an hour; after that, `kontra publish`
+asks you to confirm it's you in place: it prints a code, the gate mails the address you sign
+in with a link, and once you type the code on the link's page the command publishes. Nothing
+is published before. Without a terminal (CI) it fails instead and says to run `kontra
+confirm` first; a `kontra dev` login confirms at once (decisions I23). An API key never
+publishes, however new (403 `fresh_login_required`): publishing is a person's act.
 
 `kontra serve` connects to Temporal with a 15-minute worker token, refreshed in the
 background. That token can do one thing: run workers in your namespace. It cannot publish,

@@ -18,14 +18,15 @@ NOW = "2026-10-11T00:00:00Z"
 
 
 def minimal(model: type[BaseModel]) -> dict[str, Any]:
-    """The smallest JSON object ``model`` accepts: every required field, nothing else."""
+    """The smallest JSON object ``model`` accepts: every required field, nothing else (and
+    what a model's own cross-field rule needs on top, :data:`CONSISTENT`)."""
     out: dict[str, Any] = {}
     for name, field in model.model_fields.items():
         if field.is_required():
             patterns = [getattr(c, "pattern", None) for c in field.metadata]
             patterned = next((PATTERNED[p] for p in patterns if p in PATTERNED), None)
             out[field.alias or name] = patterned or _value(field.annotation)
-    return out
+    return {**out, **CONSISTENT.get(model, {})}
 
 
 #: Values for constrained string fields (opaque gate-assigned ids, digests, API keys).
@@ -36,6 +37,13 @@ PATTERNED = {
     m.API_KEY_PATTERN: m.API_KEY_PREFIX + "k" * 43,
     m.API_KEY_LABEL_PATTERN: "ci",
     m.USER_CODE_PATTERN: "BCDF-GHJK",
+    m.CONFIRM_ID_PATTERN: "cfm_" + "0" * 32,
+}
+
+#: Optional fields a model's validator requires given the minimal required ones: a pending
+#: confirmation (the first literal of ``status``) shows a code.
+CONSISTENT: dict[type[BaseModel], dict[str, Any]] = {
+    m.ConfirmStart: {"user_code": "BCDF-GHJK"},
 }
 
 

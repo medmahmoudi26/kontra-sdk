@@ -523,7 +523,8 @@ class Worker:
                     except GateError as e:
                         problems.append(
                             f"{b.key} is not published and publishing it failed ({e.message}); "
-                            "run `kontra publish` (it needs a recent login)"
+                            "run `kontra publish` (it needs your login, confirmed within "
+                            "the hour; in a terminal it asks)"
                         )
                         continue
                     log.info("published %s (dev profile), contract %s", b.key, entry.contract_hash)
