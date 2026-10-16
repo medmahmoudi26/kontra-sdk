@@ -39,7 +39,7 @@ flowchart LR
   BS -- "HTTP" --> GATE
   SW -- "HTTP" --> GATE
   GATE --> DB
-  GATE -- "namespaces, endpoints, quote relay, job watching" --> IFE
+  GATE -- "namespaces, endpoints, quote relay, job watching, task-queue stats" --> IFE
   SW -- "presigned PUT" --> B
   BS -- "presigned GET" --> B
 ```
@@ -75,13 +75,15 @@ is what lets a ledger adapter be swapped and keeps a future split into services 
 | `kontra.codec` | the `PayloadCodec`: age encryption with recipients from the serialization context, claim-check above 256 KiB |
 | `kontra.artifacts`, `kontra.types` | `Artifact`: streamed, encrypted upload and verified download through presigned URLs |
 | `kontra.gate_client` | the hand-written HTTP client: one method per route of `routes.py`, models in `models.py` |
-| `kontra.profile`, `kontra.auth` | the local profile and key; the session that refreshes gate and Temporal tokens |
-| `kontra.serve` | the seller's `Worker`: generated Nexus handler, hold-token check, codec, progress forwarding |
+| `kontra.profile`, `kontra.auth` | the local profile, this machine's key and a buyer's per-job keys; the session that refreshes gate and Temporal tokens |
+| `kontra`, `kontra.workflow`, `kontra.activity` | the seller's façade: Temporal's own objects re-exported, never wrapped (`activity.defn` returns Temporal's own, after noting it for `serve()`), plus `serve`, `Worker`, `Page` and `workflow.execute_activities_in_parallel` (`kontra._parallel`, the `kontra.batch.v1` child) |
+| `kontra.serve` | the seller's `serve()` and `Worker`: generated Nexus handler, hold-token check, codec, progress forwarding; Temporal's own metrics and spans when asked (`kontra serve --metrics`, `--otlp`) |
 | `kontra.hire` | the buyer's `Kontra` client, `service()` for workflows, the hire worker |
 | `kontra.mcp` | `kontra mcp`, the eight agent tools and a seller's `workers`, built on `kontra.hire` |
 | `kontra.cli` | the `kontra` command; no business rule lives here |
 | `kontra.ledger`, `kontra.escrow` | the `Ledger` Protocol; the job and escrow rules as pure functions |
-| `kontra._control` | the control-plane calls on Temporal's internal frontend, shared by the real and the fake gate |
+| `kontra.workers` | the Workers view's verdict, as pure functions of what `DescribeTaskQueue` reports |
+| `kontra._control` | the control-plane calls on Temporal's internal frontend (the Workers view's `DescribeTaskQueue` and `ListWorkers` among them), shared by the real and the fake gate |
 | `kontra.testing` | a fake for every seam: `fake_ledger`, `fake_gate`, a dev server with standalone Nexus, `Marketplace` |
 
 ## The five seams
@@ -92,11 +94,11 @@ the same pull request.**
 
 | # | Seam | What crosses | Contract | Test | CI job |
 |---|---|---|---|---|---|
-| ① | Temporal frontend | Nexus calls, task polls, the hold-token header | Temporal's protocol + the policy in `temporal/authorizer` | the Go deny matrix + `tests/temporal` over the wire | `deny-matrix` (required) |
-| ② | Gate HTTP API | quote, hire, jobs, progress, artifacts, disputes, catalog, publish | `kontra/gate_client/models.py` + `routes.py` | `tests/gate_client/test_routes.py`; the gate's OpenAPI snapshot in `kontra-cloud` | `seams` |
-| ③ | Contract document | the offering, seller to buyer | `kontra/contract` + `spec/` | `tests/contract`; the golden `examples/*/contract.yaml`, reproduced byte for byte | `seams` |
+| ① | Temporal frontend | Nexus calls, task polls, the hold-token header, `DescribeTaskQueue` in the token's own namespace (a seller's backlog) | Temporal's protocol + the policy in `temporal/authorizer` | the Go deny matrix + `tests/temporal` over the wire | `deny-matrix` (required) |
+| ② | Gate HTTP API | quote, hire (with the job's own key), jobs, progress, artifacts, disputes, catalog, publish, a party's recipients, the Workers view | `kontra/gate_client/models.py` + `routes.py` | `tests/gate_client/test_routes.py`; the gate's OpenAPI snapshot in `kontra-cloud` | `seams` |
+| ③ | Contract document | the offering, seller to buyer: its types and facts (spec v2: `uses_hosted_model` when true, and no key) | `kontra/contract` + `spec/` | `tests/contract`; the golden `examples/*/contract.yaml`, reproduced byte for byte | `seams` |
 | ④ | Ledger | money state | the `Ledger` Protocol (`kontra/ledger.py`) | `kontra.testing.ledger_contract` (the §9.3 invariants, 10,000 random interleavings) against every adapter | `seams` |
-| ⑤ | Codec | plaintext to ciphertext | `kontra/codec` | round trips, plus scans of Temporal history and the bucket for a known plaintext marker | `seams` |
+| ⑤ | Codec | plaintext to ciphertext | `kontra/codec` | round trips, plus scans of Temporal history, the bucket, and a worker's metrics and exported spans (`tests/codec/test_codec_telemetry.py`) for a known plaintext marker | `seams` |
 
 Every seam has a fake in `kontra.testing`, so each side can be built and tested without the
 other: a seller runs a full lifecycle, timeout and refund included, in a unit test with no
@@ -107,11 +109,16 @@ Rules that keep the seams real:
 - **One implementation per rule.** `kontra.contract` is the only code that derives,
   canonicalises, hashes or validates a contract; `publish`, `serve` and the gate all call it.
   `kontra/escrow.py` is the only statement of who gets paid when; the real and the fake gate
-  both run it. `kontra._control` is the only code that talks to the internal frontend.
+  both run it. `kontra/workers.py` is the only code that turns a task queue's numbers into a
+  verdict; the real and the fake gate both run it too. `kontra._control` is the only code that
+  talks to the internal frontend.
 - **D1.** Seller `workflows.py` and `activities.py` import Temporal only through the `kontra`
   façade (`from kontra import workflow, activity, ...`: Temporal's own objects, so swapping in
   `from temporalio import ...` still runs on any Temporal; decisions I20); `models.py`
-  may use `kontra.types.Artifact`. The tests check the examples.
+  may use `kontra.types.Artifact`. The tests check the examples and the `kontra init`
+  scaffold, and `kontra publish` refuses a project whose modules import `temporalio` or
+  `nexusrpc` or call `continue_as_new` (the one continue-as-new is `kontra.batch.v1`'s),
+  naming file and line; a `kontra dev` profile skips that check.
 - **Distribution name.** The PyPI distribution is `kontra-sdk`; a bare `kontra` dependency
   installs an unrelated project.
 
@@ -130,13 +137,16 @@ a trailing newline. So every Temporal identifier is built in one place,
 | Task queue | `acme/enrich@1.2.0` | constructed |
 | Seller namespace | `acme` | a party's namespace is its handle |
 | Handler workflow id | `job-<32 hex>` | constructed from the job id |
+| Batch child workflow id | `<parent workflow id>/batch/<activity>/<uuid4>` (`job-<32 hex>/batch/...` under a handler) | constructed from the parent's id, the activity's Temporal name and a `workflow.uuid4()` of the parent's, for the `kontra.batch.v1` child; reads back as no job id |
 
 - No code splits a task queue, service name or endpoint to recover an offering, and no
   authorization decision reads one. The Authorizer decides by exact equality and set
   membership on the token's claims and the request's namespace.
 - The catalog is the only map between an endpoint and an offering, in both directions
   (`CatalogEntry.endpoint`, `GET /v1/endpoints/{endpoint}`). A contract document does not
-  contain its endpoint: the endpoint is assigned after the document is sealed.
+  contain its endpoint: the endpoint is assigned after the document is sealed. Nor does it
+  contain a key (spec v2): a party's recipients are catalog data too
+  (`CatalogEntry.recipients`), so adding or revoking one never forces a republish.
 - What people type (`acme/enrich@1.2`, a version, a handle) is validated with anchored,
   ASCII-only `fullmatch` patterns and length limits, never stripped or normalised first.
 - The one inverse that exists, workflow id to job id, is construct-and-compare: a candidate is
@@ -144,14 +154,17 @@ a trailing newline. So every Temporal identifier is built in one place,
 
 ## A job, end to end
 
-1. **Quote.** The buyer's client validates the input against the contract and encrypts it.
-   The gate relays it, byte for byte, as a synchronous Nexus call on the internal frontend's
-   HTTP API to the seller's handler, which runs `quote`. The answer comes back in plaintext
-   (the gate must read the price) and the gate records it as a quote with an expiry.
-2. **Hire.** The gate locks the price in the ledger against a new job id and signs a hold
-   token. The buyer's client starts `execute` as a standalone Nexus operation **in the buyer's
-   own namespace**, with the token in the `kontra-hold` header and the job's `max_duration` as
-   its schedule-to-close timeout. (A buyer workflow is itself the Nexus caller; clients without
+1. **Quote.** The buyer's client validates the input against the contract and encrypts it to
+   every recipient the seller holds, as the catalog lists them. The gate relays it, byte for
+   byte, as a synchronous Nexus call on the internal frontend's HTTP API to the seller's
+   handler, which runs `quote`. The answer comes back in plaintext (the gate must read the
+   price) and the gate records it as a quote with an expiry.
+2. **Hire.** The buyer's client makes the job's own age key and sends its public half with
+   the hire; the gate locks the price in the ledger against a new job id and signs a hold
+   token that names that key (`buyer_key`), never one of the buyer party's. The buyer's
+   client starts `execute` as a standalone Nexus operation **in the buyer's own namespace**,
+   with the token in the `kontra-hold` header and the job's `max_duration` as its
+   schedule-to-close timeout. (A buyer workflow is itself the Nexus caller; clients without
    Temporal ask the gate to start it for them.)
 3. **Start.** Temporal dispatches the operation to the seller's worker. The handler verifies
    the token offline, validates the input, re-runs `quote`, and starts the seller's workflow as
@@ -159,9 +172,9 @@ a trailing newline. So every Temporal identifier is built in one place,
 4. **Work.** The workflow runs as any Temporal workflow does. Heartbeat details are encrypted
    to the buyer and posted to the gate; the gate merges them with liveness it reads from
    history metadata into the job's progress stream.
-5. **Delivery.** The result is encrypted to the buyer (and the seller) and travels back through
-   Nexus; the gate, watching `job-<id>` through the internal frontend, records the delivery and
-   its hash and opens the review window.
+5. **Delivery.** The result is encrypted to the job's key (and every recipient of the
+   seller's) and travels back through Nexus; the gate, watching `job-<id>` through the
+   internal frontend, records the delivery and its hash and opens the review window.
 6. **Settlement.** Accept, or silence until the window closes, releases the hold to the seller
    minus the platform fee; reject opens a dispute. A failure, a missed deadline or a cancel
    refunds. A cancel of a job whose run the gate has seen terminates that run first and

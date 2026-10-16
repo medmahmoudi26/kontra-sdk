@@ -185,6 +185,59 @@ Per end-to-end test (call time, Postgres ledger): 14 288.4 s, 13 227.6 s, 4 153.
 8 101.7 s, 5 36.7 s, 15 (declared too little) 33.8 s, 1 25.0 s, 11 11.1 s, 12 8.3 s,
 15 6.9 s, 7 6.6 s, 18 5.3 s, 17 4.7 s, 19 1.9 s.
 
+### Against the images production runs (2026-10-16)
+
+`tests/e2e` was run again after the release of items 1-5 (kontra-sdk 0.2.0), against the exact
+images then running in staging and production, by digest. The suite needs `kontra dev`'s
+stack (its dev login, its own Postgres and bucket), which production neither has nor should
+have. So "against the deployed gate" means against the deployed **images**.
+
+The same images were then checked live:
+
+| Check | Staging | Production |
+|---|---|---|
+| `/healthz` | `ok` (database, Temporal) | `ok` |
+| Migrations at head | `0012` | `0012` (`party_keys` backfilled) |
+| Recipient and Workers routes | 401 without a session | 401 without a session |
+| Removed `PUT /v1/me/key` | 404 | 404 |
+| Gate's traces in Grafana Cloud | arriving | arriving |
+
+The run:
+
+* **When and where:** 2026-10-15 23:47 to 2026-10-16 00:05 UTC, on a 2-vCPU, 8 GB machine
+  shared with other workloads.
+* **kontra-sdk:** `b5c12e4` (`dev`). Its package is that of `530c28b`, the 0.2.0 release
+  commit; the tag `v0.2.0` is `b5c12e4`.
+* **kontra-cloud:** `d1d7397` (`dev`).
+* **Images**, the digests staging and production ran from 2026-10-15 23:46 and 2026-10-16
+  00:06 UTC (`.github/scripts/deploy-stack`):
+  * `KONTRA_GATE_IMAGE=ghcr.io/medmahmoudi26/kontra-gate@sha256:c46825214fdc404d70f8db8664d5574c00a32a1e59905723f9b4e689c6571b75`:
+    `kontra-gate:d1d7397`, built by kontra-cloud's deploy workflow.
+  * `KONTRA_TEMPORAL_IMAGE=ghcr.io/medmahmoudi26/kontra-temporal@sha256:235d32fe669a76fc19c6a03981c277d1ac5a33b95a01af9c6d81c79716fcfd51`:
+    `kontra-temporal:530c28b`, published by this repository's `temporal-image` workflow.
+* **The stack:** the gate and Temporal containers were checked to run exactly those digests.
+
+| What | How | Result | Wall time |
+|---|---|---|---|
+| `tests/e2e`, Postgres ledger | `kontra dev down --volumes`, then `make e2e` with the settings above | 14 passed | 1,011 s of session, plus `kontra dev up` 46 s |
+
+Per end-to-end test (call time): 14 286.3 s, 13 216.8 s, 4 158.1 s, 8 93.7 s, 1 38.3 s,
+5 36.8 s, 15 (declared too little) 36.3 s, 12 16.3 s, 17 14.7 s, 11 14.2 s, 18 13.0 s,
+7 8.7 s, 19 6.4 s, 15 6.3 s.
+
+What the criteria printed:
+
+* **4:** refunded 152.9 s after the hire (bound: 180 s).
+* **5:** released 1.6 s after the review window closed.
+* **1:** 38.2 s from `kontra dev` to an accepted delivery, 84.2 s with the stack's start.
+* **13:** 100 heartbeats in order.
+* **14:** a 3 GiB artifact.
+* **8:** six encodings of the marker scanned, none found in clear.
+
+Not run again here: the fake-ledger session (acceptance 9), nexgen (16) and the kontra-cloud
+nodes. The deny matrix (2) ran in every pull request's CI (`deny-matrix`), the matrix of the
+authorizer in these images.
+
 ## Notes and open items
 
 * **Fix: a transport failure with no message.** A seller died with
