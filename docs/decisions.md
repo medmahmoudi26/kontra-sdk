@@ -704,6 +704,13 @@ stolen session token.
 * **A key never confirms.** There is no person behind it: an API key's session is refused
   every `human` and `fresh` route, starting a confirmation included, and the platform's
   `sessions` table cannot hold a confirmed key session (`ck_sessions_key_unconfirmed`).
+* **An operator can ask again.** After a suspected compromise (or for a staging check) the
+  platform's `python -m gate.admin require-confirmation <party> [--session <id prefix>]`
+  (`FakeGate.require_confirmation` here) makes a party's sign-ins, or one, confirm before
+  their next change, whatever is left of their hour: a change then needs a confirmation
+  *later* than the request (`confirmed_at > confirm_required_at`). It signs nobody out, never
+  moves `auth_time` and never touches a key's session. Clients need nothing new: the refusal
+  is the same `confirmation_required`, and a poll's `confirmed_until` stays null until then.
 * **Sign-in mail's limits.** A confirmation link is a magic link (one table on the platform),
   so its mail counts against every sign-in mail limit -- per address and requesting network,
   per client, and the per-address and global ceilings -- and one sign-in asks at most five
