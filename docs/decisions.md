@@ -147,7 +147,11 @@ login   : auth only       -- it adds a recipient; it never decides one
   own keys. So hiring needs no key setup at all — a fresh machine, CI with `KONTRA_API_KEY`,
   `kontra mcp` — and a compromise reaches open jobs, not years of deliveries. `kontra job <id>
   --result` decrypts with the job key; `kontra job <id> --accept` shreds it, which makes the ciphertext the gate
-  and the bucket still hold unreadable by anyone. The key is written *before* the hire call,
+  and the bucket still hold unreadable by anyone. *Amended by I25:* the job key is also
+  copied to each of the account's devices, encrypted to that device alone, so a job key
+  reaches one job but a device key reaches every job wrapped to it, and `--accept` shreds
+  this machine's key file only: every device of the account, this machine included, keeps its
+  copy at the gate, so the job stays readable by the account's devices while it exists. The key is written *before* the hire call,
   under the quote id, because a lost answer can still have locked a hold: a job whose key was
   never written would be a delivery nobody can read. The seller side is unchanged — it
   encrypts to whatever `buyer_key` the signed token names, and caches it per job.
@@ -886,3 +890,153 @@ a second way into an account, and this one only shortens a way that exists.
   never load it.
 * **The CLI gets no passkeys.** A terminal has no WebAuthn; its email path is unchanged, and the
   client methods are the console's (and a test's).
+
+## I25. Share to my account
+
+The owner's plan item (decision 8): *"Wrap each job's key to your account's keys so a job hired
+in one browser reads in another, or in the CLI. It removes the last key chore."* Folded in:
+*"Exact key per job on the job page: the gate returns a job's buyer key."* Per-job keys (I7)
+made hiring need no key setup, but left a job readable only where it was hired: the console
+offered "Job keys" export, restore and save-for-CLI, and the CLI said to copy the key file.
+Nothing here touches Temporal, the hold token, the codec or the seller: the seller still
+encrypts to the `buyer_key` signed into the hold. This decides only who else gets a copy of
+the job key's secret half, and how.
+
+* **"The account's keys" are a new per-party set, devices -- not the recipients.** The plan's
+  phrase allows both readings; the recipients were rejected because they include fleet keys
+  mounted on every seller worker pod (a compromised worker host would read everything the
+  party ever bought), because a browser key registered as a recipient would receive every
+  buyer's input to the party's offerings and add a stanza to each, and because recipients are
+  public (`GET /v1/parties/{p}`), where a list of a person's browsers and laptops should not
+  be. A device is `browser` (a key per browser profile and party, non-extractable WebCrypto
+  X25519 where the browser has it) or `cli` (`kontra login`'s `~/.kontra/key`, also a
+  recipient: two rows, two revocations, the same machine). Fleet keys are never devices; an
+  API key's session is none either -- it wraps the jobs it hires to the devices and reads
+  only those.
+* **Seam ② gains six routes and only new models**, so 0.2.0-0.2.3 keep parsing every answer.
+  `GET /v1/me/devices[?for=K]` (`party`, so a program's hire wraps to them; `for` marks the
+  caller's own device used; an API key's session reads the keys, its labels hidden and no
+  sign-in or use named -- a program needs the keys, not the names of a person's browsers),
+  `POST /v1/me/devices` (`recent`, `AddDevice` -> `DeviceView`; the same live key again is the
+  same view, a removed one 409 `device_revoked`, a bad key 422 `invalid_public_key`, more than
+  `DEVICE_ADDS_PER_HOUR` (48) new ones an hour 429 `rate_limited` -- each mails the party),
+  `DELETE /v1/me/devices/{key}` (`fresh`), `GET /v1/jobs/{id}/key`
+  (`party`, the buyer only: a seller 403 `forbidden`, anyone else 404 `job_not_found`, as for
+  `result`), `GET /v1/me/job-keys?lacking=D[&for=K]` (`party`; `D` a live device of the
+  caller, else 404 `device_not_found`) and `POST /v1/me/job-keys` (`party`, at most
+  `SHARE_ITEMS_MAX` (100) jobs, a body limit of 256 KiB on the platform). Under `/v1/me`,
+  because `/v1/jobs/keys` would be read as the job "keys".
+* **Registration asks nothing in the common path.** Adding a device is `recent`, the same as
+  starting a passkey and for the same reason: a device also receives the keys of past jobs.
+  Right after a sign-in that holds, so the console registers its browser and `kontra login`
+  this machine without a prompt; the console's call is quiet (a 403 never opens the panel)
+  and is retried after the next confirmation the tab completes. `kontra login --no-device` is
+  the opt-out (a seller's box); a CLI login from before devices registers at its next
+  confirmation (`Session.confirm`, the CLI's in-place confirmations, `kontra confirm`) unless
+  it was declined, and `kontra devices add` does it on purpose. The gate mails the account's
+  address every device added and removed, naming the sign-in, with no link.
+* **A browser device that is gone retires by itself (review H1).** Every sign-in in a private
+  window, a profile that deletes site data on close, or a new profile makes a key and adds a
+  device -- useful on a borrowed machine, so such a browser registers (the design had it
+  stay out; nothing tells such storage apart reliably) -- and nothing a person does removes
+  them. So the gate *retires* a browser device nobody used for `DEVICE_IDLE_SECONDS` (30 days:
+  every catch-up lists the devices `for=` itself, so a browser in use never idles, and a
+  sign-in idle that long has expired anyway), and at `DEVICES_MAX` (32) live devices a new
+  one takes the place of the browser used least recently, named in the new device's mail;
+  only an account of 32 machines answers 409 `too_many_devices`. Retired is not removed: the
+  device is listed nowhere and gets nothing, but keeps its copies, and its browser adds the
+  same key again by itself at its next sign-in (quietly; `recent` as any add, no mail -- it
+  was a device already, and a loop of comebacks mails nobody). A browser whose device left
+  the list asks the gate, which answers which it was: back (retired) or 409
+  `device_revoked` (removed by a person: never again). A `kontra login` machine never
+  retires; one removed by mistake comes back with a key of its own, `kontra devices add
+  --new-key` (`~/.kontra/device.key`), never a new `~/.kontra/key`, which is also a
+  recipient.
+* **A wrap is a job key encrypted to one device.** Its plaintext is the CLI's key file
+  (`# job:`, `# public key:`, the `AGE-SECRET-KEY-1...` line), so `age -d -i ~/.kontra/key`
+  opens one by hand; its ciphertext is age with exactly one X25519 stanza, at most `WRAP_MAX`
+  (1024) bytes. One file per (job, device), never one with N stanzas: catch-up then adds a row
+  and never rewrites anyone's, removal deletes only that device's rows, and a stolen session
+  cannot replace the shared file. Rows are first-write-wins (`ON CONFLICT DO NOTHING`), never
+  updated. The gate checks the shape only (`kontra._jobkeys.check_wrap_shape`); a reader
+  unwraps, requires exactly one identity, and requires its public key to be *this* job's
+  `buyer_key` from the gate, so a wrap moved to another job is useless.
+* **Only a holder of the job key writes a wrap.** Without that, a stolen API key could post
+  junk for a new device first and, first write winning, keep it from ever reading the job.
+  `GET /v1/jobs/{id}/key` and every listed item carry a `challenge`: age-encrypted to the
+  job's `buyer_key`, an HMAC over the job, the asking session and a ten-minute bucket, under a
+  key derived from the gate's signing secret (`KONTRA_SIGNING_KEYS`; nothing stored). A share
+  carries the opened `proof`; the gate recomputes it for this session in this bucket and the
+  one before. Refused jobs come back by code (`job_not_found`, `not_shareable`, `bad_proof`,
+  `invalid_wrap`), whole; a wrap to no live device, or one that exists, is skipped.
+* **Exact key per job: `JobView.buyer_key`, as the plan item says -- sent only when asked
+  (review M5).** Every released SDK parses answers strictly: `JobView` with a `buyer_key`
+  (even `null`) fails `kontra job`, `kontra jobs`, `kontra hire` and every MCP job tool on
+  0.2.0-0.2.3 (measured), and I24 made "no existing response model gains a field" a rule for
+  exactly this. So the field is there, and `GET /v1/jobs/{id}` and `GET /v1/jobs` add it only
+  on `?include=buyer_key` -- absent from the JSON otherwise, never `null` -- which the console
+  asks for: the job page looks its key up by that name, with no trial and, when the key is
+  kept here, no other call. And from 0.2.4 a client reads every answer ignoring the fields it
+  does not know (requests stay strict on both sides), so once 0.2.3 and older need no
+  serving, the gate may send it, or any new field, to everyone. `GET /v1/jobs/{id}/key`
+  (`JobKey.buyer_key`, with the wraps and the challenge) is what a page without its key asks.
+* **Catch-up: every online device serves the devices it has not served.** A device keeps,
+  per party, the devices it has shown the person (*seen*) and served (*synced*). For each live
+  device it has not served, itself included (its own jobs' keys are then kept for it too), it
+  pages `lacking=D`, wraps every job whose key it holds or can unwrap from its own wrap, with
+  the proof, and marks D served; a job no key here opens is left to the device that has it. A
+  share that failed at hire is retried first. The console runs this at sign-in, when a tab
+  becomes visible and every five minutes, in one tab per browser; the CLI in `kontra login`
+  and `hire` within five seconds and in `jobs` and `job` within 1.5, each *after* it printed
+  what was asked; `kontra mcp` every five minutes; a failure only notes. Where a device's
+  listing stopped (the time, the network) is kept per device (`devices.json` `cursors`) and
+  the next catch-up resumes there, so a backlog of jobs nobody here can open -- older
+  browsers' jobs, a CI's whose keys are gone -- costs one pass in all, not every command
+  (review M2). A page with a proof the gate refused (`bad_proof`: a signing key rotated, a
+  bucket rolled over mid-page) leaves the device unserved and its cursor before that page:
+  the next catch-up sends those jobs again (review L1). Old jobs are shared too: a device's
+  first catch-up wraps every job key it holds. A device wraps only to devices it has shown
+  the person ("X can now read your jobs"), at hire as in catch-up: the console in a notice,
+  the CLI once on stderr, a library through `on_new_device` (by default a logged warning),
+  and `kontra mcp`, which has no terminal anyone reads, in its next tool answer -- until it
+  has, nothing is copied to that device from there (a hook that returns False; review L9).
+  Honest limit: a new device reads an old job only once a device holding that job's key has
+  been online since; until then the CLI says so (`JobKeyMissing`, reason `no_wrap`) and the
+  job page too (it looks again by itself while it waits). A job that closed without a
+  delivery reports its failure (`JobFailed`) wherever no key reached, as where it was hired
+  (review M4).
+* **In the SDK.** `kontra._jobkeys` (proof, challenge, wrap shape, wrap and unwrap, the
+  notices) is shared by both gates and both clients, as `kontra._passkeys` is: the platform
+  imports it. `kontra._devices` is the client's half: registration, sharing, reading a job's
+  key from this device's wrap (written to `~/.kontra/jobs/<id>.key`, 0600, never over a key
+  already there), and catch-up, with state in `~/.kontra/devices.json` and a share still owed
+  as an empty `~/.kontra/jobs/<id>.unshared` marker (one file per job, so concurrent commands
+  never lose one in a read-modify-write). `Kontra` shares a new job's key in the background,
+  so a hire neither waits for nor fails by it, reads a job's key before decrypting its result
+  or progress, and `Kontra.sync_job_keys()` is the catch-up. An API key's session shares and
+  retries but neither catches up devices nor writes `devices.json`.
+* **Removal.** `DELETE /v1/me/devices/{key}` marks the row removed (never added again), and
+  deletes its wraps of the party's jobs in the same transaction (a share in flight holds the
+  device rows it read, so a removal waits for it and then deletes what it stored: nothing is
+  left for a sweeper); from then on no hire, catch-up or listing gives it one. What it already
+  opened -- a key it unwrapped, a key it hired with, a wrap copied from a backup taken before
+  -- cannot be recalled, and job keys are never rotated: the seller encrypted to them. The
+  console, the CLI and the mails say so; removing a device does not end its sign-in.
+* **I7's shredding, amended.** `kontra job --accept` shreds this machine's key *file* only.
+  "The ciphertext the gate and the bucket hold is readable by nobody after accept" becomes
+  "readable by the account's devices while the job exists" -- this machine included, when it
+  is one: its copy at the gate stays, and a later `--result` here fetches it again, which the
+  CLI and `Job.accept` say (review M3). A job key still reaches one job; a device key now
+  reaches every job wrapped to it. A "forget this job's key everywhere" route (`DELETE
+  /v1/jobs/{id}/key`) is possible follow-up work.
+* **Never shared:** a job whose `buyer_key` is or was one of the buyer's recipients, revoked
+  ones included -- every job from before per-job keys was hired with the party's login key,
+  which also reads seller input and every older job. Its key route answers `buyer_key` and no
+  wraps; listings leave it out; a share is refused `not_shareable`. The account's login key
+  and the console's imported older key are never wrapped by the clients either.
+* **What this does not fix.** The gate is the directory for devices, as it is for
+  recipients: a compromised gate could list a key of its own and receive copies, though each
+  browser first shows it to the person, and a session stolen within five minutes of a sign-in
+  or confirmation can add a device that past jobs are then copied to (the party is mailed).
+  Signed device sets -- a key per device, each addition co-signed by an existing device or a
+  passkey assertion -- would close both, and are future work.

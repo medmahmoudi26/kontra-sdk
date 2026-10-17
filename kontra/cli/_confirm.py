@@ -35,6 +35,8 @@ ROUTE_WORDS = {
     "add_recipient": "add a recipient",
     "revoke_recipient": "revoke a recipient",
     "end_session": "end a sign-in",
+    "add_device": "add this machine as a device",
+    "remove_device": "remove a device",
     "publish": "publish",
     "resolve": "resolve a dispute",
 }

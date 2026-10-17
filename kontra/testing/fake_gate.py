@@ -4,7 +4,9 @@
 identity (dev login, the device flow, magic links to an allowlist, API keys, rotating
 refresh tokens, ES256 tokens and a JWKS, "Confirm it's you" by mail or by a passkey -- whose
 answers :mod:`kontra._passkeys` verifies, as on the platform), parties with Temporal
-namespaces, the catalog (contract validation, opaque endpoint names,
+namespaces, the devices that read a party's jobs and the job-key wraps copied to them
+(decisions I25, with :mod:`kontra._jobkeys`'s proofs), the catalog (contract validation,
+opaque endpoint names,
 the endpoint created through the control plane), the Workers view (Temporal's task-queue
 stats of a seller's own version), the quote relay, hire with a signed hold
 token, the escrow lifecycle, progress over SSE, artifacts and claim-check blobs behind
@@ -89,6 +91,7 @@ from pydantic import JsonValue, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from temporalio.api.common.v1 import Payload
 
+from kontra import _jobkeys as jk
 from kontra import _passkeys as pk
 from kontra import escrow
 from kontra._control import (
@@ -153,6 +156,8 @@ __all__ = [
     "AUD_HOLD",
     "AUD_TEMPORAL",
     "HOLD_HEADER",
+    "SUBJECT_DEVICE_ADDED",
+    "SUBJECT_DEVICE_REMOVED",
     "FakeGate",
     "GateHTTPError",
     "MagicOutcome",
@@ -202,6 +207,10 @@ SUBJECT_CONFIRM = "Confirm it's you on Kontra"
 SUBJECT_PASSKEY_ADDED = pk.SUBJECT_ADDED
 SUBJECT_PASSKEY_REVOKED = pk.SUBJECT_REVOKED
 SUBJECT_PASSKEY_REMOVED = pk.SUBJECT_REMOVED
+SUBJECT_DEVICE_ADDED = jk.SUBJECT_DEVICE_ADDED
+SUBJECT_DEVICE_REMOVED = jk.SUBJECT_DEVICE_REMOVED
+#: ``GET /v1/me/job-keys`` serves at most this many jobs a page.
+JOB_KEYS_LIMIT_MAX = 100
 #: Passkeys (decisions I24), the platform's limits: one sign-in asks for at most this many
 #: ceremonies of one purpose an hour, and gets none once this many of its answers were
 #: refused in the last hour.
@@ -599,6 +608,64 @@ class _Handoff:
     consumed: bool = False
 
 
+@dataclass
+class _DeviceKey:
+    """One device of a party (decisions I25): a key that reads the jobs the party hires.
+    Removing it sets ``revoked_at`` and keeps the row, so the key is never added again. A
+    *browser* the gate retires -- idle for ``DEVICE_IDLE_SECONDS``, or the one used least
+    recently when a new device needs room -- is not live either, but may come back."""
+
+    party: str
+    public_key: str
+    label: str
+    kind: m.DeviceKind
+    added_at: datetime
+    added_by: str | None
+    last_used_at: datetime | None = None
+    revoked_at: datetime | None = None
+    retired_at: datetime | None = None
+
+    @property
+    def last_seen(self) -> datetime:
+        """When it was last used, else added: what idleness and making room go by."""
+        return self.last_used_at or self.added_at
+
+    def live(self, now: datetime) -> bool:
+        if self.revoked_at is not None or self.retired_at is not None:
+            return False
+        idle = timedelta(seconds=m.DEVICE_IDLE_SECONDS)
+        return self.kind != "browser" or self.last_seen > now - idle
+
+    def view(self, *, hidden: bool = False) -> m.DeviceView:
+        """``hidden``: as an API key's session reads it -- the key, not the names."""
+        return m.DeviceView(
+            public_key=self.public_key,
+            label=m.HIDDEN_DEVICE_LABEL if hidden else self.label,
+            kind=self.kind,
+            added_at=self.added_at,
+            added_by=self.added_by[:12] if self.added_by and not hidden else None,
+            last_used_at=None if hidden else self.last_used_at,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _KeyWrapRow:
+    """A job key's copy for one device, as stored: ciphertext only, never updated."""
+
+    job_id: str
+    recipient: str
+    wrap: bytes
+    wrapped_at: datetime
+    wrapped_by: str
+
+    def view(self) -> m.KeyWrap:
+        return m.KeyWrap(
+            recipient=self.recipient,
+            wrap=base64.b64encode(self.wrap).decode("ascii"),
+            wrapped_at=self.wrapped_at,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class SentMail:
     """A mail the gate would have sent (:attr:`FakeGate.outbox`). A sign-in mail carries the
@@ -747,7 +814,8 @@ class _Job:
         event, self.changed = self.changed, asyncio.Event()
         event.set()
 
-    def view(self) -> m.JobView:
+    def view(self, *, buyer_key: bool = False) -> m.JobView:
+        """``buyer_key``: with the job's own key (``?include=buyer_key``); absent otherwise."""
         r = self.record
         delivery = None
         if r.delivered_at is not None and r.delivery_sha256 is not None:
@@ -772,6 +840,7 @@ class _Job:
             reason=r.reason,
             operation_id=self.operation_id,
             workflow_id=self.workflow_id,
+            buyer_key=self.buyer_key if buyer_key else None,
         )
 
 
@@ -966,6 +1035,13 @@ class FakeGate:
         self.quotes: dict[str, _Quote] = {}
         self._quote_rate: dict[str, tuple[datetime, int]] = {}
         self.jobs: dict[str, _Job] = {}
+        #: Devices by (party, public key), removed ones included (decisions I25).
+        self.devices: dict[tuple[str, str], _DeviceKey] = {}
+        #: Job-key wraps by (job id, device key): first write wins, never updated.
+        self.job_key_wraps: dict[tuple[str, str], _KeyWrapRow] = {}
+        #: The HMAC key of job-key challenges (the platform derives its own from
+        #: ``KONTRA_SIGNING_KEYS``).
+        self.job_key_proof_key = jk.proof_key(secrets.token_bytes(32))
         self.artifacts: dict[str, _Artifact] = {}
         self.blobs: dict[str, bytes] = {}
         self._party_locks: dict[str, asyncio.Lock] = {}
@@ -1203,12 +1279,12 @@ class FakeGate:
     #: Deprecated: :meth:`require_confirmed`.
     require_fresh = require_confirmed
 
-    def require_recent(self, who: Principal) -> Principal:
+    def require_recent(self, who: Principal, message: str = pk.RECENT_REQUIRED) -> Principal:
         """``recent`` (decisions I24): a person's session confirmed -- by its sign-in or a
         completed confirmation -- less than ``RECENT_CONFIRMATION_SECONDS`` (five minutes)
-        ago, with no mark since: adding a passkey, which can confirm every change after it.
-        The API-key test comes first, as for ``fresh``; the 403 is ``fresh``'s, with its own
-        message."""
+        ago, with no mark since: adding a passkey, which can confirm every change after it,
+        and adding a device, which gets the keys of past jobs (I25). The API-key test comes
+        first, as for ``fresh``; the 403 is ``fresh``'s, with the route's own ``message``."""
         self.require_human(who)
         until = self.confirmed_until(who)
         since = max(who.auth_time, who.confirmed_at or who.auth_time)
@@ -1216,7 +1292,7 @@ class FakeGate:
         recent = now - since < timedelta(seconds=m.RECENT_CONFIRMATION_SECONDS)
         if until is not None and now < until and recent:
             return who
-        raise self._confirmation_required(who, pk.RECENT_REQUIRED)
+        raise self._confirmation_required(who, message)
 
     def _confirmation_required(self, who: Principal, message: str) -> GateHTTPError:
         need = m.ConfirmationRequired(
@@ -2445,6 +2521,238 @@ class FakeGate:
             404, "recipient_not_found", "this party has no such unrevoked recipient"
         )
 
+    # ------------------------------------------------------------------ devices & job keys
+
+    def _live_devices(self, party: str) -> list[_DeviceKey]:
+        """The party's live devices, oldest first."""
+        now = self.now()
+        rows = [d for d in self.devices.values() if d.party == party and d.live(now)]
+        return sorted(rows, key=lambda d: (d.added_at, d.public_key))
+
+    def list_devices(self, who: Principal, for_: str | None = None) -> m.DeviceList:
+        """``GET /v1/me/devices`` (``party``): the live devices, oldest first. ``for_``: the
+        caller's own device, marked used. An API key's session reads keys, not names."""
+        self._check_for(for_)
+        self._touch_device(who.party, for_)
+        live = self._live_devices(who.party)
+        return m.DeviceList(devices=[d.view(hidden=who.api_key) for d in live])
+
+    def _make_room(self, party: str, now: datetime, but: str) -> _DeviceKey:
+        """At ``DEVICES_MAX`` live devices: retire the browser used least recently (never
+        ``but``), else 409 ``too_many_devices``."""
+        browsers = [
+            d for d in self._live_devices(party) if d.kind == "browser" and d.public_key != but
+        ]
+        if not browsers:
+            raise GateHTTPError(409, "too_many_devices", jk.TOO_MANY_DEVICES)
+        oldest = min(browsers, key=lambda d: (d.last_seen, d.added_at, d.public_key))
+        oldest.retired_at = now
+        return oldest
+
+    def add_device(self, who: Principal, req: m.AddDevice) -> m.DeviceView:
+        """``POST /v1/me/devices`` (``recent``): one more device, mailed to the party's
+        address. The same live key again is the same view, and mails nothing; a removed one
+        is never added again; a retired one comes back, mailing nothing. Past
+        ``DEVICES_MAX`` the browser used least recently makes room; past
+        ``DEVICE_ADDS_PER_HOUR`` new ones in the hour, 429 ``rate_limited``."""
+        try:
+            check_public_key(req.public_key)
+        except ValueError as e:
+            raise GateHTTPError(422, "invalid_public_key", str(e)) from None
+        self._party(who.party)
+        now = self.now()
+        known = self.devices.get((who.party, req.public_key))
+        if known is not None:
+            if known.revoked_at is not None:
+                raise GateHTTPError(409, "device_revoked", jk.DEVICE_REVOKED)
+            if known.live(now):
+                return known.view()
+            if len(self._live_devices(who.party)) >= m.DEVICES_MAX:
+                self._make_room(who.party, now, known.public_key)
+            known.retired_at = None
+            known.last_used_at = now.replace(second=0, microsecond=0)
+            return known.view()
+        hour_ago = now - timedelta(hours=1)
+        added = sorted(
+            d.added_at
+            for d in self.devices.values()
+            if d.party == who.party and d.added_at > hour_ago
+        )
+        if len(added) >= m.DEVICE_ADDS_PER_HOUR:
+            retry = max(1, math.ceil((added[0] + timedelta(hours=1) - now).total_seconds()))
+            raise GateHTTPError(
+                429,
+                "rate_limited",
+                jk.TOO_MANY_ADDED,
+                {"retry_after_seconds": retry},
+                headers={"Retry-After": str(retry)},
+            )
+        retired = None
+        if len(self._live_devices(who.party)) >= m.DEVICES_MAX:
+            retired = self._make_room(who.party, now, req.public_key)
+        row = _DeviceKey(who.party, req.public_key, req.label, req.kind, now, who.session_id)
+        self.devices[(who.party, req.public_key)] = row
+        session = self.sessions[who.session_id]
+        text = jk.device_added_mail(
+            req.label,
+            req.kind,
+            now,
+            via=VIA_WORDS.get(session.via, session.via),
+            signed_in=session.auth_time,
+            session_prefix=session.id[:12],
+            retired=retired.label if retired is not None else None,
+        )
+        self._notify(who.party, SUBJECT_DEVICE_ADDED, text, now)
+        return row.view()
+
+    def remove_device(self, who: Principal, public_key: str) -> None:
+        """``DELETE /v1/me/devices/{key}`` (``fresh``): the device gets no key of a new job,
+        and its wraps of the party's jobs are deleted now; the party is mailed."""
+        row = self.devices.get((who.party, public_key))
+        if row is None or row.revoked_at is not None:
+            raise GateHTTPError(404, "device_not_found", jk.DEVICE_NOT_FOUND)
+        now = self.now()
+        row.revoked_at = now
+        self.drop_wraps(who.party, public_key)
+        session = self.sessions[who.session_id]
+        text = jk.device_removed_mail(
+            row.label,
+            row.kind,
+            now,
+            via=VIA_WORDS.get(session.via, session.via),
+            signed_in=session.auth_time,
+            session_prefix=session.id[:12],
+        )
+        self._notify(who.party, SUBJECT_DEVICE_REMOVED, text, now)
+
+    def drop_wraps(self, party: str, public_key: str) -> int:
+        """Delete every wrap to ``public_key`` of ``party``'s jobs; how many."""
+        gone = [
+            k
+            for k, w in self.job_key_wraps.items()
+            if w.recipient == public_key
+            and (job := self.jobs.get(w.job_id)) is not None
+            and job.record.buyer == party
+        ]
+        for k in gone:
+            del self.job_key_wraps[k]
+        return len(gone)
+
+    def _shareable(self, job: _Job) -> bool:
+        """A job whose ``buyer_key`` is or was one of its buyer's recipients (every job from
+        before per-job keys: the party's login key) is never shared: that key also reads
+        seller input and every older job."""
+        party = self.parties.get(job.record.buyer)
+        ever = {k.public_key for k in party.keys} if party is not None else set[str]()
+        return job.buyer_key not in ever
+
+    def _job_key_view(self, who: Principal, job: _Job, for_: str | None) -> m.JobKey:
+        wraps: list[m.KeyWrap] = []
+        if self._shareable(job):
+            live = {d.public_key for d in self._live_devices(job.record.buyer)}
+            for (job_id, recipient), w in sorted(self.job_key_wraps.items()):
+                if job_id == job.job_id and recipient in live and for_ in (None, recipient):
+                    wraps.append(w.view())
+        challenge = jk.make_challenge(
+            self.job_key_proof_key, job.job_id, who.session_id, job.buyer_key, self.now()
+        )
+        return m.JobKey(
+            job_id=job.job_id, buyer_key=job.buyer_key, wraps=wraps, challenge=challenge
+        )
+
+    def _touch_device(self, party: str, public_key: str | None) -> None:
+        """A read for ``public_key`` (``?for=``): its ``last_used_at``, to the minute, at
+        most once a minute -- a live device's only (a retired one comes back by an add)."""
+        row = self.devices.get((party, public_key)) if public_key is not None else None
+        now = self.now()
+        if row is None or not row.live(now):
+            return
+        if row.last_used_at is None or now - row.last_used_at >= KEY_USE_RESOLUTION:
+            row.last_used_at = now.replace(second=0, microsecond=0)
+
+    @staticmethod
+    def _check_for(value: str | None) -> None:
+        if value is not None:
+            try:
+                check_public_key(value)
+            except ValueError as e:
+                raise GateHTTPError(422, "invalid_public_key", str(e)) from None
+
+    def job_key(self, who: Principal, job_id: str, for_: str | None) -> m.JobKey:
+        """``GET /v1/jobs/{id}/key`` (``party``): the buyer's only, like ``result``."""
+        self._check_for(for_)
+        job = self.job_for(job_id, who.party)
+        self._require_buyer(job, who.party, "read the job's key")
+        self._touch_device(who.party, for_)
+        return self._job_key_view(who, job, for_)
+
+    def job_keys(
+        self, who: Principal, lacking: str, for_: str | None, cursor: str | None, limit: int
+    ) -> m.JobKeyList:
+        """``GET /v1/me/job-keys`` (``party``): the caller's shareable buyer jobs with no wrap
+        to ``lacking`` -- a live device of the caller's -- by job id."""
+        self._check_for(for_)
+        if cursor is not None and not is_job_id(cursor):
+            raise GateHTTPError(422, "invalid_cursor", "cursor is not one this gate handed out")
+        device = self.devices.get((who.party, lacking))
+        if device is None or not device.live(self.now()):
+            raise GateHTTPError(404, "device_not_found", jk.DEVICE_NOT_FOUND)
+        rows = sorted(
+            (
+                j
+                for j in self.jobs.values()
+                if j.record.buyer == who.party
+                and self._shareable(j)
+                and (j.job_id, lacking) not in self.job_key_wraps
+                and (cursor is None or j.job_id > cursor)
+            ),
+            key=lambda j: j.job_id,
+        )
+        page = rows[:limit]
+        self._touch_device(who.party, for_)
+        nxt = page[-1].job_id if len(rows) > limit and page else None
+        return m.JobKeyList(items=[self._job_key_view(who, j, for_) for j in page], next_cursor=nxt)
+
+    def share_job_keys(self, who: Principal, req: m.ShareJobKeys) -> m.SharedJobKeys:
+        """``POST /v1/me/job-keys`` (``party``): per job, the caller is its buyer, it is
+        shareable, the proof is this session's for it now, and every wrap has a wrap's shape
+        -- else the job is refused whole. A wrap to no live device of the caller, or for a
+        (job, device) that has one already, is skipped: the first write wins."""
+        now = self.now()
+        live = {d.public_key for d in self._live_devices(who.party)}
+        stored = skipped = 0
+        refused: list[m.ShareRefusal] = []
+        for item in req.items:
+            job = self.jobs.get(item.job_id) if is_job_id(item.job_id) else None
+            code: str | None = None
+            blobs: list[bytes] = []
+            if job is None or job.record.buyer != who.party:
+                code = "job_not_found"
+            elif not self._shareable(job):
+                code = "not_shareable"
+            elif not jk.check_proof(
+                self.job_key_proof_key, job.job_id, who.session_id, item.proof, now
+            ):
+                code = "bad_proof"
+            else:
+                try:
+                    blobs = [jk.check_wrap_shape(w.wrap) for w in item.wraps]
+                except jk.InvalidWrap:
+                    code = "invalid_wrap"
+            if code is not None:
+                refused.append(m.ShareRefusal(job_id=item.job_id, code=code))
+                continue
+            for w, blob in zip(item.wraps, blobs, strict=True):
+                key = (item.job_id, w.recipient)
+                if w.recipient not in live or key in self.job_key_wraps:
+                    skipped += 1
+                    continue
+                self.job_key_wraps[key] = _KeyWrapRow(
+                    item.job_id, w.recipient, blob, now, who.session_id
+                )
+                stored += 1
+        return m.SharedJobKeys(stored=stored, skipped=skipped, refused=refused)
+
     def reputation(self, party: str) -> tuple[int, int, int]:
         """(released, refunded, disputed) of the seller's jobs: §17's raw counts. Self-hires
         and jobs the buyer canceled -- through the gate, or by cancelling its own call
@@ -2968,6 +3276,8 @@ class FakeGate:
     def _abandon(self, job: _Job) -> None:
         """The ledger refused the lock: no job, and the quote may be hired again."""
         self.jobs.pop(job.job_id, None)
+        for key in [k for k in self.job_key_wraps if k[0] == job.job_id]:
+            del self.job_key_wraps[key]  # the platform's rows cascade with the job's
         q = self.quotes.get(job.quote_id)
         if q is not None and q.job_id == job.job_id:
             q.job_id = None
@@ -2985,7 +3295,9 @@ class FakeGate:
         if party != job.record.buyer:
             raise GateHTTPError(403, "forbidden", f"only the buyer can {what}")
 
-    def _page(self, rows: list[_Job], cursor: str | None, limit: int) -> m.JobList:
+    def _page(
+        self, rows: list[_Job], cursor: str | None, limit: int, *, buyer_key: bool = False
+    ) -> m.JobList:
         rows = sorted(rows, key=lambda j: (j.record.created_at, j.job_id), reverse=True)
         if cursor:
             raw = _unb64url_json(cursor)
@@ -3003,10 +3315,17 @@ class FakeGate:
         nxt = None
         if len(rows) > limit and page:
             nxt = _b64url_json([page[-1].record.created_at.isoformat(), page[-1].job_id])
-        return m.JobList(items=[j.view() for j in page], next_cursor=nxt)
+        return m.JobList(items=[j.view(buyer_key=buyer_key) for j in page], next_cursor=nxt)
 
     def list_jobs(
-        self, party: str, as_: str, state: m.JobState | None, cursor: str | None, limit: int
+        self,
+        party: str,
+        as_: str,
+        state: m.JobState | None,
+        cursor: str | None,
+        limit: int,
+        *,
+        buyer_key: bool = False,
     ) -> m.JobList:
         rows = [
             j
@@ -3014,7 +3333,7 @@ class FakeGate:
             if (j.record.buyer if as_ == "buyer" else j.record.seller) == party
             and (state is None or j.record.state is state)
         ]
-        return self._page(rows, cursor, limit)
+        return self._page(rows, cursor, limit, buyer_key=buyer_key)
 
     def seller_view(self, who: Principal, job_id: str) -> m.SellerJobView:
         job = self.job_for(job_id, who.party)
@@ -4014,6 +4333,11 @@ async def _auth_recent(request: Request) -> Principal:
     return gate.require_recent(gate.authenticate(request, allow_worker=False))
 
 
+async def _auth_recent_device(request: Request) -> Principal:
+    gate = _gate_of(request)
+    return gate.require_recent(gate.authenticate(request, allow_worker=False), jk.RECENT_REQUIRED)
+
+
 async def _auth_resolver(request: Request) -> Principal:
     gate = _gate_of(request)
     return gate.require_resolver(gate.authenticate(request, allow_worker=False))
@@ -4034,6 +4358,8 @@ PartyOrWorker = Annotated[Principal, Depends(_auth_party_or_worker)]
 Human = Annotated[Principal, Depends(_auth_human)]
 Fresh = Annotated[Principal, Depends(_auth_fresh)]
 Recent = Annotated[Principal, Depends(_auth_recent)]
+#: ``recent``, with the device route's own words.
+RecentDevice = Annotated[Principal, Depends(_auth_recent_device)]
 Resolver = Annotated[Principal, Depends(_auth_resolver)]
 ResolverHuman = Annotated[Principal, Depends(_auth_resolver_human)]
 
@@ -4159,6 +4485,19 @@ def _build_app(gate: FakeGate) -> FastAPI:
     async def party_view(party: str) -> m.PartyView:
         return gate.party_view(party)
 
+    async def devices(
+        who: Party, for_: Annotated[str | None, Query(alias="for")] = None
+    ) -> m.DeviceList:
+        return gate.list_devices(who, for_)
+
+    async def add_device(who: RecentDevice, body: m.AddDevice, response: Response) -> m.DeviceView:
+        response.status_code = 201
+        return gate.add_device(who, body)
+
+    async def remove_device(who: Fresh, public_key: str) -> Response:
+        gate.remove_device(who, public_key)
+        return Response(status_code=204)
+
     async def create_api_key(
         who: Fresh, body: m.ApiKeyCreate, response: Response
     ) -> m.ApiKeyCreated:
@@ -4185,6 +4524,9 @@ def _build_app(gate: FakeGate) -> FastAPI:
     add("add_recipient", add_recipient)
     add("revoke_recipient", revoke_recipient)
     add("party", party_view)
+    add("devices", devices)
+    add("add_device", add_device)
+    add("remove_device", remove_device)
     add("create_api_key", create_api_key)
     add("api_keys", api_keys)
     add("revoke_api_key", revoke_api_key)
@@ -4291,11 +4633,16 @@ def _build_app(gate: FakeGate) -> FastAPI:
         state: m.JobState | None = None,
         cursor: str | None = None,
         limit: Annotated[int, Query(ge=1, le=LIST_LIMIT_MAX)] = 50,
+        include: m.JobInclude | None = None,
     ) -> m.JobList:
-        return gate.list_jobs(who.party, as_, state, cursor, limit)
+        return gate.list_jobs(
+            who.party, as_, state, cursor, limit, buyer_key=include == "buyer_key"
+        )
 
-    async def job(who: PartyOrWorker, job_id: str) -> m.JobView:
-        return gate.job_for(job_id, who.party).view()
+    async def job(
+        who: PartyOrWorker, job_id: str, include: m.JobInclude | None = None
+    ) -> m.JobView:
+        return gate.job_for(job_id, who.party).view(buyer_key=include == "buyer_key")
 
     async def seller_job(who: PartyOrWorker, job_id: str) -> m.SellerJobView:
         return gate.seller_view(who, job_id)
@@ -4314,6 +4661,23 @@ def _build_app(gate: FakeGate) -> FastAPI:
 
     async def result(who: Party, job_id: str) -> m.ResultView:
         return gate.result(who, job_id)
+
+    async def job_key(
+        who: Party, job_id: str, for_: Annotated[str | None, Query(alias="for")] = None
+    ) -> m.JobKey:
+        return gate.job_key(who, job_id, for_)
+
+    async def job_keys(
+        who: Party,
+        lacking: str,
+        for_: Annotated[str | None, Query(alias="for")] = None,
+        cursor: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=JOB_KEYS_LIMIT_MAX)] = JOB_KEYS_LIMIT_MAX,
+    ) -> m.JobKeyList:
+        return gate.job_keys(who, lacking, for_, cursor, limit)
+
+    async def share_job_keys(who: Party, body: m.ShareJobKeys) -> m.SharedJobKeys:
+        return gate.share_job_keys(who, body)
 
     async def progress(
         who: Party, job_id: str, after: Annotated[int, Query(ge=0)] = 0
@@ -4339,6 +4703,9 @@ def _build_app(gate: FakeGate) -> FastAPI:
     add("cancel", cancel)
     add("start", start)
     add("result", result)
+    add("job_key", job_key)
+    add("job_keys", job_keys)
+    add("share_job_keys", share_job_keys)
     add("progress", progress, response_class=StreamingResponse)
     add("post_progress", post_progress)
 

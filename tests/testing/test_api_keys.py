@@ -130,6 +130,8 @@ async def test_a_key_hires_and_serves_but_never_counts_as_fresh(world: World) ->
         program.revoke_passkey("pky_" + "0" * 32),
         program.confirm_passkey_options(),
         program.confirm_passkey("wac_" + "0" * 32, {"id": "x"}),
+        program.add_device("program", generate_identity()[1], "cli"),  # decisions I25
+        program.remove_device(generate_identity()[1]),
     ):
         assert await _code(call) == (403, "fresh_login_required")
     assert {r.name for r in ROUTES if r.auth == "fresh"} == {
@@ -141,8 +143,9 @@ async def test_a_key_hires_and_serves_but_never_counts_as_fresh(world: World) ->
         "end_session",
         "add_passkey",
         "revoke_passkey",
+        "remove_device",
     }
-    assert {r.name for r in ROUTES if r.auth == "recent"} == {"passkey_options"}
+    assert {r.name for r in ROUTES if r.auth == "recent"} == {"passkey_options", "add_device"}
     assert {r.name for r in ROUTES if r.auth == "human"} == {
         "api_keys",
         "sessions",

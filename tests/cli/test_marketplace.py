@@ -277,6 +277,45 @@ async def test_job_result_progress_and_reject(shop: Shop) -> None:
     assert view["escrow"] == "disputed"
 
 
+async def test_a_job_hired_on_one_machine_reads_on_another_with_nothing_copied(
+    shop: Shop,
+) -> None:
+    """Share to my account (decisions I25): a job hired on the desktop is read on the laptop
+    with `kontra job --result`, no key file copied, no prompt. The laptop became a device at
+    `kontra login`; the desktop, which holds the job's key, copies it to the laptop on its
+    next command (and says, once, that the laptop can now read the jobs)."""
+    desktop = await shop.buyer()
+    who = Profile.load(desktop.home).party
+    job_id = (await desktop.json("hire", shop.key, "-f", str(shop.input_file)))["job_id"]
+    out = shop.root / f"desktop-{job_id}"
+    await desktop.ok("job", job_id, "--result", str(out))
+
+    laptop = shop.cli(f"{who}-laptop")
+    login = await laptop.ok("login", "--dev", "--handle", who, "--gate", shop.mp.base_url)
+    assert "device    this machine reads the jobs you hire anywhere" in login.stdout
+    listed = await desktop.ok("jobs")
+    assert "can now read your jobs" in listed.stderr
+    assert "can now read your jobs" not in (await desktop.ok("jobs")).stderr  # said once
+
+    key_file = laptop.home / "jobs" / f"{job_id}.key"
+    assert not key_file.exists()
+    there = shop.root / f"laptop-{job_id}"
+    await laptop.ok("job", job_id, "--result", str(there))
+    assert (there / "result.json").read_text() == (out / "result.json").read_text()
+    assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
+
+    accepted = await desktop.ok("job", job_id, "--accept")
+    # M3: the key file here is shredded, but every device -- this one too -- keeps its copy
+    # at the gate while the job exists, and says so rather than "shredded" alone.
+    assert "this one included" in accepted.stdout
+    assert not (desktop.home / "jobs" / f"{job_id}.key").exists()
+    again = shop.root / f"laptop-again-{job_id}"
+    await laptop.ok("job", job_id, "--result", str(again))  # the laptop's copy stays
+    here = shop.root / f"desktop-again-{job_id}"
+    await desktop.ok("job", job_id, "--result", str(here))  # and this machine's, as said
+    assert (desktop.home / "jobs" / f"{job_id}.key").exists()
+
+
 async def test_job_result_still_reads_once_the_version_is_retired(shop: Shop) -> None:
     """A job outlives its version (decisions I22): retired after the delivery, the version
     still answers its exact lookup, so `kontra job --result` reads the job; nobody can quote

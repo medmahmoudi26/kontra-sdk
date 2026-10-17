@@ -89,3 +89,89 @@ async def test_the_tools_buy_with_the_key(tmp_path: Path, monkeypatch: pytest.Mo
             await tools.aclose()
     finally:
         await gate.stop()
+
+
+# --------------------------------------------------------------------------- devices (I25)
+
+
+async def test_kontra_mcp_keeps_the_devices_caught_up_whatever_happens() -> None:
+    """Every online device serves the account's new devices: ``kontra mcp`` catches up now
+    and then every few minutes, and a client that cannot be made is said and tried again."""
+    import asyncio
+
+    from kontra.mcp._server import _keep_devices_caught_up
+
+    calls: list[str] = []
+
+    class _Kontra:
+        async def sync_job_keys(self) -> None:
+            calls.append("sync")
+
+    class _Tools:
+        def __init__(self) -> None:
+            self.made = 0
+
+        def kontra(self) -> _Kontra:
+            self.made += 1
+            if self.made == 1:
+                raise RuntimeError("not logged in yet")
+            return _Kontra()
+
+    task = asyncio.create_task(_keep_devices_caught_up(_Tools(), 0.01))  # type: ignore[arg-type]
+    for _ in range(200):
+        if len(calls) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls[:2] == ["sync", "sync"]
+
+
+async def test_kontra_mcp_shows_a_new_device_before_it_copies_anything_to_it() -> None:
+    """L9: `kontra mcp` has no terminal the person reads, so a device it sees for the first
+    time is held back -- nothing is copied to it from this machine -- and shown in the next
+    tool answer (to the agent, for the person); only then does it count as shown."""
+    from datetime import UTC, datetime
+
+    from mcp.types import TextContent
+    from pydantic import BaseModel
+
+    from kontra.codec import age
+    from kontra.gate_client import models as m
+    from kontra.mcp._server import KontraTools, _answer
+
+    shown: list[list[str]] = []
+
+    class _Kontra:
+        on_new_device = None
+
+        async def devices_shown(self, keys: list[str]) -> None:
+            shown.append(list(keys))
+
+    tools = KontraTools()
+    tools._kontra = _Kontra()  # type: ignore[assignment]  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    _, key = age.generate_identity()
+    device = m.DeviceView(
+        public_key=key, label="Firefox on Linux", kind="browser", added_at=datetime.now(UTC)
+    )
+    assert tools.hold_notice(device) is False  # not shown yet: nothing copied to it from here
+    assert tools.hold_notice(device) is False  # held once
+
+    class _Out(BaseModel):
+        ok: bool = True
+
+    async def work() -> _Out:
+        return _Out()
+
+    answer = await _answer(work(), tools)
+    texts = [c.text for c in answer.content if isinstance(c, TextContent)]
+    assert len(texts) == 2
+    assert "Kontra notice" in texts[1]
+    assert "Firefox on Linux" in texts[1]
+    assert "can now read your jobs" in texts[1]
+    assert shown == [[key]]
+    assert answer.structured_content == {"ok": True}  # the tool's own answer, unchanged
+    again = await _answer(work(), tools)
+    assert len(again.content) == 1
+    assert shown == [[key]]

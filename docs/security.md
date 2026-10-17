@@ -47,6 +47,8 @@ What that means concretely, and what enforces it:
 | Kontra, its database, bucket or Temporal history leaks | payloads are ciphertext end to end; the keys live only on the parties' machines |
 | A stolen session adds a passkey of its own, to confirm every change after it | adding one needs a confirmation of the last five minutes, not the hour; the party is mailed which sign-in added it; a passkey confirms only sessions its holder already has, and never signs in |
 | A copied passkey, or a page that is not the console, confirms a change | the gate checks the RP ID, the console's origin, user verification and a single-use challenge bound to the session; a use count that does not move forward revokes a passkey on one device and asks every sign-in to confirm again (a synced passkey's such answer is refused) |
+| A stolen API key plants junk copies of job keys, or squats a new device's copy so the real one is never stored | a copy (a wrap) is stored only with the proof that its sender holds the job's key: the job's challenge, encrypted to that key and bound to the session asking, opened; copies are first-write-wins |
+| A stolen session adds a device of its own, to receive the keys of every job | adding a device needs a confirmation of the last five minutes; the party is mailed which sign-in added it; every other device says it can now read the jobs before it copies it anything |
 
 ## What Kontra can and cannot see
 
@@ -62,8 +64,10 @@ payload's serialization context (`docs/decisions.md` I7):
 
 A key does one job here, and it is not identity. A **buyer** makes a fresh keypair per job
 at hire and sends the public half with the request; the gate signs *that* into the hold
-token, so hiring needs no key setup and a compromise reaches open jobs rather than years of
-deliveries. A **seller** holds a set of recipients, one per deployment, registered with
+token, so hiring needs no key setup and a job key reaches one job. The job key is then copied
+to each of the account's **devices** -- a browser profile's key, a `kontra login` machine's
+`~/.kontra/key` -- encrypted to that device alone, so a job hired in one place reads in every
+other (decisions I25); the gate keeps those copies and cannot open them. A **seller** holds a set of recipients, one per deployment, registered with
 `kontra recipients add` like `authorized_keys`; a fleet mounts one key into every worker
 (`KONTRA_KEY_FILE`) so pod churn never changes the set. `kontra login` adds this machine as
 one more recipient and decides nothing: adding never replaces, so a second machine cannot
@@ -80,7 +84,7 @@ assigns. Ciphertext is standard age, so a party can decrypt what it received wit
 | a quote's input (relayed byte for byte) | who hired which offering, when, at what price, and the job's state; the reason a buyer gives for rejecting a delivery (it is a gate call, not a payload) |
 | the seller's heartbeat details (progress is encrypted to the buyer) | workflow metadata in Temporal: workflow ids, task queues, activity names, timers, timestamps, states, event counts, payload sizes; each task queue's backlog, rates and pollers (a worker's identity, `pid@host` by default, build id, and the SDK name and version its heartbeat names), which `kontra status --workers` shows the seller |
 | artifacts and claim-checked payloads, including the plaintext sha256 an `Artifact` reference carries (it travels inside the encrypted delivery) | the size and sha256 of each ciphertext (age's overhead is fixed, so plaintext sizes follow) and each artifact's content type |
-| any private key: every key is generated on the machine that holds it -- a buyer's per job, a seller's per deployment -- and never leaves it | public keys (the seller's recipient set, the job's buyer key), contract documents, offering facts, balances |
+| any private key: every key is generated on the machine that holds it -- a buyer's per job, a seller's per deployment -- and leaves it only encrypted to one of the account's own devices (a job key's copies, decisions I25) | public keys (the seller's recipient set, the job's buyer key, the account's device keys and labels), contract documents, offering facts, balances |
 
 Two consequences worth knowing:
 
@@ -90,7 +94,7 @@ Two consequences worth knowing:
   not encrypted).
 - **Kontra is the key directory.** A buyer encrypts to the seller's recipients as the catalog
   reports them; a seller encrypts a delivery to the buyer key carried in the hold token Kontra
-  signs. Encryption therefore protects payloads from anyone who obtains Kontra's stored data --
+  signs; a device copies a job's key to the devices the gate lists for the account. Encryption therefore protects payloads from anyone who obtains Kontra's stored data --
   a database or bucket leak, Temporal history, a request for records -- and from anyone on the
   path. It does not protect against an operator that actively substitutes keys at hire time.
   Compare `QuoteResult.seller_recipients` with what the seller publishes elsewhere if that is
@@ -109,10 +113,12 @@ Two consequences worth knowing:
   shows; opening the link consumes nothing (decisions I19).
 - A program uses an **API key** (`KONTRA_API_KEY`), stored by the gate as a hash and exchanged
   for the same 15-minute tokens. Its session is never a person's: it cannot publish, change
-  the party's recipients, see or manage keys and sign-ins, or confirm. Revoking it ends its
+  the party's recipients or devices, see or manage keys and sign-ins, or confirm. It is no
+  device either: it copies the keys of the jobs it hires to the account's devices, and reads
+  only those jobs. Revoking it ends its
   tokens on their next request.
-- A person's **changes** (publishing, API keys, recipients, ending a sign-in, resolving a
-  dispute) need the login confirmed within the hour: a sign-in counts, and so does "Confirm
+- A person's **changes** (publishing, API keys, recipients, removing a device, ending a
+  sign-in, resolving a dispute) need the login confirmed within the hour: a sign-in counts, and so does "Confirm
   it's you" -- a link mailed to the account's address whose page asks for a code only the
   asking screen shows, bound to that one session and never a sign-in itself. A stolen session
   token that asks gets a mail sent to its victim and nothing else (decisions I23).
@@ -124,6 +130,10 @@ Two consequences worth knowing:
   sign-ins to confirm again; a use count that goes back (a copy of the device) revokes a
   passkey on one device, and is only refused for a synced one. Every revocation is mailed.
   The CLI has no passkeys; email stays everywhere.
+- **Adding a device** (decisions I25) needs a sign-in or confirmation of the last five
+  minutes, because a device is then copied the keys of past jobs too. Right after a sign-in
+  that holds, so the console and `kontra login` add theirs without asking anything; the party
+  is mailed every device added and removed.
 - `kontra serve` (and a buyer's client) exchanges the session for a **15-minute** ES256 JWT,
   `permissions: ["<namespace>:worker"]`, audience `kontra:temporal`, refreshed in the
   background and swapped into the running Temporal client. Temporal's default claim mapper
@@ -259,13 +269,26 @@ deadline rule.
   `exp` (15 minutes at most). See decisions I19.
 - **Kontra is the key directory** (see above), and spec v2 widened that: a contract no longer
   seals a seller key, so nothing outside Kontra contradicts a substituted one.
-- **A job's key lives on the machine that hired.** `kontra hire` writes
-  `~/.kontra/jobs/<job_id>.key`; `kontra job <id> --result` needs it and `kontra job <id> --accept` shreds it. Hire
-  on a laptop and read the result on a desktop and the delivery will not open -- copy the key
-  file, or keep both on one machine. Sharing a job key through the gate (`kontra hire
-  --share`, wrapped to the party's recipients) is designed but not built. The shredding is
-  deliberate: once accepted, the ciphertext the gate and the bucket still hold is readable by
-  nobody, including you.
+- **A job's key reaches every device of the account, and stays there** (decisions I25). The
+  machine or browser that hires copies the job's key to each device, encrypted to it alone,
+  with the proof that it holds the key; a device added later is copied the keys of past jobs
+  by whichever device holding them is online next -- until then it cannot read them. `kontra
+  job <id> --accept` shreds *this machine's key file* only: the ciphertext the gate and the
+  bucket hold stays readable by the account's devices -- this machine too, from its copy at
+  the gate -- while the job exists, where before sharing it was readable by nobody. Removing a device stops new copies and deletes the copies the gate
+  kept for it; **keys it already opened cannot be taken back** (job keys are never rotated:
+  the seller encrypted to them). Jobs whose key is or was one of the party's recipients --
+  every job from before per-job keys -- are never copied.
+- **The gate is the directory for devices too.** A device copies a job's key to the device
+  keys the gate lists for the account. A gate that listed a key of its own would get copies;
+  every browser shows a device it has not shown before ("can now read your jobs") before it
+  copies it anything, the CLI says so on stderr, `kontra mcp` in its next answer (copying
+  nothing to it until then), and a library through its `on_new_device` hook, by default only
+  a logged warning; but nothing signs the device set (the
+  same limit as recipients; signed device sets -- a key per device, each addition co-signed by
+  an existing device or a passkey -- are future work). A session stolen within five minutes of
+  a sign-in or a confirmation can add a device; the party is mailed which sign-in added it,
+  and removing it deletes its copies, but not what it fetched meanwhile.
 - **Revoking a recipient does not reach backwards.** Deliveries already encrypted to a lost
   machine's key stay encrypted to it. `kontra recipients revoke` closes that key's future, and
   nothing more; what closes its past is the open jobs being accepted and their keys shredded.

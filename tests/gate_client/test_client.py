@@ -59,12 +59,17 @@ async def test_non_gate_errors_still_become_gate_errors(
 
 
 async def test_a_2xx_that_does_not_match_the_model_is_invalid_response() -> None:
-    rec = Recorder(lambda _: json_response(200, {"party": "acme", "surprise": 1}))
+    """A field missing or of the wrong type; a field this client does not know is skipped
+    (from 0.2.4: a newer gate may add one)."""
+    rec = Recorder(lambda _: json_response(200, {"party": 7, "surprise": 1}))
     async with GateClient("http://gate.test", transport=rec.transport) as c:
         with pytest.raises(GateError) as ei:
             await c.party("acme")
     assert (ei.value.status, ei.value.code) == (200, "invalid_response")
     assert "PartyView" in ei.value.message
+    rec = Recorder(lambda _: json_response(200, {"party": "acme", "surprise": 1}))
+    async with GateClient("http://gate.test", transport=rec.transport) as c:
+        assert (await c.party("acme")).party == "acme"
 
 
 @pytest.mark.parametrize("payload", [b"[1, 2]", b"not json"])
@@ -235,6 +240,7 @@ _ANSWERS: dict[tuple[str, str], type[BaseModel] | None] = {
     ("POST", "/v1/passkeys/options"): m.PasskeyCeremony,
     ("GET", "/v1/passkeys"): m.PasskeyList,
     ("POST", "/v1/auth/confirm/passkey/options"): m.PasskeyCeremony,
+    ("POST", "/v1/me/devices"): m.DeviceView,
 }
 
 
@@ -300,6 +306,29 @@ async def test_adding_a_passkey_is_confirmable_once() -> None:
             await c.passkey_options()
     assert ei.value.code == "confirmation_required"
     assert (len(hook.asked), len(rec.requests)) == (1, 2)
+
+
+async def test_adding_a_device_is_confirmable_unless_quiet() -> None:
+    """``add_device`` is ``recent`` (decisions I25): confirmable like a passkey. ``quiet`` --
+    the registration right after a sign-in -- never asks the hook: the gate's 403 is the
+    answer, and nobody is asked anything."""
+    age = "age1" + "q" * 58
+    rec, hook = _refuses_first(), Confirms()
+    async with GateClient(
+        "http://gate.test", token=static("t"), transport=rec.transport, confirm=hook
+    ) as c:
+        assert isinstance(await c.add_device("laptop", age, "cli"), m.DeviceView)
+    assert [route for route, _ in hook.asked] == ["add_device"]
+    assert len(rec.requests) == 2
+
+    rec, hook = _refuses_first(), Confirms()
+    async with GateClient(
+        "http://gate.test", token=static("t"), transport=rec.transport, confirm=hook
+    ) as c:
+        with pytest.raises(GateError) as ei:
+            await c.add_device("laptop", age, "cli", quiet=True)
+    assert ei.value.code == "confirmation_required"
+    assert (hook.asked, len(rec.requests)) == ([], 1)
 
 
 async def test_a_bodiless_change_is_sent_again_too() -> None:
@@ -389,3 +418,41 @@ async def test_without_a_hook_the_gates_answer_stands() -> None:
             await c.create_api_key("ci")
     assert ei.value.code == "confirmation_required"
     assert len(rec.requests) == 1
+
+
+# --------------------------------------------------------------------------- answers (0.2.4)
+
+
+async def test_an_answer_with_a_field_this_client_does_not_know_still_parses() -> None:
+    """M5 (decisions I25): from 0.2.4 a client reads the gate's answers ignoring the fields it
+    does not know -- nested ones too -- so a gate may add one (``JobView.buyer_key`` was held
+    back because 0.2.0-0.2.3 refuse any). What it knows is checked as strictly as ever."""
+    job = {**minimal(m.JobView), "tomorrow": 1}
+    page = {"items": [job], "next_cursor": None, "and": "more", **{f"k{i}": i for i in range(40)}}
+    rec = Recorder(lambda r: json_response(200, page if r.url.path == "/v1/jobs" else job))
+    async with GateClient("http://gate.test", token=static("t"), transport=rec.transport) as c:
+        assert (await c.job("0" * 32)).job_id == job["job_id"]
+        assert len((await c.jobs()).items) == 1
+    bad = {**job, "amount_minor": "lots"}
+    rec = Recorder(lambda _: json_response(200, bad))
+    async with GateClient("http://gate.test", token=static("t"), transport=rec.transport) as c:
+        with pytest.raises(GateError) as ei:
+            await c.job("0" * 32)
+    assert ei.value.code == "invalid_response"
+
+
+async def test_a_job_asks_for_its_buyer_key_only_when_told() -> None:
+    """``JobView.buyer_key`` is sent only on ``?include=buyer_key``, and never as ``null``:
+    the JSON a gate sends to a client that did not ask parses with 0.2.3's strict model."""
+    job = {**minimal(m.JobView), "buyer_key": "age1" + "q" * 58}
+    page = {"items": [job], "next_cursor": None}
+    rec = Recorder(lambda r: json_response(200, page if r.url.path == "/v1/jobs" else job))
+    async with GateClient("http://gate.test", token=static("t"), transport=rec.transport) as c:
+        view = await c.job("0" * 32, include_buyer_key=True)
+        await c.job("0" * 32)
+        await c.jobs(include_buyer_key=True)
+    assert view.buyer_key == job["buyer_key"]
+    assert [r.url.params.get("include") for r in rec.requests] == ["buyer_key", None, "buyer_key"]
+    plain = m.JobView.model_validate(minimal(m.JobView))
+    assert "buyer_key" not in plain.model_dump_json()
+    assert "buyer_key" not in plain.model_dump(mode="json")

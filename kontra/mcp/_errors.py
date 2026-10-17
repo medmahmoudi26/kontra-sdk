@@ -28,6 +28,7 @@ from kontra.hire import (
     InvalidDelivery,
     InvalidInput,
     JobFailed,
+    JobKeyMissing,
     KontraError,
     PriceAboveMax,
     QuoteRejected,
@@ -105,6 +106,8 @@ def _kontra_code(err: KontraError) -> str:
             return "job_failed"
         case InvalidDelivery():
             return "invalid_delivery"
+        case JobKeyMissing():
+            return "job_key_missing"
         case _:
             return "kontra_error"
 

@@ -175,7 +175,10 @@ See [docs/buyers.md](docs/buyers.md).
   [age](https://age-encryption.org) to the job's parties: inputs to the seller (and the buyer),
   results to the buyer (and the seller). Large values and files go to the bucket as ciphertext.
   Kontra holds ciphertext, hashes, sizes, timestamps and workflow metadata. The one payload it
-  reads is a quote's answer (a price, or a refusal), because it must lock the price.
+  reads is a quote's answer (a price, or a refusal), because it must lock the price. Each job
+  has its own key, made where it is hired and copied to each of your devices (browsers,
+  `kontra login` machines) encrypted to that device alone, so a job hired in the console reads
+  in the CLI with nothing to export.
 - **Escrow from observable facts.** Money moves by pure rules (`kontra/escrow.py`) over three
   kinds of fact: the state of the seller's handler workflow as Temporal records it, the clock,
   and the buyer's accept, reject and cancel calls. Neither party's word moves money. A job not

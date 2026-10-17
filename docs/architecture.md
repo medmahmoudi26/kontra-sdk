@@ -76,6 +76,7 @@ is what lets a ledger adapter be swapped and keeps a future split into services 
 | `kontra.artifacts`, `kontra.types` | `Artifact`: streamed, encrypted upload and verified download through presigned URLs |
 | `kontra.gate_client` | the hand-written HTTP client: one method per route of `routes.py`, models in `models.py` |
 | `kontra.profile`, `kontra.auth` | the local profile, this machine's key and a buyer's per-job keys; the session that refreshes gate and Temporal tokens |
+| `kontra._jobkeys`, `kontra._devices` | share to my account (decisions I25): a job key wrapped to each of the account's devices with a proof of possession (shared with the gate), and this machine as one of them |
 | `kontra`, `kontra.workflow`, `kontra.activity` | the seller's façade: Temporal's own objects re-exported, never wrapped (`activity.defn` returns Temporal's own, after noting it for `serve()`), plus `serve`, `Worker`, `Page` and `workflow.execute_activities_in_parallel` (`kontra._parallel`, the `kontra.batch.v1` child) |
 | `kontra.serve` | the seller's `serve()` and `Worker`: generated Nexus handler, hold-token check, codec, progress forwarding; Temporal's own metrics and spans when asked (`kontra serve --metrics`, `--otlp`) |
 | `kontra.hire` | the buyer's `Kontra` client, `service()` for workflows, the hire worker |
@@ -95,7 +96,7 @@ the same pull request.**
 | # | Seam | What crosses | Contract | Test | CI job |
 |---|---|---|---|---|---|
 | ① | Temporal frontend | Nexus calls, task polls, the hold-token header, `DescribeTaskQueue` in the token's own namespace (a seller's backlog) | Temporal's protocol + the policy in `temporal/authorizer` | the Go deny matrix + `tests/temporal` over the wire | `deny-matrix` (required) |
-| ② | Gate HTTP API | quote, hire (with the job's own key), jobs, progress, artifacts, disputes, catalog, publish, a party's recipients, the Workers view | `kontra/gate_client/models.py` + `routes.py` | `tests/gate_client/test_routes.py`; the gate's OpenAPI snapshot in `kontra-cloud` | `seams` |
+| ② | Gate HTTP API | quote, hire (with the job's own key), jobs, progress, artifacts, disputes, catalog, publish, a party's recipients and devices, job-key wraps, the Workers view | `kontra/gate_client/models.py` + `routes.py` | `tests/gate_client/test_routes.py`; the gate's OpenAPI snapshot in `kontra-cloud` | `seams` |
 | ③ | Contract document | the offering, seller to buyer: its types and facts (spec v2: `uses_hosted_model` when true, and no key) | `kontra/contract` + `spec/` | `tests/contract`; the golden `examples/*/contract.yaml`, reproduced byte for byte | `seams` |
 | ④ | Ledger | money state | the `Ledger` Protocol (`kontra/ledger.py`) | `kontra.testing.ledger_contract` (the §9.3 invariants, 10,000 random interleavings) against every adapter | `seams` |
 | ⑤ | Codec | plaintext to ciphertext | `kontra/codec` | round trips, plus scans of Temporal history, the bucket, and a worker's metrics and exported spans (`tests/codec/test_codec_telemetry.py`) for a known plaintext marker | `seams` |

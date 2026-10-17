@@ -61,6 +61,8 @@ if TYPE_CHECKING:
     from temporalio.client import Client
     from temporalio.converter import DataConverter
 
+    from kontra._devices import DeviceOutcome
+
 __all__ = [
     "API_KEY_ENV",
     "DEFAULT_GATE_URL",
@@ -451,7 +453,23 @@ class Session:
         async with self._confirm_lock:
             until = await confirm_session(self._gate, show=show, sleep=self._sleep, extend=True)
             self._confirmed += 1
+        await self._after_confirmation()
         return until
+
+    async def _after_confirmation(self) -> None:
+        """A confirmation just completed, so the session is ``recent``: a machine that
+        logged in before devices existed becomes one of the account's devices now, asking
+        nobody anything (decisions I25). Never raises."""
+        if self._api_key is not None or self._profile is None or self._home is None:
+            return  # a key's session, or a login held in memory only: not this machine's
+        from kontra import _devices
+
+        await _devices.register_if_undecided(
+            self._gate,
+            home=self.identity_home,
+            gate_url=self._profile.gate_url,
+            party=self._profile.party,
+        )
 
     async def _on_confirm(self, route: str, need: m.ConfirmationRequired) -> bool:
         """The gate client's hook: one confirmation at a time per session. A change refused
@@ -466,6 +484,7 @@ class Session:
             confirmed = await self._confirmer(self._gate, route, need)
             if confirmed:
                 self._confirmed += 1
+                await self._after_confirmation()
             return confirmed
 
     async def aclose(self) -> None:
@@ -939,10 +958,19 @@ async def login(
     tls: bool | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     prompt: Callable[[m.DeviceStart], None] | None = None,
+    device: bool = True,
+    on_device: Callable[[DeviceOutcome | None], None] | None = None,
 ) -> Profile:
     """``kontra login``: get tokens (device flow -- approved in the browser, or through
     the link the gate mails ``email`` -- or :func:`dev_login` with ``dev``), add this
-    machine as one of the party's encryption recipients, and write the profile.
+    machine as one of the party's encryption recipients and, unless ``device`` is False,
+    as one of its devices, and write the profile.
+
+    A device reads the jobs the party hires anywhere (decisions I25): each job's key is
+    copied to it. The sign-in that just happened is the confirmation adding one needs, so
+    nobody is asked anything; ``on_device`` is told how it went (None: it could not be
+    tried). ``device=False`` (``kontra login --no-device``, a seller box) also keeps later
+    confirmations from adding it.
 
     Logging in no longer *decides* the party's key (decisions I7). A party holds a set of
     recipients and adding never replaces, so a second machine simply becomes one more:
@@ -981,6 +1009,7 @@ async def login(
             )
         if not any(k.public_key == public for k in me.keys):
             me = await gate.add_recipient(this_machine_label(k.label for k in me.keys), public)
+        await _register_this_device(gate, public, home, gate_url, me.party, device, on_device)
     profile = Profile(
         gate_url=gate_url,
         temporal_address=me.temporal_address,
@@ -994,6 +1023,40 @@ async def login(
     )
     profile.save(home)
     return profile
+
+
+async def _register_this_device(
+    gate: GateClient,
+    public: str,
+    home: Path | str | None,
+    gate_url: str,
+    party: str,
+    device: bool,
+    on_device: Callable[[DeviceOutcome | None], None] | None,
+) -> None:
+    """``kontra login``'s device half: never the login's failure."""
+    from kontra import _devices
+
+    where = _devices.resolve_home(home)
+    if not device:
+        _devices.decline_device(where, gate_url, party)
+        return
+    outcome: DeviceOutcome | None = None
+    try:
+        # This machine's own device key, when its key file was removed as a device and it
+        # was added again with a new one (`kontra devices add --new-key`).
+        from kontra.codec.age import public_key_of
+
+        key = public
+        if Profile.device_key_path(where).exists():
+            key = public_key_of(Profile.device_identity(where))
+        outcome = await _devices.register_device(
+            gate, key, home=where, gate_url=gate_url, party=party
+        )
+    except (GateError, httpx.TransportError, ProfileError) as err:
+        log.warning("this machine was not added as a device: %s", err)
+    if on_device is not None:
+        on_device(outcome)
 
 
 # --------------------------------------------------------------------------- confirm it's you

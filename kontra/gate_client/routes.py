@@ -19,15 +19,17 @@ adding a row here, in the same PR.
                    :class:`~kontra.gate_client.models.ConfirmationRequired` as its detail. The
                    API-key test comes first, so a key always gets ``fresh_login_required``.
                    The changes: making or revoking an API key or a recipient, ending a
-                   sign-in, publishing, revoking a passkey (and finishing adding one). The 403
-                   is decided before the route does anything, so a client confirms in place and
-                   sends the same call once more (decisions I23).
+                   sign-in, publishing, revoking a passkey (and finishing adding one),
+                   removing a device. The 403 is decided before the route does anything, so
+                   a client confirms in place and sends the same call once more (decisions
+                   I23).
 * ``recent``    -- ``fresh``, and that sign-in or confirmation is less than
                    ``RECENT_CONFIRMATION_SECONDS`` (five minutes) old, with no operator's or
                    revocation's mark since: else the same 403 ``confirmation_required`` and
                    :class:`~kontra.gate_client.models.ConfirmationRequired` detail, the API-key
-                   test first as for ``fresh``. Only starting to add a passkey: a passkey can
-                   confirm every change after it, so the hour of an old confirmation is not
+                   test first as for ``fresh``. Starting to add a passkey (a passkey can
+                   confirm every change after it) and adding a device (a device gets the keys
+                   of past jobs too, decisions I25): the hour of an old confirmation is not
                    enough. A client that confirms in place for such a row must wait for *this*
                    confirmation to complete, not for the session's hour (decisions I24).
 * ``worker``    -- the party's Temporal *worker* JWT, also accepted on seller routes so a
@@ -175,6 +177,15 @@ ROUTES: tuple[Route, ...] = (
         m.PasskeyConfirm,
         m.PasskeyConfirmed,
     ),
+    # Devices (decisions I25): the keys that read the jobs this party hires -- a browser
+    # profile's, a `kontra login` machine's. NOT the recipients (fleet keys, public, seller
+    # input). Listed by any of the party's sessions, so a program's hire wraps to them too;
+    # adding one is `recent` (it gets past jobs' keys), removing one a change.
+    Route("devices", "GET", f"{P}/me/devices", "party", None, m.DeviceList),
+    Route("add_device", "POST", f"{P}/me/devices", "recent", m.AddDevice, m.DeviceView, status=201),
+    Route(
+        "remove_device", "DELETE", f"{P}/me/devices/{{public_key}}", "fresh", None, None, status=204
+    ),
     # catalog
     Route("publish", "POST", f"{P}/catalog", "fresh", m.PublishRequest, m.CatalogEntry),
     Route("search", "GET", f"{P}/catalog", "none", None, m.CatalogList),
@@ -211,6 +222,13 @@ ROUTES: tuple[Route, ...] = (
     Route("cancel", "POST", f"{P}/jobs/{{job_id}}/cancel", "party", None, m.JobView),
     Route("start", "POST", f"{P}/jobs/{{job_id}}/start", "party", m.StartRequest, m.JobView),
     Route("result", "GET", f"{P}/jobs/{{job_id}}/result", "party", None, m.ResultView),
+    # A job's key, shared to the party's devices (decisions I25): the buyer's own jobs only.
+    # The job's exact buyer_key, its wraps, a challenge; the jobs a device lacks; and storing
+    # wraps, each job's with the proof that the sender holds its key. Under /v1/me, because
+    # /v1/jobs/keys would be read as the job "keys".
+    Route("job_key", "GET", f"{P}/jobs/{{job_id}}/key", "party", None, m.JobKey),
+    Route("job_keys", "GET", f"{P}/me/job-keys", "party", None, m.JobKeyList),
+    Route("share_job_keys", "POST", f"{P}/me/job-keys", "party", m.ShareJobKeys, m.SharedJobKeys),
     Route(
         "progress",
         "GET",

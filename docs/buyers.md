@@ -34,8 +34,10 @@ sign-in always starts from the command, and against a gate that signs in by emai
 `kontra login` says so. Both talk to `https://api.kontra.run` unless `--gate` or
 `KONTRA_GATE` names another gate.
 
-`kontra login` writes `~/.kontra/profile` (mode 0600) and adds this machine as one of your
-party's encryption recipients. Set `KONTRA_HOME` to keep a profile elsewhere. For a local
+`kontra login` writes `~/.kontra/profile` (mode 0600), adds this machine as one of your
+party's encryption recipients, and makes it one of your **devices** (below): it then reads the
+jobs you hire anywhere, in the console or on another machine. Set `KONTRA_HOME` to keep a
+profile elsewhere. For a local
 marketplace, `kontra dev` logs you in to its gate instead
 (see [sellers.md](sellers.md#running-locally-kontra-dev)).
 
@@ -47,15 +49,43 @@ fresh machine, or CI holding only `KONTRA_API_KEY`, can hire and read results â€
 machine that is compromised yields the jobs it currently holds, not every delivery you have
 ever received.
 
-`kontra job <id> --accept` shreds the job's key once the escrow is released. That is the
-point of it: after you accept, the ciphertext the gate and the bucket still hold is readable
-by nobody, including you. Two consequences worth knowing before you rely on it:
+### Your devices: a job hired anywhere reads everywhere
 
-- **The key lives on the machine that hired.** Hire on a laptop and read the result on a
-  desktop and it will not open; copy `~/.kontra/jobs/<job_id>.key` across, or do both on one
-  machine. Sharing job keys through the gate is designed but not built.
-- **Keep the key if you may dispute later.** `--accept` is what deletes it, so accept when
-  you are done with the delivery, not as a reflex.
+Each browser you use the console in, and each machine you `kontra login` on, is one of your
+**devices**. The place that hires a job copies its key to every device, encrypted to that
+device alone (the gate keeps the copies and cannot open them), so a job hired in the console
+reads here with `kontra job <id> --result` -- nothing to export, nothing to import, no prompt:
+
+```sh
+kontra devices list                 # browsers and machines that read your jobs; this one marked
+kontra devices add                  # this machine, if it is not one (asks you to confirm it's you)
+kontra devices add --new-key        # a machine removed by mistake, with a device key of its own
+kontra devices remove age1...       # stops new copies; deletes the ones the gate kept for it
+kontra login --no-device            # a seller's box that should not read your purchases
+```
+
+A device added later gets the keys of past jobs from whichever of your devices holds them the
+next time it is online: `kontra jobs`, `kontra job` and `kontra hire` catch up for a moment
+after they print, as do `kontra mcp` (every five minutes) and an open console tab, and each
+says once which new device "can now read your jobs" (on stderr; `kontra mcp` in its next
+answer) before it copies anything to it. A catch-up cut short resumes where it stopped.
+Until one has, `kontra job <id> --result` says the key has not reached this machine yet. A
+program on an API key is no device: it copies the keys of the jobs it hires to your devices,
+reads only those jobs, and sees your devices' keys but not their names. Jobs hired before
+per-job keys (with your login key) are never copied: the machine that holds that key reads
+them. See decisions I25.
+
+A browser device nobody uses for 30 days (a private window, a deleted profile) retires by
+itself, and when an account holds 32 devices a new one takes the place of the browser used
+least recently; a retired browser comes back by itself at its next sign-in. A machine you
+removed by mistake comes back with `kontra devices add --new-key` (a device key of its own,
+`~/.kontra/device.key`; a removed key never comes back).
+
+`kontra job <id> --accept` shreds this machine's key file for the job once the escrow is
+released. Every device keeps its copy of the key at Kontra while the job exists -- this one
+too, so `--result` here reads the job again -- and the delivery stays readable by your devices
+and by nobody else. Removing a device stops new copies and deletes the gate's copies for it,
+but a key it has already opened cannot be taken back.
 
 ### Programs: API keys
 
@@ -71,10 +101,11 @@ The program reads the key from `KONTRA_API_KEY`; `Kontra()`, `kontra mcp` and ev
 command then use it instead of a profile (`KONTRA_GATE` names the gate, by default
 `https://api.kontra.run`). It also needs your key file to decrypt what it buys: copy
 `~/.kontra/key` to the machine, into `KONTRA_HOME`. Nothing is read or written there but that
-file. In code, `kontra.auth.Session.from_api_key(gate_url, key)` makes the same session.
+file and the keys of the jobs it hires (`jobs/`), which it copies to your devices. In code,
+`kontra.auth.Session.from_api_key(gate_url, key)` makes the same session.
 
 A key quotes, hires, follows, accepts and disputes jobs, and runs `kontra serve`. It never
-publishes, changes your recipients, sees or manages keys -- those answer 403
+publishes, changes your recipients or devices, sees or manages keys -- those answer 403
 `fresh_login_required` however new the key is -- so a leaked key cannot change what you sell
 or who can read your deliveries. Listing keys needs your login; making and revoking one are
 changes, which need your login confirmed within the hour. Signing in counts; after that,
@@ -109,6 +140,7 @@ kontra jobs [--state working] [--as seller]
 kontra job <job id>                                     # state, escrow, price, deadlines
 kontra job <job id> --progress                          # follow progress until the job closes
 kontra job <job id> --result out/                       # wait; write result.json and every artifact
+                                                        # (a job hired in the console too)
 kontra job <job id> --accept | --reject "why" | --cancel
 ```
 
@@ -153,8 +185,11 @@ asyncio.run(main(["https://example.com/"]))
 - `job.result(timeout=...)` raises `TimeoutError` if the delivery is not there yet; the job
   keeps running. `job.result(output_type=Model)` validates the delivery into your own pydantic
   model (for example one generated by `kontra pull --lang python`).
-- `await k.job(job_id)` picks a job back up from another process; the result is durable on
-  the server and the handle survives your script.
+- `await k.job(job_id)` picks a job back up from another process -- or one hired on another
+  of your devices, whose key reaches this machine as a copy (decisions I25); the result is
+  durable on the server and the handle survives your script. `await k.sync_job_keys()`
+  copies the keys this machine holds to your devices that lack them (the CLI does it on every
+  `jobs`, `job` and `hire`).
 - `await job.cancel()` before delivery refunds the hold and cancels the seller's workflow.
 - `job.accept()` releases the escrow now; otherwise it releases when the review window
   closes. `job.reject(reason)` within the window opens a dispute.
@@ -333,3 +368,4 @@ crosses a workflow boundary intact):
 | `HireRefused` | the gate refused for a reason you must act on (unknown offering, stale quote...) |
 | `JobFailed` | the job closed without a delivery; the hold was refunded |
 | `InvalidDelivery` | the delivery does not match the published output schema |
+| `JobKeyMissing` | no key on this machine reads the job: it was hired on another device that has not been online since this one was added, this machine is not one of your devices (`kontra devices add`), or it predates per-job keys (`reason` says which) |
