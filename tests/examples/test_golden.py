@@ -56,6 +56,8 @@ def test_golden_contract(name: str) -> None:
         ("enrich", "acme/enrich@1.2.0"),
         ("legacy-actor", "acme/probe@1.0.0"),
         ("hello", "acme/hello@0.1.0"),
+        ("chef-agents", "acme/chef-agents@0.1.0"),
+        ("chef-claude", "acme/chef-claude@0.1.0"),
     ],
 )
 def test_golden_contract_passes_the_catalog(name: str, offering: str) -> None:

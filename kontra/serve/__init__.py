@@ -75,7 +75,6 @@ class _CallablePackage(types.ModuleType):
         self,
         *workflows: type,
         quote: QuoteFunction | None = None,
-        agents: bool = False,
         mcp_servers: _agents.MCPServers | None = None,
         **temporal_worker_options: Unpack[WorkerConfig],
     ) -> Worker:
@@ -83,7 +82,6 @@ class _CallablePackage(types.ModuleType):
             sys._getframe(1).f_globals,
             workflows,
             quote=quote,
-            agents=agents,
             mcp_servers=mcp_servers,
             options=temporal_worker_options,
         )

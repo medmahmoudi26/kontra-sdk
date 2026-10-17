@@ -45,7 +45,8 @@ dependencies = [
 [project.optional-dependencies]
 mcp = ["mcp>=2.3,<3"]  # kontra.mcp is written on MCPServer (mcp 2.x)
 # Temporal's OpenAI Agents integration (temporalio.openai_agents): kontra.workflow re-exports
-# activity_as_tool and mcp_server, and serve() installs its plugin. [mcp]: serve(mcp_servers=).
+# activity_as_tool and mcp_server, and serve() installs its plugin for a workflow that imports
+# `agents`. [mcp]: serve(mcp_servers=).
 agents = ["temporalio-openai-agents[mcp]>=1.1,<2"]
 # `kontra serve --otlp`: Temporal's TracingInterceptor (temporalio's own extra of the same
 # name) and the OTLP/gRPC span exporter.

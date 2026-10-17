@@ -1,8 +1,8 @@
 """Fixtures for the examples' end-to-end tests: one Temporal dev server per test process
 (shared with the other suites), and for this package one marketplace in which ``acme``
-serves every example seller -- ``examples/enrich``, ``examples/legacy-actor`` and
-``examples/hello``, each its own ``python worker.py`` process -- next to local web sites
-for them to fetch.
+serves the example sellers -- ``examples/enrich``, ``examples/legacy-actor`` and
+``examples/hello``, each its own ``python worker.py`` process; the chefs are started by
+their own tests -- next to local web sites for them to fetch.
 
 Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once into the temp
 directory; with neither the binary nor the network, these tests are skipped."""
@@ -26,7 +26,7 @@ from kontra.testing.devserver import (
 )
 
 from .sites import Sites
-from .support import ALLOW_LOCAL_SITES, EXAMPLES, SELLERS, Market, Seller, seller_env
+from .support import ALLOW_LOCAL_SITES, EXAMPLES, SERVED, Market, Seller, seller_env
 
 # The recon example is a directory of scripts, as a buyer would write it; its workflow
 # module must be importable by name for Temporal's sandbox.
@@ -79,7 +79,7 @@ async def market(
         logs = tmp_path_factory.mktemp("sellers")
         env = seller_env(acme.home, sites)
         world = Market(mp, acme, sites)
-        for name in SELLERS:
+        for name in SERVED:
             world.sellers[name] = Seller(name, env, logs / f"{name}.log")
         try:
             for seller in world.sellers.values():

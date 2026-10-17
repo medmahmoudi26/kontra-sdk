@@ -17,8 +17,10 @@ It builds the :class:`~kontra.serve.Worker` a seller would otherwise write by ha
   is imported in this process -- an activity nothing imports cannot be referenced by a
   workflow either -- except Kontra's own (``Worker`` registers those) and methods (they need
   their instance: pass ``activities=[obj.method]``);
-* with the ``[agents]`` extra installed, ``OpenAIAgentsPlugin`` goes on the worker
-  (:mod:`kontra._agents`), serving ``mcp_servers``;
+* when the workflows imported OpenAI's ``agents`` (they run an agent), Temporal's
+  ``OpenAIAgentsPlugin`` goes on the worker, serving ``mcp_servers``, and the worker's
+  payload converter follows it (:mod:`kontra._agents`); there is no keyword for it, since
+  no keyword may change what workflow code can do (decisions I25);
 * every other keyword is ``temporalio.worker.Worker``'s, passed to ``Worker`` verbatim;
   ``activities``, ``workflows`` and ``plugins`` given there are added after serve()'s own.
 
@@ -141,7 +143,6 @@ def serve_from(
     workflows: tuple[type, ...],
     *,
     quote: QuoteFunction | None,
-    agents: bool = False,
     mcp_servers: _agents.MCPServers | None,
     options: Mapping[str, Any],
 ) -> Worker:
@@ -165,9 +166,10 @@ def serve_from(
     extra_workflows = _extend(list(workflows[1:]), options.get("workflows"))
     if extra_workflows:
         kwargs["workflows"] = extra_workflows
-    plugins = _extend(
-        _agents.plugins(agents=agents, mcp_servers=mcp_servers), options.get("plugins")
-    )
+    # The caller imported its workflows (``workflows`` are their classes), so whether they
+    # imported ``agents`` is known now.
+    given = options.get("plugins")
+    plugins = _extend(_agents.plugins(mcp_servers=mcp_servers, given=given), given)
     if plugins:
         kwargs["plugins"] = plugins
     worker = Worker(offerings=[bound], **kwargs)
@@ -187,22 +189,20 @@ def serve_from(
 def serve(
     *workflows: type,
     quote: QuoteFunction | None = None,
-    agents: bool = False,
     mcp_servers: _agents.MCPServers | None = None,
     **temporal_worker_options: Unpack[WorkerConfig],
 ) -> Worker:
     """Serve ``offering.yaml`` beside the calling file with ``workflows[0]`` (see the module
     docstring): runs the worker when the caller is ``__main__``, else returns it unstarted.
 
-    ``agents``: run the OpenAI Agents plugin (the ``[agents]`` extra; the worker then needs
-    ``OPENAI_API_KEY``). ``mcp_servers``: ``{"name": factory}`` for
-    ``kontra.workflow.mcp_server("name")``; implies ``agents``. ``temporal_worker_options``: ``temporalio.worker.Worker``'s keywords.
+    ``mcp_servers``: ``{"name": factory}``, the worker's MCP servers for a workflow's agent
+    (``kontra.workflow.mcp_server("name")``); a name no workflow asks for is unused.
+    ``temporal_worker_options``: ``temporalio.worker.Worker``'s keywords.
     """
     return serve_from(
         sys._getframe(1).f_globals,
         workflows,
         quote=quote,
-        agents=agents,
         mcp_servers=mcp_servers,
         options=temporal_worker_options,
     )

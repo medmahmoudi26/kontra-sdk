@@ -583,6 +583,69 @@ workflow, activity, RetryPolicy, ApplicationError, Page` -- and never `temporali
 - **Checked by** `tests/examples/test_imports.py` (statements, dynamic imports and module names
   in strings; what loading the code loads) over the examples and the `kontra init` scaffold.
 
+## I25. The workflow does what it wants (D1; kontra-sdk#27)
+
+Kept next to I20 because it is the same rule from the worker's side: the façade aliases
+Temporal and never wraps it, so a workflow that is a legal Temporal workflow without Kontra
+is one with Kontra. **No `serve()` or `Worker` keyword may change what workflow code can do.**
+Worker-side facts are config -- concurrency caps, timeouts, which MCP processes to spawn,
+which model endpoint to dial -- and "may this workflow run an agent" is not one of them.
+
+- **Removed: the `agents` keyword of `serve()`** (7ee0fd1, #20), and the same keyword it
+  threaded through `serve_from`, `seller_data_converter` and `payload_converter_class`. It is
+  not a `temporalio.worker.Worker` argument, so passing it to `serve()` is now the
+  `TypeError` any stranger keyword gets. Its two reasons -- the plugin builds an OpenAI client when the
+  worker starts, and swaps in `OpenAIPayloadConverter`, which validates more leniently --
+  are consequences of the workflow running an agent, not of a flag: a worker whose workflow
+  imports the Agents SDK needs both, one whose workflow does not must get neither.
+- **Derived instead.** `serve()` runs after `worker.py` imported its workflows, so
+  `"agents" in sys.modules` (OpenAI's Agents SDK, imported by the workflow module or anything
+  it passed through) puts `OpenAIAgentsPlugin` on the worker, and the worker's converter
+  follows its plugins (`kontra._agents.uses_agents`). `agents` imported without the extra is
+  a `TypeError` naming `pip install 'kontra-sdk[agents]'`; the extra installed and not
+  imported changes nothing. An `OpenAIAgentsPlugin` already in the seller's own `plugins=` is
+  the worker's, and serve() adds none (two would register the same activities).
+  For the import to stay the signal, `kontra.workflow` imports `activity_as_tool` and
+  `mcp_server` when a workflow first names them, never with the façade, and leaves them out
+  of `__all__` (a star import would name them).
+- **Where the issue and the code part ways.** The issue keeps the explicit `Worker(plugins=...)`
+  path for the seller to pass the plugin; `kontra publish` refuses `temporalio` imports in
+  seller code, so a published offering could not. `kontra.serve.Worker` therefore derives the
+  plugin the same way when it is made (its workflows are imported by then), and serve()'s
+  worker is one of those. And the signal is OpenAI's `agents`, the `openai-agents`
+  distribution's, not the name: a seller's own `agents.py` imported by the workflow module
+  runs no agent and gets nothing (it was a `TypeError` without the extra, and an
+  `ImportError` with it).
+- **What the import does not tell.** `sys.modules` is the process's: an `activities.py` the
+  workflow passes through counts as the issue words it, so an activity that runs an agent
+  in-process, outside Temporal's loop, imports `agents` inside its function to keep the
+  worker plain. An import inside `run` comes after the worker was built: no plugin, and the
+  workflow task fails. `docs/sellers.md` says both.
+- **`mcp_servers=` stays**, as worker config: a factory holds processes and credentials, the
+  same kind of thing as `max_concurrent_activities`. It implies nothing about the workflow;
+  a factory for a name no workflow asks for is unused.
+- **The model endpoint is worker config, set the Agents SDK's own way.** Checked against
+  temporalio-openai-agents 1.1: the plugin's default model activity builds
+  `OpenAIProvider(openai_client=AsyncOpenAI(max_retries=0))` when the worker is built, so it
+  never reads the SDK's default client (and refuses to build without `OPENAI_API_KEY`).
+  `serve()` therefore gives the plugin `model_provider=OpenAIProvider()`, which reads the
+  default API when it is made, with the worker, and takes the default client at the first
+  model call: `set_default_openai_client(AsyncOpenAI(base_url=...))` and
+  `set_default_openai_api("chat_completions")` in `worker.py`, before `serve()`, point an
+  agent workflow at Ollama, vLLM, OpenRouter or Mistral, with no new keyword. Without a default client it is the
+  SDK's own default from `OPENAI_API_KEY`/`OPENAI_BASE_URL`; the model, when the agent names
+  none, is the SDK's `OPENAI_DEFAULT_MODEL`. The cost: that fallback client keeps the OpenAI
+  client's own two retries inside an activity attempt, where the plugin's had none; set a
+  default client with `max_retries=0` to leave every retry to Temporal.
+- **Checked by** `tests/serve/test_serve_fn.py` (the keyword refused; no import, no plugin,
+  with or without the extra; a seller's own `agents.py` is no import; the import installs it
+  with the MCP servers, on a `Worker(...)` written out too; the default client is the
+  endpoint) and `tests/examples/test_chef_agents.py` (every example's worker built in a fresh
+  process; `examples/chef-agents` against an OpenAI-compatible stand-in). The tests start
+  each one as a worker process does, with `agents` not imported (`tests/conftest.py`).
+  The agent that is a process needs none of this: `examples/chef-claude`, one heartbeating
+  activity resuming the binary's session, `tests/examples/test_chef_claude.py`.
+
 ## I21. The Workers view (kontra-cloud#6)
 
 A seller sees whether its workers keep up from what Temporal already knows: the gate asks

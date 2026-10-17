@@ -32,7 +32,10 @@ _T = TypeVar("_T")
 REPO = Path(__file__).resolve().parents[2]
 EXAMPLES = REPO / "examples"
 #: The sellers, by directory. Their offering names start with ``acme/``.
-SELLERS = ("enrich", "legacy-actor", "hello")
+SELLERS = ("enrich", "legacy-actor", "hello", "chef-agents", "chef-claude")
+#: The ones the package's marketplace serves for every test. The chefs run in their own
+#: tests, each with what its worker dials: a local model server, a stand-in ``claude``.
+SERVED = ("enrich", "legacy-actor", "hello")
 #: What a buyer is funded with, in cents.
 START = 10_000
 #: The example sellers fetch only public addresses unless told otherwise (their READMEs);
@@ -117,6 +120,13 @@ class Seller:
                 raise RuntimeError(f"{self.name}'s worker never polled:\n{self.tail()}")
             await asyncio.sleep(0.2)
 
+    def kill(self) -> None:
+        """SIGKILL: the worker crashes, telling nobody, its activities mid-flight."""
+        proc, self._proc = self._proc, None
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(10)
+
     async def stop(self) -> None:
         """SIGTERM (a graceful shutdown), a second one (stop now), then SIGKILL."""
         proc, self._proc = self._proc, None
@@ -174,8 +184,9 @@ class Market:
 def seller_env(home: Path, sites: Sites) -> dict[str, str]:
     """The seller processes' environment: the party's profile, every heartbeat forwarded
     one by one (acceptance 13 counts them), the test sites' CA trusted for HTTPS, and their
-    address (127.0.0.1) allowed as a destination."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("KONTRA_")}
+    address (127.0.0.1) allowed as a destination. Nothing of OpenAI's: no seller here needs
+    an ``OPENAI_API_KEY``."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("KONTRA_", "OPENAI_"))}
     env.update(
         KONTRA_HOME=str(home),
         KONTRA_PROGRESS_INTERVAL="0",

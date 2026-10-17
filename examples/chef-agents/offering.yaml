@@ -1,0 +1,16 @@
+# offering.yaml: declarative facts only; nothing in here names code (D11). The catalog,
+# the console and agents read this file without running any Python.
+#
+# A published version is fixed: bump `version` whenever this file or the types in
+# models.py change, or `kontra serve` refuses to start ("republish or bump the version").
+name: acme/chef-agents     # <your party handle>/<offering>: change acme before publishing
+version: 0.1.0
+description: One dish from what is in the pantry, cooked up by an agent
+pricing_hint: "$0.05 per dish"       # display only; the price comes from quote()
+tags: [example, agents]
+uses_hosted_model: true    # the craving goes to the model endpoint the worker dials
+max_duration: 10m          # no delivery by then refunds the buyer
+review_window: 24h         # the buyer may reject a delivery until then; silence accepts
+max_concurrent_jobs: 10    # beyond this many open jobs, quotes answer busy
+max_output_bytes: 1MB      # the gate refuses artifact uploads beyond this
+artifact_retention: 7d     # after accept; the buyer must download artifacts by then
