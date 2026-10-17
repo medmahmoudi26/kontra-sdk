@@ -147,3 +147,77 @@ async def test_the_request_names_the_devices_code() -> None:
             sleep=lambda _: asyncio.sleep(0),
         )
     assert seen == [{"email": "ann@example.com", "device_user_code": "BCDF-GHJK"}]
+
+
+def _refused_link(retry: int, message: str) -> httpx.MockTransport:
+    """A gate whose ``POST /v1/auth/magic`` answers 429 ``rate_limited``."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/auth/device":
+            start = m.DeviceStart(
+                device_code="d" * 43,
+                user_code="BCDF-GHJK",
+                verification_uri="https://gate.test/device",
+                verification_uri_complete="https://gate.test/device?user_code=BCDF-GHJK",
+                interval=1,
+                expires_in=600,
+            )
+            return httpx.Response(200, json=start.model_dump(mode="json"))
+        assert request.url.path == "/v1/auth/magic"
+        return httpx.Response(
+            429,
+            json={
+                "code": "rate_limited",
+                "message": message,
+                "detail": {"retry_after_seconds": retry},
+            },
+            headers={"Retry-After": str(retry)},
+        )
+
+    return httpx.MockTransport(answer)
+
+
+@pytest.mark.parametrize(
+    ("retry", "says"),
+    [
+        (
+            1800,
+            "too many sign-in links asked for; try again later; you can ask again in 30 minutes",
+        ),
+        (
+            3600,
+            "too many sign-in links asked for; try again later; you can ask again in 60 minutes",
+        ),
+        (61, "too many sign-in links asked for; try again later; you can ask again in 2 minutes"),
+        (11, "too many sign-in links asked for; try again later; you can ask again in 1 minute"),
+    ],
+)
+async def test_a_refused_link_says_how_long_to_wait(retry: int, says: str) -> None:
+    """Past the limits the gate answers 429 with ``retry_after_seconds``: the login says the
+    wait, in minutes (kontra-cloud#36), and shows no code nobody can use."""
+    shown: list[m.DeviceStart] = []
+    with pytest.raises(LoginError) as e:
+        await login_device(
+            "https://gate.test",
+            email="ann@example.com",
+            transport=_refused_link(retry, "too many sign-in links asked for; try again later"),
+            prompt=shown.append,
+        )
+    assert (e.value.code, e.value.message) == ("rate_limited", says)
+    assert shown == []
+
+
+@pytest.mark.parametrize("retry", [1, 5, 10])
+async def test_a_busy_gate_says_only_that(retry: int) -> None:
+    """A 429 for a few seconds is the gate being busy: no wait in minutes after it."""
+    with pytest.raises(LoginError) as e:
+        await login_device(
+            "https://gate.test",
+            email="ann@example.com",
+            transport=_refused_link(retry, "the gate is busy; try again in a few seconds"),
+            prompt=lambda start: None,
+        )
+    assert (e.value.code, e.value.message) == (
+        "rate_limited",
+        "the gate is busy; try again in a few seconds",
+    )

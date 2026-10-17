@@ -715,9 +715,14 @@ could be read.
 * **Spec v1 is read-only.** `spec/x-kontra.v1.json` is back, byte for byte.
   `validate_document(doc, read_only=True)` checks a block that carries `public_key` against
   it, and the key's checksum as 0.1.0 did -- not against v2 minus one member -- and applies
-  every other rule and the hash check as before; the result says `spec_version=1`. Only a delivery is checked that way
+  every other rule and the hash check as before; the result says `spec_version=1`. Only a delivery (and a read of a retired version, below) is checked that way
   (`Kontra._job_contract`, with a cache of its own): publish, serve, quote and hire take
   spec v2 only, and the key a v1 document seals is never encrypted to.
+* **A retired version is said to be retired, never an error to read.**
+  The MCP `describe` of an exact retired version answers `retired: true` from that same
+  contract (`_job_contract`), and `kontra pull` of one warns on stderr and still writes the
+  client, reading a spec v1 document as a delivery does. Quote and hire still refuse it
+  (`offering_retired`, with the exact version in `detail.offering`).
 * A delivery made before 0.2.0 is encrypted to the buyer machine's key of then (the
   profile's `key` file), not to a per-job key, and that is the identity the SDK decrypts
   with first, so it needs nothing new.

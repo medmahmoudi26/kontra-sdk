@@ -78,7 +78,10 @@ class DescribeOut(_Out):
     description: str
     pricing_hint: str | None
     tags: list[str]
-    retired: bool
+    retired: bool = Field(
+        description="True for an exact version that takes no new jobs (quote and hire refuse "
+        "it); its jobs' results are still checked against this contract."
+    )
     contract_hash: str
     limits: LimitsOut
     input_schema: dict[str, Any] = Field(

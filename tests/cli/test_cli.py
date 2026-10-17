@@ -29,6 +29,7 @@ from kontra.cli._scaffold import class_prefix, render
 from kontra.codec.age import generate_identity
 from kontra.contract import (
     ContractError,
+    contract_hash,
     from_yaml,
     load_offering,
     seal,
@@ -459,6 +460,19 @@ def test_pull_verifies_the_catalog_entry() -> None:
         verify_entry("acme/enrich@2", _entry(doc))
     with pytest.raises(ClickException, match="service"):
         verify_entry("acme/enrich", _entry(doc, service="evil.enrich"))
+
+
+def test_pull_reads_a_retired_version_as_its_jobs_do() -> None:
+    """A document spec v1 sealed (the seller's key in x-kontra) is read only for a retired
+    version, as a job's delivery is (decisions I22); a live version takes spec v2 only."""
+    with load_worker(ENRICH) as worker:
+        doc = worker.offerings[0].build_document()
+    v1 = seal({**doc, "x-kontra": {**doc["x-kontra"], "public_key": PUBLIC_KEY}})
+    retired = _entry(doc, document=v1, contract_hash=contract_hash(v1), retired=True)
+    info = verify_entry("acme/enrich@1.2.0", retired)
+    assert (info.spec_version, info.contract_hash) == (1, contract_hash(v1))
+    with pytest.raises(ContractError):
+        verify_entry("acme/enrich@1.2.0", retired.model_copy(update={"retired": False}))
 
 
 def test_pull_output_directories_are_package_names() -> None:

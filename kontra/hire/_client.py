@@ -772,7 +772,8 @@ class Kontra:
     async def offering(self, ref: str) -> m.CatalogEntry:
         """The catalog entry ``ref`` resolves to (``acme/enrich``, ``@1``, exact), with its
         contract checked: the document's own hash, and the entry agreeing with it. A retired
-        version is refused (``offering_retired``): it takes no new jobs."""
+        version is refused (``offering_retired``, ``detail["offering"]`` the exact version):
+        it takes no new jobs."""
         await self._ready()
         entry = self._entries.get(ref)
         if entry is None:
@@ -787,7 +788,9 @@ class Kontra:
                 raise mapped from err
             if entry.retired:  # the gate answers an exact retired version, for its jobs
                 raise HireRefused(
-                    f"{entry.offering} is retired: it takes no new jobs", code="offering_retired"
+                    f"{entry.offering} is retired: it takes no new jobs",
+                    code="offering_retired",
+                    detail={"offering": entry.offering},
                 )
             self.contract(entry)
             self._entries[entry.offering] = entry

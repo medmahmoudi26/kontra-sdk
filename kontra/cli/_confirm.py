@@ -42,9 +42,11 @@ _WAITING = "Waiting for the code to be typed... (Ctrl-C stops; nothing has chang
 _STOPPED = "stopped: nothing was changed"
 #: The CLI's words for a confirmation that did not complete (``ConfirmError.code``).
 _FAILED = {
-    "expired": "the confirmation link expired before the code was typed; nothing was "
-    "changed. Run the command again (no mail? check your spam folder; an address gets only "
-    "so many links an hour)",
+    # Also a confirmation the gate ended because it could not send its link (its limits, a
+    # mail server's failure): the poll reads `expired` then too (kontra-cloud#36).
+    "expired": "the link expired or could not be sent; nothing was changed. Run the command "
+    "again for a new one (no mail? check your spam folder; an address gets only so many "
+    "links an hour)",
     "burned": "the link took three wrong codes and no longer works; nothing was changed. Run "
     "the command again for a new one",
     "unavailable": "your account cannot confirm it's you by email on this gate: run `kontra "

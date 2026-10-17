@@ -63,7 +63,7 @@ async def _refused_to_hire(k: Kontra, key: str) -> None:
     would not quote it anyway."""
     with pytest.raises(HireRefused) as refused:
         await k.quote(key, text="again")
-    assert refused.value.code == "offering_retired"
+    assert (refused.value.code, refused.value.detail) == ("offering_retired", {"offering": key})
     with pytest.raises(HireRefused) as refused:
         await k.hire(key, text="again")
     assert refused.value.code == "offering_retired"
@@ -74,6 +74,15 @@ async def _refused_to_hire(k: Kontra, key: str) -> None:
     assert (e.value.status, e.value.code) == (404, "offering_not_found")
 
 
+async def _described_retired(k: Kontra, key: str, contract_hash: str) -> None:
+    """The MCP server's ``describe`` of the exact retired version says it is retired (no
+    error), from the contract its jobs are checked against."""
+    described = await KontraTools(kontra=k).describe(key)
+    assert (described.offering, described.retired) == (key, True)
+    assert (described.seller, described.contract_hash) == (key.split("/")[0], contract_hash)
+    assert described.output_schema["properties"]["text"]
+
+
 async def test_a_job_reads_back_once_its_version_is_retired(world: World) -> None:
     buyer, key = await world.buyer(), world.key()
     job_id = await _delivered(buyer, key, "before the release")
@@ -81,11 +90,13 @@ async def test_a_job_reads_back_once_its_version_is_retired(world: World) -> Non
 
     # Another process (`kontra job <id> --result`, an agent's MCP server): nothing cached.
     async with buyer.party.kontra(client=world.mp.client(buyer.party.namespace)) as later:
-        assert (await later.gate.get_offering(key)).retired
+        entry = await later.gate.get_offering(key)
+        assert entry.retired
         result = await (await later.job(job_id)).result(timeout=30)
         assert isinstance(result, Record)
         assert result.text == "BEFORE THE RELEASE"
-        await _refused_to_hire(later, key)
+        await _described_retired(later, key, entry.contract_hash)
+        await _refused_to_hire(later, key)  # describing it let nothing through
 
 
 async def test_a_job_reads_back_when_its_contract_is_spec_v1(world: World) -> None:
@@ -104,4 +115,5 @@ async def test_a_job_reads_back_when_its_contract_is_spec_v1(world: World) -> No
         got = await tools.result(job_id, None, 30)
         assert got.ready
         assert got.output["text"] == "HIRED UNDER V1"
+        await _described_retired(later, key, v1_hash)
         await _refused_to_hire(later, key)

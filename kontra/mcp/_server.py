@@ -50,7 +50,7 @@ from kontra.contract.names import is_job_id
 from kontra.contract.units import format_duration
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
-from kontra.hire import Job, Kontra, Progress, QuoteResult
+from kontra.hire import HireRefused, Job, Kontra, Progress, QuoteResult
 from kontra.mcp import _models as out
 from kontra.mcp._errors import HANDLED, ToolRefusal, WithDetail, clip, error_result
 from kontra.profile import Profile, ProfileError
@@ -143,7 +143,9 @@ Describe one offering: what it does, its pricing hint, its limits (maximum durat
 window, output size) and the JSON Schemas of its input and output.
 
 Build the `input` for quote and hire so that it validates against `input_schema` (JSON Schema \
-2020-12; referenced types are under `$defs`). Free; moves no money."""
+2020-12; referenced types are under `$defs`). An exact version that was retired is still \
+described, with `retired: true`: it takes no new jobs, and its jobs' results keep its \
+output_schema. Free; moves no money."""
 
 QUOTE_DOC = """\
 Ask the seller what this input would cost. Free: a quote locks no money.
@@ -297,21 +299,33 @@ class KontraTools:
 
     async def describe(self, offering: str) -> out.DescribeOut:
         """From the checked contract, not the catalog entry's own fields: the schemas and
-        limits an agent sees are the ones its input will be validated against."""
+        limits an agent sees are the ones its input will be validated against.
+
+        An exact version that is retired is described too, as ``retired: true``, from the
+        contract its jobs are checked against (``Kontra._job_contract``, decisions I22): it
+        takes no new jobs, which an agent learns here rather than from an error. Quoting or
+        hiring it is still refused (``offering_retired``)."""
         k = self.kontra()
-        entry = await k.offering(offering)
-        info = k.contract(entry)
-        f = info.facts
+        retired = False
+        try:
+            info = k.contract(await k.offering(offering))
+        except HireRefused as err:
+            exact = err.detail.get("offering")
+            if err.code != "offering_retired" or not isinstance(exact, str):
+                raise
+            info, _ = await k._job_contract(exact)
+            retired = True
+        oid, f = info.offering, info.facts
         defs = info.input_schema.get("$defs")
         return out.DescribeOut(
-            offering=entry.offering,
-            name=entry.name,
-            version=entry.version,
-            seller=entry.party,
+            offering=oid.key,
+            name=oid.full_name,
+            version=str(oid.version),
+            seller=f.party,
             description=f.description,
             pricing_hint=f.pricing_hint,
             tags=list(f.tags),
-            retired=entry.retired,
+            retired=retired,
             contract_hash=info.contract_hash,
             limits=out.LimitsOut(
                 max_duration=format_duration(f.max_duration),
