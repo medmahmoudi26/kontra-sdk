@@ -173,7 +173,9 @@ def api_key_from_env() -> str | None:
 
 class LoginError(Exception):
     """A login that cannot complete. ``code`` is the RFC 8628 error (``access_denied``,
-    ``expired_token``) or one of ours (``key_mismatch``, ``party_mismatch``, ``insecure_gate``)."""
+    ``expired_token``), the gate's ``rate_limited`` (no sign-in link now: the message says
+    whether the gate is busy for a few seconds or how many minutes to wait) or one of ours
+    (``key_mismatch``, ``party_mismatch``, ``insecure_gate``)."""
 
     def __init__(self, code: str, message: str) -> None:
         self.code, self.message = code, message
@@ -182,8 +184,10 @@ class LoginError(Exception):
 
 class ConfirmError(LoginError):
     """A confirmation that cannot complete (decisions I23). ``code``: ``expired`` (the link
-    was not used in time), ``burned`` (it took three wrong codes), ``unavailable`` (only a
-    new sign-in confirms this session), ``rate_limited``, or ``api_key`` (a key never
+    was not used in time, or the gate could not send it and ended the confirmation),
+    ``burned`` (it took three wrong codes), ``unavailable`` (only a new sign-in confirms this
+    session), ``rate_limited`` (the gate busy for a few seconds, or asked too often: the
+    message says which, and then the wait in minutes), or ``api_key`` (a key never
     confirms). Nothing was changed in any of these cases."""
 
 
@@ -795,6 +799,26 @@ async def _check_device_page(gate: GateClient, gate_url: str) -> None:
         )
 
 
+#: A 429 ``rate_limited`` that asks for at most this many seconds is the gate being busy (it
+#: could not count the request in time), not a limit reached (kontra-cloud#36).
+_BUSY_RETRY_MAX_S = 10
+_BUSY = "the gate is busy; try again in a few seconds"
+
+
+def _rate_limited_words(e: GateError) -> str:
+    """What a 429 ``rate_limited`` from the gate's link routes (``POST /v1/auth/magic``,
+    ``POST /v1/auth/confirm``) says to a person: a busy gate (``retry_after_seconds`` of at
+    most :data:`_BUSY_RETRY_MAX_S`) only that, with no wait in minutes to contradict "a few
+    seconds"; a limit reached, the gate's words and the wait, in whole minutes."""
+    retry = (e.detail or {}).get("retry_after_seconds")
+    if not isinstance(retry, int) or isinstance(retry, bool) or retry <= 0:
+        return e.message
+    if retry <= _BUSY_RETRY_MAX_S:
+        return _BUSY
+    minutes = -(-retry // 60)
+    return f"{e.message}; you can ask again in {minutes} minute{'' if minutes == 1 else 's'}"
+
+
 async def login_device(
     gate_url: str,
     handle: str | None = None,
@@ -814,7 +838,9 @@ async def login_device(
     (decisions I19). Polling follows §3.5: ``authorization_pending`` keeps the interval,
     ``slow_down`` adds 5 s for the rest of the flow, a dropped connection doubles it,
     ``expired_token`` and ``access_denied`` (and the code's own ``expires_in`` running out)
-    end it with :class:`LoginError`.
+    end it with :class:`LoginError`. A link the gate refuses for a limit (429) is
+    :class:`LoginError` ``rate_limited``, whose message says how long to wait, before any
+    code is shown (kontra-cloud#36).
     """
     if handle is not None:
         validate_handle(handle)
@@ -835,7 +861,12 @@ async def login_device(
             await _check_device_page(gate, gate_url)
         start = await gate.device_start()
         if address is not None:
-            await gate.magic_link(address, start.user_code)
+            try:
+                await gate.magic_link(address, start.user_code)
+            except GateError as e:
+                if e.code != "rate_limited":
+                    raise
+                raise LoginError(e.code, _rate_limited_words(e)) from e
             (prompt or _email_prompt(address))(start)
         else:
             (prompt or _print_prompt)(start)
@@ -968,7 +999,10 @@ async def login(
 # --------------------------------------------------------------------------- confirm it's you
 
 _API_KEY_CANNOT_CONFIRM = "an API key cannot confirm: unset KONTRA_API_KEY to use your login"
-_CONFIRM_EXPIRED = "the confirmation link expired before the code was typed; nothing was changed"
+#: The poll's ``expired`` also ends a confirmation whose link the gate could not send (its
+#: limits, a mail server's failure, a shutdown), minutes before the link's own ten: these
+#: words cover both, and blame nobody (kontra-cloud#36).
+_CONFIRM_EXPIRED = "the link expired or could not be sent; ask again (nothing was changed)"
 _CONFIRM_BURNED = "the link took three wrong codes and no longer works; nothing was changed"
 _CONFIRM_UNAVAILABLE = (
     "your account cannot confirm it's you by email on this gate: a new sign-in counts as "
@@ -1010,11 +1044,7 @@ def _confirm_refused(e: GateError) -> ConfirmError | None:
     if e.code == "fresh_login_required":
         return ConfirmError("api_key", _API_KEY_CANNOT_CONFIRM)
     if e.code == "rate_limited":
-        retry = (e.detail or {}).get("retry_after_seconds")
-        later = ""
-        if isinstance(retry, int) and not isinstance(retry, bool) and retry > 0:
-            later = f"; you can ask again in {-(-retry // 60)} minute(s)"
-        return ConfirmError("rate_limited", f"{e.message}{later}")
+        return ConfirmError("rate_limited", _rate_limited_words(e))
     return None
 
 

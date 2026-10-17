@@ -63,11 +63,16 @@ def verify_entry(ref: str, entry: m.CatalogEntry) -> ContractInfo:
     """The entry's contract, or a refusal: the document must pass the catalog's rules and
     reproduce its sealed hash, and the entry must describe that document and the version
     asked for. A mismatch means the catalog (or something between) is not to be trusted
-    with code generation."""
+    with code generation.
+
+    A retired version's document is read as its jobs' deliveries are (decisions I22): one
+    spec v1 sealed is accepted too -- every version the 0.2.0 release retired is one -- and
+    its sealed key is never used (the generated client carries no ``x-kontra``)."""
     from kontra.contract import validate_document
     from kontra.contract.names import OfferingRef
 
-    info = validate_document(entry.document)  # ContractError names the path at fault
+    # ContractError names the path at fault
+    info = validate_document(entry.document, read_only=entry.retired)
     wanted = OfferingRef.parse(ref)
     problems: list[str] = []
     if info.contract_hash != entry.contract_hash:
@@ -174,6 +179,12 @@ def pull(
 
     entry = run(fetch)
     info = verify_entry(offering, entry)
+    if entry.retired:  # only an exact version is answered retired (decisions I22)
+        click.echo(
+            f"warning: {entry.offering} is retired: it takes no new jobs (its types still "
+            "match the results of the jobs hired under it)",
+            err=True,
+        )
     out = output if output is not None else _default_output(info.offering.name, language, package)
     out = out.expanduser().resolve()
     if language == "java" and package is not None and out.name != package.rsplit(".", 1)[-1]:

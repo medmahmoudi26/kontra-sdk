@@ -187,7 +187,21 @@ async def test_it_gives_up_when_the_link_runs_out_here_too() -> None:
     with pytest.raises(ConfirmError) as e:
         await _confirm(gate)
     assert e.value.code == "expired"
+    assert e.value.message.startswith("the link expired or could not be sent; ask again")
     assert len(gate.requests) == 3  # the start and two polls, then the deadline
+
+
+async def test_a_link_that_could_not_be_sent_is_not_called_expired_alone() -> None:
+    """The gate ends a confirmation whose link it could not send (its limits, a mail
+    server's failure, a shutdown), and the poll reads ``expired`` long before the link's
+    ten minutes (kontra-cloud#36): the words cover both, and say what to do."""
+    gate = Scripted(httpx.Response(201, json=_start()), [_status("expired")])
+    with pytest.raises(ConfirmError) as e:
+        await _confirm(gate)
+    assert e.value.code == "expired"
+    assert e.value.message.startswith("the link expired or could not be sent; ask again")
+    assert "nothing was changed" in e.value.message
+    assert len(gate.requests) == 2
 
 
 async def test_a_dropped_connection_is_retried_less_often() -> None:
@@ -221,7 +235,19 @@ async def test_a_dropped_connection_is_retried_less_often() -> None:
                 },
             ),
             "rate_limited",
-            "too many sign-in links asked for; try again later; you can ask again in 60",
+            "too many sign-in links asked for; try again later; you can ask again in 60 minutes",
+        ),
+        (
+            httpx.Response(
+                429,
+                json={
+                    "code": "rate_limited",
+                    "message": "this sign-in asked to confirm it's you too often; try again later",
+                    "detail": {"retry_after_seconds": 11},
+                },
+            ),
+            "rate_limited",
+            "too often; try again later; you can ask again in 1 minute",
         ),
         (
             httpx.Response(
@@ -239,6 +265,27 @@ async def test_a_refused_start_is_a_confirm_error(
         await _confirm(Scripted(answer, []))
     assert e.value.code == code
     assert says in e.value.message
+    assert "minute(s)" not in e.value.message  # 1 minute, 60 minutes
+
+
+@pytest.mark.parametrize("retry", [1, 5, 10])
+async def test_a_busy_gate_says_only_that(retry: int) -> None:
+    """A 429 for a few seconds is the gate being busy, not a limit reached: no wait in
+    minutes after "try again in a few seconds" (kontra-cloud#36)."""
+    busy = httpx.Response(
+        429,
+        json={
+            "code": "rate_limited",
+            "message": "the gate is busy; try again in a few seconds",
+            "detail": {"retry_after_seconds": retry},
+        },
+    )
+    with pytest.raises(ConfirmError) as e:
+        await _confirm(Scripted(busy, []))
+    assert (e.value.code, e.value.message) == (
+        "rate_limited",
+        "the gate is busy; try again in a few seconds",
+    )
 
 
 async def test_other_refusals_stay_gate_errors() -> None:

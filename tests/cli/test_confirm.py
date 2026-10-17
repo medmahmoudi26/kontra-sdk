@@ -163,6 +163,16 @@ async def test_kontra_confirm_then_a_script(prod: Prod) -> None:
     assert m.is_api_key((await cli.ok("keys", "create")).stdout.strip())  # no terminal needed
 
 
+#: What `kontra confirm` (or a change asking in place) says when the poll reads `expired`:
+#: the link ran out, or the gate could not send it and ended the confirmation at once
+#: (kontra-cloud#36). One instruction, said once; the spam folder only as a "no mail?".
+_EXPIRED_WORDS = (
+    "error: the link expired or could not be sent; nothing was changed. Run the command again "
+    "for a new one (no mail? check your spam folder; an address gets only so many links an "
+    "hour)\n"
+)
+
+
 async def test_an_expired_link_says_so_and_changes_nothing(prod: Prod, at_a_terminal: None) -> None:
     address, cli = await prod.person()
     prod.mp.gate.advance(HOUR)
@@ -171,11 +181,56 @@ async def test_an_expired_link_says_so_and_changes_nothing(prod: Prod, at_a_term
     prod.mp.gate.advance(timedelta(minutes=10))
     result = await command
     assert result.exit_code == 1, explain(result)
-    assert "error: the confirmation link expired before the code was typed; nothing was" in (
-        result.stderr
-    )
-    assert "Run the command again" in result.stderr
+    assert result.stderr.endswith(_EXPIRED_WORDS), explain(result)
     assert (await cli.json("keys", "list"))["keys"] == []
+
+
+async def test_a_link_the_gate_could_not_send_says_so(prod: Prod) -> None:
+    """The gate ends a confirmation whose link it could not send, and the poll reads
+    ``expired`` at once, minutes before the link's own ten (kontra-cloud#36): `kontra
+    confirm` must not blame the person for a link that never came."""
+    _, cli = await prod.person()
+    prod.mp.gate.advance(HOUR)
+    command = asyncio.create_task(cli.run("confirm"))
+    for _ in range(500):
+        if await prod.gate(lambda g: g.pending_confirm_codes()):
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError("`kontra confirm` never asked")
+
+    def unsent(g: Any) -> None:  # what the gate's sender does when the mail fails
+        for c in g._confirmations.values():
+            if c.status == "pending":
+                c.expires_at = g.now()
+
+    await prod.gate(unsent)
+    result = await command
+    assert result.exit_code == 1, explain(result)
+    assert result.stderr.endswith(_EXPIRED_WORDS), explain(result)
+    assert "expired before the code was typed" not in result.stderr
+
+
+async def test_a_refused_sign_in_link_says_how_long_to_wait(prod: Prod) -> None:
+    """`kontra login --email` past the limits: the gate's 429 carries the wait, and the
+    command says it in minutes (kontra-cloud#36)."""
+    who = handle("mail")
+    address = f"{who}@example.com"
+    await prod.gate(lambda g: g.allow_email(address))
+    cli = Cli(prod.root / who, cwd=prod.root)
+    limit = prod.mp.gate.magic_link_rate_per_client
+    prod.mp.gate.magic_link_rate_per_client = 0  # this client asked too often
+    try:
+        result = await cli.run("login", "--email", address, "--handle", who, "--gate", prod.url)
+    finally:
+        prod.mp.gate.magic_link_rate_per_client = limit
+        # Its device login was started before the link was refused: nobody types that code.
+        await prod.gate(lambda g: [g.deny_device(c) for c in g.pending_user_codes()])
+    assert result.exit_code == 1, explain(result)
+    assert result.stderr == (
+        "error: too many sign-in links asked for; try again later; you can ask again in 60 "
+        "minutes\n"
+    )
 
 
 async def test_three_wrong_codes_say_so(prod: Prod, at_a_terminal: None) -> None:

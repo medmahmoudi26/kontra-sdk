@@ -6,6 +6,7 @@ Temporal dev server, no containers), as a seller and buyers would use it: ``logi
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import re
@@ -20,7 +21,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
-from kontra.contract import from_yaml, nexgen_view
+from kontra.contract import contract_hash, from_yaml, nexgen_view, seal
 from kontra.gate_client import GateClient
 from kontra.profile import Profile
 from kontra.testing import Marketplace
@@ -397,6 +398,45 @@ async def test_pull_verifies_and_hands_nexgen_the_view(shop: Shop) -> None:
     )
     assert missing.exit_code == 1
     assert missing.stderr.startswith("error: the gate answered 404")
+
+
+async def test_pull_of_a_retired_version_warns_and_still_pulls(shop: Shop) -> None:
+    """A retired version takes no new jobs, but the jobs hired under it still read against
+    its contract (decisions I22): `pull` says so on stderr and writes the client all the
+    same -- also from a document spec v1 sealed, as was every version the 0.2.0 release
+    retired."""
+    nexgen = _stand_in_nexgen(shop.root / "fake-nexgen-retired")
+    anyone = Cli(shop.root / "nobody", env={"KONTRA_NEXGEN": str(nexgen)})
+    row = shop.mp.gate.offerings[shop.key]
+    info = row.info
+    seller_key = Profile.load(shop.seller.home).public_key
+    v1 = seal(
+        {**info.document, "x-kontra": {**info.document["x-kontra"], "public_key": seller_key}}
+    )
+    try:
+        row.retired = True
+        for spec, document in (("v2", info.document), ("v1", v1)):
+            row.info = dataclasses.replace(
+                info, document=document, contract_hash=contract_hash(document)
+            )
+            out = shop.root / f"retired-client-{spec}"
+            pulled = await anyone.run(
+                "pull", shop.key, "--lang", "ts", "-o", str(out), "--gate", shop.mp.base_url,
+                "--json",
+            )  # fmt: skip
+            assert pulled.exit_code == 0, (spec, explain(pulled))
+            assert json.loads(pulled.stdout)["contract_hash"] == contract_hash(document), spec
+            assert f"warning: {shop.key} is retired: it takes no new jobs" in pulled.stderr, spec
+            assert (out / "index.ts").is_file(), spec
+        row.info, row.retired = info, False
+        fresh = await anyone.run(
+            "pull", shop.key, "--lang", "ts", "-o", str(shop.root / "live-client"),
+            "--gate", shop.mp.base_url,
+        )  # fmt: skip
+        assert fresh.exit_code == 0, explain(fresh)
+        assert "retired" not in fresh.stderr
+    finally:
+        row.info, row.retired = info, False
 
 
 async def test_job_result_downloads_the_artifacts(shop: Shop) -> None:
