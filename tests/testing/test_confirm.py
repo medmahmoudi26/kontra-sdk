@@ -267,7 +267,8 @@ async def test_the_operator_asks_sign_ins_to_confirm_again(prod: Gate) -> None:
     for party, prefix, why in (
         ("bob", None, "no party 'bob'"),
         ("ann", laptop.session_id[:7], "8 to 32 lower-case hex"),  # too short
-        ("ann", laptop.session_id[:12].upper(), "8 to 32 lower-case hex"),
+        # Upper case, always: a 12-hex prefix of digits only (1 in 280) has no letter to raise.
+        ("ann", "A" + laptop.session_id[1:12], "8 to 32 lower-case hex"),
         ("ann", "f" * 12, r"no session\(s\) of ann"),  # 2**-48 of being a real one
         ("ann", key_session[:12], "an API key's session can never confirm"),
     ):
