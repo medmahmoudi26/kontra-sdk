@@ -12,8 +12,9 @@ Confirm it's you (decisions I23): a change (a ``fresh``, ``recent`` or ``resolve
 the gate answers 403 ``confirmation_required`` is handed to the client's ``confirm`` hook, when
 it has one; if the hook confirms the session, the same request is sent once more. The gate
 decides that 403 before the route does anything, so nothing happened the first time. A
-``recent`` row (adding a passkey, decisions I24) needs a confirmation of the last five minutes,
-so a hook must complete a new one rather than accept the session's running hour.
+``recent`` row (adding a passkey or a device, decisions I24, I25) needs a confirmation of the
+last five minutes, so a hook must complete a new one rather than accept the session's running
+hour. A call made ``quiet`` (registering a device right after a sign-in) never asks the hook.
 
 Errors: a non-2xx answer raises :class:`GateError` (decoded from
 :class:`~kontra.gate_client.models.ErrorBody`, or synthesised with code ``http_error`` when
@@ -29,7 +30,7 @@ import asyncio
 import codecs
 import json
 import re
-from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar, runtime_checkable
 from urllib.parse import quote
@@ -93,11 +94,18 @@ class GateError(Exception):
         super().__init__(f"{status} {code}: {message}")
 
 
+def _answer(model: type[_ModelT], body: bytes | str) -> _ModelT:
+    """One of the gate's answers, read as a client reads them (from 0.2.4): a field it does
+    not know is skipped, so a newer gate may add one; everything it knows is checked as
+    strictly as ever."""
+    return model.model_validate_json(body, extra="ignore", context=m.ANSWER_CONTEXT)
+
+
 def _error_from(resp: httpx.Response) -> GateError:
     """Decode an error answer. The body must already be read."""
     body = resp.content
     try:
-        err = m.ErrorBody.model_validate_json(body)
+        err = _answer(m.ErrorBody, body)
     except ValidationError:
         pass
     else:
@@ -384,12 +392,16 @@ class GateClient:
         path: Mapping[str, str] | None = None,
         params: Mapping[str, str | int | None] | None = None,
         body: BaseModel | None = None,
+        quiet: bool = False,
     ) -> httpx.Response:
+        """``quiet``: a 403 ``confirmation_required`` is raised as it is, never handed to the
+        ``confirm`` hook (a call made on the client's own initiative, which must never make a
+        person confirm: registering a device right after a sign-in, decisions I25)."""
         resp = await self._send(name, path=path, params=params, body=body)
         if resp.is_success:
             return resp
         err = _error_from(resp)
-        need = self._confirmable(BY_NAME[name], err)
+        need = None if quiet else self._confirmable(BY_NAME[name], err)
         if need is None or self._confirm is None or not await self._confirm(name, need):
             raise err
         # The same request once more: the 403 came before the route did anything.
@@ -420,12 +432,13 @@ class GateClient:
         path: Mapping[str, str] | None = None,
         params: Mapping[str, str | int | None] | None = None,
         body: BaseModel | None = None,
+        quiet: bool = False,
     ) -> _ModelT:
         if BY_NAME[name].response is not model:
             raise TypeError(f"route {name} does not answer {model.__name__}")  # a bug here
-        resp = await self._call(name, path=path, params=params, body=body)
+        resp = await self._call(name, path=path, params=params, body=body, quiet=quiet)
         try:
-            return model.model_validate_json(resp.content)
+            return _answer(model, resp.content)
         except ValidationError as e:
             raise GateError(
                 resp.status_code,
@@ -589,6 +602,29 @@ class GateClient:
         body = m.PasskeyConfirm(ceremony_id=ceremony_id, credential=dict(credential))
         return await self._model("confirm_passkey", m.PasskeyConfirmed, body=body)
 
+    # devices (decisions I25)
+    async def devices(self, *, for_: str | None = None) -> m.DeviceList:
+        """The party's live devices, oldest first: the keys each job's key is copied to.
+        ``for_``: this device's key, which the gate then marks used (a browser device nobody
+        uses for :data:`~kontra.gate_client.models.DEVICE_IDLE_SECONDS` is retired). An API
+        key's session reads the keys, not the labels."""
+        return await self._model("devices", m.DeviceList, params={"for": for_})
+
+    async def add_device(
+        self, label: str, public_key: str, kind: m.DeviceKind, *, quiet: bool = False
+    ) -> m.DeviceView:
+        """Add a device that reads the jobs this party hires (``recent``: a confirmation of
+        the last five minutes, which a sign-in is). The same live key again answers the same
+        view; a removed one is 409 ``device_revoked``. ``quiet``: never ask the ``confirm``
+        hook (the automatic registration after a sign-in asks nobody anything)."""
+        body = m.AddDevice(label=label, public_key=public_key, kind=kind)
+        return await self._model("add_device", m.DeviceView, body=body, quiet=quiet)
+
+    async def remove_device(self, public_key: str) -> None:
+        """Remove a device (a change): it gets no key of a new job, and the gate deletes the
+        copies it kept for it. What it already opened cannot be taken back."""
+        await self._none("remove_device", path={"public_key": public_key})
+
     # catalog
     async def publish(self, document: dict[str, Any]) -> m.CatalogEntry:
         return await self._model(
@@ -651,15 +687,31 @@ class GateClient:
         state: str | None = None,
         cursor: str | None = None,
         limit: int = 50,
+        include_buyer_key: bool = False,
     ) -> m.JobList:
+        """``include_buyer_key``: each job with its ``buyer_key`` (only when asked: 0.2.3 and
+        older cannot parse it)."""
         return await self._model(
             "jobs",
             m.JobList,
-            params={"as": as_, "state": state, "cursor": cursor, "limit": limit},
+            params={
+                "as": as_,
+                "state": state,
+                "cursor": cursor,
+                "limit": limit,
+                "include": "buyer_key" if include_buyer_key else None,
+            },
         )
 
-    async def job(self, job_id: str) -> m.JobView:
-        return await self._model("job", m.JobView, path={"job_id": job_id})
+    async def job(self, job_id: str, *, include_buyer_key: bool = False) -> m.JobView:
+        """``include_buyer_key``: with the job's own key (the hold's ``buyer_key``), which
+        the gate sends only when asked."""
+        return await self._model(
+            "job",
+            m.JobView,
+            path={"job_id": job_id},
+            params={"include": "buyer_key" if include_buyer_key else None},
+        )
 
     async def seller_job(self, job_id: str) -> m.SellerJobView:
         return await self._model("seller_job", m.SellerJobView, path={"job_id": job_id})
@@ -684,6 +736,36 @@ class GateClient:
 
     async def result(self, job_id: str) -> m.ResultView:
         return await self._model("result", m.ResultView, path={"job_id": job_id})
+
+    async def job_key(self, job_id: str, *, for_: str | None = None) -> m.JobKey:
+        """The buyer's view of a job's key: its exact ``buyer_key``, the wraps to the
+        party's live devices (``for_``: to that device only), and a challenge for sharing
+        it. A seller is refused 403 ``forbidden``, anyone else 404 ``job_not_found``."""
+        return await self._model("job_key", m.JobKey, path={"job_id": job_id}, params={"for": for_})
+
+    async def job_keys(
+        self,
+        lacking: str,
+        *,
+        for_: str | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> m.JobKeyList:
+        """The caller's shareable buyer jobs with no wrap to the device ``lacking`` (one of
+        the party's live devices, else 404 ``device_not_found``), by job id. Each item's wraps
+        are to the live devices, or to ``for_`` only."""
+        return await self._model(
+            "job_keys",
+            m.JobKeyList,
+            params={"lacking": lacking, "for": for_, "cursor": cursor, "limit": limit},
+        )
+
+    async def share_job_keys(self, items: Sequence[m.JobKeyShare]) -> m.SharedJobKeys:
+        """Store wraps of job keys, each job's with its proof. Wraps that exist already (the
+        first write wins) or are to no live device are skipped; a job refused is named."""
+        return await self._model(
+            "share_job_keys", m.SharedJobKeys, body=m.ShareJobKeys(items=list(items))
+        )
 
     def progress(self, job_id: str, *, after: int = 0) -> AsyncIterator[m.ProgressEvent]:
         """Server-sent events until the job is closed; reconnects from the last ``seq``."""
@@ -722,7 +804,7 @@ class GateClient:
                         if sse.event not in ("message", "progress") or not sse.data:
                             continue
                         try:
-                            event = m.ProgressEvent.model_validate_json(sse.data)
+                            event = _answer(m.ProgressEvent, sse.data)
                         except ValidationError as e:
                             raise GateError(
                                 resp.status_code,

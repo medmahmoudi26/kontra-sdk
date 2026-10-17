@@ -13,7 +13,12 @@ import pytest
 from kontra.auth import LoginError, login, login_device
 from kontra.gate_client import models as m
 from kontra.profile import Profile
-from kontra.testing.fake_gate import FakeGate
+from kontra.testing.fake_gate import (
+    SUBJECT_DEVICE_ADDED,
+    SUBJECT_SIGN_IN,
+    FakeGate,
+    Principal,
+)
 
 
 @pytest.fixture
@@ -45,8 +50,41 @@ async def test_login_by_email_writes_the_profile(gate: FakeGate, tmp_path: Path)
     assert await human == "approved"
     assert (profile.party, profile.tls, profile.dev) == ("ann", True, False)
     assert Profile.load(tmp_path).party == "ann"
-    assert [mail.to for mail in gate.outbox] == ["ann@example.com"]
+    # the sign-in link, then the notice that this machine became a device (decisions I25)
+    assert [(mail.to, mail.subject) for mail in gate.outbox] == [
+        ("ann@example.com", SUBJECT_SIGN_IN),
+        ("ann@example.com", SUBJECT_DEVICE_ADDED),
+    ]
     assert codes[0] not in gate.outbox[0].text
+    [device] = gate.list_devices(_principal(gate, "ann")).devices
+    assert (device.public_key, device.kind) == (profile.public_key, "cli")
+
+
+async def test_login_no_device_adds_no_device(gate: FakeGate, tmp_path: Path) -> None:
+    """``kontra login --no-device``: a recipient, never a device, and no notice."""
+    codes: list[str] = []
+    human = asyncio.create_task(_the_human(gate, codes, handle="ann"))
+    outcomes: list[object] = []
+    await login(
+        gate.base_url,
+        email="ann@example.com",
+        handle="ann",
+        home=tmp_path,
+        transport=httpx.ASGITransport(app=gate.app),
+        prompt=lambda start: codes.append(start.user_code),
+        device=False,
+        on_device=outcomes.append,
+    )
+    assert await human == "approved"
+    assert outcomes == []
+    assert [mail.subject for mail in gate.outbox] == [SUBJECT_SIGN_IN]
+    assert gate.list_devices(_principal(gate, "ann")).devices == []
+    assert '"device": "declined"' in (tmp_path / "devices.json").read_text()
+
+
+def _principal(gate: FakeGate, party: str) -> Principal:
+    session = next(s for s in gate.sessions.values() if s.party == party)
+    return Principal(party, session.id, session.auth_time, "api")
 
 
 async def test_the_terminal_shows_the_code_and_opens_no_browser(

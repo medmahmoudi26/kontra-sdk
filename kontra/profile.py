@@ -41,6 +41,7 @@ from pydantic import (
 from kontra.contract.names import is_handle
 
 __all__ = [
+    "DEVICE_KEY_FILE",
     "JOBS_DIR",
     "KEY_FILE",
     "KEY_FILE_ENV",
@@ -54,6 +55,10 @@ __all__ = [
 
 PROFILE_FILE = "profile"
 KEY_FILE = "key"
+#: This machine's own device key (decisions I25), made by ``kontra devices add --new-key``
+#: once its key file was removed as a device (a removed key never comes back). Without it the
+#: key file is the device key. Never a recipient: only copies of job keys are encrypted to it.
+DEVICE_KEY_FILE = "device.key"
 #: Where a worker's age identity comes from when it is not ``$KONTRA_HOME/key``: a fleet
 #: mounts ONE key into every pod from a secret, and pod churn never changes the party's
 #: recipient set, so an in-flight input stays decryptable by whichever worker takes the
@@ -313,6 +318,48 @@ class Profile(BaseModel):
         return found[0]
 
     @staticmethod
+    def device_key_path(home: Path | str | None = None) -> Path:
+        """Where this machine's own device key lives, when it has one (decisions I25)."""
+        return _resolve(home) / DEVICE_KEY_FILE
+
+    @staticmethod
+    def device_identity(home: Path | str | None = None, *, fallback: str | None = None) -> str:
+        """This machine's device key (decisions I25): its own ``device.key`` when it has
+        one, else its key file (``fallback``, when the caller read it already)."""
+        from kontra.codec.age import is_identity
+
+        path = Profile.device_key_path(home)
+        try:
+            text = _read_private(path).decode("utf-8")
+        except FileNotFoundError:
+            return fallback if fallback is not None else Profile.identity(home)
+        except UnicodeDecodeError as e:
+            raise ProfileError(f"the device key file {path} is not text") from e
+        found = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+        if len(found) != 1 or not is_identity(found[0]):
+            raise ProfileError(
+                f"the device key file {path} must hold exactly one AGE-SECRET-KEY-1... line"
+            )
+        return found[0]
+
+    @staticmethod
+    def save_device_identity(secret: str, home: Path | str | None = None) -> Path:
+        """Write ``secret`` as this machine's own device key (0600, atomically), in place of
+        one there before -- which was removed as a device too: a live one is never replaced
+        (``kontra devices add --new-key`` checks)."""
+        from kontra.codec.age import public_key_of
+
+        path = Profile.device_key_path(home)
+        _ensure_dir(path.parent)
+        created = datetime.now(UTC).replace(microsecond=0).isoformat()
+        text = (
+            f"# this machine's device key (kontra devices), created: {created}\n"
+            f"# public key: {public_key_of(secret)}\n{secret}\n"
+        )
+        _write_private(path, text.encode(), replace=True)
+        return path
+
+    @staticmethod
     def ensure_identity(home: Path | str | None = None) -> tuple[str, str]:
         """``(identity, public key)``, creating the key on first use. An existing key is
         always kept, also when two processes race to create one."""
@@ -395,6 +442,21 @@ class Profile(BaseModel):
         return secret, public
 
     @staticmethod
+    def save_job_identity(job_id: str, secret: str, home: Path | str | None = None) -> Path:
+        """Write the key of a job hired elsewhere, which reached this machine as a copy for
+        one of the account's devices (decisions I25): 0600, never over a key already
+        there, in the same format as a key made here."""
+        from kontra.codec.age import public_key_of
+
+        path = Profile.job_key_path(job_id, home)
+        _ensure_dir(path.parent)
+        public = public_key_of(secret)
+        created = datetime.now(UTC).replace(microsecond=0).isoformat()
+        text = f"# job: {job_id}\n# created: {created}\n# public key: {public}\n{secret}\n"
+        _write_private(path, text.encode(), replace=False)
+        return path
+
+    @staticmethod
     def job_identity(job_id: str, home: Path | str | None = None) -> tuple[str, str]:
         """This job's keypair from disk."""
         path = Profile.job_key_path(job_id, home)
@@ -403,9 +465,9 @@ class Profile(BaseModel):
         except FileNotFoundError:
             raise ProfileError(
                 f"no key for job {job_id} at {path}: it is written by `kontra hire` on the "
-                "machine that hired, and `kontra job <id> --accept` shreds it. Without "
-                "it this "
-                "delivery cannot be read -- by anyone."
+                "machine that hired, or by `kontra job <id> --result` from this machine's copy "
+                "when another of your devices shared it, and `kontra job <id> --accept` shreds "
+                "it here."
             ) from None
 
     @staticmethod

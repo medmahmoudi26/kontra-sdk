@@ -457,6 +457,7 @@ async def test_adding_a_passkey_waits_for_a_confirmation_made_now(prod_gate: Fak
 
 async def test_only_a_recent_row_needs_a_confirmation_made_now() -> None:
     assert _confirm_now("passkey_options")
+    assert _confirm_now("add_device")  # decisions I25: a device gets past jobs' keys
     for route in ("add_passkey", "revoke_passkey", "create_api_key", "publish", "nope"):
         assert not _confirm_now(route)
 
@@ -502,3 +503,32 @@ async def test_a_key_never_confirms_and_never_asks(dev_gate: FakeGate) -> None:
             await session.confirm()
     assert e.value.code == "api_key"
     assert requests == []
+
+
+async def test_a_confirmation_makes_an_older_login_a_device(
+    prod_gate: FakeGate, tmp_path: Any
+) -> None:
+    """A login from before devices existed (decisions I25) becomes one at its next
+    confirmation, which is ``recent``: no prompt more. One declined (``--no-device``) never
+    does, nor a login held in memory only."""
+    from kontra import _devices
+
+    def show(start: m.ConfirmStart) -> None:
+        link = prod_gate.outbox[-1].link
+        asyncio.create_task(prod_gate.use_magic_link(link, start.user_code or ""))  # noqa: RUF006
+
+    async def no_wait(_: float) -> None:
+        await asyncio.sleep(0)
+
+    _, public = Profile.ensure_identity(tmp_path)
+    async with await _email_session(prod_gate, home=tmp_path, sleep=no_wait) as ann:
+        _devices.decline_device(tmp_path, prod_gate.base_url, "ann")  # `--no-device`
+        await asyncio.wait_for(ann.confirm(show=show), 30)
+        assert (await ann.gate.devices()).devices == []  # declined: never by itself
+
+        (tmp_path / _devices.STATE_FILE).unlink()  # a login from before devices existed
+        await asyncio.wait_for(ann.confirm(show=show), 30)
+        [device] = (await ann.gate.devices()).devices
+        assert (device.public_key, device.kind) == (public, "cli")
+        state = _devices.DeviceState.load(tmp_path, prod_gate.base_url, "ann")
+        assert state.device == "added"

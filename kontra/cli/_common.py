@@ -65,8 +65,12 @@ _HINTS = {
     "stale_session": "your login is too old for this (it needs a recent one): run "
     "`kontra login` and try again",
     "fresh_login_required": "an API key hires and serves, but publishing, changing "
-    "recipients and seeing or managing keys need a person's login: unset KONTRA_API_KEY",
+    "recipients or devices and seeing or managing keys need a person's login: unset "
+    "KONTRA_API_KEY",
     "invalid_token": "the gate no longer accepts this session: run `kontra login`",
+    "device_revoked": "that key was removed as a device and can never be added again: "
+    "`kontra devices add --new-key` adds this machine with a key of its own",
+    "too_many_devices": "remove a device first: `kontra devices list`",
 }
 
 

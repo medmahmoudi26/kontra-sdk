@@ -1,10 +1,13 @@
 """The ``kontra`` command (PRD §12).
 
 ```
-kontra login [--gate URL] [--email ADDR] [--dev --handle H]
-                                               device flow (or a mailed link); key registered
+kontra login [--gate URL] [--email ADDR] [--dev --handle H] [--no-device]
+                                               device flow (or a mailed link); key registered,
+                                               this machine one of your devices (I25)
 kontra confirm                                 confirm it's you: an hour of changes (I23)
 kontra keys create|list|revoke                 API keys for programs (KONTRA_API_KEY)
+kontra recipients add|list|revoke              keys others encrypt to you (I7)
+kontra devices list|add [--new-key]|remove      machines and browsers that read your jobs (I25)
 kontra init <name> [--party P]                 scaffold an offering (§6.1)
 kontra dev [up|down|status|logs]               the local stack (compose.yaml)
 kontra publish | serve | contract [--dir D]    sell worker.py's offerings (§11.4, §6.5)
@@ -12,6 +15,8 @@ kontra status [--workers] [<offering>...]      whether your workers keep up (Tem
 kontra pull <offering> --lang go|python|typescript|java
 kontra quote|hire <offering> -f in.json        buy (§7.1)
 kontra jobs | job <id> [--accept|--reject R|--cancel|--progress|--result DIR]
+                                               a job hired in the console or elsewhere reads
+                                               here too: its key reaches every device
 kontra balance | topup <amount> | mcp
 ```
 
@@ -36,6 +41,7 @@ from kontra.cli._account import balance, confirm, login, topup
 from kontra.cli._buyer import hire, job, jobs, quote
 from kontra.cli._common import KontraGroup, fail
 from kontra.cli._dev import dev
+from kontra.cli._devices import devices
 from kontra.cli._keys import keys
 from kontra.cli._pull import pull
 from kontra.cli._recipients import recipients
@@ -66,6 +72,7 @@ for _command in (
     confirm,
     keys,
     recipients,
+    devices,
     init,
     dev,
     publish,

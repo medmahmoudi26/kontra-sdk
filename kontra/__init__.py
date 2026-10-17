@@ -23,7 +23,7 @@ from kontra._parallel import Page
 if TYPE_CHECKING:
     from kontra.serve import Worker, serve
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 __all__ = ["ApplicationError", "Page", "RetryPolicy", "Worker", "activity", "serve", "workflow"]
 
