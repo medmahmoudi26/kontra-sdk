@@ -6,7 +6,7 @@ toolchain go1.26.9
 
 require (
 	github.com/golang-jwt/jwt/v4 v4.5.2
-	go.temporal.io/api v1.63.6
+	go.temporal.io/api v1.63.7
 	go.temporal.io/server v1.32.1
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
