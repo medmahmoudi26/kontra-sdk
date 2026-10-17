@@ -32,24 +32,32 @@ from pydantic import (
     SerializationInfo,
     SerializerFunctionWrapHandler,
     StringConstraints,
+    ValidationInfo,
     field_validator,
     model_serializer,
     model_validator,
 )
 
 __all__ = [
+    "ANSWER_CONTEXT",
     "API_KEY_ID_PATTERN",
     "API_KEY_LABEL_PATTERN",
     "API_KEY_PATTERN",
     "API_KEY_PREFIX",
     "API_VERSION",
     "CEREMONY_ID_PATTERN",
+    "CHALLENGE_MAX",
     "CONFIRMATION_REQUIRED",
     "CONFIRM_ID_PATTERN",
+    "DEVICES_MAX",
+    "DEVICE_ADDS_PER_HOUR",
     "DEVICE_GRANT",
+    "DEVICE_IDLE_SECONDS",
+    "DEVICE_LABEL_PATTERN",
     "EMAIL_MAX",
     "HANDOFF_PATTERN",
     "HANDOFF_TTL_SECONDS",
+    "HIDDEN_DEVICE_LABEL",
     "MAX_API_KEYS",
     "MAX_PARTS",
     "MAX_PASSKEYS",
@@ -58,11 +66,14 @@ __all__ = [
     "POLLERS_MAX",
     "RECENT_CONFIRMATION_SECONDS",
     "REVOCATION_WINDOW_MAX",
+    "SHARE_ITEMS_MAX",
     "USER_CODE_ALPHABET",
     "USER_CODE_PATTERN",
     "WEBAUTHN_JSON_MAX",
+    "WRAP_MAX",
     "AcceptRequest",
     "AccessToken",
+    "AddDevice",
     "AddKey",
     "ApiKeyCreate",
     "ApiKeyCreated",
@@ -83,7 +94,10 @@ __all__ = [
     "ConfirmationRequired",
     "DeliveryView",
     "DevLogin",
+    "DeviceKind",
+    "DeviceList",
     "DeviceStart",
+    "DeviceView",
     "DownloadUrl",
     "ErrorBody",
     "Escrow",
@@ -91,9 +105,14 @@ __all__ = [
     "HireRequest",
     "HireView",
     "HoldClaims",
+    "JobInclude",
+    "JobKey",
+    "JobKeyList",
+    "JobKeyShare",
     "JobList",
     "JobState",
     "JobView",
+    "KeyWrap",
     "MagicLinkRequest",
     "MagicLinkSent",
     "Me",
@@ -122,6 +141,10 @@ __all__ = [
     "SellerJobView",
     "SessionList",
     "SessionView",
+    "ShareJobKeys",
+    "ShareRefusal",
+    "ShareRefusalCode",
+    "SharedJobKeys",
     "StartRequest",
     "TaskQueueStats",
     "TaskQueueType",
@@ -135,6 +158,7 @@ __all__ = [
     "UploadPart",
     "WirePayload",
     "WorkersView",
+    "WrapIn",
     "is_api_key",
     "is_api_key_id",
     "is_ceremony_id",
@@ -292,18 +316,33 @@ def is_user_code(text: str) -> bool:
     return _USER_CODE.fullmatch(text) is not None
 
 
+#: The validation context a client parses the gate's answers with, ``extra="ignore"``: a
+#: field a newer gate adds to an answer is skipped instead of failing the call (0.2.0-0.2.3
+#: refuse it, which is why a gate adds none to what they read). The gate's own requests are
+#: validated strictly, unknown fields refused, as always.
+ANSWER_CONTEXT: dict[str, bool] = {"kontra.answer": True}
+
+
+def _is_answer(info: ValidationInfo) -> bool:
+    context: object = info.context
+    return isinstance(context, dict) and context.get("kontra.answer") is True  # pyright: ignore[reportUnknownMemberType]
+
+
 class _M(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     @model_validator(mode="before")
     @classmethod
-    def _unknown_keys_are_few_errors(cls, data: Any) -> Any:
+    def _unknown_keys_are_few_errors(cls, data: Any, info: ValidationInfo) -> Any:
         """``extra="forbid"`` reports every unknown key as an error of its own, located by
         the key: 4 MiB of stray keys cost a gate ~300 MiB, and a megabyte-long key ends up
         in the error's location and in the gate's message. A few short ones are left to
         pydantic's own report; anything more is refused here, before any field is
-        validated, as one error that names the first few by their first characters."""
-        if isinstance(data, dict):
+        validated, as one error that names the first few by their first characters.
+
+        Not for an answer a client reads (:data:`ANSWER_CONTEXT`): it ignores the fields it
+        does not know, so a newer gate's answer parses (from 0.2.4)."""
+        if isinstance(data, dict) and not _is_answer(info):
             unknown = [key for key in data if key not in cls.model_fields]
             if len(unknown) > _UNKNOWN_REPORTED or any(
                 not isinstance(key, str) or len(key) > _UNKNOWN_KEY_REPORTED for key in unknown
@@ -815,6 +854,162 @@ class PartyView(_M):
     disputed: int = 0
 
 
+# --------------------------------------------------------------------------- devices & job keys
+#
+# Share to my account (decisions I25). A *device* is a key that reads the jobs the party
+# hires: a browser profile's, or a ``kontra login`` machine's ``~/.kontra/key``. Devices are a
+# set of their own, never the recipients: recipients include fleet keys mounted on every
+# seller worker, are public, and receive seller input. Each job's key is copied to each live
+# device as a *wrap* (age ciphertext to that device alone), which the gate stores and cannot
+# read. Every model here is new: no existing answer gained a field, so 0.2.0-0.2.3 keep
+# parsing every answer of a gate that serves these routes.
+#
+# A device's life: added by a recent sign-in, removed by a person (``revoked``: never again),
+# or -- a *browser* only -- **retired** by the gate: one nobody has used for
+# :data:`DEVICE_IDLE_SECONDS` (a private window, a profile deleted), or the browser used least
+# recently when a new device needs room past :data:`DEVICES_MAX`. A retired device is listed
+# nowhere and gets nothing, but keeps its copies and comes back when its browser adds it again
+# (the same key: no mail, nothing to confirm beyond the add's own ``recent``).
+
+#: The live devices one party may hold at once. A new one past it takes the place of the
+#: browser used least recently (retired); with no browser to retire, ``409 too_many_devices``.
+DEVICES_MAX = 32
+#: A browser device nobody used for this long is retired: no browser profile that is still
+#: around goes a month without a catch-up (``GET /v1/me/devices?for=<it>`` marks it used), and
+#: a sign-in that idle has expired anyway. A ``kontra login`` machine is never retired.
+DEVICE_IDLE_SECONDS = 30 * 24 * 3600
+#: New devices one party may add in an hour, removed and retired ones included (``429
+#: rate_limited``): each mails the party's address. A device coming back is not counted.
+DEVICE_ADDS_PER_HOUR = 48
+#: The largest wrap, in bytes of age ciphertext (one is about 340).
+WRAP_MAX = 1024
+#: The largest challenge, in bytes of age ciphertext (one is 243).
+CHALLENGE_MAX = 512
+#: The jobs one ``POST /v1/me/job-keys`` carries at most.
+SHARE_ITEMS_MAX = 100
+#: A device's label: the API key label rule, 1 to 64 printable ASCII characters. Shown, never
+#: parsed: nothing decides access by it.
+DEVICE_LABEL_PATTERN = API_KEY_LABEL_PATTERN
+#: A browser profile, or a ``kontra login`` machine.
+DeviceKind = Literal["browser", "cli"]
+#: A device's label as an API key's session reads it: the names of a person's browsers and
+#: machines are for the person's sign-ins, not for a program.
+HIDDEN_DEVICE_LABEL = "(hidden from API keys)"
+_B64_STD = r"^[A-Za-z0-9+/]*={0,2}$"
+_Wrap = Annotated[str, StringConstraints(max_length=4 * -(-WRAP_MAX // 3), pattern=_B64_STD)]
+_Challenge = Annotated[
+    str, StringConstraints(max_length=4 * -(-CHALLENGE_MAX // 3), pattern=_B64_STD)
+]
+#: base64url (unpadded) of an HMAC-SHA256: what a job's challenge holds.
+_Proof = Annotated[str, StringConstraints(max_length=43, pattern=r"^[A-Za-z0-9_-]{43}$")]
+_SessionPrefix = Annotated[str, StringConstraints(max_length=12, pattern=r"^[0-9a-f]{12}$")]
+
+
+class AddDevice(_M):
+    """``POST /v1/me/devices``: one more device that reads the jobs this party hires, under
+    a label that says which browser or machine holds it. Needs a confirmation of the last
+    five minutes (``recent``): a device also gets the keys of past jobs (decisions I25).
+    Adding a live device again answers the same view; a removed one is never added again."""
+
+    label: _KeyLabel
+    public_key: _Name
+    kind: DeviceKind
+
+
+class DeviceView(_M):
+    """One of the party's live devices (``GET /v1/me/devices``)."""
+
+    public_key: _Name
+    label: _KeyLabel
+    kind: DeviceKind
+    added_at: datetime
+    #: The first 12 hex of the sign-in that added it (as the sign-ins list shows it); None
+    #: once that sign-in's record is gone, and to an API key's session (as the label, which
+    #: is then :data:`HIDDEN_DEVICE_LABEL`: a program needs the keys, not the names).
+    added_by: _SessionPrefix | None = None
+    #: The last read for it (``?for=<it>`` on ``GET /v1/me/devices``, ``/v1/jobs/{id}/key``
+    #: or ``/v1/me/job-keys``), to the minute; None to an API key's session.
+    last_used_at: datetime | None = None
+
+
+class DeviceList(_M):
+    """``GET /v1/me/devices``: the party's live devices, oldest first."""
+
+    devices: list[DeviceView] = Field(max_length=_PAGE_MAX)
+
+
+class KeyWrap(_M):
+    """A job key's copy for one device: age ciphertext to ``recipient`` alone (base64)."""
+
+    recipient: _Name
+    wrap: _Wrap
+    wrapped_at: datetime
+
+
+class JobKey(_M):
+    """``GET /v1/jobs/{id}/key`` (the buyer's): the job's exact ``buyer_key`` (the one its
+    hold token seals), its wraps to the party's live devices (or to the ``for`` device
+    only), and a challenge -- this session's proof, encrypted to ``buyer_key`` -- for
+    sharing the key (``POST /v1/me/job-keys``). A job whose ``buyer_key`` is or was one of the
+    party's recipients (every job from before per-job keys) is never shared: no wraps."""
+
+    job_id: _Name
+    buyer_key: _Name
+    wraps: list[KeyWrap] = Field(max_length=DEVICES_MAX)
+    challenge: _Challenge
+
+
+class JobKeyList(_M):
+    """``GET /v1/me/job-keys?lacking=<device>``: the caller's shareable buyer jobs with no
+    wrap to that device, by job id; pass ``next_cursor`` back for more."""
+
+    items: list[JobKey] = Field(max_length=_PAGE_MAX)
+    next_cursor: _Long | None = None
+
+
+class WrapIn(_M):
+    """One wrap to store: the job key, encrypted to the device ``recipient`` alone."""
+
+    recipient: _Name
+    wrap: _Wrap
+
+
+class JobKeyShare(_M):
+    """The wraps of one job, with the proof that the sender holds its key (the job's
+    challenge, opened)."""
+
+    job_id: _Name
+    proof: _Proof = Field(repr=False)
+    wraps: list[WrapIn] = Field(max_length=DEVICES_MAX)
+
+
+class ShareJobKeys(_M):
+    """``POST /v1/me/job-keys``."""
+
+    items: list[JobKeyShare] = Field(max_length=SHARE_ITEMS_MAX)
+
+
+#: Why one job of a share was refused: not the caller's as buyer (or no such job), never
+#: shared (its key is or was a recipient's), a proof that is not this session's for it now,
+#: a wrap that is not one X25519 age file.
+ShareRefusalCode = Literal["job_not_found", "not_shareable", "bad_proof", "invalid_wrap"]
+
+
+class ShareRefusal(_M):
+    job_id: _Name
+    code: _Name
+
+
+class SharedJobKeys(_M):
+    """``POST /v1/me/job-keys`` (200): wraps ``stored``; wraps ``skipped`` (one for that job
+    and device exists already -- the first write wins -- or the recipient is not a live
+    device); the jobs ``refused`` whole, each with its code (:data:`ShareRefusalCode`)."""
+
+    stored: int = Field(ge=0)
+    skipped: int = Field(ge=0)
+    refused: list[ShareRefusal] = Field(default_factory=list, max_length=SHARE_ITEMS_MAX)
+
+
 # --------------------------------------------------------------------------- catalog
 
 
@@ -1040,6 +1235,15 @@ class DeliveryView(_M):
     delivered_at: datetime
 
 
+#: ``GET /v1/jobs/{id}?include=buyer_key`` (and ``GET /v1/jobs``): what a client asks to be
+#: added to :class:`JobView`.
+JobInclude = Literal["buyer_key"]
+
+
+def _absent(value: object) -> bool:
+    return value is None
+
+
 class JobView(_M):
     job_id: _Name
     offering: _Name
@@ -1058,6 +1262,11 @@ class JobView(_M):
     reason: _Text | None = None  # failure / cancel / dispute reason, platform-observable only
     operation_id: _Name
     workflow_id: _Name
+    #: The job's own key, the one its hold token seals (decisions I7, I25): sent only when
+    #: asked (``?include=buyer_key``) and absent from the JSON otherwise -- never ``null`` --
+    #: since 0.2.0-0.2.3 parse every answer strictly and would refuse the field. With it a
+    #: client looks the job's key up by name instead of trying each one.
+    buyer_key: _Name | None = Field(default=None, exclude_if=_absent)
 
 
 class StartRequest(_M):

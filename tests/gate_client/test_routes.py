@@ -33,6 +33,8 @@ AUTHENTICATED = {
     "resolver",
     "resolver_human",
 }
+AGE = "age1" + "q" * 58
+PROOF = "p" * 43
 CONFIRM_ID = "cfm_" + "0" * 32
 CEREMONY_ID = "wac_" + "0" * 32
 PASSKEY_ID = "pky_" + "0" * 32
@@ -75,6 +77,9 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     "revoke_passkey": (lambda c: c.revoke_passkey(PASSKEY_ID), {"passkey_id": PASSKEY_ID}),
     "confirm_passkey_options": (lambda c: c.confirm_passkey_options(), {}),
     "confirm_passkey": (lambda c: c.confirm_passkey(CEREMONY_ID, {"id": "x"}), {}),
+    "devices": (lambda c: c.devices(), {}),
+    "add_device": (lambda c: c.add_device("laptop", AGE, "cli"), {}),
+    "remove_device": (lambda c: c.remove_device(AGE), {"public_key": AGE}),
     "publish": (lambda c: c.publish({"nexusrpc": "1.0.0"}), {}),
     "search": (lambda c: c.search("enrich"), {}),
     "get_offering": (
@@ -100,6 +105,14 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     "cancel": (lambda c: c.cancel(JOB), {"job_id": JOB}),
     "start": (lambda c: c.start(JOB, WP), {"job_id": JOB}),
     "result": (lambda c: c.result(JOB), {"job_id": JOB}),
+    "job_key": (lambda c: c.job_key(JOB), {"job_id": JOB}),
+    "job_keys": (lambda c: c.job_keys(AGE), {}),
+    "share_job_keys": (
+        lambda c: c.share_job_keys(
+            [m.JobKeyShare(job_id=JOB, proof=PROOF, wraps=[m.WrapIn(recipient=AGE, wrap="AAAA")])]
+        ),
+        {},
+    ),
     "progress": (lambda c: _drain(c.progress(JOB)), {"job_id": JOB}),
     "post_progress": (
         lambda c: c.post_progress(
@@ -351,6 +364,27 @@ async def test_temporal_token_role_is_checked_locally() -> None:
         with pytest.raises(ValueError, match="worker"):
             await c.temporal_token("publisher")
     assert rec.requests == []
+
+
+async def test_job_key_queries() -> None:
+    """``for`` (a Python keyword) is sent as ``for``; ``lacking`` always, the rest when given."""
+
+    def respond(r: httpx.Request) -> httpx.Response:
+        model = m.JobKeyList if r.url.path == "/v1/me/job-keys" else m.JobKey
+        return json_response(200, minimal(model))
+
+    rec = Recorder(respond)
+    async with GateClient("http://gate.test", token=static("t"), transport=rec.transport) as c:
+        await c.job_key(JOB)
+        await c.job_key(JOB, for_=AGE)
+        await c.job_keys(AGE)
+        await c.job_keys(AGE, for_=AGE, cursor=JOB, limit=7)
+    assert [query(r) for r in rec.requests] == [
+        {},
+        {"for": AGE},
+        {"lacking": AGE, "limit": "100"},
+        {"lacking": AGE, "for": AGE, "cursor": JOB, "limit": "7"},
+    ]
 
 
 async def test_disputes_can_be_paged() -> None:

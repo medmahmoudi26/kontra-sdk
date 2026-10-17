@@ -250,7 +250,7 @@ async def test_a_client_made_here_is_closed_here_and_a_given_one_is_not(
     assert tools.kontra() is given
 
     made = StubKontra()
-    monkeypatch.setattr(_server, "Kontra", lambda: made)
+    monkeypatch.setattr(_server, "Kontra", lambda **_: made)  # with its notice hook
     tools = KontraTools()
     assert tools.kontra() is made
     tools._keep(quote("q", None))

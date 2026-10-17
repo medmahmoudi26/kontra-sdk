@@ -38,7 +38,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
@@ -58,7 +58,7 @@ from temporalio.converter import DataConverter, NexusSerializationContext
 from temporalio.exceptions import NexusOperationAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
-from kontra import _runtime
+from kontra import _devices, _runtime
 from kontra.artifacts import download, iter_plaintext, upload
 from kontra.auth import Session
 from kontra.codec import CodecError, GateBlobStore, KontraCodec, data_converter
@@ -73,6 +73,7 @@ from kontra.hire._errors import (
     InvalidDelivery,
     InvalidInput,
     JobFailed,
+    JobKeyMissing,
     KontraError,
     PriceAboveMax,
     QuoteRejected,
@@ -118,6 +119,22 @@ _VERDICT_MARGIN = 60.0
 _VERDICT_MAX_WAIT = 300.0
 #: How long a cancelled hire spends cancelling its job at the gate before it gives up.
 _ABANDON_WAIT = 10.0
+#: How long sharing a new job's key with the account's devices may take (decisions I25),
+#: and how long closing a client waits for the shares still under way.
+_SHARE_WAIT = 10.0
+#: Why a job's key is not on this machine, in words (:class:`~kontra.hire.JobKeyMissing`).
+_KEY_MISSING = {
+    "no_wrap": "this job's key has not reached this machine: a device that has it (where it "
+    "was hired) shares it when it is next online",
+    "not_a_device": "this job's key has not reached this machine: this machine is not one of "
+    "your devices (`kontra devices add`)",
+    "older_key": "this job was hired before per-job keys and is encrypted to your account's "
+    "older key {key}: only that machine's ~/.kontra/key reads it",
+    "no_key_file": "this job was hired elsewhere and this machine has no key of its own to "
+    "receive it with (`kontra login`)",
+    "api_key": "an API key's session reads only the jobs it hires: read this one where it was "
+    "hired, or with your login (`kontra login`)",
+}
 #: What a job the gate could not be told about becomes.
 _UNSETTLED = (
     "its hold could not be cancelled at the gate, so it refunds at the job's deadline "
@@ -457,6 +474,7 @@ class Job:
         # (a task group, an agent's aborted tool call) would carry on as if it had not been
         # cancelled -- here, open and validate a delivery nobody is waiting for.
         async with asyncio.timeout(timeout):  # None: no deadline
+            await self._kontra._ensure_job_key(self.job_id)
             value = await self._outcome()
         self._delivered = True
         return await self._kontra._deliver(self, value, output_type)
@@ -510,6 +528,7 @@ class Job:
     async def progress(self) -> AsyncIterator[Progress]:
         """Progress until the job closes: the seller's heartbeats (decrypted with our key)
         and liveness from history, in order. Server-sent events through the gate."""
+        await self._kontra._ensure_job_key(self.job_id, required=False)
         events = self._kontra.gate.progress(self.job_id)
         try:
             async for event in events:
@@ -525,11 +544,13 @@ class Job:
         """Release the escrow to the seller now (otherwise automatic when the review
         window closes).
 
-        ``shred_key``: delete this job's key once the escrow is released. The delivery
-        has been read and accepted, so the ciphertext the gate and the bucket still hold
-        stops being readable at all -- forward secrecy by deletion (decisions I7). Pass
-        ``shred_key=False`` to keep it (to re-read the result later, or for a dispute
-        after the fact)."""
+        ``shred_key``: delete this machine's key file for the job once the escrow is
+        released (decisions I7). That is no longer forward secrecy: every device of the
+        account -- this machine included, when it is one -- keeps its copy of the key at
+        the gate while the job exists (decisions I25), so the ciphertext the gate and the
+        bucket hold stays readable by the account's devices (and only by them), and a later
+        :meth:`result` here fetches this machine's copy again. Pass ``shred_key=False`` to
+        keep the file."""
         await self._gate_saw_delivery()
         view = await self._kontra.gate.accept(self.job_id)
         if shred_key:
@@ -574,6 +595,16 @@ class Job:
 # --------------------------------------------------------------------------- the client
 
 
+def _device_identity(session: Session, identity: str) -> str:
+    """This machine's device key: its own ``device.key`` when it has one, else its key file.
+    A damaged ``device.key`` is said, and the key file used: never the client's failure."""
+    try:
+        return Profile.device_identity(session.identity_home, fallback=identity)
+    except ProfileError as err:
+        log.warning("%s; reading with the key file instead", err)
+        return identity
+
+
 class Kontra:
     """The buyer's client. ``Kontra()`` uses ``KONTRA_API_KEY`` when it is set, else the
     profile in ``$KONTRA_HOME`` (:meth:`kontra.auth.Session.from_env`); tests pass a
@@ -585,6 +616,12 @@ class Kontra:
     worker in the same process keeps its own. Artifacts this client returns are bound to it.
     An API key's session learns its party from the gate, so with one the key check and the
     runtime wait for ``async with Kontra()`` or the first call.
+
+    A job hired here has its key copied to every device of the account (decisions I25), in
+    the background; a job hired elsewhere reads here once its key reached this machine's
+    device key (``~/.kontra/key``). ``on_new_device`` is told, once, of each device of the
+    account this machine sees for the first time; :meth:`sync_job_keys` catches the devices
+    up.
     """
 
     def __init__(
@@ -595,6 +632,7 @@ class Kontra:
         home: str | Path | None = None,
         client: Client | None = None,
         start_timeout: float = 5.0,
+        on_new_device: _devices.Notify | None = None,
     ) -> None:
         if profile is not None and session is not None:
             raise TypeError("pass a profile or a session, not both")
@@ -608,10 +646,31 @@ class Kontra:
         # hire` works on a machine that has never logged in (decisions I7).
         try:
             identity = session.identity()
+            #: This machine's device key (decisions I25): its key file, or the device key of
+            #: its own once that was removed as a device (``kontra devices add --new-key``).
+            #: With none -- or on an API key's session, which is no device -- the client
+            #: reads only the jobs it hires itself (and those its key file was hired to).
+            self._device_identity: str | None = (
+                None if session.uses_api_key else _device_identity(session, identity)
+            )
         except NotLoggedIn:
             identity, _ = age_crypto.generate_identity()
+            self._device_identity = None
         self.public_key = age_crypto.public_key_of(identity)
         self._identity = identity
+        #: This machine's key as one of the account's devices (usually :attr:`public_key`).
+        self._device_key = (
+            age_crypto.public_key_of(self._device_identity)
+            if self._device_identity is not None
+            else None
+        )
+        #: Shares of new jobs' keys still under way (:meth:`_share_soon`).
+        self._shares: set[asyncio.Task[None]] = set()
+        #: Told, once per device, of a device of the account this machine has not shown
+        #: yet, before any key is copied to it (default: a warning in the log). Returning
+        #: False means "not shown yet": nothing is copied to it from here until
+        #: :meth:`devices_shown` (``kontra mcp`` shows it in its next answer).
+        self.on_new_device = on_new_device
         #: Every job key this machine holds, plus any made during this client's life. age
         #: tries each stanza against each identity, so one client reads any job it hired;
         #: `kontra job <id> --accept` shreds a key and shortens the list.
@@ -746,6 +805,7 @@ class Kontra:
         if self._closed:
             return
         self._closed = True
+        await self._settle_shares()
         if self._runtime is not None:
             _runtime.uninstall(self._runtime)
         if self._owns_session:
@@ -989,7 +1049,7 @@ class Kontra:
             if secret not in self._job_identities:
                 self._job_identities.append(secret)
         else:
-            _, buyer_key = age_crypto.generate_identity()
+            secret, buyer_key = age_crypto.generate_identity()  # never used: the gate refuses
             pending = None
         try:
             hired = await self.gate.hire(q.quote_id, buyer_key=buyer_key, max_price_minor=cap)
@@ -1045,6 +1105,8 @@ class Kontra:
                 detail={"job_id": hired.job_id},
             )
         self._keys.remember(hired.endpoint, hired.seller_recipients)
+        if pending is not None:
+            self._share_soon(hired.job_id, secret)
         return hired
 
     async def _start(self, hired: m.HireView, value: dict[str, Any]) -> Job:
@@ -1180,6 +1242,7 @@ class Kontra:
         if q.quote_id is None or Profile.job_key_path(job_id, home).exists():
             return
         Profile.claim_job_identity(Profile.pending_job_key_path(q.quote_id, home), job_id, home)
+        _devices.mark_unshared(job_id, home)  # the next catch-up shares it
 
     async def _quote_job(self, q: QuoteResult) -> str | None:
         """The job the gate made of ``q`` when no hire of it here got the gate's answer, or
@@ -1381,6 +1444,147 @@ class Kontra:
             )
             return "unreached"
         return "cancelled" if view is not None else "closed"
+
+    # ------------------------------------------------------------------ the account's devices
+
+    def _share_soon(self, job_id: str, secret: str) -> None:
+        """Share a new job's key with the account's devices (decisions I25) in the
+        background, so a hire never waits for it, nor fails or is cancelled by it. A marker
+        (``jobs/<id>.unshared``) stays until it succeeds: the next catch-up retries it."""
+        home = self._session.identity_home
+        _devices.mark_unshared(job_id, home)
+        task = asyncio.get_running_loop().create_task(self._share(job_id, secret))
+        self._shares.add(task)
+        task.add_done_callback(self._shares.discard)
+
+    async def _share(self, job_id: str, secret: str) -> None:
+        home = self._session.identity_home
+        try:
+            async with asyncio.timeout(_SHARE_WAIT):
+                listed = (await self.gate.devices()).devices
+                if not self._session.uses_api_key:  # a program persists nothing of its own
+                    gate_url, party = self.profile.gate_url, self.party
+                    _devices.notice_new_devices(
+                        listed,
+                        home=home,
+                        gate_url=gate_url,
+                        party=party,
+                        mine=self._device_key,
+                        notify=self.on_new_device,
+                    )
+                    # Only to the devices shown to the person (D5); one whose notice waits
+                    # is caught up once it is shown.
+                    listed = _devices.shown(
+                        listed, home=home, gate_url=gate_url, party=party, mine=self._device_key
+                    )
+                await _devices.share_job_key(self.gate, job_id, secret, devices=listed)
+        except GateError as err:
+            if _devices.unsupported(err):  # a gate without devices: nothing to share with
+                _devices.clear_unshared(job_id, home)
+                return
+            log.warning("job %s: its key is not shared with your devices yet: %s", job_id, err)
+            return
+        except Exception as err:  # never the hire's failure: the next catch-up retries it
+            log.warning(
+                "job %s: its key is not shared with your devices yet (%s)",
+                job_id,
+                f"{type(err).__name__}: {err}" if str(err) else type(err).__name__,
+            )
+            return
+        _devices.clear_unshared(job_id, home)
+
+    async def _settle_shares(self) -> None:
+        """Wait (bounded) for the shares under way; cancel what is left (it is retried)."""
+        if not self._shares:
+            return
+        _, left = await asyncio.wait(set(self._shares), timeout=_SHARE_WAIT)
+        for task in left:
+            task.cancel()
+        if left:
+            await asyncio.wait(left)
+
+    async def _ensure_job_key(self, job_id: str, *, required: bool = True) -> None:
+        """Before reading a job: its key from this machine's copy at the gate when no key
+        here reads it (a job hired in a browser or on another machine, decisions I25),
+        written to ``jobs/<id>.key`` and used from then on. ``required``:
+        :class:`JobKeyMissing` when the gate says no key here can read the job; otherwise
+        (and when the gate cannot say) the decryption decides, as before."""
+        home = self._session.identity_home
+        try:
+            if Profile.job_key_path(job_id, home).exists():
+                return
+        except ValueError:
+            return  # not a job id: the gate answers that
+        found = await _devices.fetch_job_key(
+            self.gate,
+            job_id,
+            home=home,
+            identity=self._device_identity,
+            held=(self._identity, *self._job_identities),
+        )
+        if found.secret is not None:
+            if found.secret != self._identity and found.secret not in self._job_identities:
+                self._job_identities.append(found.secret)
+            return
+        if found.reason is None or not required:
+            return
+        # A job that closed without a delivery says so, as where it was hired: the missing
+        # key would not matter (and the reason the person needs is the failure).
+        with contextlib.suppress(GateError, httpx.TransportError):
+            view = await self.gate.job(job_id)
+            if view.delivery is None and view.state in (m.JobState.FAILED, m.JobState.CANCELED):
+                raise JobFailed(
+                    view.reason or f"the job is {view.state.value}",
+                    state=view.state.value,
+                    job_id=job_id,
+                )
+        reason = "api_key" if self._session.uses_api_key else found.reason
+        text = _KEY_MISSING.get(reason, _KEY_MISSING["no_wrap"])
+        raise JobKeyMissing(
+            f"job {job_id}: " + text.format(key=found.buyer_key),
+            job_id=job_id,
+            reason=reason,
+            buyer_key=found.buyer_key,
+        )
+
+    async def sync_job_keys(
+        self,
+        *,
+        budget: float = _devices.SYNC_BUDGET,
+        notify: _devices.Notify | None = None,
+    ) -> _devices.SyncReport | None:
+        """Catch up the account's devices from this machine (decisions I25): the shares of
+        new jobs still under way, then those that failed, then every device this machine
+        has not served yet, from the job keys it holds -- within ``budget`` seconds.
+        ``notify`` is told of each device this machine sees for the first time (default:
+        :attr:`on_new_device`, else a warning in the log). Never raises: None when it could
+        not run at all."""
+        await self._settle_shares()
+        try:
+            await self._ready()
+            return await _devices.sync_job_keys(
+                self.gate,
+                home=self._session.identity_home,
+                identity=self._device_identity,
+                gate_url=self.profile.gate_url,
+                party=self.party,
+                budget=budget,
+                notify=notify or self.on_new_device,
+                catch_up=not self._session.uses_api_key,
+            )
+        except Exception as err:
+            log.warning("your devices were not caught up: %s", err)
+            return None
+
+    async def devices_shown(self, keys: Iterable[str]) -> None:
+        """The person has now been shown these devices (an :attr:`on_new_device` that said
+        False, shown since): this machine copies keys to them from its next catch-up."""
+        if self._session.uses_api_key:
+            return
+        await self._ready()
+        _devices.mark_shown(
+            keys, home=self._session.identity_home, gate_url=self.profile.gate_url, party=self.party
+        )
 
     # ------------------------------------------------------------------ delivery & progress
 

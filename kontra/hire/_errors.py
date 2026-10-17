@@ -24,6 +24,7 @@ __all__ = [
     "InvalidDelivery",
     "InvalidInput",
     "JobFailed",
+    "JobKeyMissing",
     "KontraError",
     "PriceAboveMax",
     "QuoteRejected",
@@ -178,6 +179,29 @@ class InvalidDelivery(KontraError):
         self.job_id, self.value = job_id, value
 
 
+class JobKeyMissing(KontraError):
+    """This machine holds no key that reads the job: the job was hired elsewhere and no
+    copy of its key reached this machine (decisions I25). ``reason``: ``no_wrap`` (a device
+    holding the key has not been online since this one was added), ``not_a_device`` (this
+    machine is not one of the account's devices: ``kontra devices add``), ``older_key``
+    (hired before per-job keys, to the account's older key: that machine's key file reads
+    it), ``no_key_file`` (no ``kontra login`` on this machine), ``api_key`` (a program's
+    session is no device: it reads the jobs it hires). Nothing was read."""
+
+    wire_type = _PREFIX + "JobKeyMissing"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        job_id: str | None = None,
+        reason: str = "",
+        buyer_key: str | None = None,
+    ) -> None:
+        super().__init__(message, job_id=job_id, reason=reason, buyer_key=buyer_key)
+        self.job_id, self.reason, self.buyer_key = job_id, reason, buyer_key
+
+
 _BY_TYPE: dict[str, type[KontraError]] = {
     c.wire_type: c
     for c in (
@@ -190,6 +214,7 @@ _BY_TYPE: dict[str, type[KontraError]] = {
         InvalidInput,
         JobFailed,
         InvalidDelivery,
+        JobKeyMissing,
     )
 }
 

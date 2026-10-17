@@ -4,6 +4,7 @@ contract, encrypts it, and decrypts what comes back."""
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from kontra.cli._account import notice
 from kontra.cli._common import emit_json, fail, printable, read_input, run, to_jsonable
 from kontra.gate_client.models import JobState
 
@@ -146,31 +148,48 @@ def hire(
 
     value = read_input(source)
 
-    async def go() -> dict[str, Any]:
-        async with Kontra() as k:
-            j = await k.hire(offering, value, max_price=max_price)
-            out: dict[str, Any] = {
-                "job_id": j.job_id,
-                "offering": j.offering,
-                "price": str(j.price),
-                "currency": j.currency,
-            }
-            if not as_json:
-                click.echo(f"hired {j.offering}: job {j.job_id} at {j.price} {j.currency}")
-            if wait or accept_:
-                out["result"] = to_jsonable(await j.result())
-                if accept_:
-                    out["state"] = to_jsonable(await j.accept())
-            return out
+    async def go() -> None:
+        async with Kontra(on_new_device=notice) as k:
+            show(await act(k))
+            # Then the shares owed and the devices not served yet (decisions I25), the
+            # output already printed: a catch-up never holds back what was asked.
+            await k.sync_job_keys()
 
-    out = run(go)
-    if as_json:
-        emit_json(out)
-        return
-    if "result" in out:
-        emit_json(out["result"])
-    if "state" in out:
-        click.echo(f"accepted: escrow {out['state']['escrow']}")
+    async def act(k: Kontra) -> dict[str, Any]:
+        j = await k.hire(offering, value, max_price=max_price)
+        out: dict[str, Any] = {
+            "job_id": j.job_id,
+            "offering": j.offering,
+            "price": str(j.price),
+            "currency": j.currency,
+        }
+        if not as_json:
+            click.echo(f"hired {j.offering}: job {j.job_id} at {j.price} {j.currency}")
+        if wait or accept_:
+            out["result"] = to_jsonable(await j.result())
+            if accept_:
+                out["state"] = to_jsonable(await j.accept())
+        return out
+
+    def show(out: dict[str, Any]) -> None:
+        if as_json:
+            emit_json(out)
+        else:
+            if "result" in out:
+                emit_json(out["result"])
+            if "state" in out:
+                click.echo(f"accepted: escrow {out['state']['escrow']}")
+        _flush()
+
+    run(go)
+
+
+def _flush() -> None:
+    """What a command printed, out before it catches up the devices (a pipe sees it now)."""
+    import sys
+
+    with contextlib.suppress(OSError, ValueError):
+        sys.stdout.flush()
 
 
 @click.command()
@@ -191,20 +210,25 @@ def hire(
 @_JSON
 def jobs(as_: str, state: str | None, limit: int, as_json: bool) -> None:
     """Your jobs, newest first."""
+    from kontra._devices import READ_BUDGET
     from kontra.hire import Kontra
 
-    async def go() -> list[m.JobView]:
-        async with Kontra() as k:
-            return await k.jobs(as_=as_, state=state, limit=limit)
+    async def go() -> None:
+        async with Kontra(on_new_device=notice) as k:
+            show(await k.jobs(as_=as_, state=state, limit=limit))
+            await k.sync_job_keys(budget=READ_BUDGET)  # after the output, briefly
 
-    found = run(go)
-    if as_json:
-        emit_json(found)
-        return
-    if not found:
-        click.echo(f"no jobs as {as_}")
-    for v in found:
-        click.echo(_job_line(v))
+    def show(found: list[m.JobView]) -> None:
+        if as_json:
+            emit_json(found)
+        else:
+            if not found:
+                click.echo(f"no jobs as {as_}")
+            for v in found:
+                click.echo(_job_line(v))
+        _flush()
+
+    run(go)
 
 
 def _private_dirs(directory: Path) -> None:
@@ -326,25 +350,42 @@ def job(
             return {"result": str(target), "artifacts": [str(f) for f in files]}
         return await j.status()
 
-    async def go() -> Any:
-        async with Kontra() as k:
-            return await act(k, await k.job(job_id))
+    from kontra._devices import READ_BUDGET
 
-    out = run(go)
-    if as_json:
+    async def go() -> None:
+        async with Kontra(on_new_device=notice) as k:
+            show(await act(k, await k.job(job_id)))
+            await k.sync_job_keys(budget=READ_BUDGET)  # after the output, briefly
+
+    def show(out: Any) -> None:
+        _show_job_outcome(out)
+        _flush()
+
+    def _show_job_outcome(out: Any) -> None:
+        if as_json:
+            if progress:
+                emit_json([_progress_dict(p) for p in out])
+            else:
+                emit_json(out)
+            return
         if progress:
-            emit_json([_progress_dict(p) for p in out])
-        else:
-            emit_json(out)
-        return
-    if progress:
-        return
-    if result_dir is not None:
-        click.echo(f"wrote {out['result']}")
-        for f in out["artifacts"]:
-            click.echo(f"  artifact {f}")
-        return
-    _show_job(out)
+            return
+        if accept_:
+            _show_job(out)
+            click.echo(
+                "  key       this machine's key file for it is shredded; each of your devices, "
+                "this one included, keeps its copy at Kontra while the job exists and can read "
+                "it again"
+            )
+            return
+        if result_dir is not None:
+            click.echo(f"wrote {out['result']}")
+            for f in out["artifacts"]:
+                click.echo(f"  artifact {f}")
+            return
+        _show_job(out)
+
+    run(go)
 
 
 def _progress_dict(p: Any) -> dict[str, Any]:

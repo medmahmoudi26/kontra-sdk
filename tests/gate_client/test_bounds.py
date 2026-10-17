@@ -22,6 +22,8 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, ValidationError
 
+from kontra import _jobkeys as jk
+from kontra.codec import age
 from kontra.contract import agent_card, from_yaml
 from kontra.contract.names import HANDLE_MAX
 from kontra.contract.offering import DESCRIPTION_MAX, PRICING_HINT_MAX
@@ -52,6 +54,10 @@ URL = "https://bucket.example/" + "p" * 4096
 JWT = "e" * 4096
 #: A WebAuthn credential id at its largest (L3: 1023 bytes), as base64url.
 CREDENTIAL_ID = base64.urlsafe_b64encode(b"\0" * 1023).rstrip(b"=").decode()
+#: A wrap as the clients make one (decisions I25): a job key file, age-encrypted to a device.
+WRAP_B64 = jk.wrap_job_key("0" * 32, age.generate_identity()[0], age.generate_identity()[1])
+#: The largest wrap a gate keeps, as base64.
+WRAP_MAX_B64 = base64.b64encode(b"w" * m.WRAP_MAX).decode()
 TRANSPORTS = ["usb", "nfc", "ble", "smart-card", "hybrid", "internal"]
 #: The browser's answer to a registration at its largest: the longest credential id, an RSA
 #: key, and an attestation with a certificate chain (``none`` is what the gates ask for; a
@@ -221,6 +227,7 @@ def test_a_few_short_stray_keys_are_reported_where_they_are() -> None:
         (m.DevLogin, "handle", 255),
         (m.AddKey, "public_key", 255),
         (m.AddKey, "label", 255),
+        (m.AddDevice, "public_key", 255),
         (m.QuoteRequest, "offering", 255),
         (m.HireRequest, "quote_id", 255),
         (m.ResolveRequest, "note", 8 * 1024),
@@ -279,6 +286,18 @@ def _largest_request(model: type[BaseModel]) -> dict[str, Any]:
             "label": "l" * 64,
             "credential": REGISTRATION,
         },
+        m.AddDevice: {"label": "l" * 64, "public_key": AGE_KEY, "kind": "browser"},
+        # A catch-up's page: a hundred jobs, each wrapped to the device being served.
+        m.ShareJobKeys: {
+            "items": [
+                {
+                    "job_id": f"{i:032x}",
+                    "proof": "p" * 43,
+                    "wraps": [{"recipient": AGE_KEY, "wrap": WRAP_B64}],
+                }
+                for i in range(m.SHARE_ITEMS_MAX)
+            ]
+        },
         m.PasskeyConfirm: {
             "ceremony_id": "wac_" + "0" * 32,
             "credential": {
@@ -305,6 +324,8 @@ _BODY_LIMIT = {
     m.PublishRequest: 2 * MiB,
     m.ArtifactComplete: 1 * MiB,
     m.ProgressPost: 128 * 1024,
+    # A hundred jobs, or one job wrapped to thirty-two devices, with room.
+    m.ShareJobKeys: 256 * 1024,
 }
 
 
@@ -331,6 +352,8 @@ _BODY_LIMIT = {
         m.AcceptRequest,
         m.PasskeyAdd,
         m.PasskeyConfirm,
+        m.AddDevice,
+        m.ShareJobKeys,
     ],
 )
 def test_the_largest_legitimate_request_is_accepted(model: type[BaseModel]) -> None:
@@ -511,6 +534,28 @@ def test_the_largest_legitimate_responses_are_accepted() -> None:
         "revoked_by": "operator",
     }
     m.PasskeyList.model_validate({"rp_id": "r" * 253, "passkeys": [view] * 50})
+    # Devices at the cap; a page of job keys, each wrapped to every device at the largest
+    # size a gate keeps, with its challenge (decisions I25).
+    device = {
+        "public_key": AGE_KEY,
+        "label": "l" * 64,
+        "kind": "browser",
+        "added_at": NOW,
+        "added_by": "0" * 12,
+        "last_used_at": NOW,
+    }
+    m.DeviceList.model_validate({"devices": [device] * m.DEVICES_MAX})
+    wrap = {"recipient": AGE_KEY, "wrap": WRAP_MAX_B64, "wrapped_at": NOW}
+    challenge = base64.b64encode(b"c" * m.CHALLENGE_MAX).decode()
+    item = {
+        "job_id": "0" * 32,
+        "buyer_key": AGE_KEY,
+        "wraps": [wrap] * m.DEVICES_MAX,
+        "challenge": challenge,
+    }
+    m.JobKeyList.model_validate({"items": [item] * 200, "next_cursor": "0" * 32})
+    refused = [{"job_id": "0" * 32, "code": "bad_proof"}] * m.SHARE_ITEMS_MAX
+    m.SharedJobKeys.model_validate({"stored": 0, "skipped": 0, "refused": refused})
     # A version's task queue at its largest: every type with a full listing of pollers,
     # each at Temporal's default identity limit and its build id limit, and an SDK name and
     # version as long as Control lets through (kontra._control fits a heartbeat's to 255).

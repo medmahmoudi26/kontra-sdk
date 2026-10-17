@@ -11,6 +11,8 @@ unit test with no containers.
 * :class:`SoftAuthenticator` -- a software WebAuthn authenticator: real passkey answers for
   either gate (decisions I24); :mod:`kontra.testing.passkey_contract` -- the passkey rules
   both gates pass.
+* :mod:`kontra.testing.jobkey_contract` -- the rules of devices and job-key wraps both gates
+  pass (decisions I25).
 
 The gate, the marketplace and the authenticator need the ``testing`` extra (FastAPI,
 uvicorn, webauthn); they are imported on first use, so ``from kontra.testing import

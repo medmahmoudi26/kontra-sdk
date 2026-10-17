@@ -14,6 +14,7 @@ import httpx
 import pytest
 from fastapi.routing import APIRoute
 
+from kontra import _jobkeys as jk
 from kontra.artifacts import download, upload
 from kontra.codec import GateBlobStore
 from kontra.codec.age import encrypt, generate_identity
@@ -36,10 +37,14 @@ _A_BUYER_KEY = "age1e0q4lyexsefmh6hurumvgl3cmmsfnz4zyfhkd7lfrjcpqc2e250qs6j4el"
 
 QUERY = {
     "search": {"q", "cursor", "limit"},
-    "jobs": {"as", "state", "cursor", "limit"},
+    "jobs": {"as", "state", "cursor", "limit", "include"},
+    "job": {"include"},
+    "devices": {"for"},
     "balance": {"currency"},
     "progress": {"after"},
     "disputes": {"cursor", "limit"},
+    "job_key": {"for"},
+    "job_keys": {"lacking", "for", "cursor", "limit"},
 }
 
 
@@ -205,6 +210,28 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     three = await hired()
     assert (await buyer.gate.cancel(three.job_id)).state is m.JobState.CANCELED
     assert len((await buyer.gate.jobs()).items) == 3
+
+    # devices and a job's key (decisions I25): a device added, a job hired with a key held
+    # here, its key wrapped to the device with the proof, listed, read back, the device removed
+    phone_secret, phone = generate_identity()
+    assert (await buyer.gate.add_device("phone", phone, "browser")).public_key == phone
+    assert phone in [d.public_key for d in (await buyer.gate.devices()).devices]
+    job_secret, job_key = generate_identity()
+    q4 = await buyer.gate.quote(entry.name, wire(json_payload({"text": "hi"})))
+    assert q4.quote_id is not None
+    four = await buyer.gate.hire(q4.quote_id, buyer_key=job_key, max_price_minor=500)
+    assert four.job_id in [i.job_id for i in (await buyer.gate.job_keys(phone)).items]
+    held = await buyer.gate.job_key(four.job_id)
+    share = m.JobKeyShare(
+        job_id=four.job_id,
+        proof=jk.open_challenge(held.challenge, job_secret),
+        wraps=[m.WrapIn(recipient=phone, wrap=jk.wrap_job_key(four.job_id, job_secret, phone))],
+    )
+    assert (await buyer.gate.share_job_keys([share])).stored == 1
+    [wrap] = (await buyer.gate.job_key(four.job_id, for_=phone)).wraps
+    assert jk.unwrap_job_key(wrap.wrap, phone_secret, job_key) == job_secret
+    await buyer.gate.remove_device(phone)
+    await buyer.gate.cancel(four.job_id)
 
     topped = await buyer.gate.topup(1000)
     assert topped.credited

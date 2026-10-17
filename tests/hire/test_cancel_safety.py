@@ -21,10 +21,14 @@ from kontra.hire import Job
 
 
 class _Kontra:
-    """The one call ``Job.result`` makes on its client once it has the outcome."""
+    """The calls ``Job.result`` makes on its client: the job's key first (here, on this
+    machine already), and once it has the outcome, the delivery."""
 
     def __init__(self) -> None:
         self.delivered: list[Any] = []
+
+    async def _ensure_job_key(self, job_id: str, *, required: bool = True) -> None:
+        return None
 
     async def _deliver(self, job: Job, value: Any, output_type: Any) -> Any:
         self.delivered.append(value)

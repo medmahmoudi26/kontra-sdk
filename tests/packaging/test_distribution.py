@@ -72,6 +72,11 @@ def test_the_wheel_has_what_kontra_dev_and_the_contract_read(dist: Path) -> None
         "kontra/_spec/kontra-types.v1.json",
         "kontra/templates/offering/worker.py.tmpl",
         "kontra/testing/fake_gate.py",
+        # What the platform gate imports, never copies (decisions I24, I25).
+        "kontra/_passkeys.py",
+        "kontra/_jobkeys.py",
+        "kontra/testing/passkey_contract.py",
+        "kontra/testing/jobkey_contract.py",
     ):
         assert needed in names, needed
     [sdist] = dist.glob("*.tar.gz")
@@ -88,7 +93,7 @@ def test_the_metadata_is_what_pypi_shows(dist: Path) -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     assert "Name: kontra-sdk\n" in meta
     assert f"Version: {project['version']}\n" in meta
-    assert "Version: 0.2.3\n" in meta
+    assert "Version: 0.2.4\n" in meta
     assert "Requires-Python: >=3.11\n" in meta
     assert "License-Expression: Apache-2.0\n" in meta
     assert "Project-URL: Homepage, https://kontra.run\n" in meta

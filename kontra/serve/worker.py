@@ -396,8 +396,8 @@ class Worker:
             # sub-job's delivery is encrypted to the JOB's key, which `kontra.hire` wrote
             # under this home (decisions I7). Read from disk so a delivery decoded outside
             # the hiring client -- a bound artifact, a later activity -- still opens.
-            # Local to this host: a fleet that hires needs the shared-key work the issue
-            # defers (`kontra hire --share`).
+            # Local to this host: a fleet's mounted key is never one of the account's
+            # devices (decisions I25), so a sub-job's key stays where it was hired.
             more_identities=lambda: tuple(Profile.job_identities(home_dir)),
             jobs=jobs,
         )
