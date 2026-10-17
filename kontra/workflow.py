@@ -14,6 +14,8 @@ module and everything it imports is loaded once per process, never per run: noth
 ``kontra`` keeps mutable module-level state that a workflow could see.
 """
 
+from typing import TYPE_CHECKING, Any
+
 from temporalio.workflow import (
     ActivityCancellationType,
     ActivityHandle,
@@ -86,9 +88,26 @@ __all__ = [
 
 # The OpenAI Agents SDK through the façade, when the [agents] extra is installed: the agent
 # loop runs as workflow code, every model call, tool activity and MCP operation as an activity.
+# Imported when a workflow first names them, never with this module: importing ``agents`` is
+# how a workflow says it runs an agent, and the worker reads that (kontra._agents). So they
+# are in ``__all__`` for type checkers only: a star import would resolve them. ``dir()`` lists
+# them.
 from kontra import _agents
 
-if _agents.AVAILABLE:
-    from kontra._agents import activity_as_tool, mcp_server
+if TYPE_CHECKING:
+    from temporalio.openai_agents.workflow import activity_as_tool
+    from temporalio.openai_agents.workflow import temporal_mcp_server as mcp_server
 
     __all__ += ["activity_as_tool", "mcp_server"]
+
+
+def __getattr__(name: str) -> Any:
+    if name in _agents.FACADE:
+        value = _agents.facade(name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), *(_agents.FACADE if _agents.AVAILABLE else ())})

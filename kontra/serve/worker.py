@@ -116,18 +116,18 @@ async def _refused(session: Session | None) -> str | None:
     return None
 
 
-def seller_data_converter(codec: KontraCodec, *, agents: bool = False) -> DataConverter:
+def seller_data_converter(codec: KontraCodec, *, plugins: object = None) -> DataConverter:
     """:func:`kontra.codec.data_converter` (failures encrypted too) with the pydantic payload
     converter, so models in workflow and activity signatures round-trip.
 
-    ``agents`` (the worker runs the OpenAI Agents plugin): the agents package's
-    ``OpenAIPayloadConverter`` instead, because the model activities' inputs do not decode with
-    the strict pydantic one. It is laxer (it builds an object that fails validation rather
-    than refusing it), so only a worker that runs agents gets it; buyer input is checked
-    against the contract schema before either runs."""
+    A worker whose ``plugins`` include the OpenAI Agents plugin (its workflows run an agent)
+    gets the agents package's ``OpenAIPayloadConverter`` instead, because the model
+    activities' inputs do not decode with the strict pydantic one. It is laxer (it builds an
+    object that fails validation rather than refusing it), so only such a worker gets it;
+    buyer input is checked against the contract schema before either runs."""
     return dataclasses.replace(
         data_converter(codec),
-        payload_converter_class=_agents.payload_converter_class(agents=agents),
+        payload_converter_class=_agents.payload_converter_class(plugins),
     )
 
 
@@ -253,6 +253,12 @@ class Worker:
             keys.add(b.key)
         self._offerings: tuple[BoundOffering, ...] = tuple(bound)
         self._kwargs: dict[str, Any] = dict(kwargs)
+        # Its workflows were imported before it was made (it holds their classes), so whether
+        # they run an agent is known: then the agents plugin goes on first, as serve() puts it
+        # (decisions I25). A published offering could not pass it: publish refuses temporalio.
+        derived = _agents.plugins(given=self._kwargs.get("plugins"))
+        if derived:
+            self._kwargs["plugins"] = [*derived, *self._kwargs.get("plugins", ())]
         self._inner: tuple[temporalio.worker.Worker, ...] = ()
         self._services: tuple[OfferingService, ...] = ()
         self._stack: contextlib.AsyncExitStack | None = None
@@ -276,7 +282,8 @@ class Worker:
 
     @property
     def options(self) -> dict[str, Any]:
-        """The temporalio keywords as given (a copy)."""
+        """The temporalio keywords as given, and the agents plugin when the workflows run an
+        agent (a copy)."""
         return dict(self._kwargs)
 
     @property
@@ -410,9 +417,7 @@ class Worker:
             blobs=GateBlobStore(gate),
             services=[b.offering_id.service_name for b in self._offerings],
         )
-        converter = seller_data_converter(
-            codec, agents=_agents.uses_agents(self._kwargs.get("plugins"))
-        )
+        converter = seller_data_converter(codec, plugins=self._kwargs.get("plugins"))
         # Headers stay out of the codec: the kontra-job header must be readable before any
         # payload key is known (kontra.serve.interceptors).
         if client is None:

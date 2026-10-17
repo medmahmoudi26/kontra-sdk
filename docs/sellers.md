@@ -368,10 +368,14 @@ from a page source rather than its input, which, like any input, must fit a payl
 
 ## Agents
 
-With the `[agents]` extra (`pip install 'kontra-sdk[agents]'`), a workflow can run an agent
-from OpenAI's [Agents SDK](https://openai.github.io/openai-agents-python/) durably, through
-Temporal's integration: the agent loop is workflow code, and every model call and tool call is
-an activity, retried and recorded like any other.
+A workflow can run an agent, and nothing switches that on: the workflow does what it wants,
+and no `serve()` or `Worker` keyword changes what workflow code may do (`docs/decisions.md`
+I25). There are two shapes, with an example each.
+
+**An agent as workflow code**, [`examples/chef-agents`](../examples/chef-agents). OpenAI's
+[Agents SDK](https://openai.github.io/openai-agents-python/) runs its loop in the workflow,
+durably, through Temporal's integration (the extra: `pip install 'kontra-sdk[agents]'`): every
+model call and every tool call is an activity, retried and recorded like any other.
 
 ```python
 # workflows.py
@@ -380,33 +384,46 @@ from datetime import timedelta
 from kontra import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from activities import probe
+    from activities import lookup_pantry
     from agents import Agent, Runner  # OpenAI's Agents SDK: your dependency, allowed
-    from models import TriageInput, TriageOutput
+    from models import CookInput, Dish
 
 
 @workflow.defn
-class Triage:
+class ChefFlow:
     @workflow.run
-    async def run(self, inp: TriageInput) -> TriageOutput:
-        agent = Agent(
-            name="triage",
-            instructions="Probe the hosts in scope and rank what answers.",
-            tools=[workflow.activity_as_tool(probe, start_to_close_timeout=timedelta(seconds=30))],
-            mcp_servers=[workflow.mcp_server("shodan")],
+    async def run(self, inp: CookInput) -> Dish:
+        chef = Agent(
+            name="chef",
+            instructions="Look in the pantry, then propose one dish from what is there.",
+            tools=[
+                workflow.activity_as_tool(
+                    lookup_pantry, start_to_close_timeout=timedelta(seconds=30)
+                )
+            ],
         )
-        out = await Runner.run(agent, inp.scope)
-        return TriageOutput(report=str(out.final_output))
+        result = await Runner.run(chef, inp.craving)
+        return Dish(recipe=str(result.final_output))
 ```
 
 ```python
 # worker.py
-from agents.mcp import MCPServerStdio
-from workflows import Triage
+import os
+
+from agents import set_default_openai_api, set_default_openai_client, set_tracing_disabled
+from openai import AsyncOpenAI
+from workflows import ChefFlow
 
 from kontra import serve
 
-serve(Triage, mcp_servers={"shodan": lambda: MCPServerStdio(params={"command": "shodan-mcp"})})
+set_default_openai_client(
+    AsyncOpenAI(base_url=os.environ["LLM_BASE_URL"], api_key="unused", max_retries=0),
+    use_for_tracing=False,
+)
+set_default_openai_api("chat_completions")
+set_tracing_disabled(True)
+
+serve(ChefFlow)
 ```
 
 | Runs as | What |
@@ -414,13 +431,31 @@ serve(Triage, mcp_servers={"shodan": lambda: MCPServerStdio(params={"command": "
 | workflow code | the agent loop, handoffs, and `@function_tool` tools: pure computation only (no I/O, no clock, no randomness) |
 | an activity | every model call, every `workflow.activity_as_tool(...)` tool, every MCP operation |
 
-- `serve(Flow, agents=True)` installs Temporal's `OpenAIAgentsPlugin` on the worker;
-  `mcp_servers={"name": factory}` does too, and serves `workflow.mcp_server("name")`. A
-  factory runs on the worker, so it holds the processes and credentials an MCP server needs.
-- The worker then needs `OPENAI_API_KEY` (or another model provider the Agents SDK is
-  configured with) to start, and uses the integration's payload converter, which validates
-  more leniently inside your workflows and activities. A buyer's input is still checked
-  against your contract before the job starts.
+- **The import is the opt-in.** A workflow that imports `agents` runs an agent: the worker
+  sees the import and puts Temporal's `OpenAIAgentsPlugin` on itself, with the payload
+  converter its activities decode with, which validates more leniently inside your workflows
+  and activities (a buyer's input is still checked against your contract before the job
+  starts). A workflow that does not import `agents` gets neither, whatever is installed.
+  `agents` imported without the extra is a `TypeError` that names it. A `Worker(...)` written
+  out does the same as `serve()`: `kontra publish` lets your code import no `temporalio`, so
+  you could not pass the plugin yourself.
+- **The import is read when `worker.py` imports your workflows**, so make it at the top of
+  `workflows.py`, as above, or of a module it passes through. An `import agents` inside `run`
+  comes too late: the worker was built without the plugin, and the workflow task fails. A
+  module the workflow passes through counts, `activities.py` included: an activity that runs
+  an agent in-process, outside Temporal's loop, imports `agents` inside its function, or the
+  worker gets the plugin and its converter for it. Only OpenAI's `agents` counts: a module of
+  your own named `agents.py` runs no agent (and hides the SDK; rename it).
+- **The model endpoint is worker config**, never workflow code: the agent names no model and
+  no server. `worker.py` sets the Agents SDK's own default client and API before `serve()`,
+  and the plugin's model activity dials them, so any OpenAI-compatible server answers --
+  Ollama, vLLM, OpenRouter, Mistral. The model is the SDK's `OPENAI_DEFAULT_MODEL`, in the
+  worker's environment. The API is read when the worker is built, the client at the first
+  model call, so the worker starts without an `OPENAI_API_KEY`; with no default client set,
+  it is the SDK's own, from `OPENAI_API_KEY` (and `OPENAI_BASE_URL`).
+- `serve(ChefFlow, mcp_servers={"name": factory})` serves `workflow.mcp_server("name")`. It is
+  worker config, like `max_concurrent_activities`: a factory runs on the worker, so it holds
+  the processes and credentials an MCP server needs, and a name no workflow asks for is unused.
 - An activity tool gets a **copy** of the run context: what it changes does not come back.
 - `workflow.mcp_server(name, factory_argument=...)`: the argument is an activity input, so it
   is recorded in history. Never put a secret there; resolve credentials in the factory.
@@ -430,6 +465,19 @@ serve(Triage, mcp_servers={"shodan": lambda: MCPServerStdio(params={"command": "
 - Set `uses_hosted_model: true` in `offering.yaml`: the buyer's input, decrypted on your
   worker, goes to the model provider in plaintext to it. Model calls are activity payloads,
   encrypted in Temporal like the rest of the job.
+
+**An agent that is a process**, [`examples/chef-claude`](../examples/chef-claude): no SDK at
+all. One activity spawns the binary -- here `claude -p ... --output-format stream-json
+--verbose --allowedTools ... --max-turns ...` -- with `asyncio.create_subprocess_exec`,
+heartbeats once per JSON line it prints and returns on its `result` event; the workflow is one
+`execute_activity` with a `heartbeat_timeout` and a `RetryPolicy`. A crashed worker is noticed
+within the heartbeat timeout and the activity is retried, and the retry does not start over:
+attempt 1 names the binary's session (`--session-id`, a `uuid5` of the workflow id) and a
+retry passes `--resume` with the same id; when the binary says this machine does not hold
+the session, or already does, the attempt runs the other. That is the shape for any agent
+whose loop is a process rather than workflow code. The buyer writes part of its prompt, so
+give the binary only the tools a stranger's words may reach, none of your own setup, and the
+prompt on stdin rather than on a command line every local user can read.
 
 ## The worker
 
@@ -913,6 +961,7 @@ merged by hand.
 
 The examples: [`examples/hello`](../examples/hello) (the smallest offering, one field in and
 one out, as a five-minute tutorial), [`examples/enrich`](../examples/enrich) (types-first, with
-an artifact) and [`examples/legacy-actor`](../examples/legacy-actor) (an older job turned into
-an offering). Each keeps its derived `contract.yaml` as a golden file, reproduced byte for byte
-by the tests.
+an artifact), [`examples/legacy-actor`](../examples/legacy-actor) (an older job turned into
+an offering), and two agents: [`examples/chef-agents`](../examples/chef-agents) (as workflow
+code) and [`examples/chef-claude`](../examples/chef-claude) (as a process). Each keeps its
+derived `contract.yaml` as a golden file, reproduced byte for byte by the tests.
