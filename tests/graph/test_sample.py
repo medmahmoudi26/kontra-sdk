@@ -3,12 +3,16 @@ mock runs (decisions I27). No Temporal here."""
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import enum
 import ipaddress
 import json
 import math
 import re
+import subprocess
+import sys
+import time
 import uuid
 from decimal import Decimal
 from typing import Annotated, Any, Literal, Self
@@ -22,10 +26,16 @@ from pydantic import (
     UUID4,
     UUID5,
     AwareDatetime,
+    Base64Bytes,
+    Base64Str,
     BaseModel,
     ConfigDict,
     Field,
     HttpUrl,
+    NaiveDatetime,
+    PastDate,
+    PositiveInt,
+    SecretStr,
     TypeAdapter,
     create_model,
     model_validator,
@@ -260,7 +270,9 @@ def test_recursion_is_bounded() -> None:
         below = [*(v.get("kids") or []), *([v["next"]] if v.get("next") else [])]
         return 1 + max((depth(k) for k in below), default=0)
 
-    assert depth(draw(Node, 1)) <= 4  # drawn as min mode draws from depth 4 on
+    # Where Node's $ref repeats on the way down, the rest is drawn as min mode draws it.
+    assert depth(draw(Node, 1)) == 2
+    assert all(depth(draw(Node, run)) <= 2 for run in range(8))
 
     class Loop(BaseModel):
         child: Loop
@@ -268,6 +280,175 @@ def test_recursion_is_bounded() -> None:
     assert sample(Loop, 0) is None
     with pytest.raises(Unsampleable, match="nested deeper"):
         draw(Loop, 1)
+
+
+class Headers(BaseModel):
+    hsts: bool
+    grade: Literal["a", "b", "c"]
+    note: str | None
+    tags: list[str]
+
+
+class Checked(BaseModel):
+    headers: Headers
+
+
+class Report(BaseModel):
+    pages: list[Checked]
+
+
+class A5(BaseModel):
+    flag: bool
+
+
+class A4(BaseModel):
+    a: A5
+
+
+class A3(BaseModel):
+    a: A4
+
+
+class A2(BaseModel):
+    a: A3
+
+
+class A1(BaseModel):
+    a: A2
+
+
+def test_a_deep_value_is_drawn_in_the_runs_mode() -> None:
+    """Only a recursion is cut short: a boolean five models down, or in each item of a list
+    of models, takes both values within two runs and at random."""
+    assert [draw(A1, run)["a"]["a"]["a"]["a"]["flag"] for run in (0, 1)] == [False, True]
+    assert {draw(A1, run)["a"]["a"]["a"]["a"]["flag"] for run in range(3, 20)} == {True, False}
+    headers = draw(Report, 1)["pages"][0]["headers"]
+    assert (headers["hsts"], headers["grade"], len(headers["tags"])) == (True, "c", 3)
+    assert headers["note"] is not None
+    hsts = {page["headers"]["hsts"] for run in range(3, 12) for page in draw(Report, run)["pages"]}
+    assert hsts == {True, False}
+
+
+def test_the_same_value_whatever_the_string_hashing() -> None:
+    """Two sibling fields both refused (max mode's 2099 is no past datetime) are drawn again
+    in the order of the errors, never of a set's, whose order changes with
+    ``PYTHONHASHSEED``: the same command draws the same values in every process."""
+    script = (
+        "from pydantic import BaseModel, PastDatetime\n"
+        "from kontra._sample import draw\n"
+        "class Event(BaseModel):\n"
+        "    created_at: PastDatetime\n"
+        "    updated_at: PastDatetime\n"
+        "    seen: dict[str, PastDatetime]\n"
+        "print([draw(Event, run) for run in (1, 2, 5)])\n"
+    )
+    drawn = {
+        subprocess.run(
+            [sys.executable, "-c", script],
+            env={"PYTHONHASHSEED": str(seed), "PATH": ""},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for seed in (0, 1, 2)
+    }
+    assert len(drawn) == 1, drawn
+
+
+@pytest.mark.parametrize(
+    ("pattern", "lengths"),
+    [
+        (r"^[A-Za-z0-9_-]+$", {"min_length": 16, "max_length": 64}),
+        (r"^[a-z]+$", {"max_length": 2}),
+        (r"^[a-z]{2,4}-[0-9]+$", {"min_length": 12}),
+        (r"^\w+(\s\w+)*$", {}),
+        (r"^\w+\s\w+$", {}),
+        (r"^[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}$", {}),  # a UK postcode
+        (r"^[^\S]$", {}),
+    ],
+)
+def test_a_pattern_is_drawn_within_its_lengths_and_may_hold_spaces(
+    pattern: str, lengths: dict[str, int]
+) -> None:
+    tp = Annotated[str, Field(pattern=pattern, **lengths)]  # pyright: ignore[reportArgumentType]
+    for run in range(8):
+        valid(tp, draw(tp, run))
+
+
+def test_formats_their_lengths_and_offsets() -> None:
+    """bytes and a secret are strings of their lengths; base64 is the encoding of one; a
+    naive datetime loses the offset the drawing gave it; a Decimal's places and digits, which
+    its schema does not say, are met by two-decimal numbers."""
+    for tp in (
+        Annotated[bytes, Field(min_length=8)],
+        Annotated[bytes, Field(min_length=2, max_length=4)],
+        Annotated[SecretStr, Field(min_length=8)],
+        Base64Bytes,
+        Annotated[Base64Bytes, Field(min_length=3)],
+        Base64Str,
+        NaiveDatetime,
+        list[NaiveDatetime],
+        AwareDatetime,
+        Annotated[Decimal, Field(max_digits=5, decimal_places=2)],
+        Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=2)],
+    ):
+        for run in range(8):
+            valid(tp, draw(tp, run))
+    assert draw(NaiveDatetime, 1) == "2099-12-31T23:59:59"
+
+
+def test_a_refused_mapping_key_is_drawn_again_with_its_mapping() -> None:
+    """A key's error points at the key: its mapping is drawn again whole, with fresh keys
+    (at random from 1 to 1000), so ``dict[PositiveInt, X]`` is not stuck on ``"0"``."""
+    for tp in (
+        dict[PositiveInt, str],
+        dict[Annotated[int, Field(ge=5)], int],
+        dict[PastDate, int],
+        dict[str, dict[PositiveInt, bool]],
+    ):
+        for run in range(8):
+            valid(tp, draw(tp, run))
+
+
+def test_only_unsampleable_leaves_draw() -> None:
+    """A float too large to snap to its multipleOf, or a validator that raises what pydantic
+    does not wrap (a TypeError comparing None), is a type sampled again or unsampleable,
+    never an exception the CLI does not expect."""
+    huge = Annotated[float, Field(ge=0, le=sys.float_info.max, multiple_of=0.5)]
+    for run in range(8):
+        with contextlib.suppress(Unsampleable):
+            valid(huge, draw(huge, run))
+    with pytest.raises(Unsampleable, match="multiple"):
+        draw(Annotated[float, Field(ge=1e300, multiple_of=1e-10)], 0)
+
+    class Window(BaseModel):
+        start: int | None = None
+        end: int | None = None
+
+        @model_validator(mode="after")
+        def _ordered(self) -> Self:
+            if self.end is not None and self.end < self.start:  # pyright: ignore[reportOperatorIssue]
+                raise ValueError("ends before it starts")
+            return self
+
+    for run in range(8):
+        valid(Window, draw(Window, run))
+
+
+def test_a_pattern_is_read_once() -> None:
+    """Every class's characters are worked out once per pattern, not once per character:
+    a large-mode list of Artifacts (two hex patterns each) is quick to draw."""
+
+    class Shard(BaseModel):
+        parts: list[Artifact]
+
+    class Shards(BaseModel):
+        shards: list[Shard]
+
+    began = time.perf_counter()
+    for tp in (list[Artifact], Page[Artifact], Shards):
+        valid(tp, draw(tp, 2))
+    assert time.perf_counter() - began < 2  # 6.7 s when each class was worked out per character
 
 
 class Target(BaseModel):
