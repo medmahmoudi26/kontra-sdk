@@ -1,6 +1,6 @@
-"""The example sellers fetch (enrich) and probe (legacy-actor) the buyer's URLs from the
-seller's machine, inside the seller's network: neither may be made to reach a destination
-that is not public -- the cloud metadata service, loopback, the seller's LAN.
+"""The example sellers fetch (enrich), probe (legacy-actor) and check (sweep) the buyer's URLs
+from the seller's machine, inside the seller's network: none may be made to reach a
+destination that is not public -- the cloud metadata service, loopback, the seller's LAN.
 
 Each activity runs as plain Temporal code (``ActivityEnvironment``) in its example's own
 directory, as ``python worker.py`` would import it, with the default settings (nothing but
@@ -44,20 +44,22 @@ async def scripted(self, host, port, *args, **kwargs):
 asyncio.base_events.BaseEventLoop.getaddrinfo = scripted
 
 async def main():
-    return await ActivityEnvironment().run(ACTIVITY, BATCH)
+    env = ActivityEnvironment()
+    return CALL
 
 out = asyncio.run(main())
 print(json.dumps({"out": [o.model_dump(mode="json") for o in out], "asked": asked}))
 """
+#: How each example's activity is run over the URLs: one row per URL.
 CASES = {
-    "enrich": dict(
-        activity="activities.fetch_batch",
-        batch="models.Batch(urls=urls, done=0, total=len(urls))",
+    "enrich": (
+        "await env.run(activities.fetch_batch, models.Batch(urls=urls, done=0, total=len(urls)))"
     ),
-    "legacy-actor": dict(
-        activity="activities.head_batch",
-        batch="models.Batch(targets=[models.Target(url=u) for u in urls], done=0, total=len(urls))",
+    "legacy-actor": (
+        "await env.run(activities.head_batch, models.Batch(targets=[models.Target(url=u) "
+        "for u in urls], done=0, total=len(urls)))"
     ),
+    "sweep": "[await env.run(activities.check_headers, u) for u in urls]",
 }
 #: Destinations never reached by default, as address literals or a name that resolves there.
 FORBIDDEN = [
@@ -88,7 +90,13 @@ NAMES = {
 
 
 def _run(
-    name: str, urls: list[str], sites: Sites, *, allow: bool, answers: dict[str, Any] | None = None
+    name: str,
+    urls: list[str],
+    sites: Sites,
+    *,
+    allow: bool,
+    answers: dict[str, Any] | None = None,
+    call: str | None = None,
 ) -> dict[str, Any]:
     env = {k: v for k, v in os.environ.items() if k not in ALLOW_LOCAL_SITES}
     env["SSL_CERT_FILE"] = str(sites.ca_file)
@@ -98,9 +106,7 @@ def _run(
         [
             sys.executable,
             "-c",
-            _SCRIPT.replace("ACTIVITY", CASES[name]["activity"]).replace(
-                "BATCH", CASES[name]["batch"]
-            ),
+            _SCRIPT.replace("CALL", call or CASES[name]),
             json.dumps(urls),
             json.dumps(answers or {}),
         ],
@@ -194,3 +200,23 @@ def test_tls_still_checks_the_name_not_the_address(name: str, sites: Sites) -> N
     ok, wrong_name = ran["out"]
     assert (ok["status"], ok["error"]) == (200, None)
     assert (wrong_name["status"], wrong_name["error"]) == (None, "ConnectError")
+
+
+def test_the_sweeps_site_files_are_checked_too(sites: Sites) -> None:
+    """``examples/sweep`` also reads each site's robots.txt and security.txt, through the
+    same guard: a site that is not public is that site's error, in both files."""
+    port = sites.port()
+    sweep_sites = [
+        "http://169.254.169.254",
+        f"http://127.0.0.2:{port}",
+        "http://metadata.test",
+        "http://mixed.test",
+        sites.plain(""),
+    ]
+    call = (
+        "[*await env.run(activities.fetch_robots, urls), "
+        "*await env.run(activities.fetch_security_txt, urls)]"
+    )
+    ran = _run("sweep", sweep_sites, sites, allow=True, answers=NAMES, call=call)
+    assert _errors(ran) == 2 * (["ForbiddenAddress"] * 4 + [None])
+    assert [row["status"] for row in ran["out"]][4::5] == [200, 404]  # security.txt: HTTPS only

@@ -1190,3 +1190,107 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
   which no graph, union, merge, link or Mermaid text carries anything while `with_io` with
   the test codec shows it all. A codec that gives back more or fewer payloads than it was
   handed is undecodable there, never a null result.
+
+## I27. `kontra graph` (kontra-sdk#42)
+
+`kontra graph` prints the static graph of the workflows `worker.py` binds, before anyone has
+run them: for each bound offering it runs the workflow `--runs` times (default 8) in
+Temporal's time-skipping test server, every activity answered by ONE dynamic stub with a
+value of the type the seller's activity of that name declares, parses each run's history
+with its children's (I26), and prints `graph.union` of the runs -- one line per edge, Mermaid
+(`--mermaid`) or JSON (`--json`, always a list of `{offering, runs, graph,
+never_scheduled}`). Activities the worker registers that no run scheduled, runs that did not
+close, and return types no valid value was found for are warnings on stderr; the exit status
+stays 0. With a profile in `$KONTRA_HOME`, each offering's union is also saved, atomically and
+0600 in a 0700 directory, at `$KONTRA_HOME/graphs/<sha256(task queue)>.json` with the task
+queue `kontra serve` uses for it (`kontra.contract.names` builds it, nothing here does), for
+the graph page of #43 to paint a live run on; `load_static(home, task_queue)` reads it back
+only when the stored queue equals the one asked for, and anything unreadable is None. The
+values come from `kontra._sample`, an in-house sampler over the pydantic JSON Schema, by run:
+0 smallest, 1 largest, 2 large lists near the top (201 items), then seeded random ones; the
+same command prints the same graph. Every seller example's README carries its graph, which
+`tests/graph/test_cli.py` regenerates and compares (`UPDATE_GOLDEN=1` rewrites them). Checked
+against temporalio 1.34 and its test server. Where the issue and the code part ways:
+
+- **The graph is not published (moved to #44).** #42 has `kontra publish` write the graph into
+  the offering document and `kontra pull` show it. The contract document is closed and hashed,
+  a sibling field is a lockstep change of seam ②, and the catalog is public while the graph
+  names the seller's internals (activity names, children, loops). `kontra publish` and `kontra
+  pull` do not change; the graph stays on the seller's machine.
+- **A shipped example shows the three shapes.** No example had a fan-out, a batch or a branch,
+  so #42's "done when" had nothing to point at. `examples/sweep` (a security-headers sweep,
+  offline-tested over local sites like enrich) has `plan`, then `asyncio.gather` of two
+  different activities (`fetch_robots`, `fetch_security_txt`), then one
+  `execute_activities_in_parallel(check_headers, items=..., reduce=tally)`, then an `if` on
+  what the batch found (`score` or `all_clear`), then `write_report`. The fan-out is one
+  parallel group, the batch ONE node, `kontra.batch.v1[check_headers]`, labelled
+  `execute_activities_in_parallel(check_headers)` with no continue-as-new chain, and both
+  branches show from two runs; its lifecycle test parses the real job's history into the
+  same path.
+- **No hypothesis-jsonschema; an in-house, seeded sampler.** It has had no release since
+  2024-02, does not read pydantic's 2020-12 output (`prefixItems` ignored, so invalid tuples;
+  `format: uuid` unknown; recursive models raise), is MPL-2.0, and draws at random outside
+  `@given`, where "both branches with 4 runs" would be flaky. `kontra/_sample.py` is pure,
+  pyright-strict, adds no dependency, and draws by run mode. Past the issue's list: a
+  `pattern` with no `examples` or `default` is followed by a generator over Python's own
+  regex parser (enrich's and legacy-actor's inputs and `Artifact` have patterns, and giving up
+  on them would contradict sampling the input), giving up only on a lookaround, a
+  backreference or a conditional; a mapping's keys follow `propertyNames` and
+  `patternProperties` (`dict[Literal[...], X]`, as sweep's report has; found by `kontra
+  graph` on it); a value validation refuses is drawn again, in random mode, only where the
+  errors point, for up to 32 rounds (legacy-actor's "exactly one of url or host", across 201
+  targets, never passes a whole redraw); and values are checked with `validate_json`, as the
+  payload converter decodes them, and the stub returns the drawn JSON itself (`dump_python`
+  writes field names, not aliases, and can fail to round-trip). In large mode an array inside
+  an array stays at 3 items (201 x 201 is no graph). A `Page`'s `next` is `Any`, which
+  samples as null, so a `pages=` source always ends after one page.
+- **The seller commands' shape: `--dir` and `--offering`, not `<module:Workflow>`.** The
+  examples import their siblings by top-level name, and only `load_worker` puts the project
+  on `sys.path`; `worker.py` already names the workflow, its activities, the extra workflows
+  and the input type. Every bound offering by default, like `publish`.
+- **The input is sampled too, or given.** enrich's and legacy-actor's loop counts depend on
+  the input's size, so a fixed input would hide the loop. `--input FILE|-` starts every run
+  with one value, checked against the input type first (`error: ...`, exit 1).
+- **Agent workflows get a scripted model.** A workflow that imports `agents` (I25) keeps the
+  agents plugin, with a `model_provider` whose model calls every function tool it was given
+  once, in one response, then answers with a value of the agent's output type (or a short
+  text): chef-agents' model, `lookup_pantry`, model, with no network and no key. Without the
+  `[agents]` extra such a project cannot be imported, and the command says so (exit 1).
+  The seller's MCP servers, handoffs (never taken), and the worker's other options, plugins
+  and interceptors are not carried into the mock runs; no example needs them.
+- **`examples/recon` is buyer code.** It hires offerings from its own workflow and binds
+  none, so it has no `worker.py`; `kontra graph --dir examples/recon` fails with the line
+  every seller command prints for a directory without one, and the tests say why.
+- **Children's histories count.** Each `ChildWorkflowExecutionStarted` event names a child
+  (its id from the event, never built or parsed, I1); its first run's history is read, its
+  own children's too, and handed to `parse(children=)`: that names a batch node, and the
+  activities a child ran (a batch's items) count as scheduled for the never-scheduled
+  warning, as do local-activity markers.
+- **What does not close is timed out or terminated, and still drawn.** A wait no timer ends
+  (a signal, `wait_condition` without a timeout) never reaches the wall-clock deadline: the
+  test server skips to the run's execution timeout and times the run out within
+  milliseconds, so that is its own warning ("waited for what no timer brings"). A run still
+  open after `--timeout` wall-clock seconds (default 5: a loop that never sleeps) is
+  terminated; so is one whose workflow task fails on the mock values, found by reading its
+  history every 0.1 s (it would fail the same way on every retry). Either way its history up
+  to there carries its structure, and it goes into the union.
+- **One worker per offering, on its real task queue; the runs in sequence.** One test server
+  per command, a plain `temporalio.worker.Worker` per bound offering on the task queue
+  `kontra serve` would use, with the workflow, its extra workflows and `kontra.batch.v1`, the
+  stub (temporalio's `defn`, so it never lands in kontra's registry), Kontra's sandbox runner
+  and the converter `serve()` picks, without the codec. Runs are sequential and the stub
+  knows the run in progress, so a batch child's items draw in the parent run's mode.
+  temporalio's logging, the sandbox's late-import warning and the core's WARN lines are
+  silenced while they go: what matters is in the warnings.
+- **The test server is downloaded once.** temporalio fetches its time-skipping server into
+  the temp directory on first use; offline, before that, the command says it cannot start
+  it, and the tests skip.
+- **Found on the way: the batch child imported seller modules inside the sandbox.**
+  `execute_activities_in_parallel`'s child resolved its activity and `reduce=` with
+  `importlib.import_module` inside `imports_passed_through()`, which goes around the
+  sandbox's `__import__`: the module was executed again inside the child's sandbox, and
+  sweep's `activities.py`, which reads `SWEEP_ALLOWED_PRIVATE_NETWORKS` from `os.environ` as
+  it loads (as enrich's does), failed the child's every workflow task. `kontra serve` runs the
+  same sandbox, so a real job would have hung the same way. `_resolve` now imports through
+  `__import__` and reads `sys.modules`: passed through, as it always said
+  (`tests/parallel`, an activity module that reads `os.environ` at import).

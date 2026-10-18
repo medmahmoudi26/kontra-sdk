@@ -113,6 +113,23 @@ kontra serve                     # from this directory; then, in another termina
 kontra hire acme/hello -f input.json --max-price 0.01 --wait --accept
 ```
 
+## Its graph
+
+`kontra graph --mermaid`, from this directory, draws the workflow from mock runs: Temporal's
+test server runs it eight times, every activity answered with a value of the type it
+declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against the
+command:
+
+```mermaid
+%% acme/hello@0.1.0
+flowchart TD
+    s((start))
+    n0["greet"]
+    e((end))
+    n0 --> e
+    s --> n0
+```
+
 ## Tested
 
 `tests/examples/test_hello.py` runs this directory's `worker.py` as `acme` against

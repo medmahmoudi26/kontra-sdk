@@ -208,7 +208,7 @@ What Kontra can and cannot see, the threat model, and the limits: [docs/security
 | [docs/decisions.md](docs/decisions.md) | implementation decisions, checked against Temporal and nexgen |
 | [spec/](spec/README.md) | the contract document's `x-kontra` extension and reserved types |
 | [temporal/authorizer](temporal/authorizer/README.md) | the Temporal server, its policy and its configuration |
-| [examples/](examples) | `hello` (the smallest seller, a five-minute tutorial), `enrich` (seller), `legacy-actor` (seller), `recon` (buyer workflow) |
+| [examples/](examples) | `hello` (the smallest seller, a five-minute tutorial), `enrich` (seller), `legacy-actor` (seller), `sweep` (seller: a fan-out, a batch and a branch), `chef-agents` and `chef-claude` (sellers: agents), `recon` (buyer workflow) |
 
 ## Contributing
 

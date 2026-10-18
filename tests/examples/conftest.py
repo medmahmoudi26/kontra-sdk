@@ -1,8 +1,8 @@
 """Fixtures for the examples' end-to-end tests: one Temporal dev server per test process
 (shared with the other suites), and for this package one marketplace in which ``acme``
-serves the example sellers -- ``examples/enrich``, ``examples/legacy-actor`` and
-``examples/hello``, each its own ``python worker.py`` process; the chefs are started by
-their own tests -- next to local web sites for them to fetch.
+serves the example sellers -- ``examples/enrich``, ``examples/legacy-actor``,
+``examples/hello`` and ``examples/sweep``, each its own ``python worker.py`` process; the
+chefs are started by their own tests -- next to local web sites for them to fetch.
 
 Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once into the temp
 directory; with neither the binary nor the network, these tests are skipped."""

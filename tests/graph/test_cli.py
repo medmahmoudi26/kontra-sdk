@@ -1,13 +1,15 @@
 """``kontra graph`` (decisions I27; kontra-sdk#42): worker.py's workflows as a graph, from mock
 runs in Temporal's time-skipping test server.
 
-#42's "done when", as far as this command answers for it: every seller example's graph (and
-``examples/recon`` refused, with a clear line: it is buyer code, with no worker.py), a fan-out
-as one parallel group, a batch as one child node with no continue-as-new chain, both
-branches of an ``if`` on an activity result from two runs, never-scheduled activities listed
-with exit status 0. Then the other warnings, ``--json``, ``--input``, and the static graph
-``kontra dev``'s page reads. The projects under ``projects/`` are seller projects written for
-these tests; the command runs in-process (``CliRunner``)."""
+#42's "done when", as far as this command answers for it: every seller example's graph is
+the one its README documents (and ``examples/recon`` is refused, with a clear line: it is
+buyer code, with no worker.py); ``examples/sweep``'s fan-out is one parallel group, its batch
+one child node with no continue-as-new chain, and its ``if`` on what the batch found shows
+both branches from two runs; never-scheduled activities are listed with exit status 0. Then
+the other warnings, ``--json``, ``--input``, and the static graph ``kontra dev``'s page reads.
+The projects under ``projects/`` are seller projects written for these tests (``branches``
+has the same three shapes, and an activity only a signal reaches); the command runs
+in-process (``CliRunner``)."""
 
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
 from pathlib import Path
@@ -24,6 +27,7 @@ import pytest
 from click.testing import CliRunner, Result
 from temporalio.testing import WorkflowEnvironment
 
+from kontra import activity as kontra_activity
 from kontra.cli import cli
 from kontra.cli._graph import load_static, static_path
 from kontra.cli._project import load_worker
@@ -35,64 +39,16 @@ EXAMPLES = ROOT / "examples"
 PROJECTS = Path(__file__).resolve().parent / "projects"
 AGENTS = importlib.util.find_spec("temporalio.openai_agents") is not None
 
-#: Each seller example's graph, as ``kontra graph --mermaid`` prints it (8 runs, seed 0).
-EXAMPLE_GRAPHS = {
-    "hello": """\
-%% acme/hello@0.1.0
-flowchart TD
-    s((start))
-    n0["greet"]
-    e((end))
-    n0 --> e
-    s --> n0
-""",
-    # A loop over the input, by 50: the large run (201 URLs) goes round five times.
-    "enrich": """\
-%% acme/enrich@1.2.0
-flowchart TD
-    s((start))
-    n0["fetch_batch"]
-    n1["write_records"]
-    e((end))
-    n0 --> n0
-    n0 --> n1
-    s --> n0
-    n1 --> e
-""",
-    "legacy-actor": """\
-%% acme/probe@1.0.0
-flowchart TD
-    s((start))
-    n0["head_batch"]
-    e((end))
-    n0 --> e
-    n0 --> n0
-    s --> n0
-""",
-    "chef-claude": """\
-%% acme/chef-claude@0.1.0
-flowchart TD
-    s((start))
-    n0["cook"]
-    e((end))
-    n0 --> e
-    s --> n0
-""",
-    # The scripted model calls the agent's one tool, then answers.
-    "chef-agents": """\
-%% acme/chef-agents@0.1.0
-flowchart TD
-    s((start))
-    n0["invoke_model_activity"]
-    n1["lookup_pantry"]
-    n2["invoke_model_activity"]
-    e((end))
-    n0 --> n1
-    n2 --> e
-    n1 --> n2
-    s --> n0
-""",
-}
+#: Every seller example: a directory with a worker.py (examples/recon is buyer code).
+SELLERS = sorted(p.parent.name for p in EXAMPLES.glob("*/worker.py"))
+#: The one ```mermaid block of a README.
+_MERMAID = re.compile(r"^```mermaid\n(.*?)^```$", re.MULTILINE | re.DOTALL)
+
+
+def readme_graph(example: str) -> str:
+    """The graph ``examples/<example>/README.md`` documents."""
+    [block] = _MERMAID.findall((EXAMPLES / example / "README.md").read_text(encoding="utf-8"))
+    return block
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -108,6 +64,16 @@ def test_server() -> None:
         asyncio.run(start())
     except Exception as e:
         pytest.skip(f"no time-skipping test server: {e}")
+
+
+@pytest.fixture(autouse=True)
+def only_the_projects_activities(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``serve()`` registers every kontra activity defined in the process: in the command's
+    own process, the project's. This one holds every test module's too (``tests/parallel``
+    defines its activities as it is collected), which would be registered on every worker
+    and reported never scheduled. Each test starts with none defined, as ``kontra graph``
+    does; ``load_worker`` imports the project afresh, which defines its own."""
+    monkeypatch.setattr(kontra_activity, "_DEFINED", {})
 
 
 @pytest.fixture
@@ -153,14 +119,54 @@ def node(g: dict[str, Any], node_id: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- the examples
 
 
-@pytest.mark.parametrize("example", sorted(EXAMPLE_GRAPHS))
-def test_the_graph_of_every_seller_example(home: Path, example: str) -> None:
+def test_every_seller_example_is_drawn() -> None:
+    assert SELLERS == ["chef-agents", "chef-claude", "enrich", "hello", "legacy-actor", "sweep"]
+
+
+@pytest.mark.parametrize("example", SELLERS)
+def test_the_graph_of_every_seller_example_is_its_readmes(home: Path, example: str) -> None:
+    """Golden: the README's ```mermaid block is what ``kontra graph --mermaid`` prints (8
+    runs, seed 0). After a deliberate change, ``UPDATE_GOLDEN=1 pytest tests/graph/test_cli.py``
+    rewrites the blocks; review the diff."""
     if example == "chef-agents" and not AGENTS:
         pytest.skip("the [agents] extra is not installed")
     result = ok(kontra(home, "graph", "--dir", str(EXAMPLES / example), "--mermaid"))
-    assert result.stdout == EXAMPLE_GRAPHS[example]
     assert result.stderr == ""  # every activity scheduled, every run closed
     assert not home.exists()  # no profile: nothing saved
+    if os.environ.get("UPDATE_GOLDEN") == "1":
+        readme = EXAMPLES / example / "README.md"
+        text = readme.read_text(encoding="utf-8")
+        [old] = _MERMAID.findall(text)
+        readme.write_text(text.replace(old, result.stdout, 1), encoding="utf-8")
+    assert result.stdout == readme_graph(example)
+
+
+@pytest.mark.parametrize("runs", ["2", "4"])
+def test_the_sweep_example_shows_a_fan_out_a_batch_and_both_branches(home: Path, runs: str) -> None:
+    """examples/sweep, #42's three shapes: the two fetches are one parallel group (same
+    group, the same predecessor); the batch is ONE child node, named from its history and
+    labelled with the call, with no continue-as-new chain and none of its item activities
+    in the parent's graph; and the ``if`` on what it found shows both branches from two
+    runs (run 0's checks find nothing, run 1's find pages to score)."""
+    g = graph_of(home, EXAMPLES / "sweep", "--runs", runs)
+    robots, security_txt = node(g, "fetch_robots"), node(g, "fetch_security_txt")
+    assert robots["group"] == security_txt["group"] != node(g, "plan")["group"]
+    assert {s for s, t in edges(g) if t in ("fetch_robots", "fetch_security_txt")} == {"plan"}
+    batch = "kontra.batch.v1[check_headers]"
+    children = [n for n in g["nodes"] if n["kind"] == "child"]
+    assert [(n["id"], n["label"]) for n in children] == [
+        (batch, "execute_activities_in_parallel(check_headers)")
+    ]
+    assert {(s, t) for s, t in edges(g) if batch in (s, t)} == {
+        ("fetch_robots", batch),
+        ("fetch_security_txt", batch),
+        (batch, "score"),
+        (batch, "all_clear"),
+    }  # no self edge: one node, not a chain of runs
+    assert not any(n["name"] == "check_headers" for n in g["nodes"])
+    assert {("score", "write_report"), ("all_clear", "write_report"), ("write_report", "end")} <= (
+        edges(g)
+    )
 
 
 def test_recon_is_buyer_code_and_is_refused(home: Path) -> None:

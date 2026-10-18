@@ -69,6 +69,31 @@ kontra hire acme/chef-agents -f input.json --max-price 0.05 --wait --accept
 To sell it for real, sign in (`kontra login`), replace `acme` in `offering.yaml` with your
 handle, then `kontra publish` and `kontra serve`, as in `../hello/README.md`.
 
+## Its graph
+
+`kontra graph --mermaid`, from this directory, draws the workflow from mock runs: Temporal's
+test server runs it eight times, every activity answered with a value of the type it
+declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against the
+command:
+
+```mermaid
+%% acme/chef-agents@0.1.0
+flowchart TD
+    s((start))
+    n0["invoke_model_activity"]
+    n1["lookup_pantry"]
+    n2["invoke_model_activity"]
+    e((end))
+    n0 --> n1
+    n2 --> e
+    n1 --> n2
+    s --> n0
+```
+
+The agent's turns: the model (the plugin's model activity, `invoke_model_activity`), the
+tool it called, the model again. In the mock runs the model is a scripted one that calls
+every tool it is given once, then answers: no endpoint, no key.
+
 ## Tested
 
 `tests/examples/test_chef_agents.py` runs this directory's `worker.py` as `acme` against
