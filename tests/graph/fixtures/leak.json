@@ -78,7 +78,6 @@
     },
     "continuedFailure": {
      "message": "KONTRA-PLAINTEXT-MARKER-7f3a",
-     "source": "PythonSDK",
      "applicationFailureInfo": {
       "type": "RuntimeError"
      }
@@ -205,7 +204,6 @@
     "requestId": "2bd6a337-0000-4000-8000-000000000005",
     "lastFailure": {
      "message": "KONTRA-PLAINTEXT-MARKER-7f3a",
-     "source": "PythonSDK",
      "encodedAttributes": {
       "metadata": {
        "encoding": "anNvbi9wbGFpbg=="
@@ -214,7 +212,6 @@
      },
      "cause": {
       "message": "KONTRA-PLAINTEXT-MARKER-7f3a",
-      "source": "PythonSDK",
       "encodedAttributes": {
        "metadata": {
         "encoding": "anNvbi9wbGFpbg=="
@@ -433,7 +430,6 @@
    "activityTaskFailedEventAttributes": {
     "failure": {
      "message": "KONTRA-PLAINTEXT-MARKER-7f3a",
-     "source": "PythonSDK",
      "encodedAttributes": {
       "metadata": {
        "encoding": "anNvbi9wbGFpbg=="
@@ -442,7 +438,6 @@
      },
      "cause": {
       "message": "KONTRA-PLAINTEXT-MARKER-7f3a",
-      "source": "PythonSDK",
       "encodedAttributes": {
        "metadata": {
         "encoding": "anNvbi9wbGFpbg=="
@@ -494,7 +489,7 @@
    "activityTaskTimedOutEventAttributes": {
     "failure": {
      "message": "KONTRA-PLAINTEXT-MARKER-7f3a",
-     "source": "PythonSDK",
+     "source": "Server",
      "timeoutFailureInfo": {
       "timeoutType": "TIMEOUT_TYPE_HEARTBEAT",
       "lastHeartbeatDetails": {
@@ -511,7 +506,6 @@
     },
     "scheduledEventId": "12",
     "startedEventId": "16",
-    "identity": "4242@worker-a",
     "retryState": "RETRY_STATE_TIMEOUT"
    }
   },
@@ -772,7 +766,6 @@
    "childWorkflowExecutionFailedEventAttributes": {
     "failure": {
      "message": "KONTRA-PLAINTEXT-MARKER-7f3a",
-     "source": "PythonSDK",
      "encodedAttributes": {
       "metadata": {
        "encoding": "anNvbi9wbGFpbg=="
@@ -781,7 +774,6 @@
      },
      "cause": {
       "message": "KONTRA-PLAINTEXT-MARKER-7f3a",
-      "source": "PythonSDK",
       "encodedAttributes": {
        "metadata": {
         "encoding": "anNvbi9wbGFpbg=="
@@ -938,8 +930,44 @@
   {
    "eventId": "40",
    "eventTime": "2026-10-18T09:00:00.172839469Z",
-   "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+   "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
    "taskId": "1048616",
+   "activityTaskScheduledEventAttributes": {
+    "activityId": "6",
+    "activityType": {
+     "name": "slow"
+    },
+    "taskQueue": {
+     "name": "acme/enrich@1.0.0",
+     "kind": "TASK_QUEUE_KIND_NORMAL"
+    },
+    "input": {
+     "payloads": [
+      {
+       "metadata": {
+        "encoding": "anNvbi9wbGFpbg=="
+       },
+       "data": "IktPTlRSQS1QTEFJTlRFWFQtTUFSS0VSLTdmM2Ei"
+      }
+     ]
+    },
+    "scheduleToCloseTimeout": "0s",
+    "scheduleToStartTimeout": "0s",
+    "startToCloseTimeout": "30s",
+    "heartbeatTimeout": "0s",
+    "workflowTaskCompletedEventId": "36",
+    "retryPolicy": {
+     "initialInterval": "1s",
+     "backoffCoefficient": 2,
+     "maximumInterval": "100s"
+    }
+   }
+  },
+  {
+   "eventId": "41",
+   "eventTime": "2026-10-18T09:00:00.174074036Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+   "taskId": "1048617",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -950,25 +978,25 @@
    }
   },
   {
-   "eventId": "41",
-   "eventTime": "2026-10-18T09:00:00.174074036Z",
+   "eventId": "42",
+   "eventTime": "2026-10-18T09:00:00.175308603Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048617",
+   "taskId": "1048618",
    "workflowTaskStartedEventAttributes": {
-    "scheduledEventId": "40",
+    "scheduledEventId": "41",
     "identity": "4242@worker-a",
-    "historySizeBytes": "16000",
-    "requestId": "8f1c2d3e-0000-4000-8000-000000000040"
+    "historySizeBytes": "16400",
+    "requestId": "8f1c2d3e-0000-4000-8000-000000000041"
    }
   },
   {
-   "eventId": "42",
-   "eventTime": "2026-10-18T09:00:00.175308603Z",
+   "eventId": "43",
+   "eventTime": "2026-10-18T09:00:00.176543170Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048618",
+   "taskId": "1048619",
    "workflowTaskCompletedEventAttributes": {
-    "scheduledEventId": "40",
-    "startedEventId": "41",
+    "scheduledEventId": "41",
+    "startedEventId": "42",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -978,10 +1006,10 @@
    }
   },
   {
-   "eventId": "43",
-   "eventTime": "2026-10-18T09:00:00.176543170Z",
+   "eventId": "44",
+   "eventTime": "2026-10-18T09:00:00.177777737Z",
    "eventType": "EVENT_TYPE_NEXUS_OPERATION_COMPLETED",
-   "taskId": "1048619",
+   "taskId": "1048620",
    "nexusOperationCompletedEventAttributes": {
     "scheduledEventId": "39",
     "result": {
@@ -993,10 +1021,10 @@
    }
   },
   {
-   "eventId": "44",
-   "eventTime": "2026-10-18T09:00:00.177777737Z",
+   "eventId": "45",
+   "eventTime": "2026-10-18T09:00:00.179012304Z",
    "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED",
-   "taskId": "1048620",
+   "taskId": "1048621",
    "workflowExecutionTerminatedEventAttributes": {
     "reason": "KONTRA-PLAINTEXT-MARKER-7f3a",
     "details": {

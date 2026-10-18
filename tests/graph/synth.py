@@ -4,10 +4,12 @@ Each fixture is the proto3 JSON ``WorkflowHistory.to_json_dict()`` writes: camel
 int64 values as strings, ``EVENT_TYPE_*`` names, base64 payloads, and a workflow task
 (scheduled, started, completed) around every batch of commands. :class:`History` writes a
 run the way one of two servers does: the dev server (``server="dev"``: commands carry the
-WorkflowTaskCompleted id, nine fractional digits, the workflow id and an activity's last
-failure) or the time-skipping test server (``"test"``: the WorkflowTaskStarted id, three
-digits, neither of the others). Both shapes were read off real histories of both servers;
-nothing here is a copy of one.
+WorkflowTaskCompleted id, nine fractional digits, the workflow id, an activity's last
+failure, a ``taskId`` on every event and a workflow failure's own retry state) or the
+time-skipping test server (``"test"``: the WorkflowTaskStarted id, three digits, none of
+the others, and no Started event for an activity attempt that timed out). Both shapes were
+read off real histories of both servers; nothing here is a copy of one, and a test parses
+every fixture strictly into Temporal's own protos.
 
 ``python -m tests.graph.synth`` rewrites the fixtures; ``test_graph`` checks the files are
 what this module builds.
@@ -102,10 +104,14 @@ def failure(
     info_value: dict[str, Any] | None = None,
     encoded: dict[str, Any] | None = None,
     cause: dict[str, Any] | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """A failure as kontra's converter leaves it: the message is ``Encoded failure`` and
-    the real one is in ``encodedAttributes``."""
-    out: dict[str, Any] = {"message": message, "source": "PythonSDK"}
+    the real one is in ``encodedAttributes``. The Python SDK writes no ``source``; the dev
+    server writes ``Server`` on the failures it makes."""
+    out: dict[str, Any] = {"message": message}
+    if source is not None:
+        out["source"] = source
     if encoded is not None:
         out["encodedAttributes"] = encoded
     if cause is not None:
@@ -175,14 +181,16 @@ class History:
         self._ns += int(seconds * 10**9)
 
     def add(self, kind: str, attrs: dict[str, Any], **event: Any) -> int:
+        """An event; the dev server writes a ``taskId`` on each, the test server none."""
         self._ns += 1_234_567
         event_id = len(self.events) + 1
+        task_id = {"taskId": str(1_048_576 + event_id)} if self.server == "dev" else {}
         self.events.append(
             {
                 "eventId": str(event_id),
                 "eventTime": self._stamp(),
                 "eventType": f"EVENT_TYPE_{_snake(kind)}",
-                "taskId": str(1_048_576 + event_id),
+                **task_id,
                 **event,
                 _camel(kind): attrs,
             }
@@ -212,11 +220,13 @@ class History:
         if self.server == "dev":
             started_attrs["requestId"] = f"8f1c2d3e-0000-4000-8000-{len(self.events):012d}"
         started = self.add("WorkflowTaskStarted", started_attrs)
+        completed_attrs: dict[str, Any] = {"scheduledEventId": str(scheduled)}
+        if self.server == "dev":
+            completed_attrs["startedEventId"] = str(started)
         completed = self.add(
             "WorkflowTaskCompleted",
             {
-                "scheduledEventId": str(scheduled),
-                "startedEventId": str(started),
+                **completed_attrs,
                 "identity": self._identity,
                 "sdkMetadata": {"sdkName": "temporal-python", "sdkVersion": "1.34.0"},
                 "meteringMetadata": {},
@@ -293,13 +303,39 @@ class History:
         *,
         kind: str = "Failed",
     ) -> int:
+        """An activity's failure or timeout (``ActivityTaskTimedOut`` has no identity)."""
+        attrs: dict[str, Any] = {
+            "failure": how,
+            "scheduledEventId": str(scheduled),
+            "startedEventId": str(started),
+        }
+        if kind != "TimedOut":
+            attrs["identity"] = self._identity
+        return self.add(f"ActivityTask{kind}", {**attrs, "retryState": retry_state})
+
+    def timed_out(
+        self,
+        scheduled: int,
+        timeout_type: str = "START_TO_CLOSE",
+        retry_state: str = "RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED",
+        *,
+        attempt: int = 1,
+    ) -> int:
+        """The server times the activity out. The dev server writes the attempt's Started
+        event and a failure with a message and ``source: Server``; the test server writes no
+        Started event (``startedEventId: -1``) and a bare ``timeoutFailureInfo``."""
+        info = {"timeoutFailureInfo": {"timeoutType": f"TIMEOUT_TYPE_{timeout_type}"}}
+        if self.server == "dev":
+            started = self.started(scheduled, attempt=attempt)
+            words = timeout_type.title().replace("_", "")
+            how = {"message": f"activity {words} timeout", "source": "Server", **info}
+            return self.failed(scheduled, started, how, retry_state, kind="TimedOut")
         return self.add(
-            f"ActivityTask{kind}",
+            "ActivityTaskTimedOut",
             {
-                "failure": how,
+                "failure": info,
                 "scheduledEventId": str(scheduled),
-                "startedEventId": str(started),
-                "identity": self._identity,
+                "startedEventId": "-1",
                 "retryState": retry_state,
             },
         )
@@ -398,6 +434,18 @@ class History:
             {**attrs, **self._execution(initiated, run_id), "startedEventId": str(started)},
         )
 
+    def timer_canceled(self, timer: int, wtc: str) -> int:
+        """The workflow cancels the timer started at ``timer`` (its own command)."""
+        timer_id = self.events[timer - 1]["timerStartedEventAttributes"]["timerId"]
+        attrs = {
+            "timerId": timer_id,
+            "startedEventId": str(timer),
+            "workflowTaskCompletedEventId": wtc,
+        }
+        if self.server == "dev":
+            attrs["identity"] = self._identity
+        return self.add("TimerCanceled", attrs)
+
     # ----------------------------------------------------------------- the end
 
     def complete(self, wtc: str, result: Any = "done") -> int:
@@ -405,6 +453,14 @@ class History:
             "WorkflowExecutionCompleted",
             {"result": payloads(result), "workflowTaskCompletedEventId": wtc},
         )
+
+    def fail(self, wtc: str, how: dict[str, Any]) -> int:
+        """The workflow fails. The dev server writes the run's own retry state on the event
+        (``RETRY_POLICY_NOT_SET`` for a run without a policy); the test server writes none."""
+        attrs: dict[str, Any] = {"failure": how}
+        if self.server == "dev":
+            attrs["retryState"] = "RETRY_STATE_RETRY_POLICY_NOT_SET"
+        return self.add("WorkflowExecutionFailed", {**attrs, "workflowTaskCompletedEventId": wtc})
 
 
 def _then(h: History, name: str, **finish: Any) -> int:
@@ -747,19 +803,87 @@ def nexus() -> dict[str, Any]:
     return h.json()
 
 
-def failed() -> dict[str, Any]:
-    """``fetch_batch`` times out for good, and the workflow fails with it."""
+def tail_forget() -> dict[str, Any]:
+    """``x = await a(); workflow.start_activity(c); return x``: the last task schedules
+    ``c`` and completes the run in one go, so the run never waited on ``c`` (the test
+    server's shape)."""
     h = History(server="test")
-    timeout = failure(
-        "activity StartToClose timeout",
-        info="timeoutFailureInfo",
-        info_value={"timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"},
+    _then(h, "a")
+    wtc = h.task()
+    h.activity(wtc, "c")
+    h.complete(wtc)
+    return h.json()
+
+
+def local_sequence() -> dict[str, Any]:
+    """``x = await local_one(); await b(x)``: one task, the marker first, then ``b`` (sdk-core
+    commands ``b`` once the local activity resolved)."""
+    h = History(server="dev")
+    wtc = h.task()
+    h.local(wtc, "local_one")
+    h.finish(h.activity(wtc, "b"))
+    h.complete(h.task())
+    return h.json()
+
+
+def local_gather() -> dict[str, Any]:
+    """``await a(); gather(local_one(), b())``: one task, ``b`` first, then the marker (``b``
+    was commanded before the local activity resolved), and the run waits on both."""
+    h = History(server="dev")
+    _then(h, "a")
+    wtc = h.task()
+    b = h.activity(wtc, "b")
+    h.local(wtc, "local_one")
+    h.finish(b)
+    h.complete(h.task())
+    return h.json()
+
+
+def timer_race() -> dict[str, Any]:
+    """``wait([sleep(3600), a()], FIRST_COMPLETED)``, the timer canceled, then ``b``: the
+    task that saw ``a`` close schedules ``b`` and cancels the timer, in that order (the
+    test server's shape)."""
+    h = History(server="test")
+    wtc = h.task()
+    timer = h.timer(wtc, "3600s")
+    h.finish(h.activity(wtc, "a"))
+    wtc = h.task()
+    b = h.activity(wtc, "b")
+    h.timer_canceled(timer, wtc)
+    h.finish(b)
+    h.complete(h.task())
+    return h.json()
+
+
+def canceled() -> dict[str, Any]:
+    """``a``, then ``watch`` (heartbeating forever) until the run is canceled: the workflow
+    requests ``watch``'s cancel and closes as canceled in the same task, before ``watch``
+    is ever canceled."""
+    h = History(server="dev")
+    _then(h, "a")
+    watch = h.activity(h.task(), "watch")
+    h.wait(5)
+    h.add("WorkflowExecutionCancelRequested", {"identity": "admin@cli"})
+    wtc = h.task()
+    h.add(
+        "ActivityTaskCancelRequested",
+        {"scheduledEventId": str(watch), "workflowTaskCompletedEventId": wtc},
     )
+    h.add("WorkflowExecutionCanceled", {"workflowTaskCompletedEventId": wtc})
+    return h.json()
+
+
+def failed(server: str = "test") -> dict[str, Any]:
+    """``fetch_batch`` times out for good, and the workflow fails with it. The test server
+    writes no Started event for the attempt that timed out, and no retry state on the
+    workflow's failure (its activity failure's ``retryState`` is the activity's)."""
+    h = History(server=server)
     scheduled = h.activity(h.task(), "fetch_batch")
     h.wait(30)
-    h.failed(
-        scheduled, h.started(scheduled, attempt=5), timeout, "RETRY_STATE_TIMEOUT", kind="TimedOut"
-    )
+    h.timed_out(scheduled, retry_state="RETRY_STATE_TIMEOUT", attempt=5)
+    timeout = {"timeoutFailureInfo": {"timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"}}
+    if server == "dev":
+        timeout = {"message": "activity StartToClose timeout", "source": "Server", **timeout}
     wrapped = failure(
         "Activity task timed out",
         info="activityFailureInfo",
@@ -771,14 +895,7 @@ def failed() -> dict[str, Any]:
         },
         cause=timeout,
     )
-    h.add(
-        "WorkflowExecutionFailed",
-        {
-            "failure": wrapped,
-            "retryState": "RETRY_STATE_RETRY_POLICY_NOT_SET",
-            "workflowTaskCompletedEventId": h.task(),
-        },
-    )
+    h.fail(h.task(), wrapped)
     return h.json()
 
 
@@ -854,6 +971,7 @@ def leak() -> tuple[dict[str, Any], bytes]:
     h.failed(fails, h.started(fails), plain_failure, "RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED")
     heartbeat = failure(
         m,
+        source="Server",
         info="timeoutFailureInfo",
         info_value={"timeoutType": "TIMEOUT_TYPE_HEARTBEAT", "lastHeartbeatDetails": payloads(m)},
     )
@@ -913,6 +1031,8 @@ def leak() -> tuple[dict[str, Any], bytes]:
             "workflowTaskCompletedEventId": wtc,
         },
     )
+    # One still running when it ends (pending: leak_pending).
+    h.activity(wtc, "slow", input=payloads(m))
     h.task()
     h.add("NexusOperationCompleted", {"scheduledEventId": str(nexus_op), "result": payload(m)})
     h.add(
@@ -920,6 +1040,41 @@ def leak() -> tuple[dict[str, Any], bytes]:
         {"reason": m, "details": payloads(m), "identity": "admin@cli"},
     )
     return h.json(), ciphertext
+
+
+def leak_pending() -> dict[str, Any]:
+    """``DescribeWorkflowExecution`` of :func:`leak` before the operator ended it: ``slow``
+    is running its third attempt, and its heartbeat details and last failure carry
+    :data:`MARKER` (what the pending overlay reads, and must not pass on)."""
+    m = MARKER
+    last = failure(
+        m,
+        encoded=payload({"message": m, "stack_trace": f'  File "{m}.py"'}),
+        info_value={"type": "RuntimeError", "details": payloads(m)},
+    )
+    last["stackTrace"] = f'  File "{m}.py", line 1'
+    return {
+        "executionConfig": {"taskQueue": {"name": TASK_QUEUE}},
+        "workflowExecutionInfo": {
+            "execution": {"workflowId": WORKFLOW_ID, "runId": RUN_ID},
+            "type": {"name": "EnrichFlow"},
+            "memo": {"fields": {"note": payload(m)}},
+            "status": "WORKFLOW_EXECUTION_STATUS_RUNNING",
+        },
+        "pendingActivities": [
+            {
+                "activityId": "6",
+                "activityType": {"name": "slow"},
+                "state": "PENDING_ACTIVITY_STATE_STARTED",
+                "heartbeatDetails": payloads(m),
+                "lastHeartbeatTime": "2026-10-18T09:01:00.000000000Z",
+                "lastStartedTime": "2026-10-18T09:00:59.000000000Z",
+                "attempt": 3,
+                "lastFailure": last,
+                "lastWorkerIdentity": "4242@worker-a",
+            }
+        ],
+    }
 
 
 def undecodable() -> dict[str, Any]:
@@ -958,6 +1113,11 @@ FIXTURES: dict[str, Callable[[], dict[str, Any]]] = {
     "nexus": nexus,
     "failed": failed,
     "terminated": terminated,
+    "canceled": canceled,
+    "tail_forget": tail_forget,
+    "local_sequence": local_sequence,
+    "local_gather": local_gather,
+    "timer_race": timer_race,
     "leak": lambda: leak()[0],
     "undecodable": undecodable,
 }

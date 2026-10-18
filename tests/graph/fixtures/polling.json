@@ -4,7 +4,6 @@
    "eventId": "1",
    "eventTime": "2026-10-18T09:00:00.124Z",
    "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
-   "taskId": "1048577",
    "workflowExecutionStartedEventAttributes": {
     "workflowType": {
      "name": "EnrichFlow"
@@ -35,7 +34,6 @@
    "eventId": "2",
    "eventTime": "2026-10-18T09:00:00.125Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-   "taskId": "1048578",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -49,7 +47,6 @@
    "eventId": "3",
    "eventTime": "2026-10-18T09:00:00.127Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048579",
    "workflowTaskStartedEventAttributes": {
     "scheduledEventId": "2",
     "identity": "4242@worker-a",
@@ -60,10 +57,8 @@
    "eventId": "4",
    "eventTime": "2026-10-18T09:00:00.128Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048580",
    "workflowTaskCompletedEventAttributes": {
     "scheduledEventId": "2",
-    "startedEventId": "3",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -76,7 +71,6 @@
    "eventId": "5",
    "eventTime": "2026-10-18T09:00:00.129Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048581",
    "activityTaskScheduledEventAttributes": {
     "activityId": "1",
     "activityType": {
@@ -112,7 +106,6 @@
    "eventId": "6",
    "eventTime": "2026-10-18T09:00:00.180Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048582",
    "activityTaskStartedEventAttributes": {
     "scheduledEventId": "5",
     "identity": "4242@worker-a",
@@ -123,7 +116,6 @@
    "eventId": "7",
    "eventTime": "2026-10-18T09:00:00.182Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-   "taskId": "1048583",
    "activityTaskCompletedEventAttributes": {
     "result": {
      "payloads": [
@@ -144,7 +136,6 @@
    "eventId": "8",
    "eventTime": "2026-10-18T09:00:00.183Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-   "taskId": "1048584",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -158,7 +149,6 @@
    "eventId": "9",
    "eventTime": "2026-10-18T09:00:00.184Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048585",
    "workflowTaskStartedEventAttributes": {
     "scheduledEventId": "8",
     "identity": "4242@worker-a",
@@ -169,10 +159,8 @@
    "eventId": "10",
    "eventTime": "2026-10-18T09:00:00.185Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048586",
    "workflowTaskCompletedEventAttributes": {
     "scheduledEventId": "8",
-    "startedEventId": "9",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -185,7 +173,6 @@
    "eventId": "11",
    "eventTime": "2026-10-18T09:00:00.187Z",
    "eventType": "EVENT_TYPE_TIMER_STARTED",
-   "taskId": "1048587",
    "timerStartedEventAttributes": {
     "timerId": "1",
     "startToFireTimeout": "30s",
@@ -196,7 +183,6 @@
    "eventId": "12",
    "eventTime": "2026-10-18T09:00:30.188Z",
    "eventType": "EVENT_TYPE_TIMER_FIRED",
-   "taskId": "1048588",
    "timerFiredEventAttributes": {
     "timerId": "1",
     "startedEventId": "11"
@@ -206,7 +192,6 @@
    "eventId": "13",
    "eventTime": "2026-10-18T09:00:30.189Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-   "taskId": "1048589",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -220,7 +205,6 @@
    "eventId": "14",
    "eventTime": "2026-10-18T09:00:30.190Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048590",
    "workflowTaskStartedEventAttributes": {
     "scheduledEventId": "13",
     "identity": "4242@worker-a",
@@ -231,10 +215,8 @@
    "eventId": "15",
    "eventTime": "2026-10-18T09:00:30.191Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048591",
    "workflowTaskCompletedEventAttributes": {
     "scheduledEventId": "13",
-    "startedEventId": "14",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -247,7 +229,6 @@
    "eventId": "16",
    "eventTime": "2026-10-18T09:00:30.193Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048592",
    "activityTaskScheduledEventAttributes": {
     "activityId": "2",
     "activityType": {
@@ -283,7 +264,6 @@
    "eventId": "17",
    "eventTime": "2026-10-18T09:00:30.244Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048593",
    "activityTaskStartedEventAttributes": {
     "scheduledEventId": "16",
     "identity": "4242@worker-a",
@@ -294,7 +274,6 @@
    "eventId": "18",
    "eventTime": "2026-10-18T09:00:30.245Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-   "taskId": "1048594",
    "activityTaskCompletedEventAttributes": {
     "result": {
      "payloads": [
@@ -315,7 +294,6 @@
    "eventId": "19",
    "eventTime": "2026-10-18T09:00:30.246Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-   "taskId": "1048595",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -329,7 +307,6 @@
    "eventId": "20",
    "eventTime": "2026-10-18T09:00:30.248Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048596",
    "workflowTaskStartedEventAttributes": {
     "scheduledEventId": "19",
     "identity": "4242@worker-a",
@@ -340,10 +317,8 @@
    "eventId": "21",
    "eventTime": "2026-10-18T09:00:30.249Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048597",
    "workflowTaskCompletedEventAttributes": {
     "scheduledEventId": "19",
-    "startedEventId": "20",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -356,7 +331,6 @@
    "eventId": "22",
    "eventTime": "2026-10-18T09:00:30.250Z",
    "eventType": "EVENT_TYPE_TIMER_STARTED",
-   "taskId": "1048598",
    "timerStartedEventAttributes": {
     "timerId": "2",
     "startToFireTimeout": "30s",
@@ -367,7 +341,6 @@
    "eventId": "23",
    "eventTime": "2026-10-18T09:01:00.251Z",
    "eventType": "EVENT_TYPE_TIMER_FIRED",
-   "taskId": "1048599",
    "timerFiredEventAttributes": {
     "timerId": "2",
     "startedEventId": "22"
@@ -377,7 +350,6 @@
    "eventId": "24",
    "eventTime": "2026-10-18T09:01:00.253Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-   "taskId": "1048600",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -391,7 +363,6 @@
    "eventId": "25",
    "eventTime": "2026-10-18T09:01:00.254Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048601",
    "workflowTaskStartedEventAttributes": {
     "scheduledEventId": "24",
     "identity": "4242@worker-a",
@@ -402,10 +373,8 @@
    "eventId": "26",
    "eventTime": "2026-10-18T09:01:00.255Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048602",
    "workflowTaskCompletedEventAttributes": {
     "scheduledEventId": "24",
-    "startedEventId": "25",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -418,7 +387,6 @@
    "eventId": "27",
    "eventTime": "2026-10-18T09:01:00.256Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048603",
    "activityTaskScheduledEventAttributes": {
     "activityId": "3",
     "activityType": {
@@ -454,7 +422,6 @@
    "eventId": "28",
    "eventTime": "2026-10-18T09:01:00.308Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048604",
    "activityTaskStartedEventAttributes": {
     "scheduledEventId": "27",
     "identity": "4242@worker-a",
@@ -465,7 +432,6 @@
    "eventId": "29",
    "eventTime": "2026-10-18T09:01:00.309Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-   "taskId": "1048605",
    "activityTaskCompletedEventAttributes": {
     "result": {
      "payloads": [
@@ -486,7 +452,6 @@
    "eventId": "30",
    "eventTime": "2026-10-18T09:01:00.310Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-   "taskId": "1048606",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -500,7 +465,6 @@
    "eventId": "31",
    "eventTime": "2026-10-18T09:01:00.311Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048607",
    "workflowTaskStartedEventAttributes": {
     "scheduledEventId": "30",
     "identity": "4242@worker-a",
@@ -511,10 +475,8 @@
    "eventId": "32",
    "eventTime": "2026-10-18T09:01:00.312Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048608",
    "workflowTaskCompletedEventAttributes": {
     "scheduledEventId": "30",
-    "startedEventId": "31",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -527,7 +489,6 @@
    "eventId": "33",
    "eventTime": "2026-10-18T09:01:00.314Z",
    "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
-   "taskId": "1048609",
    "workflowExecutionCompletedEventAttributes": {
     "result": {
      "payloads": [

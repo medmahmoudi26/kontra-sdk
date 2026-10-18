@@ -4,7 +4,6 @@
    "eventId": "1",
    "eventTime": "2026-10-18T09:00:00.124Z",
    "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
-   "taskId": "1048577",
    "workflowExecutionStartedEventAttributes": {
     "workflowType": {
      "name": "EnrichFlow"
@@ -35,7 +34,6 @@
    "eventId": "2",
    "eventTime": "2026-10-18T09:00:00.125Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-   "taskId": "1048578",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -49,7 +47,6 @@
    "eventId": "3",
    "eventTime": "2026-10-18T09:00:00.127Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048579",
    "workflowTaskStartedEventAttributes": {
     "scheduledEventId": "2",
     "identity": "4242@worker-a",
@@ -60,10 +57,8 @@
    "eventId": "4",
    "eventTime": "2026-10-18T09:00:00.128Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048580",
    "workflowTaskCompletedEventAttributes": {
     "scheduledEventId": "2",
-    "startedEventId": "3",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -76,7 +71,6 @@
    "eventId": "5",
    "eventTime": "2026-10-18T09:00:00.129Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048581",
    "activityTaskScheduledEventAttributes": {
     "activityId": "1",
     "activityType": {
@@ -111,38 +105,22 @@
   {
    "eventId": "6",
    "eventTime": "2026-10-18T09:00:30.130Z",
-   "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048582",
-   "activityTaskStartedEventAttributes": {
-    "scheduledEventId": "5",
-    "identity": "4242@worker-a",
-    "attempt": 5
-   }
-  },
-  {
-   "eventId": "7",
-   "eventTime": "2026-10-18T09:00:30.132Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT",
-   "taskId": "1048583",
    "activityTaskTimedOutEventAttributes": {
     "failure": {
-     "message": "activity StartToClose timeout",
-     "source": "PythonSDK",
      "timeoutFailureInfo": {
       "timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"
      }
     },
     "scheduledEventId": "5",
-    "startedEventId": "6",
-    "identity": "4242@worker-a",
+    "startedEventId": "-1",
     "retryState": "RETRY_STATE_TIMEOUT"
    }
   },
   {
-   "eventId": "8",
-   "eventTime": "2026-10-18T09:00:30.133Z",
+   "eventId": "7",
+   "eventTime": "2026-10-18T09:00:30.132Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-   "taskId": "1048584",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -153,24 +131,21 @@
    }
   },
   {
-   "eventId": "9",
-   "eventTime": "2026-10-18T09:00:30.134Z",
+   "eventId": "8",
+   "eventTime": "2026-10-18T09:00:30.133Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048585",
    "workflowTaskStartedEventAttributes": {
-    "scheduledEventId": "8",
+    "scheduledEventId": "7",
     "identity": "4242@worker-a",
-    "historySizeBytes": "3200"
+    "historySizeBytes": "2800"
    }
   },
   {
-   "eventId": "10",
-   "eventTime": "2026-10-18T09:00:30.135Z",
+   "eventId": "9",
+   "eventTime": "2026-10-18T09:00:30.134Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048586",
    "workflowTaskCompletedEventAttributes": {
-    "scheduledEventId": "8",
-    "startedEventId": "9",
+    "scheduledEventId": "7",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -180,17 +155,13 @@
    }
   },
   {
-   "eventId": "11",
-   "eventTime": "2026-10-18T09:00:30.137Z",
+   "eventId": "10",
+   "eventTime": "2026-10-18T09:00:30.135Z",
    "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_FAILED",
-   "taskId": "1048587",
    "workflowExecutionFailedEventAttributes": {
     "failure": {
      "message": "Activity task timed out",
-     "source": "PythonSDK",
      "cause": {
-      "message": "activity StartToClose timeout",
-      "source": "PythonSDK",
       "timeoutFailureInfo": {
        "timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"
       }
@@ -204,8 +175,7 @@
       "retryState": "RETRY_STATE_TIMEOUT"
      }
     },
-    "retryState": "RETRY_STATE_RETRY_POLICY_NOT_SET",
-    "workflowTaskCompletedEventId": "9"
+    "workflowTaskCompletedEventId": "8"
    }
   }
  ]

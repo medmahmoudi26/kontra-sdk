@@ -4,7 +4,6 @@
    "eventId": "1",
    "eventTime": "2026-10-18T09:00:00.124Z",
    "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
-   "taskId": "1048577",
    "workflowExecutionStartedEventAttributes": {
     "workflowType": {
      "name": "EnrichFlow"
@@ -35,7 +34,6 @@
    "eventId": "2",
    "eventTime": "2026-10-18T09:00:00.125Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-   "taskId": "1048578",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -49,7 +47,6 @@
    "eventId": "3",
    "eventTime": "2026-10-18T09:00:00.127Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048579",
    "workflowTaskStartedEventAttributes": {
     "scheduledEventId": "2",
     "identity": "4242@worker-a",
@@ -60,10 +57,8 @@
    "eventId": "4",
    "eventTime": "2026-10-18T09:00:00.128Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048580",
    "workflowTaskCompletedEventAttributes": {
     "scheduledEventId": "2",
-    "startedEventId": "3",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -76,7 +71,6 @@
    "eventId": "5",
    "eventTime": "2026-10-18T09:00:00.129Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048581",
    "activityTaskScheduledEventAttributes": {
     "activityId": "1",
     "activityType": {
@@ -112,7 +106,6 @@
    "eventId": "6",
    "eventTime": "2026-10-18T09:00:00.130Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048582",
    "activityTaskScheduledEventAttributes": {
     "activityId": "2",
     "activityType": {
@@ -148,7 +141,6 @@
    "eventId": "7",
    "eventTime": "2026-10-18T09:00:00.132Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048583",
    "activityTaskScheduledEventAttributes": {
     "activityId": "3",
     "activityType": {
@@ -184,7 +176,6 @@
    "eventId": "8",
    "eventTime": "2026-10-18T09:00:00.183Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048584",
    "activityTaskStartedEventAttributes": {
     "scheduledEventId": "5",
     "identity": "4242@worker-a",
@@ -195,7 +186,6 @@
    "eventId": "9",
    "eventTime": "2026-10-18T09:00:00.184Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-   "taskId": "1048585",
    "activityTaskCompletedEventAttributes": {
     "result": {
      "payloads": [
@@ -216,7 +206,6 @@
    "eventId": "10",
    "eventTime": "2026-10-18T09:00:00.235Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048586",
    "activityTaskStartedEventAttributes": {
     "scheduledEventId": "6",
     "identity": "4242@worker-a",
@@ -227,7 +216,6 @@
    "eventId": "11",
    "eventTime": "2026-10-18T09:00:00.237Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-   "taskId": "1048587",
    "activityTaskCompletedEventAttributes": {
     "result": {
      "payloads": [
@@ -248,7 +236,6 @@
    "eventId": "12",
    "eventTime": "2026-10-18T09:00:00.288Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048588",
    "activityTaskStartedEventAttributes": {
     "scheduledEventId": "7",
     "identity": "4242@worker-a",
@@ -259,7 +246,6 @@
    "eventId": "13",
    "eventTime": "2026-10-18T09:00:00.289Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-   "taskId": "1048589",
    "activityTaskCompletedEventAttributes": {
     "result": {
      "payloads": [
@@ -280,7 +266,6 @@
    "eventId": "14",
    "eventTime": "2026-10-18T09:00:00.290Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-   "taskId": "1048590",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -294,7 +279,6 @@
    "eventId": "15",
    "eventTime": "2026-10-18T09:00:00.291Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048591",
    "workflowTaskStartedEventAttributes": {
     "scheduledEventId": "14",
     "identity": "4242@worker-a",
@@ -305,10 +289,8 @@
    "eventId": "16",
    "eventTime": "2026-10-18T09:00:00.293Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048592",
    "workflowTaskCompletedEventAttributes": {
     "scheduledEventId": "14",
-    "startedEventId": "15",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -321,7 +303,6 @@
    "eventId": "17",
    "eventTime": "2026-10-18T09:00:00.294Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048593",
    "activityTaskScheduledEventAttributes": {
     "activityId": "4",
     "activityType": {
@@ -357,7 +338,6 @@
    "eventId": "18",
    "eventTime": "2026-10-18T09:00:00.295Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048594",
    "activityTaskScheduledEventAttributes": {
     "activityId": "5",
     "activityType": {
@@ -393,7 +373,6 @@
    "eventId": "19",
    "eventTime": "2026-10-18T09:00:00.296Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048595",
    "activityTaskScheduledEventAttributes": {
     "activityId": "6",
     "activityType": {
@@ -429,7 +408,6 @@
    "eventId": "20",
    "eventTime": "2026-10-18T09:00:00.298Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048596",
    "activityTaskScheduledEventAttributes": {
     "activityId": "7",
     "activityType": {
@@ -465,7 +443,6 @@
    "eventId": "21",
    "eventTime": "2026-10-18T09:00:00.299Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
-   "taskId": "1048597",
    "activityTaskScheduledEventAttributes": {
     "activityId": "8",
     "activityType": {
@@ -501,7 +478,6 @@
    "eventId": "22",
    "eventTime": "2026-10-18T09:00:00.350Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048598",
    "activityTaskStartedEventAttributes": {
     "scheduledEventId": "17",
     "identity": "4242@worker-a",
@@ -512,7 +488,6 @@
    "eventId": "23",
    "eventTime": "2026-10-18T09:00:00.351Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-   "taskId": "1048599",
    "activityTaskCompletedEventAttributes": {
     "result": {
      "payloads": [
@@ -533,7 +508,6 @@
    "eventId": "24",
    "eventTime": "2026-10-18T09:00:00.403Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048600",
    "activityTaskStartedEventAttributes": {
     "scheduledEventId": "18",
     "identity": "4242@worker-a",
@@ -544,7 +518,6 @@
    "eventId": "25",
    "eventTime": "2026-10-18T09:00:00.404Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-   "taskId": "1048601",
    "activityTaskCompletedEventAttributes": {
     "result": {
      "payloads": [
@@ -565,7 +538,6 @@
    "eventId": "26",
    "eventTime": "2026-10-18T09:00:00.455Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048602",
    "activityTaskStartedEventAttributes": {
     "scheduledEventId": "19",
     "identity": "4242@worker-a",
@@ -576,7 +548,6 @@
    "eventId": "27",
    "eventTime": "2026-10-18T09:00:00.456Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-   "taskId": "1048603",
    "activityTaskCompletedEventAttributes": {
     "result": {
      "payloads": [
@@ -597,7 +568,6 @@
    "eventId": "28",
    "eventTime": "2026-10-18T09:00:00.508Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048604",
    "activityTaskStartedEventAttributes": {
     "scheduledEventId": "20",
     "identity": "4242@worker-a",
@@ -608,7 +578,6 @@
    "eventId": "29",
    "eventTime": "2026-10-18T09:00:00.509Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-   "taskId": "1048605",
    "activityTaskCompletedEventAttributes": {
     "result": {
      "payloads": [
@@ -629,7 +598,6 @@
    "eventId": "30",
    "eventTime": "2026-10-18T09:00:00.560Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
-   "taskId": "1048606",
    "activityTaskStartedEventAttributes": {
     "scheduledEventId": "21",
     "identity": "4242@worker-a",
@@ -640,7 +608,6 @@
    "eventId": "31",
    "eventTime": "2026-10-18T09:00:00.561Z",
    "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
-   "taskId": "1048607",
    "activityTaskCompletedEventAttributes": {
     "result": {
      "payloads": [
@@ -661,7 +628,6 @@
    "eventId": "32",
    "eventTime": "2026-10-18T09:00:00.562Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
-   "taskId": "1048608",
    "workflowTaskScheduledEventAttributes": {
     "taskQueue": {
      "name": "acme/enrich@1.0.0",
@@ -675,7 +641,6 @@
    "eventId": "33",
    "eventTime": "2026-10-18T09:00:00.564Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
-   "taskId": "1048609",
    "workflowTaskStartedEventAttributes": {
     "scheduledEventId": "32",
     "identity": "4242@worker-a",
@@ -686,10 +651,8 @@
    "eventId": "34",
    "eventTime": "2026-10-18T09:00:00.565Z",
    "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
-   "taskId": "1048610",
    "workflowTaskCompletedEventAttributes": {
     "scheduledEventId": "32",
-    "startedEventId": "33",
     "identity": "4242@worker-a",
     "sdkMetadata": {
      "sdkName": "temporal-python",
@@ -702,7 +665,6 @@
    "eventId": "35",
    "eventTime": "2026-10-18T09:00:00.566Z",
    "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
-   "taskId": "1048611",
    "workflowExecutionCompletedEventAttributes": {
     "result": {
      "payloads": [

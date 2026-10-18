@@ -1063,9 +1063,24 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
   commands, so the window holds exactly what this task (and any empty task before it)
   observed. With no close there (a signal woke it), the previous group; for the first, `start`.
   A child's Started event and a timer the workflow canceled are nothing it waited on. The
-  terminal event the workflow commanded (completed, failed, canceled, continued as new) is one
-  more group, and its predecessors lead to `end`; a run terminated, timed out or still running
-  has no edge to `end`.
+  terminal event the workflow commanded (completed, failed, canceled, continued as new) leads
+  to `end` from what it observed; a run terminated, timed out or still running has no edge to
+  `end`.
+- **A local activity splits its workflow task, and the end belongs to its task (where this
+  departs from #41's spec).** The spec groups commands by task only and treats the end as a
+  group of its own, and real histories (both servers, temporalio 1.34) show both rules wrong.
+  A local activity runs inside its task, and sdk-core writes its marker when it resolves:
+  `x = await local(); await b(x)` is the marker, then `b`, in one task; `gather(local(), b())`
+  is `b`, then the marker. Grouped by task alone, `b` looked independent of the local activity
+  and the local activity led nowhere, not even to the end the run waited on it for. So a
+  group is what one activation commanded: a task's commands split before each command that
+  follows a marker, and a marker is a close at its own place (just after itself), seen by the
+  next group's window like any other. Two markers in a row stay one group: history cannot
+  tell `gather(l1(), l2())` from `await l1(); await l2()`. And `workflow.start_activity(c);
+  return x` writes `c` and the completion in one task: as a group of its own the end found no
+  close in its window and fell back to `c`, a thing the run never waited on. The terminal
+  event joins its task's last group (unless a marker comes right before it) and leads to
+  `end` from that group's predecessors.
 - **Identity is an occurrence index after folding repeats.** "Same activity and same
   predecessors" never settles on a loop -- the second iteration of `for x in xs: await a(x)`
   has `a` before it and the first has `start`, so it makes `a#2`, `a#3`, ... -- and it splits
@@ -1074,11 +1089,19 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
   of up to 16 groups repeated, and a last iteration cut short); and a node is one
   `(kind, name)` at one position of what is left: `name` at the first position holding it,
   `name#k` at the k-th. A loop is one node with a self or back edge, `a; b; a` is `a`, `b`,
-  `a#2`, and a call site gets the same id in every run of the same code, which is what `union`
-  and `merge` match by. The accepted limits: `await a(); await a()` is a loop of two, since
-  history cannot tell two call sites in a row from two iterations; a loop that ran once
-  anywhere looks like straight code there; and a name two kinds share (a function run as an
-  activity and as a local activity) stays with the activity, the other being `name~kind`.
+  `a#2`, and a call site of straight code, or of a loop whose body does not branch, gets the
+  same id in every run, which is what `union` and `merge` match by. `%`, `#` and `~` are
+  percent-escaped in the name part, so `#k` and `~kind` only ever come from the suffixes: an
+  activity named `a#2` is `a%232`, never the second `a` of another run. The accepted limits:
+  `await a(); await a()` is a loop of two, since history cannot tell two call sites in a row
+  from two iterations; a loop that ran once anywhere looks like straight code there; folding
+  folds only iterations whose groups repeat exactly, so a loop whose body branches
+  (`for x in xs: await a(x); if x.ok: await b(x)`) folds only where its iterations happened
+  to match, its ids follow the branch pattern of that run (`a, b, a#2, b#2` for ok, no, ok;
+  `a, b` for ok, ok, ok), and `union` and `merge` do not line its runs up; and a name two
+  kinds share (a function run as an activity and as a local activity) stays with the activity
+  within a run, the other being `name~kind`, while two runs that each hold only one of them
+  give both the bare name.
 - **A timer is `wait`**, labelled with its duration (`wait 30s`; the latest when a node's
   timers differ), so a polling loop's timer is one node.
 - **A batch child is named from its own history, never from its id.** Every child of
@@ -1090,7 +1113,10 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
 - **`workflowTaskCompletedEventId` is compared by value, never looked up.** The dev server
   writes the WorkflowTaskCompleted event's id there; the time-skipping test server, which #42's
   mock runs use, writes the WorkflowTaskStarted event's, one before it. The same workflow gives
-  the same graph from both.
+  the same graph from both, but for what the test server does not write: it leaves
+  `retryState` off a workflow's and a child's failure (`retry_state` is then null, where the
+  dev server's run says `retry_policy_not_set`), writes no Started event for an activity
+  attempt that timed out, and no `taskId`.
 - **One event in Temporal UI is a path.** UI 2.55.0 has no `?eventId=` parameter: a node links
   to `/namespaces/{ns}/workflows/{wf}/{run}/history/events/{id}`, a run to `.../history`. A
   closed child links to its last run (its close event names the last of its continue-as-new
@@ -1109,23 +1135,34 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
   no input, result, heartbeat, memo, search attribute, termination reason, failure message,
   stack trace or encoded attributes -- and a failure is its kind (application; timeout, with
   its type; canceled; terminated; server; an activity or child failure is its cause's) and its
-  retry state. `with_io(graph, history, codec)`, async, decodes inputs, results and failure
-  messages through the codec it must be given and Temporal's default converter, a payload the
-  codec cannot open being `{"error": "undecodable"}`. With kontra's converter a failure's
-  `message` reads `Encoded failure` and the real one is in `encodedAttributes`, which only
-  `with_io` opens. The two payloads `parse` reads are records, not a party's data:
-  `_tracer-data`, for the trace and span ids, and a local activity marker's sdk-core record,
-  for its type and attempt.
+  retry state, the event's own: the `retryState` inside an `activityFailureInfo` the failure
+  wraps is the activity's, and taking it when the event has none made the same run report
+  `maximum_attempts_reached` on one server and `retry_policy_not_set` on the other.
+  `with_io(graph, history, codec)`, async, decodes inputs, results and failure messages
+  through the codec it must be given and Temporal's default converter, a payload the codec
+  cannot open being `{"error": "undecodable"}`. With kontra's converter a failure's `message`
+  reads `Encoded failure` and the real one is in `encodedAttributes`, which only `with_io`
+  opens. The two payloads `parse` reads are records, not a party's data: `_tracer-data`, for
+  the trace and span ids, and a local activity marker's sdk-core record, for its type and
+  attempt.
 - **Running and attempts come from `DescribeWorkflowExecution`.** Temporal writes no event per
   retry, and an activity's Started event (its attempt, its last failure) only when the activity
   closes, so history alone cannot show one running or retrying. `parse(pending=)` takes the
   answer's `pendingActivities`: an open activity whose state is started or cancel-requested is
   `running`, with the attempt and the last failure's kind.
+- **What a closed run left open ended with it** (the spec is silent). No event closes an
+  activity, timer or child still open when its run closes, and left `scheduled` with an open
+  span, a run closed days ago read as in flight and its log links queried up to now. Temporal
+  drops a closed run's activities, timers and Nexus operations (an activity heartbeating after
+  gets NotFound, which the SDK turns into a cancel), so they are `canceled`, or `terminated` /
+  `timed_out` with a run the server ended so; a child follows its parent close policy
+  (terminated by default, canceled on request cancel, still open when abandoned, since it may
+  well be running). Their `t.closed` and span end at the run's close.
 - **Local activities and Nexus operations are nodes.** A local activity is only a
   `core_local_activity` marker; other markers are no node. It runs inside its workflow task, so
-  its marker is in the group of whatever that task did next, and shows in parallel with it. A
-  Nexus operation is `service/operation`, running from its Started event, which is no close
-  either.
+  its marker is a close at its own place in the task, and what the task commanded after it
+  is a group that follows it (above). A Nexus operation is `service/operation`, running from
+  its Started event, which is no close either.
 - **Edges are objects, and union and merge are two functions.** The issue's `merge` did both.
   `union(graphs)` is structure only: every node and edge of the mock runs, and nothing any run
   said (status, counts, times, references, failures). `merge(static, live)` paints a live run
@@ -1136,10 +1173,20 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
   (a child's logs are under its own workflow id), over the node's span with a second either
   side, as epoch-millisecond strings: Grafana 13.2 drops a numeric range. `trace` is Tempo by
   the trace id. A link is left out when its base URL or datasource is not configured or the
-  graph lacks what it needs; `LinkConfig` takes http(s) base URLs only.
+  graph lacks what it needs; `LinkConfig` takes http(s) base URLs only. A string no server
+  writes (a lone surrogate: proto strings are UTF-8) is unreadable, like anything else
+  malformed, so no link is built from one. `mermaid` writes `%` as an entity code as well as
+  `#`, quotes, `<`, `>`, `&` and backticks: Mermaid applies a `%%{init: ...}%%` directive found
+  anywhere in its text, a quoted label included, and an activity's name is a label.
 - **Checked by** `tests/graph`: synthesized histories in both servers' shapes (`synth.py`
-  builds them; a test holds the checked-in files to it), one test per item of #41's "done
-  when" and per identity case above, every fixture truncated at every event and damaged at
-  random (hypothesis) without `parse` raising, and a history with a marker in every payload
-  and one sealed result, of which no graph, union, merge, link or Mermaid text carries
-  anything while `with_io` with the test codec shows it all.
+  builds them; a test holds the checked-in files to it, and another parses every one
+  strictly into Temporal's own `History` proto, so no field a server does not write creeps
+  in), one test per item of #41's "done when" and per identity case above, every fixture
+  truncated at every event and damaged at random (hypothesis, including the `json/plain`
+  payloads `parse` decodes) without `parse` raising, two 10,000-wide fan-outs and 50,000
+  folded groups in bounded time (edges are built from each source and target once, and
+  folding looks only where a block can repeat), and a history with a marker in every payload,
+  one sealed result and a pending activity whose heartbeat and last failure carry it, of
+  which no graph, union, merge, link or Mermaid text carries anything while `with_io` with
+  the test codec shows it all. A codec that gives back more or fewer payloads than it was
+  handed is undecodable there, never a null result.

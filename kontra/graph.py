@@ -3,15 +3,18 @@ back as nodes, edges and a status per node.
 
 Temporal keeps no definition of a workflow, only what each run did, so the structure is
 read from the commands a run's workflow tasks made. Commands one workflow task made share
-a ``workflowTaskCompletedEventId`` and are one parallel group (a batch). A batch's
-predecessors are the completions its task observed: the close events written between the
-previous batch's first command and its own, since what arrives while a task is in flight is
-written after that task's commands. So an edge means "this waited on that", never only
-"came later". When no close is in that window (a signal, an empty task) the previous batch
-is the predecessor; the first batch's is ``start``. The terminal event the workflow
-commanded (completed, failed, canceled, continued as new) is one more batch whose
-predecessors lead to ``end``; a run terminated, timed out or still running has no edge to
-``end``.
+a ``workflowTaskCompletedEventId`` and are one parallel group (a batch), split only where a
+local activity resolved inside the task: what the task commanded after a local activity's
+marker is a batch of its own. A batch's predecessors are the completions it observed: the
+close events written between the previous batch's first command and its own (a local
+activity closes at its marker), since what arrives while a task is in flight is written
+after that task's commands. So an edge means "this waited on that", never only "came
+later". When no close is in that window (a signal, an empty task) the previous batch is
+the predecessor; the first batch's is ``start``. The terminal event the workflow commanded
+(completed, failed, canceled, continued as new) leads to ``end`` from what it observed:
+from its own batch's predecessors when it was commanded with that batch, never from what
+that batch started. A run terminated, timed out or still running has no edge to ``end``;
+what a closed run left open ended with it.
 
 Repeats fold before nodes are named. Each batch has a signature, the set of
 ``(kind, name)`` it holds, and tandem repeats of signatures fold innermost first into
@@ -42,11 +45,13 @@ import binascii
 import bisect
 import copy
 import json
+import operator
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from itertools import compress
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote, urlsplit
 
@@ -211,7 +216,16 @@ def _at(value: object, *path: str) -> object:
 
 
 def _str(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
+    """A non-empty string Temporal could have written: proto strings are valid UTF-8, so
+    one holding a lone surrogate (only hand-built JSON has one) cannot be read."""
+    if not isinstance(value, str) or not value:
+        return None
+    if not value.isascii():
+        try:
+            value.encode()
+        except UnicodeEncodeError:
+            return None
+    return value
 
 
 def _int(value: object) -> int | None:
@@ -335,7 +349,10 @@ def _failure_info(
 def _failure(value: object, retry_state: object = None) -> dict[str, Any] | None:
     """A failure reduced to its kind (seam ⑤: never its message, stack trace or encoded
     attributes): the failure-info it carries, or, through an activity or child failure,
-    its cause's. ``retry_state`` is the event's, else the wrapper's."""
+    its cause's. ``retry_state`` is the event's own, and only that: a wrapper's
+    ``retryState`` is the inner activity's or child's, and the time-skipping server writes
+    none on a workflow's or a child's failure, so falling back to it would report another
+    retry state on one server than on the other."""
     failure = _map(value)
     if failure is None:
         return None
@@ -345,12 +362,10 @@ def _failure(value: object, retry_state: object = None) -> dict[str, Any] | None
             if info is not None:
                 timeout_type = _enum(info.get("timeoutType"), "TIMEOUT_TYPE_")
                 return _failure_info(kind, timeout_type if kind == "timeout" else None, retry_state)
-        wrapper = next((_map(failure.get(k)) for k in _FAILURE_WRAPPERS if k in failure), None)
+        wrapped = any(_map(failure.get(k)) is not None for k in _FAILURE_WRAPPERS)
         cause = _map(failure.get("cause"))
-        if wrapper is None or cause is None:
+        if not wrapped or cause is None:
             break
-        if retry_state is None:
-            retry_state = wrapper.get("retryState")
         failure = cause
     return _failure_info("unknown", None, retry_state)
 
@@ -433,17 +448,19 @@ class _Occurrence:
     start: _Event | None = None
     close: _Event | None = None
     failure: dict[str, Any] | None = None
+    #: The run's terminal event, for one still open when the run closed (no close of its own).
+    ended: _Event | None = None
 
-    @property
-    def batch(self) -> tuple[str, str]:
-        """What groups it with the rest of its workflow task's commands: the
-        ``workflowTaskCompletedEventId`` value as written (the dev server's points at the
-        WorkflowTaskCompleted event, the time-skipping server's at WorkflowTaskStarted;
-        never looked up), or, without one, its own event."""
-        wtc = self.event.attrs.get("workflowTaskCompletedEventId")
-        if isinstance(wtc, int) and not isinstance(wtc, bool):
-            wtc = str(wtc)
-        return ("wtc", wtc) if isinstance(wtc, str) else ("event", str(self.event.id))
+
+def _task(event: _Event) -> tuple[str, str]:
+    """The workflow task that commanded ``event``: its ``workflowTaskCompletedEventId`` value
+    as written (the dev server's points at the WorkflowTaskCompleted event, the
+    time-skipping server's at WorkflowTaskStarted; never looked up), or, without one, the
+    event itself."""
+    wtc = event.attrs.get("workflowTaskCompletedEventId")
+    if isinstance(wtc, int) and not isinstance(wtc, bool):
+        wtc = str(wtc)
+    return ("wtc", wtc) if isinstance(wtc, str) else ("event", str(event.id))
 
 
 def _command(event: _Event, batch_names: Mapping[str, str]) -> _Occurrence | None:
@@ -515,14 +532,19 @@ def _command(event: _Event, batch_names: Mapping[str, str]) -> _Occurrence | Non
     return None
 
 
+#: Where a close sits in event order: ``(event id, 0)``, or ``(marker id, 1)`` for a local
+#: activity, which closes just after its own marker (before anything written after it).
+_At = tuple[int, int]
+
+
 @dataclass
 class _Run:
     """What one run's history says: its occurrences in event order, the closes a later
-    workflow task can have observed (id, occurrence) in id order, and the run's own first
-    and terminal events."""
+    workflow task (or a later activation of the same one) can have observed, in event
+    order, and the run's own first and terminal events."""
 
     occurrences: list[_Occurrence] = field(default_factory=list[_Occurrence])
-    observed: list[tuple[int, _Occurrence]] = field(default_factory=list[tuple[int, _Occurrence]])
+    observed: list[tuple[_At, _Occurrence]] = field(default_factory=list[tuple[_At, _Occurrence]])
     started: _Event | None = None
     terminal: _Event | None = None
 
@@ -566,13 +588,43 @@ def _read(events: Sequence[_Event], batch_names: Mapping[str, str]) -> _Run:
                 occ.ref["run_id"] = _str(_at(a, "workflowExecution", "runId")) or occ.ref["run_id"]
             # A timer the workflow canceled is its own command, not something it waited on.
             if event.type != "TimerCanceled":
-                run.observed.append((event.id, occ))
+                run.observed.append(((event.id, 0), occ))
         elif event.type in _COMMANDS:
             occ = _command(event, batch_names)
             if occ is not None:
                 run.occurrences.append(occ)
                 by_event[event.id] = occ
+                if occ.kind == "local_activity":
+                    # It ran inside its workflow task: its marker is its command and its
+                    # close at once, and what the task commanded after it waited on it.
+                    run.observed.append(((event.id, 1), occ))
     return run
+
+
+def _settle(run: _Run) -> None:
+    """What a closed run says of the commands still open at its close: they ended with it
+    (no event of their own says so). Temporal drops a closed run's activities, timers and
+    Nexus operations (an activity heartbeating after gets NotFound, which the SDK turns
+    into a cancel), so they are ``canceled``, or ``terminated`` / ``timed_out`` with a run
+    the server ended so. A child follows its parent close policy: terminated (the default),
+    canceled (request cancel), or still open (abandon: it may well be running)."""
+    terminal = run.terminal
+    if terminal is None:
+        return
+    ending = {
+        "WorkflowExecutionTerminated": "terminated",
+        "WorkflowExecutionTimedOut": "timed_out",
+    }.get(terminal.type, "canceled")
+    for occ in run.occurrences:
+        if occ.status not in _OPEN or terminal.id <= occ.event.id:
+            continue
+        status = ending
+        if occ.kind == "child":
+            policy = _enum(occ.event.attrs.get("parentClosePolicy"), "PARENT_CLOSE_POLICY_")
+            if policy == "abandon":
+                continue
+            status = "canceled" if policy == "request_cancel" else "terminated"
+        occ.status, occ.closed, occ.ended = status, terminal.time, terminal
 
 
 def _batch_names(children: object) -> dict[str, str]:
@@ -658,18 +710,29 @@ def _fold(signatures: Sequence[_Signature]) -> tuple[list[_Signature], list[int]
     period = 1
     while period <= _PERIOD_MAX:
         out: list[tuple[int, list[tuple[int, int]]]] = []
-        i, n, folded = 0, len(seq), False
-        while i < n:
-            block = [symbol for symbol, _ in seq[i : i + period]]
+        n, folded = len(seq), False
+        symbols_now = [symbol for symbol, _ in seq]
+        # A block repeats at i only if the symbol one period on is the same: those places
+        # are found in one pass, and only they are looked at (most places repeat nothing,
+        # and every fold starts the periods again).
+        candidates = compress(
+            range(n - 2 * period + 1), map(operator.eq, symbols_now, symbols_now[period:])
+        )
+        i = 0
+        for start in candidates:
+            if start < i:
+                continue  # inside the loop just folded
             reps = 1
-            while i + (reps + 1) * period <= n and all(
-                seq[i + reps * period + j][0] == block[j] for j in range(period)
+            while start + (reps + 1) * period <= n and all(
+                symbols_now[start + reps * period + j] == symbols_now[start + j]
+                for j in range(period)
             ):
                 reps += 1
             if reps < 2:
-                out.append(seq[i])
-                i += 1
                 continue
+            out.extend(seq[i:start])
+            i = start
+            block = symbols_now[i : i + period]
             end = i + reps * period
             while end - i - reps * period < period - 1 and end < n:
                 if seq[end][0] != block[end - i - reps * period]:
@@ -690,6 +753,7 @@ def _fold(signatures: Sequence[_Signature]) -> tuple[list[_Signature], list[int]
             ]
             out.append((symbol, cover))
             i, folded = end, True
+        out.extend(seq[i:])
         seq = out
         period = 1 if folded else period + 1
 
@@ -702,17 +766,26 @@ def _fold(signatures: Sequence[_Signature]) -> tuple[list[_Signature], list[int]
     return positions, where
 
 
+def _id_name(name: str) -> str:
+    """``name`` as an id starts: ``%``, ``#`` and ``~`` percent-escaped, so that ``#k`` and
+    ``~kind`` only ever come from the suffixes and two call sites never share an id across
+    runs (an activity named ``a#2`` is not the second ``a``). Built, never parsed back."""
+    return name.replace("%", "%25").replace("#", "%23").replace("~", "%7E")
+
+
 def _ids(positions: Sequence[_Signature]) -> dict[tuple[int, _Slot], str]:
     """Each node's id: its name, then ``name#k`` at the k-th position holding the same
     ``(kind, name)``. A name two kinds share stays with the first of :data:`_KINDS` and is
-    ``name~kind`` for the others, as is a name that is ``start`` or ``end``."""
+    ``name~kind`` for the others, as is a name that is ``start`` or ``end``. The name part
+    is escaped (:func:`_id_name`), so an id is one ``(kind, name, k)`` in every run."""
     seen: Counter[_Slot] = Counter()
     wanted: list[tuple[int, _Slot, str]] = []
     for position, signature in enumerate(positions):
         for slot in signature:
             seen[slot] += 1
             index = seen[slot]
-            wanted.append((position, slot, slot[1] if index == 1 else f"{slot[1]}#{index}"))
+            name = _id_name(slot[1])
+            wanted.append((position, slot, name if index == 1 else f"{name}#{index}"))
     kinds: dict[str, set[str]] = {}
     for _, (kind, _), base in wanted:
         kinds.setdefault(base, set()).add(kind)
@@ -732,6 +805,47 @@ def _ids(positions: Sequence[_Signature]) -> dict[tuple[int, _Slot], str]:
 
 
 # --------------------------------------------------------------------------- parse
+
+
+def _batches(run: _Run) -> tuple[list[list[_Occurrence]], int | None]:
+    """The run's batches in event order, and the one its terminal event was commanded with
+    (None: one of its own).
+
+    A batch is what one activation of a workflow task commanded. Commands one task made
+    share a ``workflowTaskCompletedEventId``; a local activity runs inside its task, and
+    what the task commanded after its marker was commanded once it resolved (sdk-core
+    writes ``x = await local(); await b(x)`` as the marker, then ``b``, and
+    ``gather(local(), b())`` as ``b``, then the marker). So a task's commands split before
+    each command that follows a marker. The terminal event joins its task's last batch
+    unless a marker comes right before it: the run ended in the activation that made that
+    batch (``workflow.start_activity(c); return x``), so it waited on nothing the batch
+    started."""
+    tasks: dict[tuple[str, str], list[_Occurrence]] = {}
+    for occ in run.occurrences:
+        tasks.setdefault(_task(occ.event), []).append(occ)
+    terminal = run.terminal
+    ends_in = _task(terminal) if terminal is not None and terminal.type in _COMMANDED else None
+    batches: list[list[_Occurrence]] = []
+    joining: list[_Occurrence] | None = None
+    for task, commands in tasks.items():
+        batch: list[_Occurrence] = []
+        for occ in commands:
+            if batch and batch[-1].kind == "local_activity" and occ.kind != "local_activity":
+                batches.append(batch)
+                batch = []
+            batch.append(occ)
+        batches.append(batch)
+        last = commands[-1]
+        if (
+            task == ends_in
+            and terminal is not None
+            and terminal.id > last.event.id
+            and last.kind != "local_activity"
+        ):
+            joining = batch
+    batches.sort(key=lambda b: b[0].event.id)
+    joined = next((k for k, b in enumerate(batches) if b is joining), None)
+    return batches, joined
 
 
 def parse(
@@ -756,11 +870,9 @@ def parse(
     skipped. Deterministic, and the inputs are never changed."""
     run = _read(_events(history), _batch_names(children))
     _overlay(run.occurrences, pending)
+    _settle(run)
 
-    groups: dict[tuple[str, str], list[_Occurrence]] = {}
-    for occ in run.occurrences:
-        groups.setdefault(occ.batch, []).append(occ)
-    batches = sorted(groups.values(), key=lambda b: b[0].event.id)
+    batches, joined = _batches(run)
     signatures = [tuple(sorted({(o.kind, o.name) for o in b})) for b in batches]
     positions, where = _fold(signatures)
     ids = _ids(positions)
@@ -768,27 +880,36 @@ def parse(
         o.event.id: ids[where[k], (o.kind, o.name)] for k, b in enumerate(batches) for o in b
     }
 
-    # Causal edges: what each batch's task observed closing since the previous batch.
-    observed_ids = [event_id for event_id, _ in run.observed]
+    # Causal edges: what each batch's activation observed closing since the previous batch.
+    observed_at = [at for at, _ in run.observed]
     firsts = [b[0].event.id for b in batches]
 
-    def before(k: int, first: int) -> list[str]:
-        lo = firsts[k - 1] if k else 0
+    def before(k: int, first: int) -> set[str]:
+        lo = (firsts[k - 1] if k else 0, 0)
         window = run.observed[
-            bisect.bisect_right(observed_ids, lo) : bisect.bisect_left(observed_ids, first)
+            bisect.bisect_right(observed_at, lo) : bisect.bisect_left(observed_at, (first, 0))
         ]
         if window:
-            return [node_of[o.event.id] for _, o in window]
-        return [node_of[o.event.id] for o in batches[k - 1]] if k else [START]
+            return {node_of[o.event.id] for _, o in window}
+        return {node_of[o.event.id] for o in batches[k - 1]} if k else {START}
 
+    # Each source and target once: a fan-out of thousands into a fan-out of thousands is a
+    # handful of edges, never their product.
     edges: set[tuple[str, str]] = set()
+    sources_of: list[set[str]] = []
     for k, batch in enumerate(batches):
-        sources = before(k, firsts[k])
-        edges.update((s, node_of[o.event.id]) for o in batch for s in sources)
+        sources_of.append(before(k, firsts[k]))
+        targets = {node_of[o.event.id] for o in batch}
+        edges.update((s, t) for s in sources_of[k] for t in targets)
     terminal = run.terminal
     if terminal is not None and terminal.type in _COMMANDED:
-        k = bisect.bisect_left(firsts, terminal.id)
-        edges.update((s, END) for s in before(k, terminal.id))
+        if joined is not None:
+            # Commanded with that batch: it observed what the batch observed, and nothing
+            # the batch itself started can have closed before it.
+            ends = sources_of[joined]
+        else:
+            ends = before(bisect.bisect_left(firsts, terminal.id), terminal.id)
+        edges.update((s, END) for s in ends)
 
     members: dict[str, list[tuple[int, _Occurrence]]] = {}
     for k, batch in enumerate(batches):
@@ -816,9 +937,9 @@ def _node(
     last_batch = max(k for k, _ in members)
     status = min((o.status for k, o in members if k == last_batch), key=_PRECEDENCE.index)
     attempts = [o.attempt for o in occurrences if o.attempt is not None]
-    closed = [o for o in occurrences if o.close is not None]
+    ends = [(end.id, o) for o in occurrences if (end := o.close or o.ended) is not None]
     is_open = any(o.status in _OPEN for o in occurrences)
-    last_close = max(closed, key=lambda o: o.close.id if o.close else 0) if closed else None
+    last_close = max(ends, key=lambda pair: pair[0])[1] if ends else None
     return {
         "id": node_id,
         "name": slot[1],
@@ -987,8 +1108,8 @@ class LinkConfig:
     log_selector: str = '{service_name=~".+"}'
 
     def __post_init__(self) -> None:
-        if not self.namespace:
-            raise ValueError("namespace is required")
+        if _str(self.namespace) is None:
+            raise ValueError(f"namespace is required, as a UTF-8 string: {self.namespace!r}")
         for what in ("temporal_ui", "grafana"):
             url = getattr(self, what)
             if url is not None:
@@ -1161,8 +1282,18 @@ _STYLES = {
     "local": "stroke-dasharray:4 3",
     "unreached": "opacity:0.45",
 }
-#: Characters Mermaid reads inside a quoted label, as its entity codes.
-_ENTITIES = {"#": "#35;", '"': "#quot;", "<": "#lt;", ">": "#gt;", "&": "#amp;", "`": "#96;"}
+#: Characters Mermaid reads inside a quoted label, as its entity codes. ``%`` too: Mermaid
+#: looks for ``%%{...}%%`` directives anywhere in the text, quoted labels included, and
+#: applies them (theme, themeCSS, flowchart config) before it parses the chart.
+_ENTITIES = {
+    "#": "#35;",
+    '"': "#quot;",
+    "<": "#lt;",
+    ">": "#gt;",
+    "&": "#amp;",
+    "`": "#96;",
+    "%": "#37;",
+}
 
 
 def _mermaid_text(value: str) -> str:
@@ -1242,7 +1373,11 @@ class _Decoder:
             self._parse(dict(_map(p) or {}), self._payload(), ignore_unknown_fields=True)
             for p in payloads
         ]
-        return [self._value(p) for p in await self._codec.decode(parsed)]
+        decoded = await self._codec.decode(parsed)
+        if len(decoded) != len(parsed):
+            # A result the codec dropped would read as null, a doubled input as two.
+            raise ValueError(f"the codec gave {len(decoded)} payloads for {len(parsed)}")
+        return [self._value(p) for p in decoded]
 
     async def payloads(self, value: object, *, single: bool) -> object:
         """``{"payloads": [...]}`` (or one payload, ``single``) decoded: the list of values,

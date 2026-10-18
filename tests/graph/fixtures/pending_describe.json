@@ -22,7 +22,6 @@
    "lastStartedTime": "2026-10-18T09:00:07.500000000Z",
    "lastFailure": {
     "message": "Encoded failure",
-    "source": "PythonSDK",
     "encodedAttributes": {
      "metadata": {
       "encoding": "anNvbi9wbGFpbg=="
@@ -45,7 +44,6 @@
    "scheduledTime": "2026-10-18T09:00:00.150000000Z",
    "lastFailure": {
     "message": "Encoded failure",
-    "source": "PythonSDK",
     "timeoutFailureInfo": {
      "timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"
     }

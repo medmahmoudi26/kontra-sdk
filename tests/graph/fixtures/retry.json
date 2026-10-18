@@ -122,7 +122,6 @@
     "requestId": "2bd6a337-0000-4000-8000-000000000005",
     "lastFailure": {
      "message": "Encoded failure",
-     "source": "PythonSDK",
      "encodedAttributes": {
       "metadata": {
        "encoding": "anNvbi9wbGFpbg=="
