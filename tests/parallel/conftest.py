@@ -27,7 +27,7 @@ from kontra.testing.devserver import (
     release_shared_dev_server,
 )
 
-from . import acts
+from . import acts, configured
 from .flows import Parent
 
 ACTIVITIES = [
@@ -39,6 +39,7 @@ ACTIVITIES = [
     acts.slow,
     acts.fragile,
     acts.probe,
+    configured.scale,
 ]
 
 

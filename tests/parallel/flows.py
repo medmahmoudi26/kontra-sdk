@@ -11,6 +11,9 @@ from kontra import RetryPolicy, workflow
 from . import acts
 from .models import Tally
 
+with workflow.unsafe.imports_passed_through():
+    from . import configured
+
 _T = timedelta(seconds=30)
 
 
@@ -46,6 +49,8 @@ class Parent:
                 par(acts.double, items=[10], start_to_close_timeout=_T),
             )
             return [sorted(a), b]
+        if case == "configured":
+            return await par(configured.scale, items=list(range(n)), start_to_close_timeout=_T)
         if case == "tally":
             out = await par(
                 acts.probe,

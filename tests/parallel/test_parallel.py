@@ -4,6 +4,7 @@ batch that continues as new mid-page on a server that suggests it early."""
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import timedelta
@@ -144,6 +145,20 @@ async def test_one_parent_batches_the_same_activity_twice(worker: tuple[Client, 
     assert await handle.result() == [[2, 4], [20]]
     ids = [c for c, _ in await _children(client, handle)]
     assert len(set(ids)) == 2
+
+
+async def test_the_item_activity_module_is_passed_through_to_the_child(
+    worker: tuple[Client, str],
+) -> None:
+    """The child finds the activity's module as the parent's code imported it, passed
+    through the sandbox: imported afresh inside it, a module that reads ``os.environ`` as it
+    loads (``configured``) failed the child's every workflow task, and the call never
+    returned."""
+    client, tq = worker
+    handle = await _start(client, tq, "configured", 4)
+    assert sorted(await asyncio.wait_for(handle.result(), 30)) == [0, 3, 6, 9]
+    [(child, _)] = await _children(client, handle)
+    await _replay(client, child)
 
 
 async def test_models_reach_reduce_as_models(worker: tuple[Client, str]) -> None:
