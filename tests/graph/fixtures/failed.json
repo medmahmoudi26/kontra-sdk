@@ -1,0 +1,182 @@
+{
+ "events": [
+  {
+   "eventId": "1",
+   "eventTime": "2026-10-18T09:00:00.124Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+   "workflowExecutionStartedEventAttributes": {
+    "workflowType": {
+     "name": "EnrichFlow"
+    },
+    "taskQueue": {
+     "name": "acme/enrich@1.0.0",
+     "kind": "TASK_QUEUE_KIND_NORMAL"
+    },
+    "input": {
+     "payloads": [
+      {
+       "metadata": {
+        "encoding": "anNvbi9wbGFpbg=="
+       },
+       "data": "eyJiYXRjaCI6M30="
+      }
+     ]
+    },
+    "workflowTaskTimeout": "10s",
+    "originalExecutionRunId": "0199f0a1-5c3e-7d2a-9b41-6e0c2f8d4a10",
+    "identity": "4242@worker-a",
+    "firstExecutionRunId": "0199f0a1-5c3e-7d2a-9b41-6e0c2f8d4a10",
+    "attempt": 1,
+    "firstWorkflowTaskBackoff": "0s"
+   }
+  },
+  {
+   "eventId": "2",
+   "eventTime": "2026-10-18T09:00:00.125Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+   "workflowTaskScheduledEventAttributes": {
+    "taskQueue": {
+     "name": "acme/enrich@1.0.0",
+     "kind": "TASK_QUEUE_KIND_NORMAL"
+    },
+    "startToCloseTimeout": "10s",
+    "attempt": 1
+   }
+  },
+  {
+   "eventId": "3",
+   "eventTime": "2026-10-18T09:00:00.127Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+   "workflowTaskStartedEventAttributes": {
+    "scheduledEventId": "2",
+    "identity": "4242@worker-a",
+    "historySizeBytes": "800"
+   }
+  },
+  {
+   "eventId": "4",
+   "eventTime": "2026-10-18T09:00:00.128Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+   "workflowTaskCompletedEventAttributes": {
+    "scheduledEventId": "2",
+    "identity": "4242@worker-a",
+    "sdkMetadata": {
+     "sdkName": "temporal-python",
+     "sdkVersion": "1.34.0"
+    },
+    "meteringMetadata": {}
+   }
+  },
+  {
+   "eventId": "5",
+   "eventTime": "2026-10-18T09:00:00.129Z",
+   "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+   "activityTaskScheduledEventAttributes": {
+    "activityId": "1",
+    "activityType": {
+     "name": "fetch_batch"
+    },
+    "taskQueue": {
+     "name": "acme/enrich@1.0.0",
+     "kind": "TASK_QUEUE_KIND_NORMAL"
+    },
+    "input": {
+     "payloads": [
+      {
+       "metadata": {
+        "encoding": "anNvbi9wbGFpbg=="
+       },
+       "data": "ImZldGNoX2JhdGNoIg=="
+      }
+     ]
+    },
+    "scheduleToCloseTimeout": "0s",
+    "scheduleToStartTimeout": "0s",
+    "startToCloseTimeout": "30s",
+    "heartbeatTimeout": "0s",
+    "workflowTaskCompletedEventId": "3",
+    "retryPolicy": {
+     "initialInterval": "1s",
+     "backoffCoefficient": 2,
+     "maximumInterval": "100s"
+    }
+   }
+  },
+  {
+   "eventId": "6",
+   "eventTime": "2026-10-18T09:00:30.130Z",
+   "eventType": "EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT",
+   "activityTaskTimedOutEventAttributes": {
+    "failure": {
+     "timeoutFailureInfo": {
+      "timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"
+     }
+    },
+    "scheduledEventId": "5",
+    "startedEventId": "-1",
+    "retryState": "RETRY_STATE_TIMEOUT"
+   }
+  },
+  {
+   "eventId": "7",
+   "eventTime": "2026-10-18T09:00:30.132Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+   "workflowTaskScheduledEventAttributes": {
+    "taskQueue": {
+     "name": "acme/enrich@1.0.0",
+     "kind": "TASK_QUEUE_KIND_NORMAL"
+    },
+    "startToCloseTimeout": "10s",
+    "attempt": 1
+   }
+  },
+  {
+   "eventId": "8",
+   "eventTime": "2026-10-18T09:00:30.133Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+   "workflowTaskStartedEventAttributes": {
+    "scheduledEventId": "7",
+    "identity": "4242@worker-a",
+    "historySizeBytes": "2800"
+   }
+  },
+  {
+   "eventId": "9",
+   "eventTime": "2026-10-18T09:00:30.134Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+   "workflowTaskCompletedEventAttributes": {
+    "scheduledEventId": "7",
+    "identity": "4242@worker-a",
+    "sdkMetadata": {
+     "sdkName": "temporal-python",
+     "sdkVersion": "1.34.0"
+    },
+    "meteringMetadata": {}
+   }
+  },
+  {
+   "eventId": "10",
+   "eventTime": "2026-10-18T09:00:30.135Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_FAILED",
+   "workflowExecutionFailedEventAttributes": {
+    "failure": {
+     "message": "Activity task timed out",
+     "cause": {
+      "timeoutFailureInfo": {
+       "timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"
+      }
+     },
+     "activityFailureInfo": {
+      "scheduledEventId": "5",
+      "activityType": {
+       "name": "fetch_batch"
+      },
+      "activityId": "1",
+      "retryState": "RETRY_STATE_TIMEOUT"
+     }
+    },
+    "workflowTaskCompletedEventId": "8"
+   }
+  }
+ ]
+}

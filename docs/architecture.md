@@ -84,6 +84,7 @@ is what lets a ledger adapter be swapped and keeps a future split into services 
 | `kontra.cli` | the `kontra` command; no business rule lives here |
 | `kontra.ledger`, `kontra.escrow` | the `Ledger` Protocol; the job and escrow rules as pure functions |
 | `kontra.workers` | the Workers view's verdict, as pure functions of what `DescribeTaskQueue` reports |
+| `kontra.graph` | a run's history read back as a graph (decisions I26): nodes, causal edges and status, the union of mock runs and a live run painted on it, Temporal UI and Grafana links, Mermaid; no payload without a codec, and the standard library only at import |
 | `kontra._control` | the control-plane calls on Temporal's internal frontend (the Workers view's `DescribeTaskQueue` and `ListWorkers` among them), shared by the real and the fake gate |
 | `kontra.testing` | a fake for every seam: `fake_ledger`, `fake_gate`, a dev server with standalone Nexus, `Marketplace` |
 
