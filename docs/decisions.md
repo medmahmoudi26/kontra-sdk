@@ -1107,9 +1107,15 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
 - **A batch child is named from its own history, never from its id.** Every child of
   `execute_activities_in_parallel` is a `kontra.batch.v1`, and its id embeds the activity's
   name, but ids are constructed, never parsed (I1). Given the child's history (`children=`, its
-  first run is enough), the node is `kontra.batch.v1[<the activities it scheduled>]`, labelled
-  `execute_activities_in_parallel(...)`; without it, `kontra.batch.v1`. A seller's own child
-  workflow keeps its type.
+  first run is enough), the node is `kontra.batch.v1[<its activities>]`, labelled
+  `execute_activities_in_parallel(...)`; without it, `kontra.batch.v1`. Its activities are the
+  item activity and the `pages=` activity its input names, when that input is plain JSON (a
+  mock run's, which no codec encrypts; an encrypted one is never opened), else the ones it
+  scheduled: a run whose batch got no items, or an empty first page, schedules no item
+  activity, and would otherwise be a second node for the same call (found by #42's review,
+  `kontra graph` on a `pages=` project). Both give the same name for a batch that ran items
+  (`[enrich,fetch_page]`), so a live run's batch still matches the static one. A seller's
+  own child workflow keeps its type.
 - **`workflowTaskCompletedEventId` is compared by value, never looked up.** The dev server
   writes the WorkflowTaskCompleted event's id there; the time-skipping test server, which #42's
   mock runs use, writes the WorkflowTaskStarted event's, one before it. The same workflow gives
