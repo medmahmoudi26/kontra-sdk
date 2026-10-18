@@ -87,8 +87,8 @@ flowchart TD
 The fan-out is one parallel group: the two fetches share their predecessor and both lead to
 the batch, which waits for them. The batch is one node, however many URLs it checks and
 however many times it continues as new. And both branches are there because the runs drew
-both answers: the first run's checks find nothing (`all_clear`), the second's find pages to
-grade (`score`).
+both answers: the first run's check finds nothing wrong (`all_clear`); the second's carries an
+`error`, so its page counts as unreachable, and the run takes `score`.
 
 ## The URLs are the buyer's
 
@@ -113,12 +113,17 @@ To let buyers sweep a private network on purpose (an intranet you sell audits of
 
 ## Limits
 
-Every value crosses Temporal as one payload (2 MB at most): the URLs go into the batch's
+Every value crosses Temporal as one payload, 2 MB at most: the URLs go into the batch's
 input, the flagged ones into its accumulator, and every site's files into the report. So a
-job is at most 200 URLs of at most 2,048 characters, and each site keeps its first 10
-`Disallow:` paths and 5 contacts, of 100 characters each: the largest payload stays under
-1.7 MB. For more, split the list across
-jobs, or have `check_headers` write its rows to an `Artifact` and keep only counts.
+job is at most 200 URLs of at most 2,048 characters, written as RFC 3986 writes a URL (ASCII:
+anything else percent-encoded, `%C3%BC` for `ü`), and each site keeps its first 10
+`Disallow:` paths and 5 contacts, each cut at 100 bytes as JSON writes it (a site's files are
+whatever it sends: a control character takes six bytes there, an emoji four): the largest
+payload stays under 1.7 MB (`tests/examples/test_sweep_limits.py`). That limit is a
+Temporal's without Kontra's codec, which this code also runs on; under `kontra serve`, the
+codec carries a payload over 256 KiB in the claim-check bucket instead. For more, split the
+list across jobs, or have `check_headers` write its rows to an `Artifact` and keep only
+counts.
 
 ## Tested
 

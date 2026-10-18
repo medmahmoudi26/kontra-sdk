@@ -93,7 +93,7 @@ $defs:
         items:
           type: string
           maxLength: 2048
-          pattern: ^https?://[^\s]+$
+          pattern: ^https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$
         maxItems: 200
         minItems: 1
     required:
@@ -161,4 +161,4 @@ x-kontra:
   max_concurrent_jobs: 10
   max_output_bytes: "10MB"
   artifact_retention: "7d"
-  contract_hash: sha256:ca225f48d36436650766a59fe102fa77a8dcb439f689c356932fb78ea6e5f424
+  contract_hash: sha256:bdc63b3380318c8122b1afea18a6268a40170f1c1042ba29fbf8ef3b79b2017a

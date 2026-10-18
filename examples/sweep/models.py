@@ -3,11 +3,13 @@ signature is the contract: `kontra publish` derives the published JSON Schema fr
 `SweepInput` and `SweepOutput` (and what they use). The others are the activities' own, and
 `Report` is the content of the report artifact.
 
-Each value crosses Temporal as one payload (2 MB at most): the URLs go into the
-batch's input, the flagged ones into its accumulator, and the sites' files into the report.
-So a job is at most 200 URLs, and what is kept of each site's files is bounded
-(activities.py): the largest of them, for 200 URLs of 2,048 characters on as many sites,
-stays under 1.7 MB.
+Each value crosses Temporal as one payload (2 MB at most, on a Temporal without kontra's
+codec; `kontra serve`'s codec carries one over 256 KiB in the claim-check bucket): the
+URLs go into the batch's input, the flagged ones into its accumulator, and the sites' files
+into the report. So a job is at most 200 URLs of at most 2,048 characters, each written as
+RFC 3986 writes a URL (ASCII; anything else percent-encoded), so one byte each as JSON, and
+what is kept of each site's files is bounded in bytes (activities.py): the largest payload,
+for 200 such URLs on as many sites, stays under 1.7 MB.
 
 `Artifact` is the only Kontra type allowed here (D1): a reference to an encrypted file in
 the claim-check bucket, never the bytes.
@@ -39,7 +41,10 @@ __all__ = [
     "Unreachable",
 ]
 
-Url = Annotated[str, Field(pattern=r"^https?://[^\s]+$", max_length=2048)]
+#: A URL as RFC 3986 writes it: ASCII, anything else percent-encoded (`%C3%BC` for `ü`).
+Url = Annotated[
+    str, Field(pattern=r"^https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$", max_length=2048)
+]
 
 #: The response headers checked, as HTTP names them (lowercase: names are case-insensitive).
 Header = Literal[
@@ -107,8 +112,7 @@ class SweepOutput(BaseModel):
 class Plan(BaseModel):
     """The input, normalised: each URL once, as it is fetched, and the sites they are on."""
 
-    # At least one: the input has one. (`kontra graph` draws a Plan as the activity's
-    # value, and a batch over no items would have nothing to show.)
+    # At least one: the input has one.
     urls: list[str] = Field(min_length=1)
     sites: list[str]
 

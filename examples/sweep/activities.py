@@ -26,6 +26,7 @@ guard is examples/enrich's.)
 
 import asyncio
 import ipaddress
+import json
 import os
 import socket
 import tempfile
@@ -64,7 +65,9 @@ SITES_AT_ONCE = 16
 #: The most of a robots.txt or a security.txt read: a site that streams forever must not
 #: fill the worker's memory.
 READ_AT_MOST = 64_000
-#: What is kept of one site's files: every site's go into the report's payloads.
+#: What is kept of one site's files: every site's go into the report's payloads. A line is
+#: kept up to LINE_KEPT bytes as JSON writes it, not characters: a control character takes
+#: six (`\u0001`), a quote two, an emoji four, and the files are whatever a site sends.
 DISALLOW_KEPT = 10
 CONTACTS_KEPT = 5
 LINE_KEPT = 100
@@ -245,13 +248,23 @@ async def _each_site(
         return list(await asyncio.gather(*(one(site) for site in sites)))
 
 
+def _kept(value: str) -> str:
+    """The start of `value` that is at most LINE_KEPT bytes once written as JSON."""
+    size = 0
+    for i, c in enumerate(value):
+        size += len(json.dumps(c, ensure_ascii=False).encode()) - 2  # without its quotes
+        if size > LINE_KEPT:
+            return value[:i]
+    return value
+
+
 def _disallowed(text: str) -> list[str]:
     """The paths of a robots.txt's `Disallow:` lines, whatever user agent they are for (where
     a site asks crawlers not to look is worth a look), each once, the first few."""
     paths: list[str] = []
     for line in text.splitlines():
         field, sep, value = line.partition("#")[0].partition(":")
-        path = value.strip()[:LINE_KEPT]
+        path = _kept(value.strip())
         if sep and field.strip().lower() == "disallow" and path and path not in paths:
             paths.append(path)
             if len(paths) == DISALLOW_KEPT:
@@ -278,7 +291,7 @@ def _contacts(text: str) -> tuple[list[str], str | None]:
     expires: str | None = None
     for line in text.splitlines():
         field, sep, value = line.partition(":")
-        name, value = field.strip().lower(), value.strip()[:LINE_KEPT]
+        name, value = field.strip().lower(), _kept(value.strip())
         if not sep or not value:
             continue
         if name == "contact" and value not in contact and len(contact) < CONTACTS_KEPT:
