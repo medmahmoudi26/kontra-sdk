@@ -20,7 +20,8 @@ A boolean therefore takes both values within any two runs (0 and 1): ``if result
 shows both branches from two runs on.
 
 The value is drawn from ``TypeAdapter(tp).json_schema(mode="validation")`` -- ``$ref`` and
-``$defs``, ``anyOf``/``oneOf``/``allOf``, ``const``/``enum``, type lists, objects, arrays
+``$defs``, ``anyOf``/``oneOf``/``allOf``, ``const``/``enum``, type lists, objects (a
+mapping's keys from ``propertyNames`` or ``patternProperties``), arrays
 (``prefixItems`` tuples), strings (lengths, formats, a ``pattern`` followed by a small
 generator over Python's own regex parser), numbers (bounds, ``multipleOf``) and
 ``default`` -- and then validated by the same adapter, as the payload converter will read
@@ -319,10 +320,33 @@ class _Drawer:
         extra = s.get("additionalProperties", True)
         if properties or extra is False:
             return out
-        # A mapping (``dict[str, X]``): keys that read as numbers too (``dict[int, X]``).
-        for i in range(self._count(s, how, "minProperties", "maxProperties", large=False)):
-            out[str(i)] = self.draw(extra if extra is not True else {}, how, (*path, str(i)))
+        n = self._count(s, how, "minProperties", "maxProperties", large=False)
+        names = s.get("propertyNames")
+        patterned = list((_object(s.get("patternProperties")) or {}).items())
+        if patterned:  # ``dict[Annotated[str, pattern], X]``: keys drawn for the pattern
+            pattern, extra = patterned[0]
+            names = {"pattern": pattern}
+        # A mapping (``dict[str, X]``): keys that read as numbers too (``dict[int, X]``),
+        # or drawn from ``propertyNames`` (``dict[Literal[...], X]``, ``dict[Enum, X]``).
+        keys = [str(i) for i in range(n)] if names is None else self._keys(names, how, n)
+        for key in keys:
+            out[key] = self.draw(extra if extra is not True else {}, how, (*path, key))
         return out
+
+    def _keys(self, names: object, how: str, n: int) -> list[str]:
+        """Up to ``n`` distinct keys valid for ``propertyNames``: from its ``enum`` (or
+        ``const``) in the mode's order, else strings drawn for it (a min or max draw is the
+        same string every time, so one key)."""
+        s = self._resolved(names)
+        choices = [s["const"]] if "const" in s else list(_items(s.get("enum")) or ())
+        if choices:
+            if how == RANDOM:
+                choices = self._rng.sample(choices, len(choices))
+            elif how != MIN:
+                choices = choices[::-1]
+            return [str(c) for c in choices[:n]]
+        drawn = (self._string(s, how) for _ in range(n))
+        return list(dict.fromkeys(drawn))
 
     def _array(self, s: _Schema, how: str, path: _Path) -> list[Any]:
         prefix = _items(s.get("prefixItems")) or ()

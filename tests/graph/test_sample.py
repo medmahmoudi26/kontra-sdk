@@ -186,6 +186,27 @@ def test_prefix_items_are_tuples() -> None:
     assert draw(tuple[int, ...], 1) == [1000, 1000, 1000]
 
 
+def test_mapping_keys_follow_their_schema() -> None:
+    """``dict[Literal[...], X]`` and ``dict[Enum, X]`` (``propertyNames: {enum}``), a
+    constrained key (``propertyNames: {minLength}``) and a patterned one
+    (``patternProperties``): keys valid for the key type, distinct, in the mode's order."""
+    header = Literal["hsts", "csp", "xcto", "xfo"]
+    assert [draw(dict[header, int], run) for run in range(3)] == [
+        {},
+        {"xfo": 1000, "xcto": 1000, "csp": 1000},  # max: the last values first
+        {"xfo": 1000, "xcto": 1000, "csp": 1000},
+    ]
+    assert draw(dict[Color, int], 1) == {"blue": 1000, "red": 1000}
+    assert draw(dict[Literal["only"], int], 1) == {"only": 1000}
+    long_key = Annotated[str, Field(min_length=3)]
+    patterned = Annotated[str, Field(pattern=r"^k[0-9]$")]
+    for run in range(8):
+        assert set(draw(dict[header, int], run)) <= {"hsts", "csp", "xcto", "xfo"}
+        assert all(len(k) >= 3 for k in draw(dict[long_key, int], run))
+        assert all(re.fullmatch(r"k[0-9]", k) for k in draw(dict[patterned, int], run))
+        valid(dict[patterned, str], draw(dict[patterned, str], run))
+
+
 @pytest.mark.parametrize(
     "pattern",
     [
@@ -356,6 +377,8 @@ def _types() -> st.SearchStrategy[Any]:
             inner.map(lambda t: Annotated[list[t], Field(min_length=1, max_length=3)]),
             st.tuples(inner, inner).map(lambda ts: tuple[ts[0], ts[1]]),
             inner.map(lambda t: dict[str, t]),
+            inner.map(lambda t: dict[Literal["a", "b", "c", "d"], t]),
+            inner.map(lambda t: dict[Annotated[str, Field(pattern=r"^k[0-9]$")], t]),
             inner.map(lambda t: t | None),
             st.lists(inner, min_size=1, max_size=4).map(_model),
         )
