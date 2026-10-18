@@ -1041,20 +1041,45 @@ def _structure(node: Mapping[str, Any]) -> dict[str, Any]:
 
 def union(graphs: Iterable[Graph]) -> Graph:
     """The structure several runs of one workflow share (the mock runs of each branch):
-    every node by id, the first run's name, kind, label and group winning, and every edge.
+    every node by id, the first run's name, kind and label winning, and every edge.
     Nothing of any run stays: no status, counts, times, references or failures, and the
-    workflow keeps its type and task queue only."""
+    workflow keeps its type and task queue only.
+
+    A run's ``group`` is a position in that run, so two runs that took different branches
+    at the same point number them alike. Here two nodes share a group only when some run
+    commanded them in one batch (or they are chained by such runs): the groups are the
+    sets of nodes ever scheduled together, numbered in node order. A fan-out stays one
+    group; an ``if``'s two branches never are."""
     nodes: dict[str, dict[str, Any]] = {}
+    together: dict[Any, Any] = {}  # union-find over node ids: what shared a batch
+
+    def root(node_id: Any) -> Any:
+        while together[node_id] != node_id:
+            together[node_id] = together[together[node_id]]
+            node_id = together[node_id]
+        return node_id
+
     edges: set[tuple[str, str]] = set()
     workflow: dict[str, Any] = {"type": None, "task_queue": None}
     for graph in graphs:
         seen = graph.get("workflow") or {}
         for key in ("type", "task_queue"):
             workflow[key] = workflow[key] or seen.get(key)
+        first_in: dict[Any, Any] = {}  # this run's group -> its first node
         for node in graph.get("nodes") or []:
-            if node.get("id") not in nodes:
-                nodes[node.get("id")] = _structure(node)
+            node_id = node.get("id")
+            if node_id not in nodes:
+                nodes[node_id] = _structure(node)
+                together[node_id] = node_id
+            group = node.get("group")
+            if group is None:
+                continue
+            other = first_in.setdefault(group, node_id)
+            together[root(node_id)] = root(other)
         edges.update((e["from"], e["to"]) for e in graph.get("edges") or [])
+    numbers: dict[Any, int] = {}
+    for node_id, node in nodes.items():
+        node["group"] = numbers.setdefault(root(node_id), len(numbers))
     return {
         "version": _VERSION,
         "workflow": {

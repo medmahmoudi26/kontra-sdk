@@ -1171,7 +1171,11 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
   its Started event, which is no close either.
 - **Edges are objects, and union and merge are two functions.** The issue's `merge` did both.
   `union(graphs)` is structure only: every node and edge of the mock runs, and nothing any run
-  said (status, counts, times, references, failures). `merge(static, live)` paints a live run
+  said (status, counts, times, references, failures). Its `group` is not one run's: a run's
+  group is a position in that run, so an `if`'s two branches, taken at the same point by two
+  runs, number alike, and would read as one fan-out. In a union two nodes share a group only
+  when some run commanded them in one batch (or they are chained by such runs), numbered in
+  node order (found by #42's review). `merge(static, live)` paints a live run
   on it: a live node with `reached: true`, a static-only one (a branch not taken, or not yet)
   with `reached: false`, and each edge `{"from", "to", "reached"}`.
 - **Logs and traces are Grafana Explore panes.** A node's `logs` link is Loki,

@@ -1531,6 +1531,29 @@ def test_union_keeps_structure_only() -> None:
     }
 
 
+def test_union_groups_only_what_some_run_commanded_together() -> None:
+    """A run's group is a position in that run: an ``if``'s two branches, taken at the same
+    point by two runs, number alike there, and would read as one fan-out in the union. There
+    two nodes share a group only when one run commanded them in one batch."""
+    approve, reject = graph("branch_approve"), graph("branch_reject")
+    assert node(approve, "approve")["group"] == node(reject, "reject")["group"]
+    static = union([approve, reject])
+    assert [(n["id"], n["group"]) for n in static["nodes"]] == [
+        ("check", 0),
+        ("approve", 1),
+        ("ship", 2),
+        ("reject", 3),
+    ]
+    fan = union([graph("sequence"), graph("fan_out")])
+    groups = {n["id"]: n["group"] for n in fan["nodes"]}
+    assert groups["lookup_company"] == groups["lookup_domain"] == groups["lookup_person"]
+    assert len(set(groups.values())) == 5  # the three sequence steps, the fan-out, score
+    # A node scheduled with one node in one run and another in the next joins both.
+    a = {"nodes": [{"id": "x", "group": 0}, {"id": "y", "group": 0}], "edges": []}
+    b = {"nodes": [{"id": "z", "group": 0}, {"id": "y", "group": 0}, {"id": "w", "group": 1}]}
+    assert [n["group"] for n in union([a, b])["nodes"]] == [0, 0, 0, 1]
+
+
 def test_union_of_nothing_is_empty() -> None:
     empty = union([])
     assert (empty["nodes"], empty["edges"], empty["workflow"]["type"]) == ([], [], None)
