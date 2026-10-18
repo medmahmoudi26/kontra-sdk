@@ -1040,3 +1040,106 @@ the job key's secret half, and how.
   or confirmation can add a device that past jobs are then copied to (the party is mailed).
   Signed device sets -- a key per device, each addition co-signed by an existing device or a
   passkey assertion -- would close both, and are future work.
+
+## I26. The workflow graph is read from history (kontra-sdk#40, #41)
+
+Temporal keeps no definition of a workflow, only what each run did, so the graph page (#43) and
+the mock runs of #42 read the structure back from a run's history. `kontra.graph.parse` turns
+history JSON (`WorkflowHistory.to_json_dict()`, `temporal workflow show --output json`, the UI's
+API) into `{workflow, nodes, edges}`, with a status, an attempt, a span and references per node;
+`union` keeps the structure several runs share, `merge` paints a live run on it, `links` adds
+Temporal UI and Grafana URLs and `mermaid` draws it as text. The module imports nothing but the
+standard library at import time, so the fake gate, the CLI and a page server read histories
+without loading the SDK. Checked against temporalio 1.34, server 1.32 (the dev server and the
+time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code part ways:
+
+- **Edges are causal, not "batches chain".** Commands one workflow task made share a
+  `workflowTaskCompletedEventId` and are one parallel group, as the issue says. Chaining each
+  group to the next, though, draws edges from what a task never waited on: in
+  `gather(chain(x), chain(y))` the second `b` would hang off the first, a fire-and-forget
+  activity would precede everything after it, and the shape would change between runs with
+  timing. A group's predecessors are the closes written between the previous group's first
+  command and its own: what arrives while a task is in flight is written after that task's
+  commands, so the window holds exactly what this task (and any empty task before it)
+  observed. With no close there (a signal woke it), the previous group; for the first, `start`.
+  A child's Started event and a timer the workflow canceled are nothing it waited on. The
+  terminal event the workflow commanded (completed, failed, canceled, continued as new) is one
+  more group, and its predecessors lead to `end`; a run terminated, timed out or still running
+  has no edge to `end`.
+- **Identity is an occurrence index after folding repeats.** "Same activity and same
+  predecessors" never settles on a loop -- the second iteration of `for x in xs: await a(x)`
+  has `a` before it and the first has `start`, so it makes `a#2`, `a#3`, ... -- and it splits
+  the join after an if/else into `ship` and `ship#2`. Instead each group's set of
+  `(kind, name)` is its signature; tandem repeats of signatures fold, innermost first (a block
+  of up to 16 groups repeated, and a last iteration cut short); and a node is one
+  `(kind, name)` at one position of what is left: `name` at the first position holding it,
+  `name#k` at the k-th. A loop is one node with a self or back edge, `a; b; a` is `a`, `b`,
+  `a#2`, and a call site gets the same id in every run of the same code, which is what `union`
+  and `merge` match by. The accepted limits: `await a(); await a()` is a loop of two, since
+  history cannot tell two call sites in a row from two iterations; a loop that ran once
+  anywhere looks like straight code there; and a name two kinds share (a function run as an
+  activity and as a local activity) stays with the activity, the other being `name~kind`.
+- **A timer is `wait`**, labelled with its duration (`wait 30s`; the latest when a node's
+  timers differ), so a polling loop's timer is one node.
+- **A batch child is named from its own history, never from its id.** Every child of
+  `execute_activities_in_parallel` is a `kontra.batch.v1`, and its id embeds the activity's
+  name, but ids are constructed, never parsed (I1). Given the child's history (`children=`, its
+  first run is enough), the node is `kontra.batch.v1[<the activities it scheduled>]`, labelled
+  `execute_activities_in_parallel(...)`; without it, `kontra.batch.v1`. A seller's own child
+  workflow keeps its type.
+- **`workflowTaskCompletedEventId` is compared by value, never looked up.** The dev server
+  writes the WorkflowTaskCompleted event's id there; the time-skipping test server, which #42's
+  mock runs use, writes the WorkflowTaskStarted event's, one before it. The same workflow gives
+  the same graph from both.
+- **One event in Temporal UI is a path.** UI 2.55.0 has no `?eventId=` parameter: a node links
+  to `/namespaces/{ns}/workflows/{wf}/{run}/history/events/{id}`, a run to `.../history`. A
+  closed child links to its last run (its close event names the last of its continue-as-new
+  chain; its Started event names the first), an open one to `/workflows/{child}` with no run,
+  which the UI resolves to the latest. Every segment is percent-encoded: a batch child's id
+  holds `/`.
+- **Trace ids are per command.** `TracingInterceptor` writes its carrier under `_tracer-data`
+  (the issue's correction stands): a `json/plain` payload of `{"traceparent": ...}` that
+  Temporal stores unencoded, since kontra keeps headers out of the codec. Each activity and
+  child start carries its own trace; a run is one trace only when a traced client started it,
+  and its own Started event then holds it (the workflow's `trace_id`). Timers and local
+  activities carry none. A traceparent is read by an anchored full match, version `00` and the
+  flags as written (`03` was seen, not `01`); anything else is no trace.
+- **Payloads are a separate step, with a codec (seam ⑤).** The issue's `with_io=True` flag
+  would put decoding inside the parser. Here `parse` emits no payload, encrypted or not --
+  no input, result, heartbeat, memo, search attribute, termination reason, failure message,
+  stack trace or encoded attributes -- and a failure is its kind (application; timeout, with
+  its type; canceled; terminated; server; an activity or child failure is its cause's) and its
+  retry state. `with_io(graph, history, codec)`, async, decodes inputs, results and failure
+  messages through the codec it must be given and Temporal's default converter, a payload the
+  codec cannot open being `{"error": "undecodable"}`. With kontra's converter a failure's
+  `message` reads `Encoded failure` and the real one is in `encodedAttributes`, which only
+  `with_io` opens. The two payloads `parse` reads are records, not a party's data:
+  `_tracer-data`, for the trace and span ids, and a local activity marker's sdk-core record,
+  for its type and attempt.
+- **Running and attempts come from `DescribeWorkflowExecution`.** Temporal writes no event per
+  retry, and an activity's Started event (its attempt, its last failure) only when the activity
+  closes, so history alone cannot show one running or retrying. `parse(pending=)` takes the
+  answer's `pendingActivities`: an open activity whose state is started or cancel-requested is
+  `running`, with the attempt and the last failure's kind.
+- **Local activities and Nexus operations are nodes.** A local activity is only a
+  `core_local_activity` marker; other markers are no node. It runs inside its workflow task, so
+  its marker is in the group of whatever that task did next, and shows in parallel with it. A
+  Nexus operation is `service/operation`, running from its Started event, which is no close
+  either.
+- **Edges are objects, and union and merge are two functions.** The issue's `merge` did both.
+  `union(graphs)` is structure only: every node and edge of the mock runs, and nothing any run
+  said (status, counts, times, references, failures). `merge(static, live)` paints a live run
+  on it: a live node with `reached: true`, a static-only one (a branch not taken, or not yet)
+  with `reached: false`, and each edge `{"from", "to", "reached"}`.
+- **Logs and traces are Grafana Explore panes.** A node's `logs` link is Loki,
+  `{selector} | workflow_id="..." | run_id="..."` and `| activity_type="..."` for an activity
+  (a child's logs are under its own workflow id), over the node's span with a second either
+  side, as epoch-millisecond strings: Grafana 13.2 drops a numeric range. `trace` is Tempo by
+  the trace id. A link is left out when its base URL or datasource is not configured or the
+  graph lacks what it needs; `LinkConfig` takes http(s) base URLs only.
+- **Checked by** `tests/graph`: synthesized histories in both servers' shapes (`synth.py`
+  builds them; a test holds the checked-in files to it), one test per item of #41's "done
+  when" and per identity case above, every fixture truncated at every event and damaged at
+  random (hypothesis) without `parse` raising, and a history with a marker in every payload
+  and one sealed result, of which no graph, union, merge, link or Mermaid text carries
+  anything while `with_io` with the test codec shows it all.

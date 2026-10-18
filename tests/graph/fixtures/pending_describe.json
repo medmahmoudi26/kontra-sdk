@@ -1,0 +1,62 @@
+{
+ "workflowExecutionInfo": {
+  "execution": {
+   "workflowId": "job-5f2c2bee7e154e03a4f4ebde4bdb09d1",
+   "runId": "0199f0a1-5c3e-7d2a-9b41-6e0c2f8d4a10"
+  },
+  "type": {
+   "name": "EnrichFlow"
+  },
+  "status": "WORKFLOW_EXECUTION_STATUS_RUNNING"
+ },
+ "pendingActivities": [
+  {
+   "activityId": "2",
+   "activityType": {
+    "name": "enrich"
+   },
+   "state": "PENDING_ACTIVITY_STATE_STARTED",
+   "attempt": 3,
+   "maximumAttempts": 5,
+   "scheduledTime": "2026-10-18T09:00:00.150000000Z",
+   "lastStartedTime": "2026-10-18T09:00:07.500000000Z",
+   "lastFailure": {
+    "message": "Encoded failure",
+    "source": "PythonSDK",
+    "encodedAttributes": {
+     "metadata": {
+      "encoding": "anNvbi9wbGFpbg=="
+     },
+     "data": "eyJtZXNzYWdlIjoidXBzdHJlYW0gNTAzIn0="
+    },
+    "applicationFailureInfo": {
+     "type": "RuntimeError"
+    }
+   },
+   "lastWorkerIdentity": "4242@worker-a"
+  },
+  {
+   "activityId": "3",
+   "activityType": {
+    "name": "audit"
+   },
+   "state": "PENDING_ACTIVITY_STATE_SCHEDULED",
+   "attempt": 2,
+   "scheduledTime": "2026-10-18T09:00:00.150000000Z",
+   "lastFailure": {
+    "message": "Encoded failure",
+    "source": "PythonSDK",
+    "timeoutFailureInfo": {
+     "timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"
+    }
+   }
+  },
+  {
+   "activityId": "99",
+   "activityType": {
+    "name": "stranger"
+   },
+   "state": "PENDING_ACTIVITY_STATE_STARTED"
+  }
+ ]
+}
