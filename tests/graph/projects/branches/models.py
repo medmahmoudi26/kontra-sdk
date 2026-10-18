@@ -17,8 +17,9 @@ class BranchesOutput(BaseModel):
 
 
 class Plan(BaseModel):
-    # At least one item: a batch that schedules nothing in its first run is unnamed.
-    items: list[str] = Field(min_length=1)
+    # No min_length: run 0's batch gets no items and schedules no activity, and is still
+    # the one node every other run's batch is.
+    items: list[str]
 
 
 class Verdict(BaseModel):

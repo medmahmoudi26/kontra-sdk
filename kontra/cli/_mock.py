@@ -11,14 +11,20 @@ a tool -- with a value of the type the seller's activity of that name declares
 (:mod:`kontra._sample`), or null for a name the worker does not register. An agent workflow
 keeps the agents plugin, with a scripted model (:mod:`kontra.cli._scripted`). The data
 converter is the one ``kontra serve`` gives such a worker, without the codec: nothing is
-encrypted, and nothing leaves the process but the test server's loopback.
+encrypted. The test server cannot be bound to the loopback (it takes a port, nothing else),
+so it listens on every interface, unauthenticated, while the command runs: anyone who can
+reach the machine can read the runs' inputs and results -- an ``--input`` given too -- and
+start workflows the mock worker runs. It is downloaded once into a directory only this user
+can write (:func:`server_dir`), never the shared temp directory temporalio defaults to,
+where whoever creates that file name first chooses what runs.
 
 Runs are sequential, in one test server: run ``i`` is workflow ``kontra-graph-<i>``, started
 with the given input or one sampled in run ``i``'s mode, and waited for up to a wall-clock
 deadline. Timers skip, and so does a wait no timer ends (a signal, a ``wait_condition``
 without a timeout): the test server skips to the run's timeout and times it out. A run
-still open at the deadline (a loop that never waits), or whose workflow task fails on the
-mock values (it fails again on every retry), is terminated. Either way its history up to
+still open at the deadline (a loop on an activity's result, which the stub answers the
+same way every time in a run, or a very long one), or whose workflow task fails on the mock
+values (it fails again on every retry), is terminated. Either way its history up to
 there still carries its structure. Each run's history is parsed with every child's (the
 first run of each, found by the ids its events name, never built), and the graphs are
 united.
@@ -29,9 +35,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import stat
 import warnings
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import temporalio.worker
@@ -50,7 +59,7 @@ from kontra._sample import Unsampleable, draw
 from kontra.cli._common import fail
 from kontra.serve.worker import _dedupe, workflow_runner
 
-__all__ = ["Explored", "explore"]
+__all__ = ["Explored", "explore", "server_dir"]
 
 #: How often a run still open is looked at for a workflow task that keeps failing.
 _POLL_S = 0.1
@@ -61,6 +70,8 @@ _SAID = 200
 _ACTIVITY_KINDS = ("activity", "local_activity")
 #: The module temporalio's sandbox warns from.
 _SANDBOX = r"temporalio\.worker\.workflow_sandbox\..*"
+#: Where the test server is kept, under the user's cache directory.
+_SERVER_DIR = ("kontra", "temporal-test-server")
 
 
 @dataclass
@@ -74,7 +85,8 @@ class Explored:
     runs: int
     #: :func:`kontra.graph.union` of the runs' graphs.
     graph: graph.Graph
-    #: Activities the worker registers that no run (nor any of its children) scheduled.
+    #: Activities the worker registers that no run of any offering explored (nor any of
+    #: their children) scheduled: the same list for every offering of one command.
     never_scheduled: list[str]
     #: Runs the test server timed out: they waited for what no timer brings.
     timed_out: list[int] = field(default_factory=list[int])
@@ -84,6 +96,8 @@ class Explored:
     failing: dict[int, str] = field(default_factory=dict[int, str])
     #: Activities whose return value could not be sampled (the stub returned null): why.
     unsampled: dict[str, str] = field(default_factory=dict[str, str])
+    #: Each run's status as its history ends (``terminated`` once it was terminated).
+    statuses: list[str | None] = field(default_factory=list[str | None])
 
 
 class _Answers:
@@ -111,7 +125,8 @@ def _stub(answers: _Answers) -> Callable[..., Any]:
     # Temporal's defn, not kontra's: kontra's would note it for serve() to register.
     @activity.defn(dynamic=True)
     async def stub(args: Sequence[RawValue]) -> Any:
-        return answers.returned(activity.info().activity_type)
+        # Drawn off the event loop: a large value must not hold up the runs' deadline.
+        return await asyncio.to_thread(answers.returned, activity.info().activity_type)
 
     return stub
 
@@ -172,6 +187,39 @@ async def _children(client: Client, history: WorkflowHistory) -> dict[str, Any]:
         found[workflow_id] = child.to_json_dict()
         queue.extend(_started_children(child))
     return found
+
+
+def server_dir() -> Path:
+    """Where the time-skipping test server is downloaded to and run from:
+    ``$XDG_CACHE_HOME/kontra/temporal-test-server`` (``~/.cache`` without it), made 0700.
+    temporalio's default is the shared temp directory, where it runs whatever file sits at
+    its predictable name: on a shared machine, whoever creates that name first chooses
+    what runs as the user. So the directory must be the user's own, a real directory that
+    no one else can write, and so must everything in it; anything else is refused."""
+    cache = os.environ.get("XDG_CACHE_HOME") or ""
+    base = Path(cache) if os.path.isabs(cache) else Path.home() / ".cache"
+    path = base.joinpath(*_SERVER_DIR)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not hasattr(os, "getuid"):
+        return path
+    uid = os.getuid()
+    found = os.lstat(path)
+    if not stat.S_ISDIR(found.st_mode) or found.st_uid != uid:
+        fail(
+            f"{path} is not a directory of yours: kontra graph runs the test server it holds, "
+            "so no one else may own it"
+        )
+    if stat.S_IMODE(found.st_mode) & 0o077:
+        os.chmod(path, 0o700)
+    for entry in os.scandir(path):
+        held = entry.stat(follow_symlinks=False)
+        if held.st_uid != uid or held.st_mode & 0o022 or stat.S_ISLNK(held.st_mode):
+            fail(
+                f"{entry.path} is not yours alone (a link, or someone else's, or writable by "
+                "others): kontra graph would run it; remove it and the test server is "
+                "downloaded again"
+            )
+    return path
 
 
 @dataclass
@@ -280,15 +328,17 @@ async def explore(
 
         worker_plugins.append(scripted_plugin(lambda: answers.run, seed))
     out: list[Explored] = []
+    scheduled: list[set[str]] = []
+    where = server_dir()
     with _quiet():
         try:
             env = await WorkflowEnvironment.start_time_skipping(
-                data_converter=converter, runtime=_quiet_runtime()
+                data_converter=converter, runtime=_quiet_runtime(), download_dest_dir=str(where)
             )
         except Exception as e:  # first use, offline: the download failed
             fail(
                 "cannot start Temporal's time-skipping test server, which temporalio "
-                f"downloads into the temp directory on first use: {e}"
+                f"downloads into {where} on first use: {e}"
             )
         async with env:
             for bound, args in zip(bindings, inputs, strict=True):
@@ -307,7 +357,8 @@ async def explore(
                         answers.run = i
                         runs.append(await _run(env.client, bound, i, arg, deadline))
                 union = graph.union(r.graph for r in runs)
-                scheduled = set[str]().union(*(r.scheduled for r in runs))
+                scheduled.append(set[str]().union(*(r.scheduled for r in runs)))
+                statuses = [r.graph["workflow"]["status"] for r in runs]
                 out.append(
                     Explored(
                         offering=bound.key,
@@ -315,15 +366,17 @@ async def explore(
                         workflow=union["workflow"]["type"] or bound.workflow.__name__,
                         runs=len(runs),
                         graph=union,
-                        never_scheduled=sorted(set(registered) - scheduled),
-                        timed_out=[
-                            i
-                            for i, r in enumerate(runs)
-                            if r.graph["workflow"]["status"] == "timed_out"
-                        ],
+                        never_scheduled=[],
+                        timed_out=[i for i, status in enumerate(statuses) if status == "timed_out"],
                         deadline=[i for i, r in enumerate(runs) if r.deadline],
                         failing={i: r.failing for i, r in enumerate(runs) if r.failing},
                         unsampled=dict(sorted(answers.unsampled.items())),
+                        statuses=statuses,
                     )
                 )
+    # The worker's activities are every offering's: one offering's runs never schedule
+    # another's, so what counts is what no offering's runs scheduled.
+    never = sorted(set(registered) - set[str]().union(*scheduled))
+    for found in out:
+        found.never_scheduled = never
     return out

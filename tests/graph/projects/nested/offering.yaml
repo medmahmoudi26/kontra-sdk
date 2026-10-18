@@ -1,0 +1,9 @@
+# A project for `kontra graph`'s tests: what only a child's history or a marker shows.
+name: acme/nested
+version: 1.0.0
+description: A local activity, a child workflow running a batch, a batch over pages
+max_duration: 5m
+review_window: 24h
+max_concurrent_jobs: 10
+max_output_bytes: 10MB
+artifact_retention: 7d

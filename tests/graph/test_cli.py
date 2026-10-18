@@ -8,8 +8,9 @@ one child node with no continue-as-new chain, and its ``if`` on what the batch f
 both branches from two runs; never-scheduled activities are listed with exit status 0. Then
 the other warnings, ``--json``, ``--input``, and the static graph ``kontra dev``'s page reads.
 The projects under ``projects/`` are seller projects written for these tests (``branches``
-has the same three shapes, and an activity only a signal reaches); the command runs
-in-process (``CliRunner``)."""
+has the same three shapes, and an activity only a signal reaches; ``nested`` what only a
+child's history or a marker shows, and a batch over pages; ``two`` a worker that binds two
+offerings); the command runs in-process (``CliRunner``)."""
 
 from __future__ import annotations
 
@@ -19,10 +20,15 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
+import click
 import pytest
 from click.testing import CliRunner, Result
 from temporalio.testing import WorkflowEnvironment
@@ -30,6 +36,7 @@ from temporalio.testing import WorkflowEnvironment
 from kontra import activity as kontra_activity
 from kontra.cli import cli
 from kontra.cli._graph import load_static, static_path
+from kontra.cli._mock import explore, server_dir
 from kontra.cli._project import load_worker
 
 pytestmark = pytest.mark.temporal
@@ -53,11 +60,12 @@ def readme_graph(example: str) -> str:
 
 @pytest.fixture(scope="module", autouse=True)
 def test_server() -> None:
-    """Temporal's time-skipping test server, which temporalio downloads into the temp
+    """Temporal's time-skipping test server, which ``kontra graph`` downloads into its own
     directory on first use: without it, and without the network, these tests are skipped."""
 
     async def start() -> None:
-        async with await WorkflowEnvironment.start_time_skipping():
+        where = str(server_dir())
+        async with await WorkflowEnvironment.start_time_skipping(download_dest_dir=where):
             pass
 
     try:
@@ -144,14 +152,17 @@ def test_the_graph_of_every_seller_example_is_its_readmes(home: Path, example: s
 @pytest.mark.parametrize("runs", ["2", "4"])
 def test_the_sweep_example_shows_a_fan_out_a_batch_and_both_branches(home: Path, runs: str) -> None:
     """examples/sweep, #42's three shapes: the two fetches are one parallel group (same
-    group, the same predecessor); the batch is ONE child node, named from its history and
-    labelled with the call, with no continue-as-new chain and none of its item activities
-    in the parent's graph; and the ``if`` on what it found shows both branches from two
-    runs (run 0's checks find nothing, run 1's find pages to score)."""
+    group, the same predecessor), which the ``if``'s two branches are not; the batch is ONE
+    child node, named from its input and labelled with the call, with no continue-as-new
+    chain and none of its item activities in the parent's graph; and the ``if`` on what it
+    found shows both branches from two runs (run 0's check finds nothing, run 1's carries an
+    error, so its page counts as unreachable and the run scores)."""
     g = graph_of(home, EXAMPLES / "sweep", "--runs", runs)
     robots, security_txt = node(g, "fetch_robots"), node(g, "fetch_security_txt")
     assert robots["group"] == security_txt["group"] != node(g, "plan")["group"]
     assert {s for s, t in edges(g) if t in ("fetch_robots", "fetch_security_txt")} == {"plan"}
+    # The same predecessor, but taken by different runs: two groups, not a fan-out.
+    assert node(g, "score")["group"] != node(g, "all_clear")["group"]
     batch = "kontra.batch.v1[check_headers]"
     children = [n for n in g["nodes"] if n["kind"] == "child"]
     assert [(n["id"], n["label"]) for n in children] == [
@@ -196,11 +207,12 @@ def test_a_fan_out_is_one_parallel_group_and_a_batch_one_child(home: Path) -> No
     g = graph_of(home, PROJECTS / "branches", "--runs", "4")
     a, b = node(g, "fetch_a"), node(g, "fetch_b")
     assert a["group"] == b["group"] != node(g, "plan")["group"]
+    assert node(g, "accept")["group"] != node(g, "reject")["group"]  # an if/else
     assert {s for s, t in edges(g) if t in ("fetch_a", "fetch_b")} == {"plan"}
     children = [n for n in g["nodes"] if n["kind"] == "child"]
     assert [(n["id"], n["label"]) for n in children] == [
         ("kontra.batch.v1[check]", "execute_activities_in_parallel(check)")
-    ]  # one node, named from its history: no continue-as-new chain, no item activities
+    ]  # one node, though run 0's batch got no items: no continue-as-new chain, no item activities
     assert ("fetch_a", "kontra.batch.v1[check]") in edges(g)
     assert ("fetch_b", "kontra.batch.v1[check]") in edges(g)
     assert ("kontra.batch.v1[check]", "classify") in edges(g)
@@ -227,6 +239,54 @@ def test_never_scheduled_activities_are_listed_and_the_exit_status_is_0(home: Pa
         ok(kontra(home, "graph", "--dir", str(PROJECTS / "branches"), "--json")).stdout
     )
     assert found["never_scheduled"] == ["ship"]
+
+
+def test_what_only_a_marker_or_a_childs_child_schedules_is_scheduled(home: Path) -> None:
+    """A local activity leaves only its marker in history, and ``probe`` runs only in the
+    batch a child workflow starts: both count as scheduled. The batch over pages is one node,
+    though run 0's first page was empty and scheduled no item activity."""
+    result = ok(kontra(home, "graph", "--dir", str(PROJECTS / "nested"), "--json"))
+    assert result.stderr == ""
+    [found] = json.loads(result.stdout)
+    assert found["never_scheduled"] == []
+    g = found["graph"]
+    assert [(n["id"], n["kind"]) for n in g["nodes"]] == [
+        ("note", "local_activity"),
+        ("Inner", "child"),
+        ("kontra.batch.v1[list_pages,visit]", "child"),
+    ]
+    assert edges(g) == {
+        ("start", "note"),
+        ("note", "Inner"),
+        ("Inner", "kontra.batch.v1[list_pages,visit]"),
+        ("kontra.batch.v1[list_pages,visit]", "end"),
+    }
+
+
+def test_a_worker_of_two_offerings_warns_once_of_what_neither_scheduled(home: Path) -> None:
+    """Each offering's runs schedule only its own activity: neither is reported because
+    the other's runs never scheduled it; ``unused``, which no run scheduled, is, once."""
+    directory = str(PROJECTS / "two")
+    result = ok(kontra(home, "graph", "--dir", directory, "--runs", "2"))
+    assert result.stderr == (
+        "warning: acme/two-a@1.0.0, acme/two-b@1.0.0: never scheduled in 4 mock runs: unused "
+        "— branches on timers, signals or inputs the runs did not reach\n"
+    )
+    found = json.loads(
+        ok(kontra(home, "graph", "--dir", directory, "--json", "--runs", "1")).stdout
+    )
+    assert [(f["offering"], f["never_scheduled"]) for f in found] == [
+        ("acme/two-a@1.0.0", ["unused"]),
+        ("acme/two-b@1.0.0", ["unused"]),
+    ]
+    only = ok(
+        kontra(home, "graph", "--dir", directory, "--runs", "1", "--offering", "acme/two-a@1.0.0")
+    )
+    assert only.stderr == (
+        "warning: acme/two-a@1.0.0: never scheduled in 1 mock run: act_b, unused — branches "
+        "on timers, signals or inputs the runs did not reach, or the worker's offerings "
+        "--offering left out\n"
+    )
 
 
 # --------------------------------------------------------------------------- output, input
@@ -304,10 +364,70 @@ def test_a_run_still_open_at_the_deadline_is_terminated(home: Path) -> None:
         "  step#2 → step#2\n"
     )
     assert (
-        "warning: acme/stuck@1.0.0: runs 0, 1 of 2 did not close within 0.5s and were "
-        "terminated (a loop that never waits on a timer runs until then); what they did until "
-        "then is in the graph\n"
+        "warning: acme/stuck@1.0.0: runs 0, 1 of 2 still open after 0.5s were terminated (a "
+        "loop on an activity's result, which the mock answers the same way every time in a "
+        "run, or a very long loop); what they did until then is in the graph\n"
     ) in result.stderr
+
+
+def test_the_runs_open_at_the_deadline_are_terminated_not_left_running() -> None:
+    """Their histories end terminated: a run left open would go on looping on the worker
+    while the next runs go."""
+    with load_worker(PROJECTS / "stuck") as worker:
+        [found] = asyncio.run(
+            explore(worker, worker.offerings, [[{"then": "loop"}] * 2], seed=0, deadline=0.5)
+        )
+    assert found.deadline == [0, 1]
+    assert found.statuses == ["terminated", "terminated"]
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads /proc")
+@pytest.mark.parametrize("sig", ["SIGTERM", "SIGHUP"])
+def test_sigterm_and_sighup_shut_the_test_server_down(home: Path, sig: str) -> None:
+    """A supervisor, an IDE's stop button or ``subprocess.terminate()`` sends SIGTERM, a
+    closed terminal SIGHUP: like Ctrl-C, the command stops and the test server stops with
+    it, instead of staying behind, orphaned, on a port of every interface."""
+    stdin = json.dumps({"then": "loop"})
+    command = [sys.executable, "-m", "kontra.cli", "graph", "--dir", str(PROJECTS / "stuck")]
+    env = {**os.environ, "KONTRA_HOME": str(home)}
+    with subprocess.Popen(
+        [*command, "--input", "-", "--runs", "1", "--timeout", "60"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    ) as proc:
+        assert proc.stdin is not None
+        proc.stdin.write(stdin.encode())
+        proc.stdin.close()
+        server = None
+        for _ in range(300):  # the run loops for a minute once the server is up
+            server = next(iter(children_of(proc.pid)), None)
+            if server is not None:
+                break
+            time.sleep(0.05)
+        assert server is not None, "no test server started"
+        time.sleep(1)
+        proc.send_signal(getattr(signal, sig))
+        assert proc.wait(timeout=30) != 0
+    for _ in range(100):
+        if not Path(f"/proc/{server}").exists():
+            break
+        time.sleep(0.05)
+    assert not Path(f"/proc/{server}").exists(), f"test server {server} left running"
+
+
+def children_of(pid: int) -> list[int]:
+    """The processes whose parent is ``pid``."""
+    found: list[int] = []
+    for stat_file in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat_file.read_text().rpartition(")")[2].split()
+        except OSError:
+            continue
+        if int(fields[1]) == pid:
+            found.append(int(stat_file.parent.name))
+    return found
 
 
 def test_a_workflow_task_that_keeps_failing_and_an_unsampleable_return_are_reported(
@@ -318,15 +438,69 @@ def test_a_workflow_task_that_keeps_failing_and_an_unsampleable_return_are_repor
         "StuckFlow (acme/stuck@1.0.0): 2 mock runs\n  start → step\n  step → odd\n"
     )
     assert result.stderr.splitlines() == [
-        "warning: acme/stuck@1.0.0: never scheduled in 2 mock runs: after — branches on "
-        "timers, signals or inputs the runs did not reach",
         "warning: acme/stuck@1.0.0: run 0's workflow task kept failing on the mock values "
         "(cannot handle a crash); the run was terminated",
         "warning: acme/stuck@1.0.0: run 1's workflow task kept failing on the mock values "
         "(cannot handle a crash); the run was terminated",
         "warning: acme/stuck@1.0.0: no valid return value of odd could be sampled (the "
         "pattern '^(?=x)y$' has a lookaround); the stub returned null",
+        "warning: acme/stuck@1.0.0: never scheduled in 2 mock runs: after — branches on "
+        "timers, signals or inputs the runs did not reach",
     ]
+
+
+# --------------------------------------------------------------------------- the test server
+
+
+def test_the_test_server_is_kept_where_only_its_user_can_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """temporalio's default is the shared temp directory, where it runs whatever file sits
+    at its predictable name. The command's is the user's cache directory, 0700, and anything
+    in it that someone else owns, or can write, is refused."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    where = server_dir()
+    assert where == tmp_path / "cache" / "kontra" / "temporal-test-server"
+    assert stat.S_IMODE(where.stat().st_mode) == 0o700
+    where.chmod(0o777)  # ours, but loose: made private again
+    assert stat.S_IMODE(server_dir().stat().st_mode) == 0o700
+    planted = where / "temporal-test-server-sdk-python-1.34.0"
+    planted.write_text("#!/bin/sh\n")
+    planted.chmod(0o777)
+    with pytest.raises(click.ClickException, match="not yours alone"):
+        server_dir()
+    planted.unlink()
+    planted.symlink_to("/bin/sh")
+    with pytest.raises(click.ClickException, match="not yours alone"):
+        server_dir()
+    planted.unlink()
+    if os.getuid() == 0:  # only root can give a file away
+        planted.write_text("#!/bin/sh\n")
+        planted.chmod(0o700)
+        os.chown(planted, 4242, 4242)
+        with pytest.raises(click.ClickException, match="not yours alone"):
+            server_dir()
+        planted.unlink()
+        os.chown(where, 4242, 4242)
+        with pytest.raises(click.ClickException, match="not a directory of yours"):
+            server_dir()
+    monkeypatch.setenv("XDG_CACHE_HOME", "relative")  # not a path the spec allows: ignored
+    assert server_dir() == Path.home() / ".cache" / "kontra" / "temporal-test-server"
+
+
+def test_kontra_graph_runs_the_test_server_from_that_directory(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: list[object] = []
+    start = WorkflowEnvironment.start_time_skipping
+
+    async def spy(**kwargs: Any) -> WorkflowEnvironment:
+        asked.append(kwargs.get("download_dest_dir"))
+        return await start(**kwargs)
+
+    monkeypatch.setattr(WorkflowEnvironment, "start_time_skipping", staticmethod(spy))
+    ok(kontra(home, "graph", "--dir", str(EXAMPLES / "hello"), "--runs", "1"))
+    assert asked == [str(server_dir())]
 
 
 # --------------------------------------------------------------------------- the static graph

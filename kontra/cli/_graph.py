@@ -7,8 +7,9 @@ bound offering's workflow ``--runs`` times in Temporal's time-skipping test serv
 activity answered with a value of the type it declares (:mod:`kontra._sample`, seeded, so
 the same command prints the same graph), and unites the runs' graphs. The graph is printed
 as one line per edge, as Mermaid (``--mermaid``) or as JSON (``--json``). On stderr, and
-advisory (the exit status stays 0): activities the worker registers that no run scheduled,
-runs that did not close, and return types no valid value was found for.
+advisory (the exit status stays 0): runs that did not close, return types no valid value was
+found for, and, once for the worker, the activities it registers that no run of any
+offering scheduled.
 
 With a profile in ``$KONTRA_HOME``, each offering's graph is also saved where ``kontra dev``'s
 graph page (#43) reads it (:func:`save_static`, :func:`load_static`): that page is served by
@@ -21,9 +22,13 @@ import contextlib
 import hashlib
 import json
 import os
+import signal
 import stat
 import tempfile
+import threading
+from collections.abc import Generator
 from pathlib import Path
+from types import FrameType
 from typing import TYPE_CHECKING, Any
 
 import click
@@ -123,6 +128,34 @@ def load_static(home: Path, task_queue: str) -> Graph | None:
     return saved_graph  # pyright: ignore[reportUnknownVariableType]
 
 
+# --------------------------------------------------------------------------- signals
+
+
+@contextlib.contextmanager
+def _stopped_like_ctrl_c() -> Generator[None]:
+    """SIGTERM and SIGHUP (a supervisor, an IDE's stop button, ``subprocess.terminate()``, a
+    closed terminal) take Ctrl-C's way out while the runs go: the test server is shut down
+    on the way, instead of being left running, orphaned, on a port of every interface."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def interrupted(signum: int, frame: FrameType | None) -> None:
+        handler = signal.getsignal(signal.SIGINT)  # asyncio.run's own while it runs
+        if callable(handler):
+            handler(signal.SIGINT, frame)
+        else:  # SIGINT ignored (a background job): end anyway
+            raise KeyboardInterrupt
+
+    signals = [getattr(signal, name) for name in ("SIGTERM", "SIGHUP") if hasattr(signal, name)]
+    before = {sig: signal.signal(sig, interrupted) for sig in signals}
+    try:
+        yield
+    finally:
+        for sig, handler in before.items():
+            signal.signal(sig, handler)
+
+
 # --------------------------------------------------------------------------- printing
 
 
@@ -171,13 +204,22 @@ def _inputs(bound: Any, given: object, source: str | None, runs: int, seed: int)
     return [given] * runs
 
 
+def _never_scheduled(explored: list[Explored], every_offering: bool) -> None:
+    """The worker's activities no run scheduled: once for the worker, since one offering's
+    runs never schedule another's activities."""
+    if not explored or not explored[0].never_scheduled:
+        return
+    offerings = ", ".join(e.offering for e in explored)
+    runs = sum(e.runs for e in explored)
+    _warn(
+        f"{offerings}: never scheduled in {_mock_runs(runs)}: "
+        f"{', '.join(explored[0].never_scheduled)} — branches on timers, signals or inputs "
+        "the runs did not reach"
+        + ("" if every_offering else ", or the worker's offerings --offering left out")
+    )
+
+
 def _warnings(e: Explored, timeout: float) -> None:
-    if e.never_scheduled:
-        _warn(
-            f"{e.offering}: never scheduled in {_mock_runs(e.runs)}: "
-            f"{', '.join(e.never_scheduled)} — branches on timers, signals or inputs the "
-            "runs did not reach"
-        )
     if e.timed_out:
         _warn(
             f"{e.offering}: {_which(e.timed_out)} of {e.runs} waited for what no timer brings "
@@ -186,9 +228,10 @@ def _warnings(e: Explored, timeout: float) -> None:
         )
     if e.deadline:
         _warn(
-            f"{e.offering}: {_which(e.deadline)} of {e.runs} did not close within {timeout:g}s "
-            "and were terminated (a loop that never waits on a timer runs until then); what "
-            "they did until then is in the graph"
+            f"{e.offering}: {_which(e.deadline)} of {e.runs} still open after {timeout:g}s "
+            f"{'was' if len(e.deadline) == 1 else 'were'} terminated (a loop on an "
+            "activity's result, which the mock answers the same way every time in a run, or "
+            "a very long loop); what they did until then is in the graph"
         )
     for run, said in e.failing.items():
         _warn(
@@ -224,7 +267,9 @@ def _warnings(e: Explored, timeout: float) -> None:
     "--input",
     "source",
     metavar="FILE|-",
-    help="Start every run with this input (a JSON file, - for stdin) instead of sampled ones.",
+    help="Start every run with this input (a JSON file, - for stdin) instead of sampled ones. "
+    "The test server listens on every interface, unauthenticated, while the runs go: anyone "
+    "who can reach this machine can read it there.",
 )
 @click.option(
     "--timeout",
@@ -262,8 +307,10 @@ def graph(
     try:
         with load_worker(directory) as worker:
             chosen = _pick(worker.offerings, only)
+            every_offering = len(chosen) == len(worker.offerings)
             inputs = [_inputs(b, given, source, runs, seed) for b in chosen]
-            explored = run(lambda: explore(worker, chosen, inputs, seed=seed, deadline=timeout))
+            with _stopped_like_ctrl_c():
+                explored = run(lambda: explore(worker, chosen, inputs, seed=seed, deadline=timeout))
     except ModuleNotFoundError as err:
         # An agent workflow's project imports `agents`: without the extra it cannot even
         # be imported, so it cannot be run either.
@@ -298,6 +345,7 @@ def graph(
             for a, b in _edges(found.graph):
                 click.echo(f"  {a} → {b}")
         _warnings(found, timeout)
+    _never_scheduled(explored, every_offering)
     home = kontra_home()
     if no_save or not (home / PROFILE_FILE).is_file():
         return

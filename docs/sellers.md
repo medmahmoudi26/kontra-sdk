@@ -605,11 +605,13 @@ draws the smallest values (false, 0, empty lists, no optional fields), run 1 the
 (true, 3 items, every field), run 2 large lists near the top of the value (201 items, so a
 loop that batches its input by 50 or 100 goes round), and the others random ones from
 `--seed`: an `if` on a boolean an activity returned shows both branches from two runs on,
+however deep in the value it sits (only a recursive model is cut short, where it recurses),
 and the same command prints the same graph. The runs' graphs are then united: a loop is one
 node with an edge back, the activities one workflow task starts at once share a parallel
-group, and `execute_activities_in_parallel` is one node,
-`execute_activities_in_parallel(<activity>)`, however many items it ran and however many
-times it continued as new. [`examples/sweep`](../examples/sweep) shows the three, and every
+group (an `if`'s branches, which no run starts together, never do), and
+`execute_activities_in_parallel` is one node, `execute_activities_in_parallel(<activity>)`
+(a `pages=` batch names its page activity too, the two sorted), however many items it ran,
+none included, and however many times it continued as new. [`examples/sweep`](../examples/sweep) shows the three, and every
 example's README shows its graph.
 
 An agent workflow (one that imports `agents`) runs with a scripted model instead of yours:
@@ -619,21 +621,31 @@ import the project at all.
 
 What the runs could not show goes to stderr, and the exit status stays 0 (it is advice):
 
-- activities the worker registers that no run scheduled (`never scheduled in 8 mock runs:
-  ship — branches on timers, signals or inputs the runs did not reach`): a branch only a
-  signal, a particular input or more runs reach. Activities a batch child or a local activity
-  ran count as scheduled.
+- activities the worker registers that no run of any offering scheduled, once for the worker
+  (`never scheduled in 8 mock runs: ship — branches on timers, signals or inputs the runs did
+  not reach`): a branch only a signal, a particular input or more runs reach. Activities a
+  batch child, a child's child or a local activity ran count as scheduled, and so do another
+  offering's; with `--offering`, the offerings left out ran nothing.
 - runs that waited for what no timer brings (a signal, a `wait_condition` without a timeout):
   the test server skips to the run's timeout and times it out; the graph holds what it did
-  until then. A run still open after `--timeout` seconds of wall-clock time (default 5: a loop
-  that never sleeps), or whose workflow task fails on the mock values every time, is
-  terminated, with the same note.
+  until then. A run still open after `--timeout` seconds of wall-clock time (default 5), or
+  whose workflow task fails on the mock values every time, is terminated, with the same
+  note. The stub answers an activity the same way every time within a run, so a loop that
+  polls one until it says done (`while not (await status()).done`) ends only in the runs
+  that drew `done`; a loop over a large drawn count (1000 in run 1) can take that long too.
 - a return type no valid value could be drawn for (a pattern with a lookaround, a model
   validator nothing satisfies): the stub returned null, and the workflow may have failed on
   it.
 
-The test server is a binary temporalio downloads once into the temp directory on first use;
-offline, before that, `kontra graph` says it cannot start it. With a profile in
+The test server is a binary temporalio downloads once on first use into
+`~/.cache/kontra/temporal-test-server` (under `$XDG_CACHE_HOME` when that is set), a
+directory made 0700; never the shared temp directory, where whoever creates the file name
+first chooses what runs. Anything in that directory someone else owns or can write is
+refused. Offline, before the download, `kontra graph` says it cannot start it. The server
+cannot be bound to the loopback: while the command runs it listens on every interface, on a
+random port, unauthenticated, so anyone who can reach the machine can read the runs there --
+an `--input` you give included -- and start workflows the mock worker runs. Ctrl-C, SIGTERM
+and SIGHUP stop the command and the server with it. With a profile in
 `$KONTRA_HOME`, each offering's graph is also saved under `$KONTRA_HOME/graphs/`, for
 `kontra dev`'s graph page to paint a live run on (`--no-save` skips it); it is never sent
 anywhere: `kontra publish` does not carry it.

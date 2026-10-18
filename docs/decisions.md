@@ -1236,12 +1236,26 @@ against temporalio 1.34 and its test server. Where the issue and the code part w
   parallel group, the batch ONE node, `kontra.batch.v1[check_headers]`, labelled
   `execute_activities_in_parallel(check_headers)` with no continue-as-new chain, and both
   branches show from two runs; its lifecycle test parses the real job's history into the
-  same path.
+  same path. Two things #42's review found in the parser serve these checks (I26): a batch
+  is named from what its input asked for, so a run whose batch got no items (min mode draws
+  `[]` for a list without `minItems`; a `Page`'s items never have one) is not a second node;
+  and in a union only nodes some run commanded together share a group, so an `if`'s two
+  branches, taken at the same point by two runs, do not pass for a fan-out. Every value of
+  sweep's job is bounded in bytes, not characters, as the payload limit is: its URLs follow
+  RFC 3986 (ASCII, the rest percent-encoded) and each kept line of a site's files is cut at
+  100 bytes as JSON writes it (a control character is six there); a site sending lines of
+  U+0001 had pushed `Findings` past 2 MiB on a Temporal without the codec, whose claim-check
+  carries a payload over 256 KiB under `kontra serve`.
 - **No hypothesis-jsonschema; an in-house, seeded sampler.** It has had no release since
   2024-02, does not read pydantic's 2020-12 output (`prefixItems` ignored, so invalid tuples;
   `format: uuid` unknown; recursive models raise), is MPL-2.0, and draws at random outside
   `@given`, where "both branches with 4 runs" would be flaky. `kontra/_sample.py` is pure,
-  pyright-strict, adds no dependency, and draws by run mode. Past the issue's list: a
+  pyright-strict, adds no dependency, and draws by run mode. Recursion is bounded where it
+  recurses: once a `$ref` repeats on the way down, the rest is drawn in min mode, and past 32
+  path elements nothing is. A first cut drew everything from 4 path elements down in min mode
+  (array indexes count), so `report.pages[i].headers.hsts` was false in every run and an `if`
+  on it never showed its other branch (#42's review); 16 elements now bound only the size of
+  a value nested that deep without recursing. Past the issue's list: a
   `pattern` with no `examples` or `default` is followed by a generator over Python's own
   regex parser (enrich's and legacy-actor's inputs and `Artifact` have patterns, and giving up
   on them would contradict sampling the input), giving up only on a lookaround, a
@@ -1249,9 +1263,21 @@ against temporalio 1.34 and its test server. Where the issue and the code part w
   `patternProperties` (`dict[Literal[...], X]`, as sweep's report has; found by `kontra
   graph` on it); a value validation refuses is drawn again, in random mode, only where the
   errors point, for up to 32 rounds (legacy-actor's "exactly one of url or host", across 201
-  targets, never passes a whole redraw); and values are checked with `validate_json`, as the
-  payload converter decodes them, and the stub returns the drawn JSON itself (`dump_python`
-  writes field names, not aliases, and can fail to round-trip). In large mode an array inside
+  targets, never passes a whole redraw), in the order of the errors (a set's order follows
+  the process's string hashing, and two refused sibling fields came out swapped from one
+  process to the next), a refused mapping key redrawing its mapping with fresh keys, and a
+  datetime's offset a `NaiveDatetime` refuses taken off in place; a pattern's draw meets its
+  `minLength`/`maxLength` (extra repetitions go to its first repeats with room), a class no
+  printable character matches (`\s`) draws a space, and each pattern is read once, its
+  classes' characters worked out once (a large-mode list of `Artifact`s took 1 s, long
+  enough to starve the run's deadline; the stub now also draws off the event loop); `bytes`
+  and `SecretStr` are strings of their lengths, base64 the encoding of one, random numbers
+  have two decimals (a `Decimal`'s `decimal_places` and `max_digits` are not in its schema);
+  anything but `Unsampleable` a draw runs into (an overflowing `multipleOf`, a validator
+  raising `TypeError`) is unsampleable or drawn again, never a traceback; and values are
+  checked with `validate_json`, as the payload converter decodes them, and the stub returns
+  the drawn JSON itself (`dump_python` writes field names, not aliases, and can fail to
+  round-trip). In large mode an array inside
   an array stays at 3 items (201 x 201 is no graph). A `Page`'s `next` is `Any`, which
   samples as null, so a `pages=` source always ends after one page.
 - **The seller commands' shape: `--dir` and `--offering`, not `<module:Workflow>`.** The
@@ -1275,15 +1301,26 @@ against temporalio 1.34 and its test server. Where the issue and the code part w
   (its id from the event, never built or parsed, I1); its first run's history is read, its
   own children's too, and handed to `parse(children=)`: that names a batch node, and the
   activities a child ran (a batch's items) count as scheduled for the never-scheduled
-  warning, as do local-activity markers.
+  warning, as do local-activity markers (`tests/graph/projects/nested` holds both).
+- **Never scheduled is the worker's, said once.** A worker's activities are every bound
+  offering's, and one offering's runs never schedule another's: per offering, each one's
+  warning listed the others' activities as unreached branches (#42's review). The warning
+  lists what no run of any offering scheduled, once, naming the offerings (and, with
+  `--offering`, that the ones left out ran nothing); `--json` gives each offering that list.
 - **What does not close is timed out or terminated, and still drawn.** A wait no timer ends
   (a signal, `wait_condition` without a timeout) never reaches the wall-clock deadline: the
   test server skips to the run's execution timeout and times the run out within
   milliseconds, so that is its own warning ("waited for what no timer brings"). A run still
-  open after `--timeout` wall-clock seconds (default 5: a loop that never sleeps) is
-  terminated; so is one whose workflow task fails on the mock values, found by reading its
-  history every 0.1 s (it would fail the same way on every retry). Either way its history up
-  to there carries its structure, and it goes into the union.
+  open after `--timeout` wall-clock seconds (default 5) is terminated; so is one whose
+  workflow task fails on the mock values, found by reading its history every 0.1 s (it would
+  fail the same way on every retry). Either way its history up to there carries its
+  structure, and it goes into the union. The warning says what is known, that the run was
+  still open: the stub answers an activity the same way every time in a run, so a poll loop
+  that sleeps between calls (`while not (await status()).done`) runs until then in every run
+  that drew `done: false`, and a loop over a drawn count runs 1000 times in run 1. The first
+  wording blamed "a loop that never waits on a timer" for both (#42's review). Answers are
+  not varied call by call: calls of one run race (a batch's items), so which call got which
+  value would change from one command to the next.
 - **One worker per offering, on its real task queue; the runs in sequence.** One test server
   per command, a plain `temporalio.worker.Worker` per bound offering on the task queue
   `kontra serve` would use, with the workflow, its extra workflows and `kontra.batch.v1`, the
@@ -1292,9 +1329,21 @@ against temporalio 1.34 and its test server. Where the issue and the code part w
   knows the run in progress, so a batch child's items draw in the parent run's mode.
   temporalio's logging, the sandbox's late-import warning and the core's WARN lines are
   silenced while they go: what matters is in the warnings.
-- **The test server is downloaded once.** temporalio fetches its time-skipping server into
-  the temp directory on first use; offline, before that, the command says it cannot start
-  it, and the tests skip.
+- **The test server is downloaded once, into a directory only the user can write
+  (departs from #42's spec).** The spec has it fetched "into the temp dir", temporalio's
+  default, and temporalio runs whatever file sits at its predictable name there
+  (`/tmp/temporal-test-server-sdk-python-1.34.0`), with no check of owner or checksum: on a
+  shared machine, another user who creates that name first (or after a reboot cleans `/tmp`)
+  runs code as whoever runs `kontra graph` (#42's review planted one). It goes to
+  `$XDG_CACHE_HOME/kontra/temporal-test-server` (`~/.cache` without it), made 0700, and the
+  command refuses a directory it does not own or anything in it that is a link, someone
+  else's, or writable by others. Offline, before the download, the command says it cannot
+  start it, and the tests skip. The server takes a port and nothing else, so it cannot be
+  bound to the loopback: it listens on every interface, unauthenticated, while the command
+  runs (an `--input` is readable there, and the docs and `--help` say so). SIGTERM and SIGHUP
+  take Ctrl-C's way out while the runs go, so the server is shut down with the command;
+  before, Python died without leaving `async with env`, and the server stayed, orphaned and
+  listening.
 - **Found on the way: the batch child imported seller modules inside the sandbox.**
   `execute_activities_in_parallel`'s child resolved its activity and `reduce=` with
   `importlib.import_module` inside `imports_passed_through()`, which goes around the
