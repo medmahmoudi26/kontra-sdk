@@ -37,22 +37,44 @@ async def main():
 
 start = time.monotonic()
 out = asyncio.run(main())
+out = out if isinstance(out, list) else [out]
 print(json.dumps({{
     "seconds": time.monotonic() - start,
     "out": [o.model_dump(mode="json") for o in out],
     "beats": len(beats),
 }}))
 """
+#: Each example's activity over the one stalled URL (or its site): the example's directory,
+#: its deadline setting, the call, and the heartbeats it sends meanwhile (a batch reports
+#: the URL it gave up on; one URL's own activity says nothing).
 CASES = {
     "enrich": dict(
+        directory="enrich",
         deadline="URL_DEADLINE_SECONDS",
         activity="activities.fetch_batch",
         batch="models.Batch(urls=[URL], done=0, total=1)",
+        beats=1,
     ),
     "legacy-actor": dict(
+        directory="legacy-actor",
         deadline="TARGET_DEADLINE_SECONDS",
         activity="activities.head_batch",
         batch="models.Batch(targets=[models.Target(url=URL)], done=0, total=1)",
+        beats=1,
+    ),
+    "sweep": dict(
+        directory="sweep",
+        deadline="URL_DEADLINE_SECONDS",
+        activity="activities.check_headers",
+        batch="URL",
+        beats=0,
+    ),
+    "sweep-sites": dict(
+        directory="sweep",
+        deadline="URL_DEADLINE_SECONDS",
+        activity="activities.fetch_robots",
+        batch="[URL.rstrip('/')]",
+        beats=1,
     ),
 }
 
@@ -61,7 +83,7 @@ def _run(name: str, url: str, sites: Sites) -> dict[str, Any]:
     script = _SCRIPT.format(seconds=DEADLINE, **CASES[name])
     result = subprocess.run(
         [sys.executable, "-c", script, url],
-        cwd=EXAMPLES / name,
+        cwd=EXAMPLES / str(CASES[name]["directory"]),
         env={**os.environ, "SSL_CERT_FILE": str(sites.ca_file)},
         capture_output=True,
         text=True,
@@ -84,4 +106,4 @@ def test_a_url_that_stalls_ends_at_its_deadline(name: str, sites: Sites) -> None
     [record] = ran["out"]
     assert (record["status"], record["error"]) == (None, "TimeoutError")
     assert DEADLINE <= ran["seconds"] < DEADLINE + 8
-    assert ran["beats"] == 1  # the batch still reports it, and goes on
+    assert ran["beats"] == CASES[name]["beats"]  # a batch still reports it, and goes on

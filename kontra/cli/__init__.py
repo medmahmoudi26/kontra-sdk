@@ -11,6 +11,9 @@ kontra devices list|add [--new-key]|remove      machines and browsers that read 
 kontra init <name> [--party P]                 scaffold an offering (§6.1)
 kontra dev [up|down|status|logs]               the local stack (compose.yaml)
 kontra publish | serve | contract [--dir D]    sell worker.py's offerings (§11.4, §6.5)
+kontra graph [--dir D] [--runs N] [--mermaid|--json]
+                                               worker.py's workflows as a graph, from mock
+                                               runs (I27)
 kontra status [--workers] [<offering>...]      whether your workers keep up (Temporal's stats)
 kontra pull <offering> --lang go|python|typescript|java
 kontra quote|hire <offering> -f in.json        buy (§7.1)
@@ -42,6 +45,7 @@ from kontra.cli._buyer import hire, job, jobs, quote
 from kontra.cli._common import KontraGroup, fail
 from kontra.cli._dev import dev
 from kontra.cli._devices import devices
+from kontra.cli._graph import graph
 from kontra.cli._keys import keys
 from kontra.cli._pull import pull
 from kontra.cli._recipients import recipients
@@ -78,6 +82,7 @@ for _command in (
     publish,
     serve,
     contract,
+    graph,
     status,
     pull,
     quote,

@@ -45,3 +45,26 @@ To let buyers reach a private network on purpose (an intranet you sell access to
 byte for byte. It seals no key (spec v2): the same offering derives the same document and
 `contract_hash` on every machine and for every seller key. After a deliberate contract change, regenerate it with
 `UPDATE_GOLDEN=1 pytest tests/examples/test_golden.py` and review the diff.
+
+## Its graph
+
+`kontra graph --mermaid`, from this directory, draws the workflow from mock runs: Temporal's
+test server runs it eight times, every activity answered with a value of the type it
+declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against the
+command:
+
+```mermaid
+%% acme/enrich@1.2.0
+flowchart TD
+    s((start))
+    n0["fetch_batch"]
+    n1["write_records"]
+    e((end))
+    n0 --> n0
+    n0 --> n1
+    s --> n0
+    n1 --> e
+```
+
+`fetch_batch` is a loop over the URLs, 50 at a time: one node with an edge to itself (one
+mock run drew 201 URLs, and went round five times).

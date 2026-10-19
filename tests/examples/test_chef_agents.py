@@ -193,6 +193,7 @@ print(json.dumps({
         ("enrich", False),
         ("legacy-actor", False),
         ("chef-claude", False),
+        ("sweep", False),
         ("chef-agents", True),
     ],
 )

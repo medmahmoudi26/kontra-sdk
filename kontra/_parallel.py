@@ -29,8 +29,8 @@ from __future__ import annotations
 import asyncio
 import collections
 import dataclasses
-import importlib
 import inspect
+import sys
 import types
 import typing
 from collections.abc import Callable, Sequence
@@ -127,9 +127,15 @@ class _Cursor:
 def _resolve(ref: _Ref) -> Any:
     """The object ``ref`` names. In a workflow, its module is passed through the sandbox:
     imported once per process (the worker has it already: it registered the activities)
-    rather than once per batch run, and without the sandbox's late-import warning."""
+    rather than once per batch run, and without the sandbox's late-import warning.
+
+    Through ``__import__``, the sandbox's own: ``importlib.import_module`` goes around it,
+    and loads the module afresh *inside* the sandbox, where a seller's module that reads
+    its settings as it loads (``os.environ``, as examples/enrich and examples/sweep do)
+    fails the batch's every workflow task."""
     with workflow.unsafe.imports_passed_through():
-        obj: Any = importlib.import_module(ref.module)
+        __import__(ref.module)
+    obj: Any = sys.modules[ref.module]
     for part in ref.qualname.split("."):
         obj = getattr(obj, part)
     return obj

@@ -18,6 +18,12 @@ everything reaches; :attr:`Sites.endless_capped` says whether one did). ``/host`
 with the ``Host`` header it was sent, and ``/to?<location>`` redirects (302) to the
 percent-encoded location after the ``?``, wherever that is (:meth:`Sites.redirect`).
 
+Security headers (the sweep example checks them): every page sends none, but ``/hardened``
+(:data:`HARDENED`: all five) and ``/partial`` (:data:`PARTIAL`: no Strict-Transport-Security
+and no X-Frame-Options, whose job its policy's ``frame-ancestors`` does). Every site has a
+``/robots.txt`` (:data:`ROBOTS_TXT`), and the HTTPS ones a ``/.well-known/security.txt``
+(:data:`SECURITY_TXT`; RFC 9116 wants it served over HTTPS).
+
 Hostile ones: ``/redirect-endless`` (to a GET, a 301 to ``/page/landed`` whose body is
 endless like ``/endless``'s; to a HEAD, the bare 301), ``/redirect-twice`` (301 to
 ``/redirect-endless``: a client that turns a redirected HEAD into a GET meets that body),
@@ -49,7 +55,16 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from kontra.testing.devserver import free_port
 
-__all__ = ["BOMB_SIZE", "ENDLESS_CAP", "SERVER", "Sites"]
+__all__ = [
+    "BOMB_SIZE",
+    "ENDLESS_CAP",
+    "HARDENED",
+    "PARTIAL",
+    "ROBOTS_TXT",
+    "SECURITY_TXT",
+    "SERVER",
+    "Sites",
+]
 
 #: The ``Server`` header every page carries.
 SERVER = "kontra-test-site"
@@ -61,6 +76,37 @@ _BOMB = gzip.compress(
     gzip.compress(b"<html><head><title>Bomb</title></head>" + bytes(BOMB_SIZE), 9), 9
 )
 _STALL_MAX = 120.0
+#: What ``/hardened`` sends: every header the sweep example checks.
+HARDENED = {
+    "Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+    "Content-Security-Policy": "default-src 'self'",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+}
+#: What ``/partial`` sends.
+PARTIAL = {
+    "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin",
+}
+ROBOTS_TXT = (
+    "# robots.txt of the test sites\n"
+    "User-agent: *\n"
+    "Disallow: /admin/\n"
+    "Disallow: /backup.zip  # an old one\n"
+    "Allow: /page/\n"
+    "\n"
+    "User-agent: BadBot\n"
+    "Disallow: /\n"
+    "Disallow: /admin/\n"
+)
+SECURITY_TXT = (
+    "Contact: mailto:security@example.test\n"
+    "Contact: https://example.test/report\n"
+    "Expires: 2031-01-01T00:00:00.000Z\n"
+    "Preferred-Languages: en\n"
+)
 _PAGE = re.compile(r"/page/([A-Za-z0-9_-]{1,40})")
 
 
@@ -103,6 +149,14 @@ def _handler(state: _State, *, stall: bool) -> type[BaseHTTPRequestHandler]:
                 return self._page(200, "Home", body)
             if path == "/host":
                 return self._page(200, f"Host {self.headers.get('Host', '')}", body)
+            if path == "/hardened":
+                return self._page(200, "Hardened", body, HARDENED)
+            if path == "/partial":
+                return self._page(200, "Partial", body, PARTIAL)
+            if path == "/robots.txt":
+                return self._text(ROBOTS_TXT, body)
+            if path == "/.well-known/security.txt" and isinstance(self.request, ssl.SSLSocket):
+                return self._text(SECURITY_TXT, body)
             if path == "/to":
                 return self._moved(unquote(self.path.partition("?")[2]), status=302)
             if page is not None:
@@ -141,10 +195,23 @@ def _handler(state: _State, *, stall: bool) -> type[BaseHTTPRequestHandler]:
             except OSError:  # the client gave up
                 self.close_connection = True
 
-        def _page(self, status: int, title: str, body: bool) -> None:
+        def _page(
+            self, status: int, title: str, body: bool, headers: dict[str, str] | None = None
+        ) -> None:
             data = f"<html><head><title>{html.escape(title)}</title></head></html>\n".encode()
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
+            self.end_headers()
+            if body:
+                self.wfile.write(data)
+
+        def _text(self, text: str, body: bool) -> None:
+            data = text.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             if body:

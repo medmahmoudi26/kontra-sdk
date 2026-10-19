@@ -1,0 +1,9 @@
+# A project for `kontra graph`'s tests: every shape the mock runs must show.
+name: acme/stuck
+version: 1.0.0
+description: Waits forever, or fails on what it is given
+max_duration: 5m
+review_window: 24h
+max_concurrent_jobs: 10
+max_output_bytes: 10MB
+artifact_retention: 7d

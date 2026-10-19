@@ -962,6 +962,72 @@ def test_a_batch_child_is_named_from_its_own_history_never_from_its_id() -> None
     assert node(parse(history, children={BATCH_ID: fixture("child_batch")}), "kontra.batch.v1")
 
 
+def batch_child(*scheduled: str, spec: Any = None, encrypted: bool = False) -> dict[str, Any]:
+    """A batch child's first run: started with ``spec`` (none: no input), plain or
+    encrypted, scheduling ``scheduled`` one after the other."""
+    given: tuple[Any, ...] = () if spec is None else (spec, {"next": None, "acc": None})
+    extra = None
+    if encrypted:
+        extra = {"input": {"payloads": [synth.sealed(v)[0] for v in given]}}
+    h = synth.History(
+        "kontra.batch.v1",
+        workflow_id=BATCH_ID,
+        run_id=BATCH_FIRST_RUN,
+        input=given,
+        extra=extra,
+    )
+    for name in scheduled:
+        h.finish(h.activity(h.task(), name))
+    h.complete(h.task())
+    return h.json()
+
+
+def spec(activity: str, pages: str | None = None, items: list[Any] | None = None) -> dict[str, Any]:
+    """``kontra._parallel._Spec`` as the pydantic converter writes it."""
+    return {
+        "activity": activity,
+        "activity_ref": {"module": "activities", "qualname": activity},
+        "pages": pages,
+        "pages_ref": None if pages is None else {"module": "activities", "qualname": pages},
+        "items": items,
+        "max_concurrent": 50,
+        "options": {"start_to_close_timeout": "PT30S"},
+        "reduce": None,
+    }
+
+
+def test_a_batch_is_named_from_what_its_input_asked_for_when_that_is_plain() -> None:
+    """A run whose batch got no items, or an empty first page, schedules no item activity:
+    named from its history alone it would be another node than every other run of the same
+    call. A mock run's batch input is plain JSON (no codec), and names both activities; an
+    encrypted one is never opened, and the names are what the child scheduled."""
+    full = parse(fixture("child"), children={BATCH_ID: fixture("child_batch")})
+    name = "kontra.batch.v1[enrich,fetch_page]"
+    assert name in ids(full)
+    asked = spec("enrich", pages="fetch_page")
+    for child in (
+        batch_child("fetch_page", spec=asked),  # an empty first page: no item activity
+        batch_child("fetch_page", "enrich", "enrich", "fetch_page", spec=asked),
+    ):
+        named = parse(fixture("child"), children={BATCH_ID: child})
+        assert ids(named) == ids(full)
+        assert node(named, name)["label"] == "execute_activities_in_parallel(enrich,fetch_page)"
+    no_items = parse(
+        fixture("child"), children={BATCH_ID: batch_child(spec=spec("check", items=[]))}
+    )
+    assert (node(no_items, "kontra.batch.v1[check]")["label"]) == (
+        "execute_activities_in_parallel(check)"
+    )
+    sealed = batch_child("fetch_page", spec=asked, encrypted=True)
+    assert "kontra.batch.v1[fetch_page]" in ids(
+        parse(fixture("child"), children={BATCH_ID: sealed})
+    )
+    # Only a kontra.batch.v1 input is read, and only names that are strings.
+    for odd in ({"activity": 7, "pages": ["x"]}, "not an object", None):
+        child = batch_child("enrich", spec=odd)
+        assert "kontra.batch.v1[enrich]" in ids(parse(fixture("child"), children={BATCH_ID: child}))
+
+
 def test_the_batch_workflow_name_is_kontras() -> None:
     from kontra._parallel import BATCH_WORKFLOW
 
@@ -1463,6 +1529,29 @@ def test_union_keeps_structure_only() -> None:
         "ref": None,
         "failure": None,
     }
+
+
+def test_union_groups_only_what_some_run_commanded_together() -> None:
+    """A run's group is a position in that run: an ``if``'s two branches, taken at the same
+    point by two runs, number alike there, and would read as one fan-out in the union. There
+    two nodes share a group only when one run commanded them in one batch."""
+    approve, reject = graph("branch_approve"), graph("branch_reject")
+    assert node(approve, "approve")["group"] == node(reject, "reject")["group"]
+    static = union([approve, reject])
+    assert [(n["id"], n["group"]) for n in static["nodes"]] == [
+        ("check", 0),
+        ("approve", 1),
+        ("ship", 2),
+        ("reject", 3),
+    ]
+    fan = union([graph("sequence"), graph("fan_out")])
+    groups = {n["id"]: n["group"] for n in fan["nodes"]}
+    assert groups["lookup_company"] == groups["lookup_domain"] == groups["lookup_person"]
+    assert len(set(groups.values())) == 5  # the three sequence steps, the fan-out, score
+    # A node scheduled with one node in one run and another in the next joins both.
+    a = {"nodes": [{"id": "x", "group": 0}, {"id": "y", "group": 0}], "edges": []}
+    b = {"nodes": [{"id": "z", "group": 0}, {"id": "y", "group": 0}, {"id": "w", "group": 1}]}
+    assert [n["group"] for n in union([a, b])["nodes"]] == [0, 0, 0, 1]
 
 
 def test_union_of_nothing_is_empty() -> None:

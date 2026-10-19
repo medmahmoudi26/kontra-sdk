@@ -32,10 +32,10 @@ _T = TypeVar("_T")
 REPO = Path(__file__).resolve().parents[2]
 EXAMPLES = REPO / "examples"
 #: The sellers, by directory. Their offering names start with ``acme/``.
-SELLERS = ("enrich", "legacy-actor", "hello", "chef-agents", "chef-claude")
+SELLERS = ("enrich", "legacy-actor", "hello", "chef-agents", "chef-claude", "sweep")
 #: The ones the package's marketplace serves for every test. The chefs run in their own
 #: tests, each with what its worker dials: a local model server, a stand-in ``claude``.
-SERVED = ("enrich", "legacy-actor", "hello")
+SERVED = ("enrich", "legacy-actor", "hello", "sweep")
 #: What a buyer is funded with, in cents.
 START = 10_000
 #: The example sellers fetch only public addresses unless told otherwise (their READMEs);
@@ -43,6 +43,7 @@ START = 10_000
 ALLOW_LOCAL_SITES = {
     "ENRICH_ALLOWED_PRIVATE_NETWORKS": "127.0.0.1/32",
     "PROBE_ALLOWED_PRIVATE_NETWORKS": "127.0.0.1/32",
+    "SWEEP_ALLOWED_PRIVATE_NETWORKS": "127.0.0.1/32",
 }
 
 

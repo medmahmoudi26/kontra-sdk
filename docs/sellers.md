@@ -580,6 +580,76 @@ The test `kontra init` writes does exactly this; read it for a full lifecycle, i
 seller that never delivers and the refund at the deadline. Install with
 `pip install "kontra-sdk[testing]" pytest`.
 
+## The graph: `kontra graph`
+
+Temporal keeps no definition of a workflow, only what each run did. `kontra graph` draws
+yours before anyone pays for a run, from mock runs:
+
+```sh
+kontra graph                     # from the directory with worker.py: one line per edge
+kontra graph --mermaid           # a Mermaid flowchart, for a `mermaid` block GitHub renders
+kontra graph --json              # [{"offering", "runs", "graph", "never_scheduled"}]
+kontra graph --runs 16 --seed 7  # more runs, other random values
+kontra graph --input in.json     # every run starts with this input
+```
+
+For each offering `worker.py` binds (`--offering NAME@VERSION` picks one, `--dir` names
+another directory), the workflow runs `--runs` times (default 8) in Temporal's time-skipping
+test server, with what `serve()` registers -- the bound workflow, the further ones it
+registers (the children it starts) and the batch child, under Kontra's sandbox and payload
+converter -- but none of the worker's other options, and no codec. Every activity is
+answered by a stub with a value of the type it declares, so no activity body runs, nothing
+is fetched and no key is needed; timers are skipped. The input is drawn the same way from the
+workflow's input type, unless `--input` gives one (checked against the type first). Run 0
+draws the smallest values (false, 0, empty lists, no optional fields), run 1 the largest
+(true, 3 items, every field), run 2 large lists near the top of the value (201 items, so a
+loop that batches its input by 50 or 100 goes round), and the others random ones from
+`--seed`: an `if` on a boolean an activity returned shows both branches from two runs on,
+however deep in the value it sits (only a recursive model is cut short, where it recurses),
+and the same command prints the same graph. The runs' graphs are then united: a loop is one
+node with an edge back, the activities one workflow task starts at once share a parallel
+group (an `if`'s branches, which no run starts together, never do), and
+`execute_activities_in_parallel` is one node, `execute_activities_in_parallel(<activity>)`
+(a `pages=` batch names its page activity too, the two sorted), however many items it ran,
+none included, and however many times it continued as new. [`examples/sweep`](../examples/sweep) shows the three, and every
+example's README shows its graph.
+
+An agent workflow (one that imports `agents`) runs with a scripted model instead of yours:
+it calls every tool the agent was given once, then answers with a value of the agent's output
+type, so the graph shows model, tools, model. Its `[agents]` extra must be installed to
+import the project at all.
+
+What the runs could not show goes to stderr, and the exit status stays 0 (it is advice):
+
+- activities the worker registers that no run of any offering scheduled, once for the worker
+  (`never scheduled in 8 mock runs: ship — branches on timers, signals or inputs the runs did
+  not reach`): a branch only a signal, a particular input or more runs reach. Activities a
+  batch child, a child's child or a local activity ran count as scheduled, and so do another
+  offering's; with `--offering`, the offerings left out ran nothing.
+- runs that waited for what no timer brings (a signal, a `wait_condition` without a timeout):
+  the test server skips to the run's timeout and times it out; the graph holds what it did
+  until then. A run still open after `--timeout` seconds of wall-clock time (default 5), or
+  whose workflow task fails on the mock values every time, is terminated, with the same
+  note. The stub answers an activity the same way every time within a run, so a loop that
+  polls one until it says done (`while not (await status()).done`) ends only in the runs
+  that drew `done`; a loop over a large drawn count (1000 in run 1) can take that long too.
+- a return type no valid value could be drawn for (a pattern with a lookaround, a model
+  validator nothing satisfies): the stub returned null, and the workflow may have failed on
+  it.
+
+The test server is a binary temporalio downloads once on first use into
+`~/.cache/kontra/temporal-test-server` (under `$XDG_CACHE_HOME` when that is set), a
+directory made 0700; never the shared temp directory, where whoever creates the file name
+first chooses what runs. Anything in that directory someone else owns or can write is
+refused. Offline, before the download, `kontra graph` says it cannot start it. The server
+cannot be bound to the loopback: while the command runs it listens on every interface, on a
+random port, unauthenticated, so anyone who can reach the machine can read the runs there --
+an `--input` you give included -- and start workflows the mock worker runs. Ctrl-C, SIGTERM
+and SIGHUP stop the command and the server with it. With a profile in
+`$KONTRA_HOME`, each offering's graph is also saved under `$KONTRA_HOME/graphs/`, for
+`kontra dev`'s graph page to paint a live run on (`--no-save` skips it); it is never sent
+anywhere: `kontra publish` does not carry it.
+
 ## Running locally: `kontra dev`
 
 ```sh
@@ -962,6 +1032,9 @@ merged by hand.
 The examples: [`examples/hello`](../examples/hello) (the smallest offering, one field in and
 one out, as a five-minute tutorial), [`examples/enrich`](../examples/enrich) (types-first, with
 an artifact), [`examples/legacy-actor`](../examples/legacy-actor) (an older job turned into
-an offering), and two agents: [`examples/chef-agents`](../examples/chef-agents) (as workflow
-code) and [`examples/chef-claude`](../examples/chef-claude) (as a process). Each keeps its
-derived `contract.yaml` as a golden file, reproduced byte for byte by the tests.
+an offering), [`examples/sweep`](../examples/sweep) (a fan-out, a batch of one activity per
+URL and a branch, and the graph `kontra graph` draws of them), and two agents:
+[`examples/chef-agents`](../examples/chef-agents) (as workflow code) and
+[`examples/chef-claude`](../examples/chef-claude) (as a process). Each keeps its derived
+`contract.yaml` as a golden file, reproduced byte for byte by the tests, and its README its
+graph, which the tests compare with `kontra graph --mermaid`.

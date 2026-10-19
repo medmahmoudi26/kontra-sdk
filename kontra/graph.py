@@ -28,8 +28,10 @@ by.
 
 :func:`parse` is total over anything history-shaped and never emits a payload -- no input,
 result, heartbeat, memo or failure message, encrypted or not (seam ⑤). A failure is its
-kind. The payloads it reads are the ``_tracer-data`` header (for the trace and span ids)
-and a local activity marker's own record (for its type and attempt). Inputs, results and
+kind. The payloads it reads are the ``_tracer-data`` header (for the trace and span ids),
+a local activity marker's own record (for its type and attempt), and a batch child's
+input when it is plain JSON (for the names of the activities it was asked to run; an
+encrypted one is never opened). Inputs, results and
 failure messages are :func:`with_io`'s, a separate step that decodes them through a codec.
 :func:`links` adds Temporal UI and Grafana URLs, and :func:`mermaid` draws a graph as text.
 
@@ -99,6 +101,11 @@ _PERIOD_MAX = 16
 _CAUSE_DEPTH = 32
 #: The longest header or marker payload (base64) read.
 _PAYLOAD_MAX = 1 << 16
+#: The longest batch child's input (base64) read: Temporal's 2 MiB payload, base64'd.
+_SPEC_MAX = 3 << 20
+#: The fields of ``kontra._parallel._Spec`` that name what a batch runs: its item activity
+#: and its ``pages=`` activity.
+_SPEC_NAMES = ("activity", "pages")
 #: Grafana Explore's pane key: three of [0-9a-z], one a letter.
 _PANE = "kon"
 _NO_IO: dict[str, Any] = {"input": None, "result": None, "failure": None}
@@ -311,11 +318,11 @@ def _b64(value: object, limit: int = _PAYLOAD_MAX) -> bytes | None:
         return None
 
 
-def _json_payload(value: object) -> object:
+def _json_payload(value: object, limit: int = _PAYLOAD_MAX) -> object:
     """The JSON value a ``json/plain`` payload holds; None for any other payload."""
     if _b64(_at(value, "metadata", "encoding")) != b"json/plain":
         return None
-    data = _b64(_at(value, "data"))
+    data = _b64(_at(value, "data"), limit)
     if data is None:
         return None
     try:
@@ -627,9 +634,23 @@ def _settle(run: _Run) -> None:
         occ.status, occ.closed, occ.ended = status, terminal.time, terminal
 
 
+def _asked(events: Sequence[_Event]) -> set[str]:
+    """What a ``kontra.batch.v1`` run was asked to run, from its input: the item activity
+    and the ``pages=`` activity its spec names. Read only from a ``json/plain`` input (a
+    mock run's, or any run no codec encoded): an encrypted one is never opened."""
+    started = next((e for e in events if e.type == "WorkflowExecutionStarted"), None)
+    if started is None or _str(_at(started.attrs, "workflowType", "name")) != _BATCH_WORKFLOW:
+        return set()
+    payloads = _seq(_at(started.attrs, "input", "payloads"))
+    spec = _map(_json_payload(payloads[0], _SPEC_MAX)) if payloads else None
+    return {name for key in _SPEC_NAMES if (name := _str((spec or {}).get(key))) is not None}
+
+
 def _batch_names(children: object) -> dict[str, str]:
-    """Each ``kontra.batch.v1`` child's activity names, from the child's own history:
-    sorted, unique, comma-joined."""
+    """Each ``kontra.batch.v1`` child's activity names, sorted, unique, comma-joined: the
+    ones its input asked for when that is readable (so a batch over no items, or whose
+    first page was empty, has the name of every other run of the same call), else the
+    ones its history scheduled."""
     if children is None:
         return {}
     given = _map(children)
@@ -637,9 +658,10 @@ def _batch_names(children: object) -> dict[str, str]:
         raise ValueError(f"children maps a child workflow id to its history, got {children!r}")
     names: dict[str, str] = {}
     for workflow_id, history in given.items():
-        found = {
+        events = _events(history)
+        found = _asked(events) or {
             name
-            for event in _events(history)
+            for event in events
             if event.type == "ActivityTaskScheduled"
             and (name := _str(_at(event.attrs, "activityType", "name"))) is not None
         }
@@ -863,7 +885,7 @@ def parse(
     ``pendingActivities`` (or its whole answer): history alone cannot tell an activity
     running, or its attempt, until it closes. ``children`` maps a child workflow id to its
     history (its first run is enough): a ``kontra.batch.v1`` child is named after the
-    activities it scheduled.
+    activities its input names when no codec encoded it, else the ones it scheduled.
 
     Total: ``ValueError`` only when ``history`` (or ``pending``, ``children``) is not
     history-shaped at the top level; whatever the events hold, what cannot be read is
@@ -1019,20 +1041,45 @@ def _structure(node: Mapping[str, Any]) -> dict[str, Any]:
 
 def union(graphs: Iterable[Graph]) -> Graph:
     """The structure several runs of one workflow share (the mock runs of each branch):
-    every node by id, the first run's name, kind, label and group winning, and every edge.
+    every node by id, the first run's name, kind and label winning, and every edge.
     Nothing of any run stays: no status, counts, times, references or failures, and the
-    workflow keeps its type and task queue only."""
+    workflow keeps its type and task queue only.
+
+    A run's ``group`` is a position in that run, so two runs that took different branches
+    at the same point number them alike. Here two nodes share a group only when some run
+    commanded them in one batch (or they are chained by such runs): the groups are the
+    sets of nodes ever scheduled together, numbered in node order. A fan-out stays one
+    group; an ``if``'s two branches never are."""
     nodes: dict[str, dict[str, Any]] = {}
+    together: dict[Any, Any] = {}  # union-find over node ids: what shared a batch
+
+    def root(node_id: Any) -> Any:
+        while together[node_id] != node_id:
+            together[node_id] = together[together[node_id]]
+            node_id = together[node_id]
+        return node_id
+
     edges: set[tuple[str, str]] = set()
     workflow: dict[str, Any] = {"type": None, "task_queue": None}
     for graph in graphs:
         seen = graph.get("workflow") or {}
         for key in ("type", "task_queue"):
             workflow[key] = workflow[key] or seen.get(key)
+        first_in: dict[Any, Any] = {}  # this run's group -> its first node
         for node in graph.get("nodes") or []:
-            if node.get("id") not in nodes:
-                nodes[node.get("id")] = _structure(node)
+            node_id = node.get("id")
+            if node_id not in nodes:
+                nodes[node_id] = _structure(node)
+                together[node_id] = node_id
+            group = node.get("group")
+            if group is None:
+                continue
+            other = first_in.setdefault(group, node_id)
+            together[root(node_id)] = root(other)
         edges.update((e["from"], e["to"]) for e in graph.get("edges") or [])
+    numbers: dict[Any, int] = {}
+    for node_id, node in nodes.items():
+        node["group"] = numbers.setdefault(root(node_id), len(numbers))
     return {
         "version": _VERSION,
         "workflow": {

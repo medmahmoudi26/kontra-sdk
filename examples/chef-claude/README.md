@@ -76,6 +76,25 @@ kontra hire acme/chef-claude -f input.json --max-price 0.25 --wait --accept
 Stop `kontra serve` with `kill -9` while the job runs and start it again: the job completes,
 and the second `claude` is a `--resume` of the first one's session.
 
+## Its graph
+
+`kontra graph --mermaid`, from this directory, draws the workflow from mock runs: Temporal's
+test server runs it eight times, every activity answered with a value of the type it
+declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against the
+command:
+
+```mermaid
+%% acme/chef-claude@0.1.0
+flowchart TD
+    s((start))
+    n0["cook"]
+    e((end))
+    n0 --> e
+    s --> n0
+```
+
+One activity: `cook` runs `claude` for the whole session, and a retry resumes it.
+
 ## Tested
 
 `tests/examples/test_chef_claude.py` runs this directory's `worker.py` as `acme` against

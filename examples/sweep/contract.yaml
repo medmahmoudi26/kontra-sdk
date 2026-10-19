@@ -1,0 +1,164 @@
+# GOLDEN FILE (seam ③), checked by tests/examples/test_golden.py: the contract `kontra
+# publish` derives from models.py and offering.yaml. No key is sealed into a contract
+# (spec x-kontra.v2.json), so this is the document -- and the contract_hash -- that
+# anyone publishing this example gets.
+# Regenerate after a deliberate contract change:
+#   UPDATE_GOLDEN=1 pytest tests/examples/test_golden.py
+nexusrpc: "1.0.0"
+$schema: https://json-schema.org/draft/2020-12/schema
+services:
+  AcmeSweep:
+    fqn: acme.sweep
+    description: Check pages for missing security headers, and their sites' robots.txt and security.txt
+    operations:
+      quote:
+        fqn: quote
+        description: 'Price this input. Cheap and synchronous: answers ok with a fixed price, rejected with a reason, or busy with an ETA. Nothing runs and nothing is charged.'
+        input:
+          $ref: '#/$defs/SweepInput'
+        output:
+          $ref: '#/$defs/KontraQuote'
+      execute:
+        fqn: execute
+        description: Run the job on this input. Requires a Kontra hold token in the kontra-hold header; the result is delivered encrypted to the buyer and paid from escrow.
+        input:
+          $ref: '#/$defs/SweepInput'
+        output:
+          $ref: '#/$defs/SweepOutput'
+$defs:
+  KontraArtifact:
+    description: 'A file in the claim-check bucket, encrypted (age) to the job''s parties: a reference, never the bytes. size and sha256 are of the plaintext; a download verifies both.'
+    type: object
+    additionalProperties: false
+    properties:
+      content_type:
+        type: string
+        maxLength: 255
+        minLength: 1
+      key:
+        type: string
+        maxLength: 32
+        minLength: 32
+        pattern: ^[0-9a-f]{32}$
+      sha256:
+        type: string
+        pattern: ^[0-9a-f]{64}$
+      size:
+        type: integer
+        minimum: 0
+    required:
+    - content_type
+    - key
+    - sha256
+    - size
+  KontraQuote:
+    description: 'The answer of the quote operation. ok: a fixed price (amount_minor in the currency''s minor unit, e.g. cents) valid for a job of at most max_duration_seconds. rejected: the seller will not take this input, with a reason. busy: try again after eta_seconds.'
+    type: object
+    additionalProperties: false
+    properties:
+      amount_minor:
+        type: integer
+        maximum: 9007199254740991
+        minimum: 0
+      currency:
+        type: string
+        pattern: ^[A-Z][A-Z0-9]{2,7}$
+      eta_seconds:
+        type: integer
+        maximum: 2592000
+        minimum: 0
+      max_duration_seconds:
+        type: integer
+        maximum: 2592000
+        minimum: 1
+      reason:
+        type: string
+        maxLength: 1000
+        minLength: 1
+      status:
+        type: string
+        enum:
+        - ok
+        - rejected
+        - busy
+    required:
+    - status
+  SweepInput:
+    type: object
+    additionalProperties: false
+    properties:
+      urls:
+        description: The pages to check. Each one's site (scheme, host, port) has its robots.txt and security.txt read once.
+        type: array
+        items:
+          type: string
+          maxLength: 2048
+          pattern: ^https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$
+        maxItems: 200
+        minItems: 1
+    required:
+    - urls
+  SweepOutput:
+    type: object
+    additionalProperties: false
+    properties:
+      report:
+        description: 'The report (JSON): each flagged page''s grade and missing headers, a value to start from for each, the pages that did not answer, and each site''s robots.txt Disallow paths and security.txt contacts.'
+        $ref: '#/$defs/KontraArtifact'
+      summary:
+        $ref: '#/$defs/SweepSummary'
+    required:
+    - report
+    - summary
+  SweepSummary:
+    type: object
+    additionalProperties: false
+    properties:
+      flagged:
+        description: Pages that miss at least one header.
+        type: integer
+      grade:
+        description: 'The worst grade of the pages that answered (A: no page misses a header); null when none answered.'
+        oneOf:
+        - type: string
+          enum:
+          - A
+          - B
+          - C
+          - D
+          - F
+        - type: "null"
+      sites:
+        description: Sites whose robots.txt and security.txt were read.
+        type: integer
+      unreachable:
+        description: Pages that did not answer.
+        type: integer
+      urls:
+        description: Pages checked, each URL once.
+        type: integer
+      without_security_txt:
+        description: Sites with no security.txt naming a contact (RFC 9116).
+        type: integer
+    required:
+    - flagged
+    - grade
+    - sites
+    - unreachable
+    - urls
+    - without_security_txt
+x-kontra:
+  name: acme/sweep
+  version: "0.1.0"
+  description: Check pages for missing security headers, and their sites' robots.txt and security.txt
+  pricing_hint: $0.002 per url, $0.01 minimum
+  tags:
+  - example
+  - headers
+  - security
+  max_duration: "1h"
+  review_window: "1d"
+  max_concurrent_jobs: 10
+  max_output_bytes: "10MB"
+  artifact_retention: "7d"
+  contract_hash: sha256:bdc63b3380318c8122b1afea18a6268a40170f1c1042ba29fbf8ef3b79b2017a

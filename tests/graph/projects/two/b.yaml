@@ -1,0 +1,9 @@
+# One of the two offerings the two project's worker binds.
+name: acme/two-b
+version: 1.0.0
+description: Offering b of a worker that binds two
+max_duration: 5m
+review_window: 24h
+max_concurrent_jobs: 10
+max_output_bytes: 10MB
+artifact_retention: 7d
