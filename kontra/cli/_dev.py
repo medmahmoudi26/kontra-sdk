@@ -23,7 +23,9 @@ others, so ``kontra dev up`` alone is the stack it always was. ``--ui`` is
 Temporal's own UI, which shows what is encrypted to this machine's key through a codec server
 ``up`` starts on 127.0.0.1 when the home holds a dev profile (:mod:`kontra.cli._codec_server`,
 in the background; ``down`` stops it). ``--observability`` is Prometheus and Grafana, with Temporal's metrics listener
-turned on for Prometheus to scrape. ``status``, ``logs`` and ``down`` see every profile.
+turned on for Prometheus to scrape, and an OpenTelemetry Collector on 127.0.0.1 that writes what
+``kontra serve --otlp`` exports to Tempo (traces) and Loki (logs), both Grafana data sources.
+``status``, ``logs`` and ``down`` see every profile.
 """
 
 from __future__ import annotations
@@ -69,6 +71,8 @@ PROFILES = ("ui", "observability")
 #: Prometheus scrapes ``temporal:8000`` (observability/prometheus.yml).
 _METRICS_SETTING = "KONTRA_TEMPORAL_METRICS_ADDR"
 _METRICS_ADDR = "0.0.0.0:8000"
+#: The observability profile's OpenTelemetry Collector (observability/otelcol.yaml).
+_COLLECTOR = "otelcol"
 #: The background codec server's pid, port and stop token (0600), and its output.
 CODEC_STATE = "codec.json"
 CODEC_LOG = "codec.log"
@@ -237,14 +241,33 @@ def _gate_env(config: dict[str, Any]) -> dict[str, str]:
     return {str(k): "" if v is None else str(v) for k, v in env.items()}
 
 
-def _published(config: dict[str, Any], service: str) -> str | None:
+def _published_port(config: dict[str, Any], service: str) -> tuple[str, str] | None:
+    """The host address (empty: every one) and port ``service`` is first published on."""
     svc: Any = (config.get("services") or {}).get(service) or {}
     for port in svc.get("ports") or []:
         if isinstance(port, dict) and port.get("published"):
-            host = port.get("host_ip") or ""
-            local = host in ("", "127.0.0.1", "0.0.0.0")  # noqa: S104 -- compares, binds nothing
-            return f"{'localhost' if local else host}:{port['published']}"
+            return str(port.get("host_ip") or ""), str(port["published"])
     return None
+
+
+def _published(config: dict[str, Any], service: str) -> str | None:
+    if (published := _published_port(config, service)) is None:
+        return None
+    host, port = published
+    local = host in ("", "127.0.0.1", "0.0.0.0")  # noqa: S104 -- compares, binds nothing
+    return f"{'localhost' if local else host}:{port}"
+
+
+def _otlp_url(config: dict[str, Any]) -> str | None:
+    """What ``kontra serve --otlp`` is given for the profile's collector: its published
+    OTLP/gRPC port at the address it is published on, 127.0.0.1 -- an IP rather than
+    ``localhost``, which a gRPC client may try as ::1 first, where nothing listens."""
+    if (published := _published_port(config, _COLLECTOR)) is None:
+        return None
+    host, port = published
+    if host in ("", "0.0.0.0"):  # noqa: S104 -- compares, binds nothing
+        host = "127.0.0.1"
+    return f"http://{host}:{port}"
 
 
 def _in_profiles(config: dict[str, Any], profiles: Sequence[str]) -> list[str]:
@@ -477,7 +500,7 @@ def dev(ctx: click.Context, handle: str | None, env_files: tuple[Path, ...]) -> 
     """The local Kontra stack: Temporal, the gate, Postgres and a bucket, with play money.
 
     `kontra dev` alone is `kontra dev up`; `up --ui` and `up --observability` add Temporal's
-    UI and Prometheus with Grafana."""
+    UI and Prometheus, Loki and Tempo with Grafana."""
     ctx.obj = {"env_files": env_files, "handle": handle}
     if ctx.invoked_subcommand is None:
         ctx.invoke(up)
@@ -500,7 +523,8 @@ def dev(ctx: click.Context, handle: str | None, env_files: tuple[Path, ...]) -> 
 @click.option(
     "--observability",
     is_flag=True,
-    help="Also Prometheus and Grafana with Temporal's dashboards, on 127.0.0.1.",
+    help="Also Prometheus and Grafana with Temporal's dashboards, and a collector for "
+    "`kontra serve --otlp` into Loki and Tempo, on 127.0.0.1.",
 )
 def up(
     ctx: click.Context,
@@ -550,6 +574,8 @@ def up(
     for service, shown in (("ui", ui), ("prometheus", observability), ("grafana", observability)):
         if shown and (where := _published(config, service)) is not None:
             click.echo(f"  {service:<9} http://{where}")
+    if observability and (otlp := _otlp_url(config)) is not None:
+        click.echo(f"  otlp      {otlp}  (kontra serve --otlp)")
     profile = None if no_login else _dev_login(gate_env, url, handle, existing, home)
     if ui:
         if profile is not None and (where := _published(config, "ui")) is not None:

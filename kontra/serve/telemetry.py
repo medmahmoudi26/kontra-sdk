@@ -8,13 +8,17 @@
   in milliseconds), which is what Temporal's published SDK dashboard reads. Kontra adds no
   metric and renames none.
 * ``--otlp URL`` is :func:`otlp_tracing`: ``temporalio.contrib.opentelemetry.TracingInterceptor``
-  exporting spans over OTLP/gRPC to ``URL`` (:mod:`kontra.serve._tracing`). It needs the
+  exporting spans over OTLP/gRPC to ``URL`` (:mod:`kontra.serve._tracing`), and
+  :func:`otlp_logs`: the worker's Python logs, each tagged with the Temporal context it was
+  emitted in, exported to the same ``URL`` (:mod:`kontra.serve._logs`). It needs the
   ``opentelemetry`` extra (``pip install 'kontra-sdk[opentelemetry]'``); without it,
-  :class:`TelemetryError` says so.
+  :class:`TelemetryError` says so. ``kontra dev up --observability`` runs a collector for it.
 
-Neither carries a payload, an input, a result, a failure message or a heartbeat detail out
-of the worker: ``tests/codec/test_codec_telemetry.py`` scans the metrics text and the
-exported spans of a worker serving a job for its marker (seam ⑤).
+Neither the metrics nor the spans carry a payload, an input, a result, a failure message or
+a heartbeat detail out of the worker: ``tests/codec/test_codec_telemetry.py`` scans the
+metrics text and the exported spans of a worker serving a job for its marker (seam ⑤). The
+logs are the seller's own output to the seller's own collector, sent as written
+(:mod:`kontra.serve._logs`).
 """
 
 from __future__ import annotations
@@ -24,9 +28,10 @@ from typing import TYPE_CHECKING
 from temporalio.runtime import PrometheusConfig, Runtime, TelemetryConfig
 
 if TYPE_CHECKING:
+    from kontra.serve._logs import Logs
     from kontra.serve._tracing import Tracing
 
-__all__ = ["EXTRA", "TelemetryError", "metrics_runtime", "otlp_tracing"]
+__all__ = ["EXTRA", "TelemetryError", "metrics_runtime", "otlp_logs", "otlp_tracing"]
 
 #: The extra ``--otlp`` needs: temporalio's own of that name, and the OTLP exporter.
 EXTRA = "opentelemetry"
@@ -50,10 +55,8 @@ def metrics_runtime(bind_address: str) -> Runtime:
         ) from None
 
 
-def otlp_tracing(url: str) -> Tracing:
-    """``TracingInterceptor`` exporting to the OTLP/gRPC collector at ``url``
-    (``http://`` for plaintext, ``https://`` for TLS). Shut the returned :class:`Tracing`
-    down when the worker stops: spans are exported in batches."""
+def _collector(url: str) -> None:
+    """Refuse a ``url`` that is not an http(s) URL with a host and a port."""
     from urllib.parse import urlsplit
 
     try:
@@ -65,13 +68,39 @@ def otlp_tracing(url: str) -> Tracing:
         raise TelemetryError(
             f"--otlp takes the collector's URL, e.g. http://localhost:4317, not {url!r}"
         )
+
+
+def _missing(e: ImportError) -> TelemetryError:
+    return TelemetryError(
+        f"--otlp needs OpenTelemetry, which is not installed ({e.name or e}): "
+        f"pip install 'kontra-sdk[{EXTRA}]'"
+    )
+
+
+def otlp_tracing(url: str) -> Tracing:
+    """``TracingInterceptor`` exporting to the OTLP/gRPC collector at ``url``
+    (``http://`` for plaintext, ``https://`` for TLS). Shut the returned :class:`Tracing`
+    down when the worker stops: spans are exported in batches."""
+    _collector(url)
     try:
         from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
         from kontra.serve._tracing import tracing
     except ImportError as e:
-        raise TelemetryError(
-            f"--otlp needs OpenTelemetry, which is not installed ({e.name or e}): "
-            f"pip install 'kontra-sdk[{EXTRA}]'"
-        ) from None
+        raise _missing(e) from None
     return tracing(OTLPSpanExporter(endpoint=url))
+
+
+def otlp_logs(url: str) -> Logs:
+    """The worker's logs at INFO and above, exported to the OTLP/gRPC collector at ``url``
+    as :func:`otlp_tracing` exports its spans: a handler on the root logger from now on.
+    Shut the returned :class:`Logs` down when the worker stops: it takes the handler off
+    and exports what is still batched."""
+    _collector(url)
+    try:
+        from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+
+        from kontra.serve._logs import logs
+    except ImportError as e:
+        raise _missing(e) from None
+    return logs(OTLPLogExporter(endpoint=url))

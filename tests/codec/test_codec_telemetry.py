@@ -1,6 +1,9 @@
 """The marker-string scan, extended to a worker's telemetry (seam ⑤): what ``kontra serve
---metrics`` serves and what ``--otlp`` exports carry no payload, input, result, failure
-message or heartbeat detail.
+--metrics`` serves and the spans ``--otlp`` exports carry no payload, input, result, failure
+message or heartbeat detail. (``--otlp`` also exports the worker's Python logs: the seller's
+own output to the seller's own collector, sent as written and deliberately not scanned --
+``docs/sellers.md``, "Scaling and observability"; their attributes are
+``tests/serve/test_logs.py``'s.)
 
 A seller's ``kontra.serve`` Worker runs on a real dev server with the fake gate, connected
 with the runtime and the tracing interceptor those two flags build

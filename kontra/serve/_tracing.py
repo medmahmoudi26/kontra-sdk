@@ -6,6 +6,11 @@ The provider is the interceptor's alone, never OpenTelemetry's global one: the s
 makes with OpenTelemetry's API are theirs to export where they choose, and only what this
 provider holds is held to the rule below.
 
+The provider's resource is OpenTelemetry's default (``OTEL_SERVICE_NAME`` and
+``OTEL_RESOURCE_ATTRIBUTES`` apply), except that a service they leave unnamed -- which
+OpenTelemetry would call ``unknown_service`` -- is :data:`SERVICE_NAME`; the worker's logs
+(:mod:`kontra.serve._logs`) have the same resource.
+
 Each span carries ``temporalTaskQueue``, the task queue of the worker it was started in,
 beside the interceptor's own ``temporalWorkflowID``, ``temporalRunID`` and
 ``temporalActivityID`` (the name follows theirs; Temporal has none for it). It is read from
@@ -50,18 +55,34 @@ from opentelemetry.trace import Status
 from temporalio.contrib.opentelemetry import TracingInterceptor
 
 __all__ = [
+    "SERVICE_NAME",
     "TASK_QUEUE_ATTRIBUTE",
     "Scrubbed",
     "SellerTracingInterceptor",
     "Tracing",
+    "resource",
     "scrub",
     "tracing",
 ]
+
+#: ``service.name`` when the environment names none: what the graph page of
+#: ``kontra dev up --ui`` selects a worker's logs by in Loki.
+SERVICE_NAME = "kontra-worker"
 
 #: The span attribute naming the task queue (spelled like ``temporalWorkflowID``).
 TASK_QUEUE_ATTRIBUTE = "temporalTaskQueue"
 #: What an ``exception`` event keeps: the type, and whether it escaped the span.
 _EXCEPTION_KEPT = frozenset({"exception.type", "exception.escaped"})
+
+
+def resource() -> Resource:
+    """OpenTelemetry's default resource, with ``service.name`` :data:`SERVICE_NAME` unless
+    ``OTEL_SERVICE_NAME`` or ``OTEL_RESOURCE_ATTRIBUTES`` names the service."""
+    detected = Resource.create()
+    name = str(detected.attributes.get("service.name", ""))
+    if name == "unknown_service" or name.startswith("unknown_service:"):
+        return detected.merge(Resource({"service.name": SERVICE_NAME}))
+    return detected
 
 
 @dataclasses.dataclass(frozen=True)
@@ -79,10 +100,8 @@ class Tracing:
 
 def tracing(exporter: SpanExporter) -> Tracing:
     """:class:`SellerTracingInterceptor` on a provider that stamps the task queue and
-    exports through :class:`Scrubbed` (batched) to ``exporter``. The resource is
-    OpenTelemetry's default, so ``OTEL_SERVICE_NAME`` and ``OTEL_RESOURCE_ATTRIBUTES``
-    apply."""
-    provider = TracerProvider(resource=Resource.create())
+    exports through :class:`Scrubbed` (batched) to ``exporter``, with :func:`resource`."""
+    provider = TracerProvider(resource=resource())
     provider.add_span_processor(_TaskQueue())
     provider.add_span_processor(BatchSpanProcessor(Scrubbed(exporter)))
     # The interceptor's own instrumentation scope, as when it builds its tracer itself.

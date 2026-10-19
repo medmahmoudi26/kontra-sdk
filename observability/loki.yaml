@@ -1,0 +1,58 @@
+# The Loki of `kontra dev up --observability` (compose.yaml): one process, its index and
+# chunks on its volume (/loki), no authentication (one tenant). The collector writes the logs
+# `kontra serve --otlp` exports to its OTLP endpoint (/otlp): the resource's service.name
+# becomes the `service_name` label, each record's attributes (workflow_id, run_id,
+# activity_type, ... and trace_id) its structured metadata, so
+#   {service_name="kontra-worker"} | workflow_id="..." | activity_type="..."
+# finds one activity's lines. Kept 7 days, as Prometheus keeps its samples.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  log_level: warn
+
+common:
+  path_prefix: /loki
+  instance_addr: 127.0.0.1
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+
+schema_config:
+  configs:
+    - from: "2024-01-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  allow_structured_metadata: true
+  retention_period: 168h
+
+ingester:
+  wal:
+    # From Loki 3.7 the ingester refuses every push ("Ingester is shutting down") while the
+    # disk its write-ahead log is on is fuller than this: 90% by default, which a developer's
+    # disk often is (measured: at 94% not one line arrived). Kept as a guard, at the point
+    # where the disk is truly full.
+    disk_full_threshold: 0.98
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+
+pattern_ingester:
+  enabled: false
+
+# Nothing sent to Grafana Labs.
+analytics:
+  reporting_enabled: false

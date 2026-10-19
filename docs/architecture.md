@@ -78,7 +78,7 @@ is what lets a ledger adapter be swapped and keeps a future split into services 
 | `kontra.profile`, `kontra.auth` | the local profile, this machine's key and a buyer's per-job keys; the session that refreshes gate and Temporal tokens |
 | `kontra._jobkeys`, `kontra._devices` | share to my account (decisions I25): a job key wrapped to each of the account's devices with a proof of possession (shared with the gate), and this machine as one of them |
 | `kontra`, `kontra.workflow`, `kontra.activity` | the seller's façade: Temporal's own objects re-exported, never wrapped (`activity.defn` returns Temporal's own, after noting it for `serve()`), plus `serve`, `Worker`, `Page` and `workflow.execute_activities_in_parallel` (`kontra._parallel`, the `kontra.batch.v1` child) |
-| `kontra.serve` | the seller's `serve()` and `Worker`: generated Nexus handler, hold-token check, codec, progress forwarding; Temporal's own metrics and spans when asked (`kontra serve --metrics`, `--otlp`) |
+| `kontra.serve` | the seller's `serve()` and `Worker`: generated Nexus handler, hold-token check, codec, progress forwarding; Temporal's own metrics and spans, and the worker's logs, when asked (`kontra serve --metrics`, `--otlp`) |
 | `kontra.hire` | the buyer's `Kontra` client, `service()` for workflows, the hire worker |
 | `kontra.mcp` | `kontra mcp`, the eight agent tools and a seller's `workers`, built on `kontra.hire` |
 | `kontra.cli` | the `kontra` command; no business rule lives here |
@@ -215,7 +215,8 @@ networks whose other members may reach its other ports:
 | `temporal-db` | temporal, postgres-relay | Temporal's own database connections (the internal frontend does not listen here; a peer that could route Temporal's `control` address through it would still reach it, which takes a capability the relay does not have) |
 | `database` | postgres, postgres-relay, gate, migrate | the gate's and the migrations' database connections |
 | `bucket` | s3, gate | SeaweedFS's S3 port and its unauthenticated master, volume and filer ports |
-| `observability` | prometheus, grafana (the `observability` profile) | Grafana's queries; Grafana's one peer |
+| `observability` | prometheus, grafana (the `observability` profile) | Grafana's queries to Prometheus |
+| `telemetry` | otelcol, loki, tempo, grafana (the `observability` profile) | the collector's writes to Loki and Tempo; Grafana's queries to them |
 
 Two compose profiles add dev tools that production never enables (`kontra dev up --ui`,
 `--observability`; [sellers.md](sellers.md#the-ui-and-the-dashboards)). The `ui` profile puts
@@ -223,8 +224,11 @@ Temporal's UI on `control`: it reads every namespace through the internal fronte
 the point of it locally and why it is published on 127.0.0.1 only. The `observability`
 profile puts Prometheus on `temporal-db`, to scrape the metrics listener Temporal opens there
 when asked (`KONTRA_TEMPORAL_METRICS_ADDR`), held to the relay's terms there (no
-capabilities, not root, no forwarding), and Grafana on `observability` alone. Its third
-service, Prometheus's agent (`prometheus-agent`), is on no network of the stack's: it runs in
+capabilities, not root, no forwarding), and Grafana on `observability` and `telemetry`, with
+forwarding off. The OpenTelemetry Collector (`otelcol`), which takes whatever reaches its
+port published on 127.0.0.1 (what `kontra serve --otlp` exports), shares `telemetry` with
+the two stores it writes, Loki and Tempo, and with Grafana, and no network with Prometheus or
+Temporal. Prometheus's agent (`prometheus-agent`) is on no network of the stack's: it runs in
 the host's network namespace, because a worker's `kontra serve --metrics 127.0.0.1:PORT` is
 on the host's loopback and a container on a bridge network reaches the host only through
 Docker's gateway, which a host firewall may drop (ufw's default does, measured). It scrapes

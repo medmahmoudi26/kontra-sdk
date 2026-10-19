@@ -1,0 +1,33 @@
+# The OpenTelemetry Collector of `kontra dev up --observability` (compose.yaml): what
+# `kontra serve --otlp URL` sends to URL. OTLP over gRPC in, on the port compose publishes on
+# 127.0.0.1 (KONTRA_DEV_OTLP_PORT); traces out to Tempo, logs out to Loki's OTLP endpoint.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  otlp_grpc/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_grpc/tempo]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_http/loki]

@@ -45,7 +45,7 @@
 #   KONTRA_LEDGER (postgres), KONTRA_JWKS_REFRESH (15s), and the gate's other KONTRA_*
 #   settings, passed through when set (signing keys, resolvers, fee, GitHub, Stripe).
 #   KONTRA_DEV_UI_PORT (8233), KONTRA_DEV_CODEC_PORT (8081), KONTRA_DEV_PROMETHEUS_PORT
-#   (9090), KONTRA_DEV_GRAFANA_PORT (3000)
+#   (9090), KONTRA_DEV_GRAFANA_PORT (3000), KONTRA_DEV_OTLP_PORT (4317)
 #                                  the host ports of the two profiles below (remembered
 #                                  like the other four), always on 127.0.0.1
 #
@@ -59,10 +59,13 @@
 #   observability  `kontra dev up --observability`: Prometheus, scraping Temporal
 #                  (observability/prometheus.yml); Prometheus's agent, scraping every
 #                  `kontra serve --metrics` on the host's loopback and writing what it
-#                  scrapes to Prometheus (prometheus-agent, below); and Grafana with
-#                  Temporal's published server and SDK dashboards (docs/dashboards).
-#                  Prometheus and Grafana are published on 127.0.0.1 only; the agent
-#                  publishes nothing.
+#                  scrapes to Prometheus (prometheus-agent, below); an OpenTelemetry
+#                  Collector (otelcol), taking what `kontra serve --otlp` exports and
+#                  writing its traces to Tempo and its logs to Loki; and Grafana with
+#                  Temporal's published server and SDK dashboards (docs/dashboards) and
+#                  Prometheus, Loki and Tempo as data sources. Prometheus, Grafana and the
+#                  collector's OTLP/gRPC port (KONTRA_DEV_OTLP_PORT) are published on
+#                  127.0.0.1 only; the agent, Loki and Tempo publish nothing.
 # Their configuration files sit beside this file in observability/ and docs/dashboards/
 # (kontra/_dev/observability and kontra/_dev/docs/dashboards in the wheel) and are mounted
 # read-only as compose `configs`: the only host paths any service sees, and only these
@@ -88,7 +91,9 @@
 #                (prometheus)                Temporal's metrics listener, off `control`
 #   database     postgres, postgres-relay, gate, migrate
 #   bucket       s3, gate                    SeaweedFS's own unauthenticated ports
-#   observability  (prometheus, grafana)     Grafana's one peer is Prometheus
+#   observability  (prometheus, grafana)     Grafana and its metrics
+#   telemetry    (otelcol, loki, tempo,      the collector and the two stores it writes;
+#                grafana)                    Grafana reads them
 #   the host's   (prometheus-agent)          see below
 # Temporal's other listeners (the public frontend, authenticated) answer on every network
 # it is on; the internal frontend does not listen on `temporal-db`. The bind alone does not
@@ -154,6 +159,7 @@ x-kontra-dev-settings:
   KONTRA_DEV_CODEC_PORT: ${KONTRA_DEV_CODEC_PORT:-}
   KONTRA_DEV_PROMETHEUS_PORT: ${KONTRA_DEV_PROMETHEUS_PORT:-}
   KONTRA_DEV_GRAFANA_PORT: ${KONTRA_DEV_GRAFANA_PORT:-}
+  KONTRA_DEV_OTLP_PORT: ${KONTRA_DEV_OTLP_PORT:-}
 
 x-database-url: &database-url postgresql+asyncpg://${KONTRA_PG_USER:-kontra}:${KONTRA_PG_PASSWORD:?set KONTRA_PG_PASSWORD (`kontra dev` writes one into its dev.env)}@postgres:5432/${KONTRA_PG_DB:-kontra}
 
@@ -562,21 +568,29 @@ services:
     image: grafana/grafana:13.2.3@sha256:b28bae15e219c998fb0e0424ed724930cc61b1f61fb404d47c862f9a23f9e572
     profiles: [observability]
     environment:
-      # Anyone on this machine's loopback views the dashboards, anonymously and as a Viewer
-      # (no data source, contact point or plugin to add); no one signs in at all (no login
-      # form, no basic auth), so no admin password is left at its default. Ad hoc queries
-      # go to Prometheus's own UI, published beside it.
+      # Anyone on this machine's loopback uses it anonymously, as an Editor: the graph page's
+      # Logs and Trace links open Explore, which needs datasources:explore, and Grafana 13
+      # gives a Viewer that only through the deprecated viewers_can_edit. (It also logs that
+      # an anonymous org_role is deprecated, "only viewer role is supported": a Grafana that
+      # stops honouring it takes Explore away from those links.) An Editor still adds no
+      # data source or plugin (an Admin's), every data source is provisioned read-only, and
+      # alerting is off, so no one makes Grafana send anything anywhere (contact points are
+      # an Editor's). No one signs in at all (no login form, no basic auth), so no admin
+      # password is left at its default.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       GF_AUTH_BASIC_ENABLED: "false"
+      GF_UNIFIED_ALERTING_ENABLED: "false"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/temporal-core-sdks-otel.json
-      # Nothing fetched from the internet: no update checks, usage reports or plugins.
+      # Nothing fetched from the internet: no update checks, usage reports or plugins; and
+      # nothing an Editor publishes there (no external snapshots).
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
       GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
       GF_PLUGINS_PREINSTALL_DISABLED: "true"
       GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_SNAPSHOTS_EXTERNAL_ENABLED: "false"
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       http_proxy: ""
@@ -603,13 +617,96 @@ services:
     depends_on:
       prometheus:
         condition: service_started
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
     restart: unless-stopped
-    networks: [observability]
+    sysctls:
+      net.ipv4.ip_forward: 0 # on two networks: never a router between them (see the header)
+    networks: [observability, telemetry]
+
+  otelcol:
+    # otel/opentelemetry-collector-contrib:0.163.1 (the contrib build: the core one has no
+    # exporter Loki takes)
+    image: otel/opentelemetry-collector-contrib:0.163.1@sha256:1175b03003053962012f5a231f5567f66a3e8fdb960c7835c0e48f7aa1555806
+    profiles: [observability]
+    command: ["--config=/etc/otelcol/config.yaml"]
+    configs:
+      - source: otelcol
+        target: /etc/otelcol/config.yaml
+    environment:
+      # Never a proxy: Go exempts only loopback, and the collector's exports to Loki and
+      # Tempo would go to one.
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    ports:
+      # What `kontra serve --otlp http://127.0.0.1:PORT` sends to: OTLP over gRPC.
+      - "127.0.0.1:${KONTRA_DEV_OTLP_PORT:-4317}:4317"
+    user: "10001:10001" # the image's own user, named
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+    networks: [telemetry]
+
+  loki:
+    # grafana/loki:3.7.8
+    image: grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193
+    profiles: [observability]
+    command: ["-config.file=/etc/loki/kontra.yaml"]
+    configs:
+      - source: loki
+        target: /etc/loki/kontra.yaml
+    volumes:
+      - loki:/loki
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    user: "10001:10001" # the image's own user, named: /loki is its
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [telemetry]
+
+  tempo:
+    # grafana/tempo:3.1.0
+    image: grafana/tempo:3.1.0@sha256:3076b8dcdfb32fd6bc5ccef85e7b7313e6199b9cb84366257fc17ecb696db5fd
+    profiles: [observability]
+    command: ["-config.file=/etc/tempo/kontra.yaml"]
+    configs:
+      - source: tempo
+        target: /etc/tempo/kontra.yaml
+    volumes:
+      - tempo:/var/tempo
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    user: "10001:10001" # the image's own user, named: /var/tempo is its
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [telemetry]
 
 volumes:
   postgres:
   s3:
   prometheus:
+  loki:
+  tempo:
 
 # The profiles' configuration (see the header), mounted read-only.
 configs:
@@ -623,6 +720,12 @@ configs:
     file: ./docs/dashboards/temporal-core-sdks-otel.json
   temporal-server-dashboard:
     file: ./docs/dashboards/server-general.json
+  otelcol:
+    file: ./observability/otelcol.yaml
+  loki:
+    file: ./observability/loki.yaml
+  tempo:
+    file: ./observability/tempo.yaml
 
 networks:
   control:
@@ -637,3 +740,4 @@ networks:
   database:
   bucket:
   observability:
+  telemetry:
