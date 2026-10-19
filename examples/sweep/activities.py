@@ -22,6 +22,11 @@ address that was checked -- httpx never resolves the name again, so a DNS answer
 changes between the check and the connection (rebinding) cannot swap it. Each redirect is
 checked the same way. A URL that fails the check gets the error `ForbiddenAddress`. (The
 guard is examples/enrich's.)
+
+Each activity logs what it did through `activity.logger`, in counts and statuses, never a
+URL or a file's text: the job's inputs are the buyer's. `kontra serve --otlp` exports the
+lines with the run they belong to, and `kontra dev up --ui`'s graph page links each step to
+its own.
 """
 
 import asyncio
@@ -215,6 +220,7 @@ async def plan(inp: SweepInput) -> Plan:
     found = [_normalised(url) for url in inp.urls]
     urls = list(dict.fromkeys(url for url, _ in found))
     sites = list(dict.fromkeys(site for _, site in found if site is not None))
+    activity.logger.info("%d URLs to check, on %d sites", len(urls), len(sites))
     return Plan(urls=urls, sites=sites)
 
 
@@ -245,7 +251,9 @@ async def _each_site(
             activity.heartbeat({"message": f"{what}: {done} of {len(sites)} sites"})
             return found
 
-        return list(await asyncio.gather(*(one(site) for site in sites)))
+        results = list(await asyncio.gather(*(one(site) for site in sites)))
+    activity.logger.info("%s read from %d sites", what, len(sites))
+    return results
 
 
 def _kept(value: str) -> str:
@@ -359,8 +367,13 @@ async def check_headers(url: str) -> HeaderCheck:
         async with _client() as http, asyncio.timeout(URL_DEADLINE_SECONDS):
             r, _ = await _get(http, url, read=0)
     except Exception as e:  # this URL's failure, recorded; never the activity's
+        activity.logger.info("no answer: %s", type(e).__name__)
         return HeaderCheck(url=url, error=type(e).__name__)
-    return HeaderCheck(url=url, status=r.status_code, missing=_missing(r))
+    missing = _missing(r)
+    activity.logger.info(
+        "HTTP %d, %d of %d headers missing", r.status_code, len(missing), len(HEADERS)
+    )
+    return HeaderCheck(url=url, status=r.status_code, missing=missing)
 
 
 # --------------------------------------------------------------------------- the report
@@ -397,6 +410,12 @@ async def score(found: Findings) -> Report:
     if len(found.tally.unreachable) == found.tally.checked:
         grade = None  # no page answered: there is nothing to grade
     missed = {h for page in pages for h in page.missing}
+    activity.logger.info(
+        "grade %s: %d pages flagged, %d did not answer",
+        grade or "none",
+        len(pages),
+        len(found.tally.unreachable),
+    )
     return Report(
         summary=_summary(found, grade),
         pages=pages,
@@ -411,6 +430,7 @@ async def score(found: Findings) -> Report:
 async def all_clear(found: Findings) -> Report:
     """The report of a sweep where every page answered with every header: graded A, and
     the sites' files, which are worth reading anyway."""
+    activity.logger.info("all clear: every one of %d pages sends every header", found.tally.checked)
     return Report(
         summary=_summary(found, "A"), robots=found.robots, security_txt=found.security_txt
     )
@@ -421,4 +441,5 @@ async def write_report(report: Report) -> Artifact:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "report.json"
         path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        activity.logger.info("report written: %d bytes", path.stat().st_size)
         return await Artifact.from_path(path, content_type="application/json")

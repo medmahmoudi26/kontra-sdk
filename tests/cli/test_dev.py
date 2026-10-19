@@ -1467,8 +1467,8 @@ def _profiled_world(monkeypatch: pytest.MonkeyPatch) -> tuple[Recorder, list[str
     }
     codec: list[str] = []
 
-    def start(home: Path, config: dict[str, Any]) -> str:
-        codec.append("start")
+    def start(home: Path, config: dict[str, Any], *, observability: bool = False) -> str:
+        codec.append("start" + (" with grafana" if observability else ""))
         return "http://127.0.0.1:8081"
 
     def stop(home: Path) -> bool:
@@ -1494,16 +1494,26 @@ def test_dev_up_runs_exactly_the_profiles_it_is_asked_for(
     assert (_after_options(up)[0], _profiles(up)) == ("up", ["ui", "observability"])
     # Temporal's metrics listener, for Prometheus to scrape, in compose's environment.
     assert (rec.envs[1] or {})["KONTRA_TEMPORAL_METRICS_ADDR"] == "0.0.0.0:8000"
-    assert codec == ["start"]
-    for line in (
-        "ui        http://localhost:8233",
-        "prometheus http://localhost:9090",
-        "grafana   http://localhost:3000",
-        "otlp      http://127.0.0.1:4317  (kontra serve --otlp)",
-        "workflows http://localhost:8233/namespaces/carol/workflows",
-        "codec server http://127.0.0.1:8081",
-    ):
-        assert line in both.stdout, line
+    assert codec == ["start with grafana"]
+    home = tmp_path / "home"
+    assert both.stdout.splitlines() == [
+        "kontra dev is up (compose project kontra-dev)",
+        "  gate      http://localhost:8402",
+        "  temporal  ?",
+        "  bucket    ?",
+        "  postgres  localhost:5444",
+        "  ui        http://localhost:8233",
+        "  prometheus http://localhost:9090",
+        "  grafana   http://localhost:3000",
+        "  otlp      http://127.0.0.1:4317  (kontra serve --otlp)",
+        "logged in as carol (namespace carol), play money",
+        f"  profile   {home / 'profile'} (dev)",
+        f"  key       {home / 'key'} (None)",
+        "  workflows http://localhost:8233/namespaces/carol/workflows",
+        "  graph     http://127.0.0.1:8081/graph",
+        "codec server http://127.0.0.1:8081: the UI decodes with this machine's key",
+        "next: kontra init <name> && cd <name> && kontra serve",
+    ]
 
     rec.calls.clear()
     rec.envs.clear()
@@ -1514,9 +1524,10 @@ def test_dev_up_runs_exactly_the_profiles_it_is_asked_for(
     assert _after_options(rm) == ["rm", "--stop", "--force", "prometheus", "grafana", "otelcol"]
     assert _profiles(up) == ["ui"]
     assert rec.envs[2] is None  # no metrics listener without Prometheus
-    assert codec == ["start"]
+    assert codec == ["start"]  # the page links no Grafana that is not running
     assert "grafana" not in ui.stdout
     assert "otlp" not in ui.stdout
+    assert "  graph     http://127.0.0.1:8081/graph" in ui.stdout.splitlines()
 
     rec.calls.clear()
     codec.clear()
@@ -1529,6 +1540,7 @@ def test_dev_up_runs_exactly_the_profiles_it_is_asked_for(
     assert (_after_options(up), _profiles(up)) == (["up", "--detach", "--remove-orphans"], [])
     assert codec == ["stop"]
     assert "codec" not in plain.stdout
+    assert "graph" not in plain.stdout
 
     # A metrics address the environment already names is left as it is.
     rec.calls.clear()

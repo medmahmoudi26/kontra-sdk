@@ -1441,6 +1441,25 @@ async def test_a_payload_the_codec_cannot_open_is_undecodable_alone() -> None:
     assert "bm90IHNlYWxlZA" not in json.dumps(io)  # base64 of what it could not open
 
 
+class PlaceholderCodec(SealCodec):
+    """Shows what it cannot open as ``{"encrypted": true}``, as the graph page's does."""
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return [
+            Payload(metadata={"encoding": b"json/plain"}, data=b'{"encrypted":true}')
+            for _ in payloads
+        ]
+
+
+async def test_a_failure_the_codec_shows_a_placeholder_for_is_that_placeholder() -> None:
+    """Encoded failure attributes that decode to something other than a message and a
+    stack trace are shown as they decoded, not as a failure without a message."""
+    history = fixture("retry")
+    fetch = node(await with_io(parse(history), history, PlaceholderCodec()), "fetch_batch")
+    assert fetch["io"]["failure"] == {"encrypted": True}
+    assert fetch["io"]["input"] == [{"encrypted": True}]
+
+
 class MiscountingCodec(SealCodec):
     """Opens what it sealed, then drops the last payload (``extra`` < 0) or repeats every
     one (``extra`` > 0)."""
@@ -1529,6 +1548,23 @@ def test_union_keeps_structure_only() -> None:
         "ref": None,
         "failure": None,
     }
+
+
+def test_merge_never_groups_an_untaken_branch_with_a_step_of_the_run() -> None:
+    """The run's groups are its positions, the static graph's union's: ``approve`` (the
+    run's) and ``reject`` (static only) number alike, and would be drawn as one fan-out."""
+    static = union([graph("branch_approve"), graph("branch_reject")])
+    live = parse(fixture("branch_approve"))
+    painted = merge(static, live)
+    groups = {n["id"]: n["group"] for n in painted["nodes"]}
+    live_groups = {n["id"]: n["group"] for n in live["nodes"]}
+    assert {i: groups[i] for i in live_groups} == live_groups  # the run's, as they were
+    assert groups["reject"] > max(live_groups.values())
+    assert len(set(groups.values())) == len(groups)
+    # Static-only nodes that shared a group still do.
+    two = {"nodes": [{"id": "x", "group": 0}, {"id": "y", "group": 0}], "edges": []}
+    shared = merge(two, {"nodes": [{"id": "a", "group": 3}], "edges": []})
+    assert [n["group"] for n in shared["nodes"]] == [4, 4, 3]
 
 
 def test_union_groups_only_what_some_run_commanded_together() -> None:

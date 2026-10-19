@@ -1103,12 +1103,22 @@ def merge(static: Graph, live: Graph) -> Graph:
     """``live`` painted on ``static``: every node of both, a live one in place of the
     static one with ``reached: true``, a static-only one (a branch this run did not take,
     or not yet) with ``reached: false``; every edge of both, ``reached`` when the live run
-    has it; the live run's workflow."""
+    has it; the live run's workflow.
+
+    The live run's groups are its positions and the static graph's are :func:`union`'s,
+    two numberings: a static-only node's group is moved past every live one, so it never
+    shares a group with a step of the run (an ``if``'s untaken branch drawn as one fan-out
+    with the taken one); static-only nodes that shared a group still do."""
     live_nodes = {n.get("id"): n for n in live.get("nodes") or []}
+    live_groups = [g for n in live_nodes.values() if isinstance(g := n.get("group"), int)]
+    past = max(live_groups, default=-1) + 1
     nodes: list[dict[str, Any]] = []
     for node in static.get("nodes") or []:
         found = live_nodes.get(node.get("id"))
-        nodes.append({**copy.deepcopy(found or node), "reached": found is not None})
+        painted = {**copy.deepcopy(found or node), "reached": found is not None}
+        if found is None and isinstance(group := node.get("group"), int):
+            painted["group"] = past + group
+        nodes.append(painted)
     static_ids = {n.get("id") for n in static.get("nodes") or []}
     nodes += [
         {**copy.deepcopy(n), "reached": True} for i, n in live_nodes.items() if i not in static_ids
@@ -1447,7 +1457,12 @@ class _Decoder:
                 [attributes] = await self._values([failure["encodedAttributes"]])
             except Exception:
                 return {"error": "undecodable"}
-            failure = _map(attributes) or {}
+            decoded = _map(attributes)
+            if decoded is not None and not {"message", "stack_trace"} & decoded.keys():
+                # Not a failure's attributes: what the codec gave in their place (a
+                # placeholder for what it cannot open, another encoding's size), as it is.
+                return dict(decoded)
+            failure = decoded or {}
             return {"message": failure.get("message"), "stack_trace": failure.get("stack_trace")}
         return {"message": failure.get("message"), "stack_trace": failure.get("stackTrace")}
 
@@ -1499,7 +1514,9 @@ async def with_io(graph: Graph, history: HistoryJSON, codec: PayloadCodec) -> Gr
     not, so only a caller holding the codec sees one. Values come out as Temporal's
     default converter reads them untyped: JSON for ``json/plain``, None for
     ``binary/null``, ``{"encoding", "bytes"}`` for any other encoding; a failure is
-    ``{"message", "stack_trace"}``. A field the codec cannot decode is
+    ``{"message", "stack_trace"}``, or what its encoded attributes decode to when that is
+    not them (a codec's placeholder for a payload it cannot open, as the graph page's
+    ``{"encrypted": true}``). A field the codec cannot decode is
     ``{"error": "undecodable"}``, never its bytes."""
     if codec is None:  # pyright: ignore[reportUnnecessaryComparison]
         raise TypeError("with_io decodes payloads through a codec: pass one (parse emits none)")

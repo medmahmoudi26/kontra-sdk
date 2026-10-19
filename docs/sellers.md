@@ -654,7 +654,7 @@ anywhere: `kontra publish` does not carry it.
 
 ```sh
 kontra dev                    # = kontra dev up
-kontra dev up --ui            # + Temporal's UI, reading your payloads (below)
+kontra dev up --ui            # + Temporal's UI, reading your payloads, and the graph page (below)
 kontra dev up --observability # + Prometheus, Grafana, and Loki and Tempo for `kontra serve --otlp` (below)
 kontra dev status             # containers, the gate's health, the codec server, the profile
 kontra dev logs [gate|temporal|postgres|postgres-relay|s3|migrate|ui|prometheus|prometheus-agent|grafana|otelcol|loki|tempo] [-f] [--tail N]
@@ -700,7 +700,7 @@ profile. Each tool is published on 127.0.0.1 only, whatever `KONTRA_DEV_BIND` sa
 | Flag | Service | Address | Port setting |
 |---|---|---|---|
 | `--ui` | Temporal's UI (`temporalio/ui`) | http://localhost:8233 | `KONTRA_DEV_UI_PORT` |
-| `--ui` | the codec server, a process of `kontra dev` on the host | http://127.0.0.1:8081 | `KONTRA_DEV_CODEC_PORT` |
+| `--ui` | the codec server, a process of `kontra dev` on the host, and the [graph page](#the-graph-page) it serves | http://127.0.0.1:8081 | `KONTRA_DEV_CODEC_PORT` |
 | `--observability` | Prometheus | http://localhost:9090 | `KONTRA_DEV_PROMETHEUS_PORT` |
 | `--observability` | Grafana: Temporal's dashboards; Prometheus, Loki and Tempo to explore; no sign-in | http://localhost:3000 | `KONTRA_DEV_GRAFANA_PORT` |
 | `--observability` | an OpenTelemetry Collector, OTLP over gRPC, for `kontra serve --otlp` | http://127.0.0.1:4317 | `KONTRA_DEV_OTLP_PORT` |
@@ -778,6 +778,56 @@ already is. Grafana's anonymous user is an Editor here, because Explore needs on
 13: an Editor also changes dashboards (the vendored ones are read-only), but adds no data
 source or plugin, and alerting and external snapshots are off, so it cannot make Grafana send
 anything out.
+
+### The graph page
+
+`kontra dev up --ui` also prints the graph page, which the codec server serves:
+
+```text
+  workflows http://localhost:8233/namespaces/acme/workflows
+  graph     http://127.0.0.1:8081/graph
+```
+
+It lists your namespace's latest 50 runs (the batches' children left out), and opens one as
+its graph: the steps of the workflow as [`kontra graph`](#the-graph-kontra-graph) draws them,
+with what this run did painted on. Each step shows its status (scheduled, running,
+completed, failed, timed out, canceled) and duration, `×3` when it is on its third attempt,
+`∥50` when it ran 50 at once; the activities one workflow task started together are boxed as
+one parallel group, an `execute_activities_in_parallel` batch is one double-bordered node, a
+timer is rounded, and a step this run did not take (or has not reached yet) is dashed and
+muted. While the run is open the page repaints by itself: the codec server asks Temporal
+about once a second whether the run changed, its running activities and their attempts
+included, so a retry shows while it runs rather than once history records it, and the page
+stops once the run has closed. Click a step (or focus it and press Enter) for its attempts,
+timing, task queue and failure, its input, result and failure message decoded with this
+machine's key, and its links:
+
+- **Temporal UI**: the step's own event in the run's history (a child workflow's own run);
+- **Logs**: Grafana's Explore on Loki, the step's lines over its time range (a second either
+  side), `{service_name="kontra-worker"} | workflow_id="job-..." | run_id="..." |
+  activity_type="..."`;
+- **Trace**: Explore on Tempo, the job's trace.
+
+The header has the same three for the whole run. Logs and Trace need `--observability` and a
+worker serving with `kontra serve --otlp http://127.0.0.1:4317`, which also writes the trace
+context the Trace link reads into the run's history. The Logs link selects `kontra-worker`,
+or `OTEL_SERVICE_NAME` as `kontra dev up` saw it: give the worker the same one.
+
+The whole workflow, branches this run never takes included, comes from `kontra graph`: run
+`kontra graph --dir <project>` with the dev profile's `KONTRA_HOME` once the workflow changes,
+and the page paints each run on the graph saved for its task queue (the one `kontra serve`
+serves, exactly). Without one, it draws what the run did and says how to get the rest.
+
+The run's graph carries names, statuses and times, never an input, result, failure message
+or heartbeat (it is read from history by `kontra.graph`, which emits no payload). A step's
+payloads come from one route of the codec server, decoded there, for the page's own requests
+only (a header a page on another origin cannot send without a preflight, which is refused):
+what is encrypted to keys this machine does not hold is shown as such, and a payload
+claim-checked to the bucket as stored there, never their bytes. The page runs
+nothing but its own script and loads nothing from elsewhere, and its data routes answer its
+own origin alone. The codec server reads Temporal as you, with your dev login's worker token,
+from the first time the page asks (so it starts, and decodes for the UI, without Temporal);
+like the decoding, it runs for a dev profile only.
 
 ## Publishing and serving
 

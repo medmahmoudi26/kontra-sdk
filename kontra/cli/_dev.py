@@ -22,9 +22,12 @@ only then: ``up`` runs exactly the profiles it is given and stops the containers
 others, so ``kontra dev up`` alone is the stack it always was. ``--ui`` is
 Temporal's own UI, which shows what is encrypted to this machine's key through a codec server
 ``up`` starts on 127.0.0.1 when the home holds a dev profile (:mod:`kontra.cli._codec_server`,
-in the background; ``down`` stops it). ``--observability`` is Prometheus and Grafana, with Temporal's metrics listener
-turned on for Prometheus to scrape, and an OpenTelemetry Collector on 127.0.0.1 that writes what
-``kontra serve --otlp`` exports to Tempo (traces) and Loki (logs), both Grafana data sources.
+in the background; ``down`` stops it), which also serves the graph page (``/graph``,
+:mod:`kontra.cli._console`): a run painted on ``kontra graph``'s static graph, live, with
+links to the UI and, with ``--observability``, to Grafana. ``--observability`` is Prometheus
+and Grafana, with Temporal's metrics listener turned on for Prometheus to scrape, and an
+OpenTelemetry Collector on 127.0.0.1 that writes what ``kontra serve --otlp`` exports to Tempo
+(traces) and Loki (logs), both Grafana data sources.
 ``status``, ``logs`` and ``down`` see every profile.
 """
 
@@ -357,10 +360,24 @@ def _codec_ports(config: dict[str, Any]) -> tuple[int, int]:
     return int(m.group(1)), int(published.rsplit(":", 1)[1])
 
 
-def _start_codec(home: Path, config: dict[str, Any]) -> str:
+def _link_bases(config: dict[str, Any], observability: bool) -> list[str]:
+    """The graph page's link bases as the codec server takes them: Temporal's UI, and
+    Grafana when the observability profile runs, where ``config`` publishes them."""
+    args: list[str] = []
+    for service, flag, wanted in (
+        ("ui", "--temporal-ui", True),
+        ("grafana", "--grafana", observability),
+    ):
+        if wanted and (where := _published(config, service)) is not None:
+            args += [flag, f"http://{where}"]
+    return args
+
+
+def _start_codec(home: Path, config: dict[str, Any], *, observability: bool = False) -> str:
     """Start the codec server in the background for the UI of ``config`` (the one an
-    earlier ``up`` started is stopped first); its URL. Raises :class:`CliError` with the
-    server's own words if it does not come up."""
+    earlier ``up`` started is stopped first), with the graph page's links to the UI and,
+    with ``observability``, to Grafana; its URL. Raises :class:`CliError` with the server's
+    own words if it does not come up."""
     port, ui_port = _codec_ports(config)
     _stop_codec(home)
     token = secrets.token_urlsafe(32)
@@ -372,6 +389,7 @@ def _start_codec(home: Path, config: dict[str, Any]) -> str:
                 sys.executable,
                 *("-m", "kontra.cli._codec_server"),
                 *("--port", str(port), "--ui-port", str(ui_port)),
+                *_link_bases(config, observability),
             ],
             stdin=subprocess.PIPE,
             stdout=log,
@@ -518,7 +536,8 @@ def dev(ctx: click.Context, handle: str | None, env_files: tuple[Path, ...]) -> 
 @click.option(
     "--ui",
     is_flag=True,
-    help="Also Temporal's UI, on 127.0.0.1, decoding with this machine's key (dev only).",
+    help="Also Temporal's UI and the graph page, on 127.0.0.1, decoding with this machine's "
+    "key (dev only).",
 )
 @click.option(
     "--observability",
@@ -578,9 +597,12 @@ def up(
         click.echo(f"  otlp      {otlp}  (kontra serve --otlp)")
     profile = None if no_login else _dev_login(gate_env, url, handle, existing, home)
     if ui:
+        codec = _up_codec(home, config, observability)
         if profile is not None and (where := _published(config, "ui")) is not None:
             click.echo(f"  workflows http://{where}/namespaces/{profile.namespace}/workflows")
-        _up_codec(home, config)
+        if codec is not None:
+            click.echo(f"  graph     {codec}/graph")
+            click.echo(f"codec server {codec}: the UI decodes with this machine's key")
     if profile is not None:
         click.echo("next: kontra init <name> && cd <name> && kontra serve")
 
@@ -614,11 +636,12 @@ def _dev_login(
     return profile
 
 
-def _up_codec(home: Path, config: dict[str, Any]) -> None:
-    """Start the UI's codec server, for a dev profile only: it decrypts with this home's key
-    for whoever reaches its port, so never with a real login's (``--no-login`` and a gate
-    that is not a dev gate skip the checks that otherwise keep one out of ``up``). A refusal
-    or a failure is said and the stack stays up: the UI then shows payloads as ciphertext."""
+def _up_codec(home: Path, config: dict[str, Any], observability: bool) -> str | None:
+    """Start the UI's codec server, which also serves the graph page, for a dev profile
+    only: it decrypts with this home's key for whoever reaches its port, so never with a
+    real login's (``--no-login`` and a gate that is not a dev gate skip the checks that
+    otherwise keep one out of ``up``). Its URL; a refusal or a failure is said, None, and
+    the stack stays up: the UI then shows payloads as ciphertext, and there is no page."""
     from kontra.profile import Profile, ProfileError
 
     try:
@@ -638,13 +661,12 @@ def _up_codec(home: Path, config: dict[str, Any]) -> None:
             "(KONTRA_HOME=~/.kontra-dev kontra dev up --ui).",
             err=True,
         )
-        return
+        return None
     try:
-        where = _start_codec(home, config)
+        return _start_codec(home, config, observability=observability)
     except CliError as e:
         click.echo(f"codec server not started: {e.format_message()}", err=True)
-        return
-    click.echo(f"codec server {where}: the UI decodes with this machine's key")
+        return None
 
 
 @dev.command()

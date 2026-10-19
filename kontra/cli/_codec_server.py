@@ -20,8 +20,15 @@ rebinds a name of its own to 127.0.0.1), whose ``Origin`` is not the UI's (the o
 its CORS headers name), or whose body is not JSON (a cross-site form). It is for a machine
 whose loopback is its user's alone.
 
-``kontra dev`` runs it as ``python -m kontra.cli._codec_server --port P --ui-port U`` in the
-background, handing it a token on standard input. Two requests take that token (as
+It also serves the graph page of ``kontra dev up --ui`` (:mod:`kontra.cli._console`, decisions
+I28): ``GET /graph`` and its ``/api/...`` routes, for the console's own origin
+(``http://127.0.0.1:P``, ``http://localhost:P``) and no other, behind the same ``Host`` check;
+``/decode`` and ``/encode`` keep the UI's origin alone, and a preflight is answered for those
+two only.
+
+``kontra dev`` runs it as ``python -m kontra.cli._codec_server --port P --ui-port U
+[--temporal-ui URL] [--grafana URL]`` in the background (the two URLs are where the page's
+links point), handing it a token on standard input. Two requests take that token (as
 ``Authorization: Bearer``, with no ``Origin``): ``GET /ready`` answers 204, which is how
 ``kontra dev`` knows the server answering on the port is the one it started and not another
 (one started from another ``KONTRA_HOME``, decrypting with that home's key); ``POST /stop``
@@ -39,10 +46,12 @@ from collections.abc import Callable, Sequence
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlsplit
 
 from google.protobuf import json_format
 from temporalio.api.common.v1 import Payload, Payloads
 
+from kontra.cli import _console
 from kontra.codec import CodecError, KontraCodec
 from kontra.codec.age import public_key_of
 from kontra.profile import Profile, kontra_home
@@ -55,11 +64,13 @@ HOST = "127.0.0.1"
 #: sends an event's payloads together.
 MAX_BODY = 32 * 1024 * 1024
 _ALLOWED_HEADERS = "Content-Type, X-Namespace"
+_CODEC_ROUTES = ("/decode", "/encode")
 
 
 class CodecServer(ThreadingHTTPServer):
     """The HTTP server: ``codec`` made per request (job keys come and go), the UI's
-    ``origins``, and the ``token`` that stops it."""
+    ``origins``, the ``token`` that stops it, and the graph page's ``console`` (None: no
+    page)."""
 
     daemon_threads = True
 
@@ -70,13 +81,17 @@ class CodecServer(ThreadingHTTPServer):
         codec: Callable[[], KontraCodec],
         origins: Sequence[str],
         token: str,
+        console: _console.Console | None = None,
     ) -> None:
         super().__init__((HOST, port), _Handler)
         self.codec = codec
         self.origins = frozenset(origins)
         self.token = token
+        self.console = console
         self.port = int(self.server_address[1])
         self.hosts = frozenset({f"{HOST}:{self.port}", f"localhost:{self.port}"})
+        #: The page's own origins: the console routes' only ones.
+        self.console_origins = frozenset(f"http://{h}" for h in self.hosts)
 
 
 def _decode_each(codec: KontraCodec, payloads: Sequence[Payload]) -> list[Payload]:
@@ -109,16 +124,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
-    def _allowed(self) -> bool:
-        """The Host is this server's and the Origin, if any, the UI's."""
+    def _allowed(self, origins: frozenset[str] | None = None) -> bool:
+        """The Host is this server's and the Origin, if any, one of ``origins`` (default:
+        the UI's)."""
         if self.headers.get("Host") not in self.server.hosts:
             self._refuse(HTTPStatus.FORBIDDEN, "unexpected Host")
             return False
         origin = self._origin()
-        if origin is not None and origin not in self.server.origins:
+        if origin is not None and origin not in (origins or self.server.origins):
             self._refuse(HTTPStatus.FORBIDDEN, "unexpected Origin")
             return False
         return True
@@ -145,6 +163,11 @@ class _Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         if not self._allowed():
             return
+        if urlsplit(self.path).path not in _CODEC_ROUTES:
+            # The console's routes are same-origin: a preflight for one is another origin's,
+            # which may not send X-Kontra-Console.
+            self._refuse(HTTPStatus.FORBIDDEN, "no cross-origin requests here")
+            return
         self.send_response(HTTPStatus.NO_CONTENT)
         self._cors()
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -160,10 +183,16 @@ class _Handler(BaseHTTPRequestHandler):
         return self._origin() is None and hmac.compare_digest(given, expected)
 
     def do_GET(self) -> None:
+        url = urlsplit(self.path)
+        console = self.server.console
+        if console is not None and url.path in _console.ROUTES:
+            if self._allowed(self.server.console_origins):
+                _console.handle(self, console, url.path, url.query)
+            return
         if not self._allowed():
             return
         if self.path != "/ready":
-            self._refuse(HTTPStatus.NOT_FOUND, "GET /ready")
+            self._refuse(HTTPStatus.NOT_FOUND, "GET /ready" + (" or /graph" if console else ""))
             return
         if not self._from_kontra_dev():
             self._refuse(HTTPStatus.FORBIDDEN, "not yours")
@@ -178,7 +207,10 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/stop":
             self._stop()
             return
-        if self.path not in ("/decode", "/encode"):
+        # Temporal's UI (2.55) asks for /decode?preserveStorageRefs=true: this server never
+        # fetches a claim-check reference, so every query is answered alike.
+        route = urlsplit(self.path).path
+        if route not in _CODEC_ROUTES:
             self._refuse(HTTPStatus.NOT_FOUND, "POST /decode or /encode")
             return
         kind = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -196,7 +228,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         codec = self.server.codec()
         try:
-            if self.path == "/decode":
+            if route == "/decode":
                 out = _decode_each(codec, given.payloads)
             else:
                 out = asyncio.run(codec.encode(list(given.payloads)))
@@ -244,6 +276,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="python -m kontra.cli._codec_server")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--ui-port", type=int, required=True)
+    parser.add_argument("--temporal-ui", metavar="URL", help="Where the graph page links runs.")
+    parser.add_argument("--grafana", metavar="URL", help="Where it links logs and traces.")
     args = parser.parse_args(argv)
     token = sys.stdin.readline().strip()
     if not token:
@@ -252,16 +286,30 @@ def main(argv: Sequence[str] | None = None) -> None:
         codec = _codec_factory()
     except Exception as e:  # no key, an unreadable one: said in the log `kontra dev` shows
         sys.exit(f"cannot load this machine's key: {e}")
+    try:
+        console = _console.Console(
+            kontra_home(), codec, temporal_ui=args.temporal_ui, grafana=args.grafana
+        )
+    except ValueError as e:  # a link base that is not an http(s) URL
+        sys.exit(str(e))
     ui = int(args.ui_port)
     server = CodecServer(
         int(args.port),
         codec=codec,
         origins=[f"http://localhost:{ui}", f"http://{HOST}:{ui}"],
         token=token,
+        console=console,
     )
-    print(f"codec server on http://{HOST}:{server.port} for the UI at :{ui}", flush=True)
-    with server:
-        server.serve_forever()
+    print(
+        f"codec server on http://{HOST}:{server.port} for the UI at :{ui}; "
+        f"the graph page at http://{HOST}:{server.port}{_console.PAGE_ROUTE}",
+        flush=True,
+    )
+    try:
+        with server:
+            server.serve_forever()
+    finally:
+        console.close()
 
 
 if __name__ == "__main__":
