@@ -654,10 +654,10 @@ anywhere: `kontra publish` does not carry it.
 
 ```sh
 kontra dev                    # = kontra dev up
-kontra dev up --ui            # + Temporal's UI, reading your payloads (below)
-kontra dev up --observability # + Prometheus and Grafana with Temporal's dashboards (below)
+kontra dev up --ui            # + Temporal's UI, reading your payloads, and the graph page (below)
+kontra dev up --observability # + Prometheus, Grafana, and Loki and Tempo for `kontra serve --otlp` (below)
 kontra dev status             # containers, the gate's health, the codec server, the profile
-kontra dev logs [gate|temporal|postgres|postgres-relay|s3|migrate|ui|prometheus|prometheus-agent|grafana] [-f] [--tail N]
+kontra dev logs [gate|temporal|postgres|postgres-relay|s3|migrate|ui|prometheus|prometheus-agent|grafana|otelcol|loki|tempo] [-f] [--tail N]
 kontra dev down [--volumes]   # --volumes also deletes the stack's data
 ```
 
@@ -700,11 +700,13 @@ profile. Each tool is published on 127.0.0.1 only, whatever `KONTRA_DEV_BIND` sa
 | Flag | Service | Address | Port setting |
 |---|---|---|---|
 | `--ui` | Temporal's UI (`temporalio/ui`) | http://localhost:8233 | `KONTRA_DEV_UI_PORT` |
-| `--ui` | the codec server, a process of `kontra dev` on the host | http://127.0.0.1:8081 | `KONTRA_DEV_CODEC_PORT` |
+| `--ui` | the codec server, a process of `kontra dev` on the host, and the [graph page](#the-graph-page) it serves | http://127.0.0.1:8081 | `KONTRA_DEV_CODEC_PORT` |
 | `--observability` | Prometheus | http://localhost:9090 | `KONTRA_DEV_PROMETHEUS_PORT` |
-| `--observability` | Grafana, Temporal's dashboards, no sign-in | http://localhost:3000 | `KONTRA_DEV_GRAFANA_PORT` |
+| `--observability` | Grafana: Temporal's dashboards; Prometheus, Loki and Tempo to explore; no sign-in | http://localhost:3000 | `KONTRA_DEV_GRAFANA_PORT` |
+| `--observability` | an OpenTelemetry Collector, OTLP over gRPC, for `kontra serve --otlp` | http://127.0.0.1:4317 | `KONTRA_DEV_OTLP_PORT` |
 
-The four ports are remembered in `$KONTRA_HOME/dev.env` like the stack's.
+The five ports are remembered in `$KONTRA_HOME/dev.env` like the stack's. Loki and Tempo
+publish nothing: the collector writes to them and Grafana reads them.
 
 `--ui` is Temporal's own UI, not a Kontra one; after the login, `kontra dev up --ui` prints
 the link to your namespace's workflows. Payloads in Kontra's Temporal are age ciphertext, so
@@ -723,8 +725,9 @@ was encrypted to it. Both answer on 127.0.0.1 alone, and the codec server to no 
 the UI's; run them on a machine that is yours. Loopback does not keep out a web page whose
 name rebinds to 127.0.0.1: such a page is same-origin with the UI, Prometheus and Grafana,
 which (as upstream) check no `Host` and ask no sign-in, so it can use the UI's actions --
-start, signal, terminate a workflow in any namespace -- and read the metrics. The codec
-server checks `Host` and refuses it, so your payloads stay sealed. `kontra dev up` alone stops
+start, signal, terminate a workflow in any namespace -- read the metrics, and read your
+workers' logs and traces and edit dashboards through Grafana. The codec server checks `Host`
+and refuses it, so your payloads stay sealed. `kontra dev up` alone stops
 the profiles when you are not using them.
 
 `--observability` runs Prometheus, Prometheus's agent and Grafana. Prometheus scrapes Kontra's
@@ -747,6 +750,85 @@ Docker Desktop's name for this machine. Either way, the query `up{job="kontra-se
 http://localhost:9090 says per port whether a worker answered: `instance` `127.0.0.1:PORT`
 through the agent, `host.docker.internal:PORT` directly (Prometheus's targets page lists only
 the direct ones).
+
+`--observability` also runs an OpenTelemetry Collector (`otelcol`), Loki and Tempo, for what
+`kontra serve --otlp` exports ([Scaling and observability](#scaling-and-observability)): the
+collector takes OTLP over gRPC on 127.0.0.1:4317 and writes the spans to Tempo and the logs to
+Loki, and Grafana has both as data sources (uids `loki` and `tempo`) beside Prometheus.
+`kontra dev up --observability` prints the URL to give `--otlp`:
+
+```sh
+kontra dev up --observability   # ...  otlp      http://127.0.0.1:4317  (kontra serve --otlp)
+kontra serve --otlp http://127.0.0.1:4317
+```
+
+In Grafana's Explore, Loki finds a worker's lines by the Temporal context each was logged in,
+for example one activity of one run:
+
+```text
+{service_name="kontra-worker"} | workflow_id="job-..." | run_id="..." | activity_type="fetch"
+```
+
+A line's `trace_id` links to its trace in Tempo, and a span to its trace's lines in Loki.
+`kontra-worker` is the service name when `OTEL_SERVICE_NAME` sets none. Loki keeps 7 days of
+logs and Tempo 14 days of traces, on volumes of their own (`kontra dev down --volumes`
+deletes them with the rest). From Loki 3.7, Loki refuses every line while the disk its data
+is on is fuller than a threshold; it is 98% here, not Loki's 90%, at which many a laptop's disk
+already is. Grafana's anonymous user is an Editor here, because Explore needs one in Grafana
+13: an Editor also changes dashboards (the vendored ones are read-only), but adds no data
+source or plugin, and alerting and external snapshots are off, so it cannot make Grafana send
+anything out.
+
+### The graph page
+
+`kontra dev up --ui` also prints the graph page, which the codec server serves:
+
+```text
+  workflows http://localhost:8233/namespaces/acme/workflows
+  graph     http://127.0.0.1:8081/graph
+```
+
+It lists your namespace's latest 50 runs (the batches' children left out), and opens one as
+its graph: the steps of the workflow as [`kontra graph`](#the-graph-kontra-graph) draws them,
+with what this run did painted on. Each step shows its status (scheduled, running,
+completed, failed, timed out, canceled) and duration, `×3` when it is on its third attempt,
+`∥50` when it ran 50 at once; the activities one workflow task started together are boxed as
+one parallel group, an `execute_activities_in_parallel` batch is one double-bordered node, a
+timer is rounded, and a step this run did not take (or has not reached yet) is dashed and
+muted. While the run is open the page repaints by itself: the codec server asks Temporal
+about once a second whether the run changed, its running activities and their attempts
+included, so a retry shows while it runs rather than once history records it (a step
+waiting for its next attempt says how long it has been backing off since the last one failed,
+and its pane shows that failure's message), and the page stops once the run has closed. Click a step (or focus it and press Enter) for its attempts,
+timing, task queue and failure, its input, result and failure message decoded with this
+machine's key, and its links:
+
+- **Temporal UI**: the step's own event in the run's history (a child workflow's own run);
+- **Logs**: Grafana's Explore on Loki, the step's lines over its time range (a second either
+  side), `{service_name="kontra-worker"} | workflow_id="job-..." | run_id="..." |
+  activity_type="..."`;
+- **Trace**: Explore on Tempo, the job's trace.
+
+The header has the same three for the whole run. Logs and Trace need `--observability` and a
+worker serving with `kontra serve --otlp http://127.0.0.1:4317`, which also writes the trace
+context the Trace link reads into the run's history. The Logs link selects `kontra-worker`,
+or `OTEL_SERVICE_NAME` as `kontra dev up` saw it: give the worker the same one.
+
+The whole workflow, branches this run never takes included, comes from `kontra graph`: run
+`kontra graph --dir <project>` with the dev profile's `KONTRA_HOME` once the workflow changes,
+and the page paints each run on the graph saved for its task queue (the one `kontra serve`
+serves, exactly). Without one, it draws what the run did and says how to get the rest.
+
+The run's graph carries names, statuses and times, never an input, result, failure message
+or heartbeat (it is read from history by `kontra.graph`, which emits no payload). A step's
+payloads come from one route of the codec server, decoded there, for the page's own requests
+only (a header a page on another origin cannot send without a preflight, which is refused):
+what is encrypted to keys this machine does not hold is shown as such, and a payload
+claim-checked to the bucket as stored there, never their bytes. The page runs
+nothing but its own script and loads nothing from elsewhere, and its data routes answer its
+own origin alone. The codec server reads Temporal as you, with your dev login's worker token,
+from the first time the page asks (so it starts, and decodes for the UI, without Temporal);
+like the decoding, it runs for a dev profile only.
 
 ## Publishing and serving
 
@@ -847,7 +929,7 @@ unless given, and neither adds a metric name or an exporter of Kontra's own.
 
 ```sh
 kontra serve --metrics 0.0.0.0:9464          # Prometheus text at http://<this host>:9464/metrics
-kontra serve --otlp http://collector:4317    # traces over OTLP/gRPC
+kontra serve --otlp http://collector:4317    # traces and logs over OTLP/gRPC
 ```
 
 `--metrics IP:PORT` serves the SDK's own metrics: the worker's client connects with a
@@ -881,12 +963,22 @@ plaintext, `https://` over TLS): the Nexus `quote` and `execute` handlers, `Star
 `temporalTaskQueue`, its task queue. A workflow's spans and `RunActivity` also carry
 `temporalWorkflowID` (`job-<id>` for a job's workflow) and `temporalRunID`, `RunActivity` its
 `temporalActivityID` too; `StartWorkflow` carries the workflow ID alone, and a Nexus handler's
-span the task queue alone. `OTEL_SERVICE_NAME` names the service. It needs the `opentelemetry` extra, `pip install 'kontra-sdk[opentelemetry]'`; without
-it `kontra serve --otlp` says so and does not start. The interceptor's tracer provider is its
-own: spans you make with OpenTelemetry's API go wherever your own setup sends them.
+span the task queue alone. `OTEL_SERVICE_NAME` names the service (`kontra-worker` when it
+names none). It needs the `opentelemetry` extra, `pip install 'kontra-sdk[opentelemetry]'`;
+without it `kontra serve --otlp` says so and does not start. The interceptor's tracer provider
+is its own: spans you make with OpenTelemetry's API go wherever your own setup sends them.
 
-Neither carries what a buyer sent or received. Metrics are counts and latencies labelled with
-names. Spans carry names and IDs. A buyer's Nexus call may carry a trace context of its own
+`--otlp` also exports the worker's Python logs to the same collector, at INFO and above, from
+a handler on the root logger and a log provider of its own (never OpenTelemetry's global one),
+with the spans' service name. Each record carries the Temporal context it was logged in as
+attributes -- `workflow_id`, `run_id`, `workflow_type`, `attempt` and `task_queue`, and in an
+activity `activity_id` and `activity_type` -- whether it came through `workflow.logger`,
+`activity.logger` or a logger of your own inside an activity, and, inside a span, that span's
+trace and span IDs. An exception keeps its type, message and stack trace
+(`exception.type`, `exception.message`, `exception.stacktrace`).
+
+Neither the metrics nor the spans carry what a buyer sent or received. Metrics are counts and
+latencies labelled with names. Spans carry names and IDs. A buyer's Nexus call may carry a trace context of its own
 (`traceparent`, `tracestate`, `baggage`): the worker removes it before Temporal's interceptor
 reads it, so a handler's span starts a trace of yours, recorded whatever the buyer's sampling
 flag says, and nothing of the buyer's reaches a span or the history of the workflow it
@@ -895,6 +987,15 @@ failure message, encrypted everywhere else), is removed before export, so a fail
 its status and its exception's type only. The codec's leak test runs jobs whose input,
 result, failure, heartbeats and trace context carry a marker through a worker with both flags
 on, and finds it in neither the metrics text nor the exported spans.
+
+Logs are different: they are your own output, going to your own collector, and they leave as
+your code wrote them -- not scrubbed and not checked for a job's data, exception messages
+included. What your workflow or activity logs of a job's input, result or failure is in your
+logs, as it is on the worker's console. Log what you would keep; the buyer's data is yours to
+handle under the same terms as everywhere else in your code. Kontra's own serving code logs no
+payload as such, but what it logs about a refused input (the paths of its invalid fields, where
+a map key is the buyer's) or a call that failed (the exception, as raised) can carry pieces of
+one, and those lines are exported like yours.
 
 ### Dashboards
 

@@ -254,7 +254,8 @@ deadline rule.
   carry it. A deployment that adds a container to `control` gives that container the
   internal frontend; `kontra dev up --ui` does so on purpose with Temporal's UI, a dev tool
   published on 127.0.0.1 only that production never runs (as is the codec server it starts,
-  which decrypts with the machine's key for whoever reaches its loopback port). The bind is
+  which decrypts with the machine's key for whoever reaches its loopback port, and serves the
+  graph page, reading the dev party's runs with its worker token). The bind is
   not the whole wall on `temporal-db`: Linux accepts a packet
   for any of its addresses on any interface, so a peer there that routes Temporal's `control`
   address through Temporal's `temporal-db` address reaches it (measured); that takes

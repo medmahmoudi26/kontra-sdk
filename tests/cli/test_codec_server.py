@@ -103,6 +103,28 @@ def test_decode_opens_what_is_ours_and_leaves_the_rest(server: CodecServer) -> N
     assert out[2:] == [theirs, claim, plain]
 
 
+def test_the_ui_s_query_string_is_answered_alike(server: CodecServer) -> None:
+    """Temporal's UI 2.55 posts to ``/decode?preserveStorageRefs=true`` (and preflights
+    that); this server fetches no claim-check reference in any case."""
+    sealed = _sealed(_plain(MARKER), PUBLIC)
+    path = "/decode?preserveStorageRefs=true"
+    with httpx.Client(trust_env=False) as http:
+        pre = http.options(
+            f"http://127.0.0.1:{server.port}{path}",
+            headers={
+                "Origin": UI,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,x-namespace",
+            },
+        )
+    assert pre.status_code == 204
+    assert pre.headers["Access-Control-Allow-Origin"] == UI
+    r = _post(server, path, _body(sealed))
+    assert r.status_code == 200, r.text
+    assert _payloads(r) == [_plain(MARKER)]
+    assert _post(server, "/decode/x?y", _body(sealed)).status_code == 404
+
+
 def test_encode_seals_to_this_machine_alone(server: CodecServer) -> None:
     r = _post(server, "/encode", _body(_plain(MARKER)))
     assert r.status_code == 200, r.text
@@ -241,6 +263,15 @@ def test_kontra_dev_starts_and_stops_it_in_the_background(
                 headers={"Content-Type": "application/json", "Origin": UI},
             )
         assert _payloads(r) == [_plain(MARKER)]
+        # The graph page, from the same process; Temporal only at the first request that
+        # needs it -- this home holds no profile, which that request says.
+        with httpx.Client(trust_env=False, timeout=30) as http:
+            page = http.get(f"{url}/graph")
+            runs = http.get(f"{url}/api/workflows")
+        assert page.status_code == 200
+        assert "nonce-" in page.headers["Content-Security-Policy"]
+        assert runs.status_code == 502
+        assert runs.json()["error"].startswith("NotLoggedIn: not logged in")
         # Started again (a second `up --ui`): the first is stopped, one runs.
         assert dev_module._start_codec(home, config) == url
     finally:
@@ -307,6 +338,41 @@ def test_only_a_loopback_endpoint_is_served(tmp_path: Path) -> None:
         with pytest.raises(ClickException, match=r"127\.0\.0\.1"):
             dev_module._codec_ports(_ui_config(8081, 8233, endpoint))
     assert dev_module._codec_ports(_ui_config(8081, 8234)) == (8081, 8234)
+
+
+def test_the_page_s_links_are_where_this_up_published_them() -> None:
+    config = _ui_config(8081, 8234)
+    config["services"]["grafana"] = {
+        "ports": [{"host_ip": "127.0.0.1", "published": "3300", "target": 3000}]
+    }
+    assert dev_module._link_bases(config, observability=True) == [
+        *("--temporal-ui", "http://localhost:8234"),
+        *("--grafana", "http://localhost:3300"),
+    ]
+    # Without the observability profile no Grafana runs: the page links none.
+    assert dev_module._link_bases(config, observability=False) == [
+        "--temporal-ui",
+        "http://localhost:8234",
+    ]
+
+
+def test_a_link_base_that_is_not_an_http_url_is_refused(tmp_path: Path) -> None:
+    home = _home(tmp_path / "home")
+    env = {**os.environ, "KONTRA_HOME": str(home)}
+    env.pop(KEY_FILE_ENV, None)
+    proc = subprocess.run(
+        [
+            *(sys.executable, "-m", "kontra.cli._codec_server"),
+            *("--port", "0", "--ui-port", "1", "--grafana", "javascript:alert(1)"),
+        ],
+        input=b"token\n",
+        capture_output=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert b"grafana must be an http(s) base URL" in proc.stderr
 
 
 def test_the_module_runs_as_kontra_dev_starts_it(tmp_path: Path) -> None:

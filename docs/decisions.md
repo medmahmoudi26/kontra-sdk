@@ -1155,7 +1155,11 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
   retry, and an activity's Started event (its attempt, its last failure) only when the activity
   closes, so history alone cannot show one running or retrying. `parse(pending=)` takes the
   answer's `pendingActivities`: an open activity whose state is started or cancel-requested is
-  `running`, with the attempt and the last failure's kind.
+  `running`, with the attempt, the last failure's kind and, in `t.last_failed`, when that
+  attempt ended (`lastAttemptCompleteTime`; the pending `scheduledTime` is the next attempt's,
+  and history's is the first). `with_io(pending=)` takes the same answer: a retrying activity's
+  last failure, message included, is there alone until the activity closes (found by #43's
+  review: the page said it was decoding a message that history did not have).
 - **What a closed run left open ended with it** (the spec is silent). No event closes an
   activity, timer or child still open when its run closes, and left `scheduled` with an open
   span, a run closed days ago read as in flight and its log links queried up to now. Temporal
@@ -1177,7 +1181,11 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
   when some run commanded them in one batch (or they are chained by such runs), numbered in
   node order (found by #42's review). `merge(static, live)` paints a live run
   on it: a live node with `reached: true`, a static-only one (a branch not taken, or not yet)
-  with `reached: false`, and each edge `{"from", "to", "reached"}`.
+  with `reached: false`, and each edge `{"from", "to", "reached"}`. A live batch not named yet
+  (its child has scheduled nothing, and its input is encrypted) is painted on the static
+  graph's one batch whose predecessors include all of its, under that batch's name; with two
+  such batches, or none, it stays `kontra.batch.v1` (found live by #43's review: the run drew
+  an unnamed batch beside the static one, which read "not reached yet", for over a second).
 - **Logs and traces are Grafana Explore panes.** A node's `logs` link is Loki,
   `{selector} | workflow_id="..." | run_id="..."` and `| activity_type="..."` for an activity
   (a child's logs are under its own workflow id), over the node's span with a second either
@@ -1353,3 +1361,139 @@ against temporalio 1.34 and its test server. Where the issue and the code part w
   same sandbox, so a real job would have hung the same way. `_resolve` now imports through
   `__import__` and reads `sys.modules`: passed through, as it always said
   (`tests/parallel`, an activity module that reads `os.environ` at import).
+
+## I28. The dev graph page (kontra-sdk#43)
+
+`kontra dev up --ui` prints `graph http://127.0.0.1:<codec port>/graph`: one page, shipped as
+`kontra/cli/_console.html` (no build step), served by the codec server process
+(`kontra/cli/_console.py`), that lists the dev party's latest 50 runs and draws one as a
+layered SVG graph: `kontra graph`'s static graph for the run's task queue with the live run
+painted on it (`graph.links(graph.merge(static, live) or live)`, I26, I27), repainted over
+server-sent events while the run is open. A node opens a pane with its attempts, timing, task
+queue, failure, its decoded input, result and failure message, and links to its event in
+Temporal's UI, its lines in Loki and its trace in Tempo through Grafana's Explore.
+`kontra serve --otlp` exports the worker's Python logs beside its spans, each line tagged with
+the Temporal context it was logged in, and `--observability` gains a collector, Loki and Tempo
+for them. Checked against temporalio 1.34, Kontra's Temporal server (1.32) and the CLI's dev
+server, Temporal's UI 2.55.0, Grafana 13.2.3, Loki 3.7.8, Tempo 3.1.0, collector-contrib
+0.163.1 and headless Chromium (Playwright 1.58), end to end on a real `kontra dev up --ui
+--observability` with `examples/sweep` served and hired. Where the issue and the code part
+ways:
+
+- **The codec server serves the page, not "the fake gate".** `kontra dev` runs the real
+  kontra-gate image (the fake gate exists only in pytest), and the SDK cannot add routes to
+  it. The codec server is already SDK code, loopback-only, dev-profile-only and
+  Host-checked, and holds this machine's key; it gains a dev session (`Session.load` of its
+  home, `connect_temporal("worker")`, which keeps the token fresh) to read history in the
+  party's own namespace. The Authorizer already allows a worker token
+  `DescribeWorkflowExecution`, `GetWorkflowExecutionHistory` and `ListWorkflowExecutions`
+  there: no seam ① change. One event loop on a daemon thread owns the session and the client,
+  connected at the first request that needs them, so the server starts without Temporal and
+  `/decode` answers while Temporal is down; request threads hand it coroutines and wait 30 s
+  at most; an error is a JSON `{"error": ...}` of one line, in Temporal's or the profile's
+  words or the error's type alone, never a traceback nor an exception's text that could hold
+  a payload. Its routes take the console's own origins (`http://127.0.0.1:P`,
+  `http://localhost:P`) and no other, and a cross-site `Sec-Fetch-Site` on a data route is
+  refused; `/decode` and `/encode` keep the UI's origin alone, and a preflight is answered for
+  those two only.
+- **Payloads only through `/api/io`, and only for the page.** `kontra.graph.parse` emits no
+  payload, so `/api/graph`, its event stream, `/api/workflows` and the page carry no input,
+  result, failure message or heartbeat, encrypted or not; the page never receives ciphertext.
+  `/api/io?w=&r=&node=` decodes the latest occurrence of that one node (`node=` empty: the
+  workflow) with `graph.with_io` in this process, through a codec that shows what this
+  machine's keys cannot open as `{"encrypted": true}` and a claim-check reference as
+  `{"claim_check": true}` (this process holds no gate session to fetch it) -- never their
+  bytes. It requires `X-Kontra-Console: 1`, which a page on another origin cannot send without
+  a preflight, and the preflight is refused. "Without the codec server reachable, the page shows
+  no payload bytes" (the issue's seam ⑤ item) holds trivially: without it there is no page. The
+  seam ⑤ scan is `tests/codec/test_codec_console.py`: a seller's worker on a real dev server
+  runs a workflow whose input, heartbeat, failure message, result and batch items carry a
+  marker; the page, every graph read while it ran, the whole event stream and the runs list
+  hold neither the marker in any case nor any payload's ciphertext, as base64, URL-safe base64,
+  hex or a 32-character start of each; `/api/io` returns it decoded only with the header and
+  the right `Host` (wrong `Host`, the UI's or a foreign `Origin`, a cross-site fetch, another
+  header value and a preflight are refused with none of it). `with_io` shows a failure whose
+  encoded attributes decode to something other than a message and a stack trace as what they
+  decoded to, so an undecryptable failure reads `{"encrypted": true}`, not "no message".
+  Every answer is `Cache-Control: no-store` and `nosniff`; the page has a policy with a
+  per-response nonce (`default-src 'none'; script-src 'nonce-…'; style-src 'nonce-…';
+  connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none';
+  frame-ancestors 'none'`), `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`; it has
+  no style or handler attribute, loads nothing from elsewhere, and puts every string from the
+  server in with `textContent` or `setAttribute`, never as HTML.
+- **No `kontra.yaml`.** The issue's `console:` keys exist nowhere. `kontra dev up` resolves the
+  UI's and Grafana's URLs from the compose configuration it ran (`_published()`) and hands them
+  to the codec server (`--temporal-ui`, and `--grafana` with `--observability` only); the data
+  source uids are the provisioned ones (`loki`, `tempo`); the LogQL selector is
+  `{service_name="kontra-worker"}`, or `OTEL_SERVICE_NAME` as `kontra dev up` saw it.
+  The production console's per-fleet Grafana (the issue's note on the recipients fleet entry) is
+  kontra-cloud's.
+- **Logs and traces get backends.** The issue links logs to a Grafana that had nothing to
+  show: `kontra serve --otlp` exported spans only and `--observability` had no log or trace
+  store. The profile gains an OpenTelemetry Collector (OTLP/gRPC on
+  `127.0.0.1:${KONTRA_DEV_OTLP_PORT:-4317}`, traces to Tempo, logs to Loki's OTLP endpoint),
+  Loki and Tempo, pinned by digest and held to the stack's walls, on a `telemetry` network
+  shared with Grafana alone. Grafana provisions Loki and Tempo beside Prometheus and its
+  anonymous user is an Editor: Explore needs `datasources:explore`, which Grafana 13 gives a
+  Viewer only through the deprecated `viewers_can_edit` (it warns that a non-Viewer anonymous
+  role is deprecated; a later Grafana may take Explore away from these links). Alerting and
+  external snapshots are off, so an Editor cannot make it send anything out. Loki is 3.7.8, not
+  the 3.6.18 the spec named: 3.7 is the newest stable line, and its write-ahead-log disk guard,
+  which refuses every push above 90% disk use (nothing arrived on a 94% full disk), is moved
+  to 98%; 3.6.18 has a later Go security bump. The collector's exporters are `otlp_grpc` and
+  `otlp_http`, the 0.163 names. `--otlp` exports the worker's logs at INFO and above through a
+  handler and a log provider of its own (never the global ones) with the tracer provider's
+  resource (`OTEL_SERVICE_NAME`, else `kontra-worker`, now the spans' default too), each record
+  carrying `workflow_id`, `run_id`, `workflow_type`, `activity_id`, `activity_type`, `attempt`
+  and `task_queue` from temporalio's logger extras or `activity.info()`, and the span's trace
+  and span ids. Not OpenTelemetry's `LoggingHandler`: deprecated in opentelemetry-sdk 1.45,
+  it exports every logging extra, and temporalio's are dicts, which OpenTelemetry refuses with
+  a warning. **Seam ⑤ policy:** logs are the seller's own output to the seller's own stack, so
+  they are neither scrubbed nor marker-scanned (spans still are); `docs/sellers.md` says so.
+  `examples/sweep` logs a line per step, in counts and statuses, never a URL or a file's text.
+- **Live attempts come from `DescribeWorkflowExecution`.** History says nothing of an
+  activity's attempts or that it started until it closes, so the stream asks
+  `DescribeWorkflowExecution` about once a second and sends the graph again (with its pending
+  activities, I26's `pending=`) when the history's length, the status, the close time or a
+  pending activity's state, attempt, start or last failure changed -- never for a heartbeat. A
+  retry's `×n` and a running activity show before history has them, and the stream ends with
+  `event: end` after a closed run's graph; it says `: keepalive` after 15 quiet seconds, sets
+  EventSource's `retry` to 3 s, ends (and EventSource reconnects) on an error midway, and at
+  most 16 are open at once (503 beyond). A batch node is named from its child's history (its
+  input is encrypted, I26), which names nothing until the child schedules an activity and then
+  grows while the run's history does not: while one is unnamed the stream reads the graph
+  again at every poll and sends it when it differs, and `merge` paints it on the static batch
+  after the same steps meanwhile (I26). Closed batch children's histories are kept, 256 at
+  most; 64 are read per graph. **Where #43's spec falls short:** it has `/api/io` read
+  `graph.with_io` of history alone, and a step backing off between attempts has no failure in
+  history until it closes, so its pane said "Decoding the message…" for as long as it
+  retried; `/api/io` passes the same `DescribeWorkflowExecution` answer (`with_io(pending=)`),
+  and a step still open with no message yet says so. A step backing off counts from when its
+  last attempt ended (`t.last_failed`), not from its first schedule.
+- **The static graph is `kontra graph`'s, matched by the exact task queue.** Not one cached per
+  `name@version` by the page: `load_static(home, task_queue)` with the task queue
+  `DescribeWorkflowExecution` reports, which the cache file stores (the file name is only its
+  hash, I27). Without one the graph says `static_graph: false` and the page says to run
+  `kontra graph --dir <project>`. `merge` now keeps a static-only node's group apart from the
+  run's: the run's groups are its positions and the static graph's are `union`'s, and an
+  untaken `if` branch numbered like the taken one was drawn live as one parallel group with it.
+- **Explore's links take string ranges and its event path.** Explore drops a numeric `range`,
+  so `from`/`to` are epoch milliseconds as strings, a second either side of the node's span
+  (`now` while it is open); the Logs query is the selector with `workflow_id`, `run_id` and,
+  for an activity, `activity_type` (a child's lines are under its own workflow id). The
+  Temporal link is the UI's event path, `/namespaces/<ns>/workflows/<id>/<run>/history/events/<event id>`
+  (a child: its own run's history, or its id alone while open, which the UI follows); Trace
+  is Tempo by the trace id `--otlp` writes into the command's `_tracer-data` header.
+- **The page is not in `kontra/templates/`**, which is `kontra init`'s scaffold. Its layout is
+  the longest path from `start` over forward edges (back edges found by a DFS from `start` and
+  drawn as return arcs), vertical under 640 px or when it does not fit, with parallel groups
+  boxed, start and end circles, double-bordered children, rounded timers, status classes and
+  `×n`/`∥n` badges, and keyboard-focusable nodes. The preview's page had no doctype (quirks
+  mode) and showed placeholders as raw JSON; it now has a doctype, says what a placeholder
+  means, and says so when the stream is refused or the codec server goes away.
+- **Found on the way: Temporal's UI 2.55 could not reach the codec server.** It posts to
+  `/decode?preserveStorageRefs=true`, and the server compared the whole request target with
+  `/decode`: every decode was a 404 and the UI said "Codec Server could not connect", showing
+  ciphertext. Routes are compared without the query now (the server fetches no claim-check
+  reference whatever the query says), and `tests/cli/test_codec_server.py` posts what the UI
+  posts.

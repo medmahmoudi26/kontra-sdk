@@ -78,7 +78,7 @@ is what lets a ledger adapter be swapped and keeps a future split into services 
 | `kontra.profile`, `kontra.auth` | the local profile, this machine's key and a buyer's per-job keys; the session that refreshes gate and Temporal tokens |
 | `kontra._jobkeys`, `kontra._devices` | share to my account (decisions I25): a job key wrapped to each of the account's devices with a proof of possession (shared with the gate), and this machine as one of them |
 | `kontra`, `kontra.workflow`, `kontra.activity` | the seller's façade: Temporal's own objects re-exported, never wrapped (`activity.defn` returns Temporal's own, after noting it for `serve()`), plus `serve`, `Worker`, `Page` and `workflow.execute_activities_in_parallel` (`kontra._parallel`, the `kontra.batch.v1` child) |
-| `kontra.serve` | the seller's `serve()` and `Worker`: generated Nexus handler, hold-token check, codec, progress forwarding; Temporal's own metrics and spans when asked (`kontra serve --metrics`, `--otlp`) |
+| `kontra.serve` | the seller's `serve()` and `Worker`: generated Nexus handler, hold-token check, codec, progress forwarding; Temporal's own metrics and spans, and the worker's logs, when asked (`kontra serve --metrics`, `--otlp`) |
 | `kontra.hire` | the buyer's `Kontra` client, `service()` for workflows, the hire worker |
 | `kontra.mcp` | `kontra mcp`, the eight agent tools and a seller's `workers`, built on `kontra.hire` |
 | `kontra.cli` | the `kontra` command; no business rule lives here |
@@ -100,7 +100,7 @@ the same pull request.**
 | ② | Gate HTTP API | quote, hire (with the job's own key), jobs, progress, artifacts, disputes, catalog, publish, a party's recipients and devices, job-key wraps, the Workers view | `kontra/gate_client/models.py` + `routes.py` | `tests/gate_client/test_routes.py`; the gate's OpenAPI snapshot in `kontra-cloud` | `seams` |
 | ③ | Contract document | the offering, seller to buyer: its types and facts (spec v2: `uses_hosted_model` when true, and no key) | `kontra/contract` + `spec/` | `tests/contract`; the golden `examples/*/contract.yaml`, reproduced byte for byte | `seams` |
 | ④ | Ledger | money state | the `Ledger` Protocol (`kontra/ledger.py`) | `kontra.testing.ledger_contract` (the §9.3 invariants, 10,000 random interleavings) against every adapter | `seams` |
-| ⑤ | Codec | plaintext to ciphertext | `kontra/codec` | round trips, plus scans of Temporal history, the bucket, and a worker's metrics and exported spans (`tests/codec/test_codec_telemetry.py`) for a known plaintext marker | `seams` |
+| ⑤ | Codec | plaintext to ciphertext | `kontra/codec` | round trips, plus scans of Temporal history, the bucket, a worker's metrics and exported spans (`tests/codec/test_codec_telemetry.py`) and the dev graph page's routes (`tests/codec/test_codec_console.py`) for a known plaintext marker | `seams` |
 
 Every seam has a fake in `kontra.testing`, so each side can be built and tested without the
 other: a seller runs a full lifecycle, timeout and refund included, in a unit test with no
@@ -215,7 +215,8 @@ networks whose other members may reach its other ports:
 | `temporal-db` | temporal, postgres-relay | Temporal's own database connections (the internal frontend does not listen here; a peer that could route Temporal's `control` address through it would still reach it, which takes a capability the relay does not have) |
 | `database` | postgres, postgres-relay, gate, migrate | the gate's and the migrations' database connections |
 | `bucket` | s3, gate | SeaweedFS's S3 port and its unauthenticated master, volume and filer ports |
-| `observability` | prometheus, grafana (the `observability` profile) | Grafana's queries; Grafana's one peer |
+| `observability` | prometheus, grafana (the `observability` profile) | Grafana's queries to Prometheus |
+| `telemetry` | otelcol, loki, tempo, grafana (the `observability` profile) | the collector's writes to Loki and Tempo; Grafana's queries to them |
 
 Two compose profiles add dev tools that production never enables (`kontra dev up --ui`,
 `--observability`; [sellers.md](sellers.md#the-ui-and-the-dashboards)). The `ui` profile puts
@@ -223,8 +224,11 @@ Temporal's UI on `control`: it reads every namespace through the internal fronte
 the point of it locally and why it is published on 127.0.0.1 only. The `observability`
 profile puts Prometheus on `temporal-db`, to scrape the metrics listener Temporal opens there
 when asked (`KONTRA_TEMPORAL_METRICS_ADDR`), held to the relay's terms there (no
-capabilities, not root, no forwarding), and Grafana on `observability` alone. Its third
-service, Prometheus's agent (`prometheus-agent`), is on no network of the stack's: it runs in
+capabilities, not root, no forwarding), and Grafana on `observability` and `telemetry`, with
+forwarding off. The OpenTelemetry Collector (`otelcol`), which takes whatever reaches its
+port published on 127.0.0.1 (what `kontra serve --otlp` exports), shares `telemetry` with
+the two stores it writes, Loki and Tempo, and with Grafana, and no network with Prometheus or
+Temporal. Prometheus's agent (`prometheus-agent`) is on no network of the stack's: it runs in
 the host's network namespace, because a worker's `kontra serve --metrics 127.0.0.1:PORT` is
 on the host's loopback and a container on a bridge network reaches the host only through
 Docker's gateway, which a host firewall may drop (ufw's default does, measured). It scrapes

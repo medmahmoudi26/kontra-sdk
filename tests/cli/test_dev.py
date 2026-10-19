@@ -655,6 +655,9 @@ def test_third_party_images_are_pinned_by_digest() -> None:
         "prometheus",
         "prometheus-agent",
         "grafana",
+        "otelcol",
+        "loki",
+        "tempo",
     ):
         image = raw["services"][name]["image"]
         assert pinned.fullmatch(image), f"{name}: {image}"
@@ -676,24 +679,26 @@ def test_compose_lists_every_host_port_it_reads() -> None:
     listed = raw.pop("x-kontra-dev-settings")
     read = set(re.findall(r"\$\{(KONTRA_DEV_[A-Z0-9_]+)", json.dumps(raw)))
     ports = {name for name in read if name.endswith("_PORT")}
-    assert len(ports) == 8  # the stack's four, the UI, its codec server, Prometheus, Grafana
+    # The stack's four, the UI, its codec server, Prometheus, Grafana, the OTLP collector.
+    assert len(ports) == 9
     assert read - ports == {"KONTRA_DEV_BIND", "KONTRA_DEV_PG_BIND"}
     assert set(listed) == ports
     assert all(value == f"${{{name}:-}}" for name, value in listed.items())
 
 
-_PROFILED = {"ui", "prometheus", "prometheus-agent", "grafana"}
+_PROFILED = {"ui", "prometheus", "prometheus-agent", "grafana", "otelcol", "loki", "tempo"}
 
 
 @needs_compose
-def test_the_profiles_add_four_services_on_loopback_and_nothing_by_default(
+def test_the_profiles_add_their_services_on_loopback_and_nothing_by_default(
     tmp_path: Path,
 ) -> None:
     """`kontra dev up` is today's stack: the profiles' services are absent and Temporal
-    serves no metrics. `--ui --observability` adds exactly four services, three published on
+    serves no metrics. `--ui --observability` adds exactly seven services, four published on
     the host's loopback whatever KONTRA_DEV_BIND says (the UI controls every namespace, and
-    none of the three has an authentication of its own worth the name) and Prometheus's
-    agent, which publishes nothing."""
+    none of the four has an authentication of its own worth the name: the collector takes
+    whatever reaches it into Loki and Tempo) and three that publish nothing: Prometheus's
+    agent, Loki and Tempo, which only the collector writes to and Grafana reads."""
     default = _resolved(tmp_path, KONTRA_DEV_BIND="0.0.0.0")
     assert not _PROFILED & set(default["services"])
     assert default["services"]["temporal"]["environment"]["KONTRA_METRICS_ADDR"] == ""
@@ -705,6 +710,9 @@ def test_the_profiles_add_four_services_on_loopback_and_nothing_by_default(
         "prometheus": ["observability"],
         "prometheus-agent": ["observability"],
         "grafana": ["observability"],
+        "otelcol": ["observability"],
+        "loki": ["observability"],
+        "tempo": ["observability"],
     }
     published = {
         name: [
@@ -718,6 +726,9 @@ def test_the_profiles_add_four_services_on_loopback_and_nothing_by_default(
         "prometheus": [("127.0.0.1", "9090", 9090)],
         "prometheus-agent": [],
         "grafana": [("127.0.0.1", "3000", 3000)],
+        "otelcol": [("127.0.0.1", "4317", 4317)],  # OTLP/gRPC, what `kontra serve --otlp` sends
+        "loki": [],
+        "tempo": [],
     }
     moved = _with_profiles(
         tmp_path,
@@ -725,11 +736,14 @@ def test_the_profiles_add_four_services_on_loopback_and_nothing_by_default(
         KONTRA_DEV_CODEC_PORT="18081",
         KONTRA_DEV_PROMETHEUS_PORT="19090",
         KONTRA_DEV_GRAFANA_PORT="13000",
+        KONTRA_DEV_OTLP_PORT="14317",
         KONTRA_TEMPORAL_METRICS_ADDR="0.0.0.0:8000",
     )["services"]
-    assert [p["published"] for n in ("ui", "prometheus", "grafana") for p in moved[n]["ports"]] == [
-        "18233", "19090", "13000",
+    shown = ("ui", "prometheus", "grafana", "otelcol")
+    assert [p["published"] for n in shown for p in moved[n]["ports"]] == [
+        "18233", "19090", "13000", "14317",
     ]  # fmt: skip
+    assert dev_module._otlp_url({"services": moved}) == "http://127.0.0.1:14317"
     ui = moved["ui"]["environment"]
     # The browser calls the codec server; the UI names it on loopback, for its own origins.
     assert ui["TEMPORAL_CODEC_ENDPOINT"] == "http://127.0.0.1:18081"
@@ -747,7 +761,11 @@ def test_the_profiles_keep_the_stack_s_walls(tmp_path: Path) -> None:
     its way to the internal frontend's bind; Grafana's one peer is Prometheus. Prometheus's
     agent alone is in the host's network namespace, the one way to a worker on the host's
     loopback, and holds nothing but its tmpfs (its configuration comes in its environment).
-    The only host paths are the read-only `configs` of observability/ and docs/dashboards/."""
+    The collector, which takes whatever reaches its published port, shares a network
+    (`telemetry`) with the two stores it writes and with Grafana, which reads them, and with
+    nothing else: not Prometheus, whose other network is Temporal's. Grafana's peers are its
+    three data sources and the collector. The only host paths are the read-only `configs` of
+    observability/ and docs/dashboards/."""
     config = _with_profiles(tmp_path)
     services = config["services"]
     for name in _PROFILED:
@@ -767,6 +785,13 @@ def test_the_profiles_keep_the_stack_s_walls(tmp_path: Path) -> None:
     assert services["prometheus"]["user"] == "65534:65534"
     assert services["prometheus-agent"]["user"] == "65534:65534"
     assert services["grafana"]["user"] == "472"
+    for name in ("otelcol", "loki", "tempo"):  # the images' own unprivileged user, named
+        assert services[name]["user"] == "10001:10001", name
+    # Loki and Tempo keep what they hold on a volume of their own, as Prometheus does.
+    assert {n: [v["source"] for v in services[n].get("volumes", [])] for n in _PROFILED} == {
+        "ui": [], "prometheus": ["prometheus"], "prometheus-agent": [], "grafana": [],
+        "otelcol": [], "loki": ["loki"], "tempo": ["tempo"],
+    }  # fmt: skip
     agent = services["prometheus-agent"]
     assert "--agent" in agent["command"]  # scrapes and forwards: no database, no queries
     assert "--web.listen-address=127.0.0.1:0" in agent["command"]
@@ -779,7 +804,10 @@ def test_the_profiles_keep_the_stack_s_walls(tmp_path: Path) -> None:
         "ui": {"control"},
         "prometheus": {"temporal-db", "observability"},
         "prometheus-agent": set(),  # network_mode: host
-        "grafana": {"observability"},
+        "grafana": {"observability", "telemetry"},
+        "otelcol": {"telemetry"},
+        "loki": {"telemetry"},
+        "tempo": {"telemetry"},
     }
     assert {n for n, nets in networks.items() if "control" in nets} == {"temporal", "gate", "ui"}
     # The control network's dynamic range (.8/29) holds every member but Temporal.
@@ -791,23 +819,31 @@ def test_the_profiles_keep_the_stack_s_walls(tmp_path: Path) -> None:
         svc = services[name]
         assert (svc.get("cap_drop"), svc.get("cap_add")) == (["ALL"], None), name
         assert svc.get("user") not in (None, "", "root", "0", "0:0"), name
-    assert {n for n, nets in networks.items() if nets & networks["grafana"]} == {
-        "grafana",
-        "prometheus",
-    }
-    assert services["prometheus"].get("sysctls") == {"net.ipv4.ip_forward": "0"}
+
+    def peers_of(name: str) -> set[str]:
+        return {n for n, nets in networks.items() if nets & networks[name]}
+
+    assert peers_of("grafana") == {"grafana", "prometheus", "otelcol", "loki", "tempo"}
+    assert peers_of("otelcol") == {"otelcol", "loki", "tempo", "grafana"}
+    assert peers_of("prometheus") == {"prometheus", "grafana", "temporal", "postgres-relay"}
+    for name in ("prometheus", "grafana"):  # on two networks: never a router between them
+        assert services[name].get("sysctls") == {"net.ipv4.ip_forward": "0"}, name
     grafana = services["grafana"]["environment"]
-    assert grafana["GF_AUTH_ANONYMOUS_ORG_ROLE"] == "Viewer"
+    # Explore (the graph page's Logs and Trace links) needs an Editor in Grafana 13; nothing
+    # an Editor could make Grafana send out is on: alerting, external snapshots.
+    assert grafana["GF_AUTH_ANONYMOUS_ORG_ROLE"] == "Editor"
     assert (grafana["GF_AUTH_DISABLE_LOGIN_FORM"], grafana["GF_AUTH_BASIC_ENABLED"]) == (
         "true",
         "false",
     )
+    assert grafana["GF_UNIFIED_ALERTING_ENABLED"] == "false"
+    assert grafana["GF_SNAPSHOTS_EXTERNAL_ENABLED"] == "false"
     mounted = {
         name: {(c["source"], c["target"]) for c in svc.get("configs", [])}
         for name, svc in services.items()
         if svc.get("configs")
     }
-    assert set(mounted) == {"prometheus", "grafana"}
+    assert set(mounted) == {"prometheus", "grafana", "otelcol", "loki", "tempo"}
     for source in config["configs"].values():
         path = Path(source["file"]).resolve()
         assert path.is_file(), path
@@ -839,8 +875,57 @@ def test_prometheus_scrapes_what_the_cli_turns_on() -> None:
     for board in boards_dir.glob("*.json"):
         assert json.loads(board.read_text())["title"]  # vendored as published: valid JSON
     sources = yaml.safe_load((REPO / "observability" / "grafana" / "datasources.yaml").read_text())
-    [source] = sources["datasources"]
-    assert (source["url"], source["isDefault"]) == ("http://prometheus:9090", True)
+    [default] = [s for s in sources["datasources"] if s.get("isDefault")]
+    assert (default["uid"], default["url"]) == ("prometheus", "http://prometheus:9090")
+
+
+def test_the_collector_writes_where_grafana_reads() -> None:
+    """What `kontra serve --otlp` sends reaches the collector's published port, leaves it
+    for Tempo (traces) and Loki's OTLP endpoint (logs), and is read back by Grafana under
+    the uids the graph page's links name; each service reads the file compose mounts."""
+    import yaml
+
+    observability = REPO / "observability"
+    raw = yaml.safe_load(COMPOSE.read_text())
+    services, configs = raw["services"], raw["configs"]
+
+    def mounted(service: str) -> dict[str, Any]:
+        """The service's one configuration file, as the path its command names."""
+        [config] = services[service]["configs"]
+        [flag] = [a for a in services[service]["command"] if a.endswith(config["target"])]
+        assert flag.split("=", 1)[1] == config["target"]
+        return yaml.safe_load((REPO / configs[config["source"]]["file"]).read_text())
+
+    collector, loki, tempo = mounted("otelcol"), mounted("loki"), mounted("tempo")
+    assert collector == yaml.safe_load((observability / "otelcol.yaml").read_text())
+    [port] = services["otelcol"]["ports"]
+    assert port == "127.0.0.1:${KONTRA_DEV_OTLP_PORT:-4317}:4317"
+    assert collector["receivers"]["otlp"]["protocols"] == {"grpc": {"endpoint": "0.0.0.0:4317"}}
+    exporters = collector["exporters"]
+    pipelines = collector["service"]["pipelines"]
+    [traces_out] = pipelines["traces"]["exporters"]
+    [logs_out] = pipelines["logs"]["exporters"]
+    assert pipelines["traces"]["receivers"] == pipelines["logs"]["receivers"] == ["otlp"]
+    receiver = tempo["distributor"]["receivers"]["otlp"]["protocols"]["grpc"]["endpoint"]
+    assert traces_out.startswith("otlp_grpc/")
+    assert exporters[traces_out]["endpoint"] == f"tempo:{receiver.rsplit(':', 1)[1]}"
+    loki_http = f"http://loki:{loki['server']['http_listen_port']}"
+    assert logs_out.startswith("otlp_http/")
+    assert exporters[logs_out]["endpoint"] == f"{loki_http}/otlp"
+    # Record attributes (workflow_id, run_id, ...) become Loki's structured metadata.
+    assert loki["limits_config"]["allow_structured_metadata"] is True
+    sources = yaml.safe_load((observability / "grafana" / "datasources.yaml").read_text())
+    by_uid = {s["uid"]: s for s in sources["datasources"]}
+    assert set(by_uid) == {"prometheus", "loki", "tempo"}
+    assert by_uid["loki"]["type"] == "loki"
+    assert by_uid["loki"]["url"] == loki_http
+    assert by_uid["tempo"]["type"] == "tempo"
+    assert by_uid["tempo"]["url"] == f"http://tempo:{tempo['server']['http_listen_port']}"
+    assert all(s["editable"] is False for s in by_uid.values())
+    # A log line's trace_id leads to its trace, and a span to its trace's lines.
+    [derived] = by_uid["loki"]["jsonData"]["derivedFields"]
+    assert (derived["matcherRegex"], derived["datasourceUid"]) == ("trace_id", "tempo")
+    assert by_uid["tempo"]["jsonData"]["tracesToLogsV2"]["datasourceUid"] == "loki"
 
 
 @needs_compose
@@ -1378,11 +1463,12 @@ def _profiled_world(monkeypatch: pytest.MonkeyPatch) -> tuple[Recorder, list[str
         "ui": {"profiles": ["ui"], "ports": ports(8233)},
         "prometheus": {"profiles": ["observability"], "ports": ports(9090)},
         "grafana": {"profiles": ["observability"], "ports": ports(3000)},
+        "otelcol": {"profiles": ["observability"], "ports": ports(4317)},
     }
     codec: list[str] = []
 
-    def start(home: Path, config: dict[str, Any]) -> str:
-        codec.append("start")
+    def start(home: Path, config: dict[str, Any], *, observability: bool = False) -> str:
+        codec.append("start" + (" with grafana" if observability else ""))
         return "http://127.0.0.1:8081"
 
     def stop(home: Path) -> bool:
@@ -1408,15 +1494,26 @@ def test_dev_up_runs_exactly_the_profiles_it_is_asked_for(
     assert (_after_options(up)[0], _profiles(up)) == ("up", ["ui", "observability"])
     # Temporal's metrics listener, for Prometheus to scrape, in compose's environment.
     assert (rec.envs[1] or {})["KONTRA_TEMPORAL_METRICS_ADDR"] == "0.0.0.0:8000"
-    assert codec == ["start"]
-    for line in (
-        "ui        http://localhost:8233",
-        "prometheus http://localhost:9090",
-        "grafana   http://localhost:3000",
-        "workflows http://localhost:8233/namespaces/carol/workflows",
-        "codec server http://127.0.0.1:8081",
-    ):
-        assert line in both.stdout, line
+    assert codec == ["start with grafana"]
+    home = tmp_path / "home"
+    assert both.stdout.splitlines() == [
+        "kontra dev is up (compose project kontra-dev)",
+        "  gate      http://localhost:8402",
+        "  temporal  ?",
+        "  bucket    ?",
+        "  postgres  localhost:5444",
+        "  ui        http://localhost:8233",
+        "  prometheus http://localhost:9090",
+        "  grafana   http://localhost:3000",
+        "  otlp      http://127.0.0.1:4317  (kontra serve --otlp)",
+        "logged in as carol (namespace carol), play money",
+        f"  profile   {home / 'profile'} (dev)",
+        f"  key       {home / 'key'} (None)",
+        "  workflows http://localhost:8233/namespaces/carol/workflows",
+        "  graph     http://127.0.0.1:8081/graph",
+        "codec server http://127.0.0.1:8081: the UI decodes with this machine's key",
+        "next: kontra init <name> && cd <name> && kontra serve",
+    ]
 
     rec.calls.clear()
     rec.envs.clear()
@@ -1424,21 +1521,26 @@ def test_dev_up_runs_exactly_the_profiles_it_is_asked_for(
     ui = cli("dev", "up", "--ui")
     assert ui.exit_code == 0, ui.output
     [_, rm, up] = rec.calls
-    assert _after_options(rm) == ["rm", "--stop", "--force", "prometheus", "grafana"]
+    assert _after_options(rm) == ["rm", "--stop", "--force", "prometheus", "grafana", "otelcol"]
     assert _profiles(up) == ["ui"]
     assert rec.envs[2] is None  # no metrics listener without Prometheus
-    assert codec == ["start"]
+    assert codec == ["start"]  # the page links no Grafana that is not running
     assert "grafana" not in ui.stdout
+    assert "otlp" not in ui.stdout
+    assert "  graph     http://127.0.0.1:8081/graph" in ui.stdout.splitlines()
 
     rec.calls.clear()
     codec.clear()
     plain = cli("dev", "up")  # today's stack: what the flags started stops
     assert plain.exit_code == 0, plain.output
     [_, rm, up] = rec.calls
-    assert _after_options(rm) == ["rm", "--stop", "--force", "ui", "prometheus", "grafana"]
+    assert _after_options(rm) == [
+        "rm", "--stop", "--force", "ui", "prometheus", "grafana", "otelcol",
+    ]  # fmt: skip
     assert (_after_options(up), _profiles(up)) == (["up", "--detach", "--remove-orphans"], [])
     assert codec == ["stop"]
     assert "codec" not in plain.stdout
+    assert "graph" not in plain.stdout
 
     # A metrics address the environment already names is left as it is.
     rec.calls.clear()

@@ -1,5 +1,8 @@
-# The Prometheus of `kontra dev up --observability`, Grafana's default data source: the
-# server dashboard names none and reads the default.
+# The data sources of `kontra dev up --observability`. Prometheus is the default: the server
+# dashboard names none and reads the default. Loki (logs) and Tempo (traces) hold what
+# `kontra serve --otlp` exports, through the collector; their uids are what the graph page's
+# Logs and Trace links name. A log line's trace_id (structured metadata) links to its trace
+# in Tempo, and a span to its trace's log lines in Loki.
 apiVersion: 1
 
 datasources:
@@ -10,3 +13,32 @@ datasources:
     url: http://prometheus:9090
     isDefault: true
     editable: false
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      derivedFields:
+        - name: trace_id
+          matcherType: label
+          matcherRegex: trace_id
+          datasourceUid: tempo
+          # $$ is a literal $ here: Grafana expands environment variables in this file.
+          url: "$${__value.raw}"
+          urlDisplayLabel: Trace
+
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-1m"
+        spanEndTimeShift: "1m"
+        filterByTraceID: true

@@ -1,0 +1,30 @@
+# The Tempo of `kontra dev up --observability` (compose.yaml): every component in one process
+# (target: all), its blocks and write-ahead log on its volume (/var/tempo), no
+# authentication. The collector forwards the spans `kontra serve --otlp` exports to its OTLP
+# gRPC receiver; Grafana finds a trace by id on its HTTP port. Traces are kept 14 days
+# (Tempo's default block_retention). Tempo 3 needs no Kafka in this mode; its backend worker
+# logs "no jobs found" every 15 s while there is nothing to compact, which is harmless.
+target: all
+
+server:
+  http_listen_port: 3200
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+
+# Nothing sent to Grafana Labs.
+usage_report:
+  reporting_enabled: false

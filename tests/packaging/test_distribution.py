@@ -64,6 +64,9 @@ def test_the_wheel_has_what_kontra_dev_and_the_contract_read(dist: Path) -> None
         "kontra/_dev/observability/prometheus.yml",
         "kontra/_dev/observability/grafana/datasources.yaml",
         "kontra/_dev/observability/grafana/dashboards.yaml",
+        "kontra/_dev/observability/otelcol.yaml",
+        "kontra/_dev/observability/loki.yaml",
+        "kontra/_dev/observability/tempo.yaml",
         "kontra/_dev/docs/dashboards/temporal-core-sdks-otel.json",
         "kontra/_dev/docs/dashboards/server-general.json",
         "kontra/_dev/docs/dashboards/LICENSE",
@@ -71,6 +74,7 @@ def test_the_wheel_has_what_kontra_dev_and_the_contract_read(dist: Path) -> None
         "kontra/_spec/x-kontra.v1.json",  # read-only, for the jobs hired under it
         "kontra/_spec/kontra-types.v1.json",
         "kontra/templates/offering/worker.py.tmpl",
+        "kontra/cli/_console.html",  # kontra dev's graph page, which the codec server serves
         "kontra/testing/fake_gate.py",
         # What the platform gate imports, never copies (decisions I24, I25).
         "kontra/_passkeys.py",

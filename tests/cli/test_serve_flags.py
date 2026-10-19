@@ -1,11 +1,14 @@
 """``kontra serve --metrics IP:PORT`` and ``--otlp URL``: off unless asked, handed to the
-worker as the ``runtime`` and client ``interceptors`` of its connection, refused with one
-line when they cannot be honoured. What they carry is seam ⑤'s
-(``tests/codec/test_codec_telemetry.py``)."""
+worker as the ``runtime`` and client ``interceptors`` of its connection (and, for
+``--otlp``, a log handler on the root logger while it runs), refused with one line when they
+cannot be honoured. What the metrics and spans carry is seam ⑤'s
+(``tests/codec/test_codec_telemetry.py``); the logs' attributes are
+``tests/serve/test_logs.py``'s."""
 
 from __future__ import annotations
 
 import contextlib
+import logging
 import socket
 import sys
 from collections.abc import Generator
@@ -18,6 +21,7 @@ from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.runtime import Runtime
 
 import kontra.cli._seller as seller_module
+from kontra.serve._logs import OtlpHandler
 from kontra.serve.telemetry import EXTRA
 
 from .support import Cli
@@ -30,9 +34,12 @@ class FakeWorker:
         self.metrics_url = metrics_url
         self.runs: list[dict[str, Any]] = []
         self.served: bytes | None = None
+        #: The root logger's handlers while it ran.
+        self.handlers: list[logging.Handler] = []
 
     def run(self, **kwargs: Any) -> None:
         self.runs.append(kwargs)
+        self.handlers = list(logging.getLogger().handlers)
         if self.metrics_url is not None:
             with httpx.Client(trust_env=False) as http:
                 self.served = http.get(self.metrics_url, timeout=10).content
@@ -58,6 +65,7 @@ def test_off_unless_asked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     result = Cli(tmp_path)("serve")
     assert result.exit_code == 0, result.output
     assert worker.runs == [{"runtime": None, "interceptors": []}]
+    assert not [h for h in worker.handlers if isinstance(h, OtlpHandler)]
 
 
 def test_metrics_and_otlp_reach_the_connection(
@@ -75,6 +83,10 @@ def test_metrics_and_otlp_reach_the_connection(
     [interceptor] = run["interceptors"]
     assert isinstance(interceptor, TracingInterceptor)
     assert worker.served is not None  # the endpoint answered while the worker ran
+    # The worker's logs went to the collector while it ran, and stop going when it stops.
+    [handler] = [h for h in worker.handlers if isinstance(h, OtlpHandler)]
+    assert handler.level == logging.INFO
+    assert handler not in logging.getLogger().handlers
 
 
 def test_what_cannot_be_honoured_is_one_line(
@@ -110,3 +122,11 @@ def test_otlp_without_the_extra_names_it(tmp_path: Path, monkeypatch: pytest.Mon
     assert result.exit_code == 1
     assert f"pip install 'kontra-sdk[{EXTRA}]'" in result.stderr
     assert worker.runs == []
+    # The log exporter is the same package: missing alone, it is named the same way.
+    monkeypatch.delitem(sys.modules, "opentelemetry.exporter.otlp.proto.grpc.trace_exporter")
+    monkeypatch.setitem(sys.modules, "opentelemetry.exporter.otlp.proto.grpc._log_exporter", None)
+    result = Cli(tmp_path)("serve", "--otlp", "http://127.0.0.1:4317")
+    assert result.exit_code == 1
+    assert f"pip install 'kontra-sdk[{EXTRA}]'" in result.stderr
+    assert worker.runs == []
+    assert not [h for h in logging.getLogger().handlers if isinstance(h, OtlpHandler)]

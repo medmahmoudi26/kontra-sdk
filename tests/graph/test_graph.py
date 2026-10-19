@@ -569,7 +569,7 @@ def test_a_node_has_every_key_whatever_its_kind() -> None:
         for n in graph(name)["nodes"]:
             assert set(n) == keys, (name, n["id"])
             assert set(n["ref"]) == ref | {"timer_id"}
-            assert set(n["t"]) == {"scheduled", "started", "closed"}
+            assert set(n["t"]) == {"scheduled", "started", "closed", "last_failed"}
             assert n["status"] is not None
 
 
@@ -626,7 +626,13 @@ def test_pending_activities_paint_what_history_cannot_tell() -> None:
             "timeout_type": "start_to_close",
             "retry_state": None,
         }
+        # When the attempt before ended: a step backing off has waited since then, not
+        # since it was first scheduled (history's time) nor since the next attempt's.
+        assert audit["t"]["last_failed"] == "2026-10-18T09:00:30.150000000Z"
+        assert audit["t"]["scheduled"] == node(bare, "audit")["t"]["scheduled"]
+        assert enrich["t"]["last_failed"] == "2026-10-18T09:00:05.250000000Z"
         assert node(g, "fetch_batch") == node(bare, "fetch_batch")  # closed: not pending
+    assert node(bare, "audit")["t"]["last_failed"] is None
     with pytest.raises(ValueError, match="pending"):
         graph("pending", pending=3)
 
@@ -881,6 +887,7 @@ def test_a_loop_node_describes_its_latest_iteration() -> None:
         "scheduled": times[last],
         "started": times[last + 1],
         "closed": times[last + 2],
+        "last_failed": None,
     }
     assert a["span"] == {"from": times[first], "to": times[last + 2]}
     assert node(links(g, CFG), "a")["links"]["temporal"].endswith(f"/history/events/{last}")
@@ -1433,12 +1440,50 @@ async def test_with_io_decodes_through_the_codec() -> None:
     }
 
 
+async def test_with_io_reads_a_retrying_activity_s_last_failure_from_pending() -> None:
+    """History writes an activity's Started event, and its last failure, only once it
+    closes: while it retries, the failure is in ``DescribeWorkflowExecution`` alone."""
+    history, describe = fixture("pending"), fixture("pending_describe")
+    g = parse(history, pending=describe)
+    io = await with_io(g, history, SealCodec(), pending=describe)
+    assert node(io, "enrich")["io"]["failure"] == {"message": "upstream 503", "stack_trace": None}
+    assert node(io, "audit")["io"]["failure"] == {"message": "Encoded failure", "stack_trace": None}
+    assert node(io, "fetch_batch")["io"]["failure"] is None  # closed, and never failed
+    without = await with_io(g, history, SealCodec())
+    assert node(without, "enrich")["io"]["failure"] is None
+    # Only an open activity's: a closed one's failure is history's.
+    closed = fixture("retry")
+    io = await with_io(parse(closed), closed, SealCodec(), pending=describe)
+    assert node(io, "fetch_batch")["io"]["failure"]["message"] == "rate limited (attempt 2)"
+    with pytest.raises(ValueError, match="pending"):
+        await with_io(g, history, SealCodec(), pending=3)  # pyright: ignore[reportArgumentType]
+
+
 async def test_a_payload_the_codec_cannot_open_is_undecodable_alone() -> None:
     history = fixture("undecodable")
     g = parse(history)
     io = node(await with_io(g, history, SealCodec()), "fetch_batch")["io"]
     assert io == {"input": {"error": "undecodable"}, "result": {"rows": 3}, "failure": None}
     assert "bm90IHNlYWxlZA" not in json.dumps(io)  # base64 of what it could not open
+
+
+class PlaceholderCodec(SealCodec):
+    """Shows what it cannot open as ``{"encrypted": true}``, as the graph page's does."""
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return [
+            Payload(metadata={"encoding": b"json/plain"}, data=b'{"encrypted":true}')
+            for _ in payloads
+        ]
+
+
+async def test_a_failure_the_codec_shows_a_placeholder_for_is_that_placeholder() -> None:
+    """Encoded failure attributes that decode to something other than a message and a
+    stack trace are shown as they decoded, not as a failure without a message."""
+    history = fixture("retry")
+    fetch = node(await with_io(parse(history), history, PlaceholderCodec()), "fetch_batch")
+    assert fetch["io"]["failure"] == {"encrypted": True}
+    assert fetch["io"]["input"] == [{"encrypted": True}]
 
 
 class MiscountingCodec(SealCodec):
@@ -1531,6 +1576,23 @@ def test_union_keeps_structure_only() -> None:
     }
 
 
+def test_merge_never_groups_an_untaken_branch_with_a_step_of_the_run() -> None:
+    """The run's groups are its positions, the static graph's union's: ``approve`` (the
+    run's) and ``reject`` (static only) number alike, and would be drawn as one fan-out."""
+    static = union([graph("branch_approve"), graph("branch_reject")])
+    live = parse(fixture("branch_approve"))
+    painted = merge(static, live)
+    groups = {n["id"]: n["group"] for n in painted["nodes"]}
+    live_groups = {n["id"]: n["group"] for n in live["nodes"]}
+    assert {i: groups[i] for i in live_groups} == live_groups  # the run's, as they were
+    assert groups["reject"] > max(live_groups.values())
+    assert len(set(groups.values())) == len(groups)
+    # Static-only nodes that shared a group still do.
+    two = {"nodes": [{"id": "x", "group": 0}, {"id": "y", "group": 0}], "edges": []}
+    shared = merge(two, {"nodes": [{"id": "a", "group": 3}], "edges": []})
+    assert [n["group"] for n in shared["nodes"]] == [4, 4, 3]
+
+
 def test_union_groups_only_what_some_run_commanded_together() -> None:
     """A run's group is a position in that run: an ``if``'s two branches, taken at the same
     point by two runs, number alike there, and would read as one fan-out in the union. There
@@ -1569,6 +1631,49 @@ def test_union_and_merge_leave_their_inputs_alone() -> None:
     assert (a, b) == before
     assert edges(static) == edges(union([b, a]))
     assert ids(static) == ["check", "approve", "ship", "reject"]  # in the order first seen
+
+
+def test_merge_paints_an_unnamed_batch_on_the_static_batch_after_the_same_steps() -> None:
+    """A batch is named from its child's history, which names nothing until the child
+    schedules an activity (or ever, for an encrypted batch over no items): the live
+    ``kontra.batch.v1`` is the static graph's one batch after the same steps, not a second
+    node beside it."""
+    static = union([graph("child", children={BATCH_ID: fixture("child_batch")})])
+    name = "kontra.batch.v1[enrich,fetch_page]"
+    events = fixture("child")["events"]
+    started = next(
+        i
+        for i, e in enumerate(events)
+        if e["eventType"].endswith("CHILD_WORKFLOW_EXECUTION_STARTED")
+    )
+    for live in (parse(events[: started + 1]), graph("child")):
+        assert "kontra.batch.v1" in ids(live)
+        painted = merge(static, live)
+        assert ids(painted) == ids(static)
+        batch, unnamed = node(painted, name), node(live, "kontra.batch.v1")
+        assert batch["reached"] is True
+        assert (batch["name"], batch["label"]) == (
+            name,
+            "execute_activities_in_parallel(enrich,fetch_page)",
+        )
+        assert (batch["status"], batch["ref"]) == (unnamed["status"], unnamed["ref"])
+        reached = {(e["from"], e["to"]): e["reached"] for e in painted["edges"]}
+        assert reached[("fetch_batch", name)] is True
+    assert node(merge(static, parse(events[: started + 1])), name)["status"] == "running"
+    live = graph("child")
+    assert live == graph("child")  # its input left alone
+
+    # Two static batches after those steps, or none: which one it is cannot be told.
+    two = copy.deepcopy(static)
+    two["nodes"].append({**node(static, name), "id": "kontra.batch.v1[other]"})
+    two["edges"].append({"from": "fetch_batch", "to": "kontra.batch.v1[other]"})
+    elsewhere = copy.deepcopy(static)
+    for e in elsewhere["edges"]:
+        if e["to"] == name:
+            e["from"] = START
+    for kept in (merge(two, live), merge(elsewhere, live)):
+        assert node(kept, "kontra.batch.v1")["reached"] is True
+        assert node(kept, name)["reached"] is False
 
 
 def test_merge_keeps_a_live_node_the_static_graph_lacks() -> None:
