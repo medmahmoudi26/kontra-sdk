@@ -678,17 +678,21 @@ def pending_describe() -> dict[str, Any]:
                 "lastStartedTime": "2026-10-18T09:00:07.500000000Z",
                 "lastFailure": failure(encoded=payload({"message": "upstream 503"})),
                 "lastWorkerIdentity": "4242@worker-a",
+                "lastAttemptCompleteTime": "2026-10-18T09:00:05.250000000Z",
             },
             {
                 "activityId": "3",
                 "activityType": {"name": "audit"},
                 "state": "PENDING_ACTIVITY_STATE_SCHEDULED",
                 "attempt": 2,
-                "scheduledTime": "2026-10-18T09:00:00.150000000Z",
+                # In backoff, the next attempt's: neither the first schedule nor the failure.
+                "scheduledTime": "2026-10-18T09:01:00.150000000Z",
                 "lastFailure": failure(
                     info="timeoutFailureInfo",
                     info_value={"timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"},
                 ),
+                "lastAttemptCompleteTime": "2026-10-18T09:00:30.150000000Z",
+                "nextAttemptScheduleTime": "2026-10-18T09:01:00.150000000Z",
             },
             {
                 "activityId": "99",

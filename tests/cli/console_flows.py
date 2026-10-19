@@ -59,3 +59,30 @@ class WaitFlow:
     async def run(self, text: str) -> str:
         await workflow.sleep(timedelta(minutes=1))
         return text
+
+
+#: How long :func:`fails_once` backs off after its first attempt: a test reads the step
+#: while it waits, then terminates the run.
+BACKOFF = timedelta(minutes=1)
+
+
+@activity.defn
+async def fails_once(text: str) -> str:
+    """Fails its first attempt with ``text`` in the message; the second returns it."""
+    if activity.info().attempt == 1:
+        raise ApplicationError(f"attempt 1 failed on {text}")
+    return text
+
+
+@workflow.defn
+class BackoffFlow:
+    """:func:`fails_once`, retried after :data:`BACKOFF`."""
+
+    @workflow.run
+    async def run(self, text: str) -> str:
+        return await workflow.execute_activity(
+            fails_once,
+            text,
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(initial_interval=BACKOFF),
+        )

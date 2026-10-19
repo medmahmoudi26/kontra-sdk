@@ -74,8 +74,8 @@ updates:
       prefix: deps(image)
 
   # compose.yaml pins Postgres (twice: postgres and postgres-relay), SeaweedFS and the dev
-  # profiles' Temporal UI, Prometheus and Grafana by digest; without this entry those digests
-  # would never move, security fixes included.
+  # profiles' Temporal UI, Prometheus, Grafana, OpenTelemetry Collector, Loki and Tempo by
+  # digest; without this entry those digests would never move, security fixes included.
   - package-ecosystem: docker-compose
     directory: /
     target-branch: dev

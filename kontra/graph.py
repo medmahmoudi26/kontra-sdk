@@ -457,6 +457,9 @@ class _Occurrence:
     failure: dict[str, Any] | None = None
     #: The run's terminal event, for one still open when the run closed (no close of its own).
     ended: _Event | None = None
+    #: When an open activity's latest attempt failed (``DescribeWorkflowExecution`` alone
+    #: says; history writes nothing per attempt).
+    last_failed: str | None = None
 
 
 def _task(event: _Event) -> tuple[str, str]:
@@ -670,12 +673,13 @@ def _batch_names(children: object) -> dict[str, str]:
     return names
 
 
-def _overlay(occurrences: Sequence[_Occurrence], pending: object) -> None:
-    """What ``DescribeWorkflowExecution`` says of the activities still open (history has
-    nothing of an attempt until it closes): running, the attempt, the last failure's kind.
-    ``pending`` is its ``pendingActivities``, or the whole answer."""
+def _pending(
+    occurrences: Sequence[_Occurrence], pending: object
+) -> list[tuple[_Occurrence, Mapping[str, object]]]:
+    """Each open activity's entry in ``DescribeWorkflowExecution``'s ``pendingActivities``
+    (``pending`` is that list, or the whole answer), matched by activity id."""
     if pending is None:
-        return
+        return []
     entries = _at(pending, "pendingActivities") if _map(pending) is not None else pending
     if not isinstance(entries, list | tuple) and entries is not None:
         raise ValueError(
@@ -686,11 +690,21 @@ def _overlay(occurrences: Sequence[_Occurrence], pending: object) -> None:
         for o in occurrences
         if o.kind == "activity" and o.close is None and o.ref["activity_id"] is not None
     }
+    found: list[tuple[_Occurrence, Mapping[str, object]]] = []
     for entry in _seq(entries):
         info = _map(entry)
         occ = open_activities.get(_str(info.get("activityId"))) if info is not None else None
-        if info is None or occ is None:
-            continue
+        if info is not None and occ is not None:
+            found.append((occ, info))
+    return found
+
+
+def _overlay(occurrences: Sequence[_Occurrence], pending: object) -> None:
+    """What ``DescribeWorkflowExecution`` says of the activities still open (history has
+    nothing of an attempt until it closes): running, the attempt, the last failure's kind
+    and when that attempt ended. ``pending`` is its ``pendingActivities``, or the whole
+    answer."""
+    for occ, info in _pending(occurrences, pending):
         if _enum(info.get("state"), "PENDING_ACTIVITY_STATE_") in ("started", "cancel_requested"):
             occ.status = "running"
             occ.started = occ.started or _time(info.get("lastStartedTime"))
@@ -700,6 +714,8 @@ def _overlay(occurrences: Sequence[_Occurrence], pending: object) -> None:
         failure = _failure(info.get("lastFailure"))
         if failure is not None:
             occ.failure = failure
+            # An open activity's completed attempt is a failed one: success closes it.
+            occ.last_failed = _time(info.get("lastAttemptCompleteTime"))
 
 
 # --------------------------------------------------------------------------- folding
@@ -973,7 +989,12 @@ def _node(
         "parallel": max(Counter(k for k, _ in members).values()),
         "attempt": max(attempts) if attempts else None,
         "counts": dict(sorted(Counter(o.status for o in occurrences).items())),
-        "t": {"scheduled": latest.event.time, "started": latest.started, "closed": latest.closed},
+        "t": {
+            "scheduled": latest.event.time,
+            "started": latest.started,
+            "closed": latest.closed,
+            "last_failed": latest.last_failed,
+        },
         "span": {
             "from": first.event.time,
             "to": None if is_open or last_close is None else last_close.closed,
@@ -1099,6 +1120,39 @@ def union(graphs: Iterable[Graph]) -> Graph:
     }
 
 
+def _predecessors(graph: Graph) -> dict[Any, set[Any]]:
+    found: dict[Any, set[Any]] = {}
+    for e in graph.get("edges") or []:
+        found.setdefault(e.get("to"), set()).add(e.get("from"))
+    return found
+
+
+def _named_batches(static: Graph, live: Graph) -> dict[Any, dict[str, Any]]:
+    """Each unnamed batch node of ``live`` (``kontra.batch.v1``: its child scheduled
+    nothing yet, and its input is encrypted) and the one named batch node of ``static``
+    it is: the only one the run has not reached whose predecessors include all of its,
+    claimed by no other. None found, or two, leaves it as it is."""
+    live_ids = {n.get("id") for n in live.get("nodes") or []}
+    live_before, static_before = _predecessors(live), _predecessors(static)
+    candidates = [
+        n
+        for n in static.get("nodes") or []
+        if n.get("kind") == "child"
+        and str(n.get("name")).startswith(f"{_BATCH_WORKFLOW}[")
+        and n.get("id") not in live_ids
+    ]
+    claims: dict[Any, list[Any]] = {}
+    for node in live.get("nodes") or []:
+        before = live_before.get(node.get("id"))
+        if node.get("kind") != "child" or node.get("name") != _BATCH_WORKFLOW or not before:
+            continue
+        found = [c for c in candidates if before <= static_before.get(c.get("id"), set())]
+        if len(found) == 1:
+            claims.setdefault(found[0].get("id"), []).append(node.get("id"))
+    by_id = {c.get("id"): c for c in candidates}
+    return {ids[0]: by_id[claimed] for claimed, ids in claims.items() if len(ids) == 1}
+
+
 def merge(static: Graph, live: Graph) -> Graph:
     """``live`` painted on ``static``: every node of both, a live one in place of the
     static one with ``reached: true``, a static-only one (a branch this run did not take,
@@ -1108,7 +1162,20 @@ def merge(static: Graph, live: Graph) -> Graph:
     The live run's groups are its positions and the static graph's are :func:`union`'s,
     two numberings: a static-only node's group is moved past every live one, so it never
     shares a group with a step of the run (an ``if``'s untaken branch drawn as one fan-out
-    with the taken one); static-only nodes that shared a group still do."""
+    with the taken one); static-only nodes that shared a group still do.
+
+    A batch is named from its child's history, which names nothing until the child
+    schedules an activity: an unnamed live batch is painted on the one static batch after
+    the same steps (its id, name and label), not drawn beside it."""
+    named = _named_batches(static, live)
+    if named:
+        live = copy.deepcopy(live)
+        for node in live.get("nodes") or []:
+            if (found := named.get(node.get("id"))) is not None:
+                node.update({k: found.get(k) for k in ("id", "name", "label")})
+        renamed = {old: found.get("id") for old, found in named.items()}
+        for e in live.get("edges") or []:
+            e["from"], e["to"] = renamed.get(e["from"], e["from"]), renamed.get(e["to"], e["to"])
     live_nodes = {n.get("id"): n for n in live.get("nodes") or []}
     live_groups = [g for n in live_nodes.values() if isinstance(g := n.get("group"), int)]
     past = max(live_groups, default=-1) + 1
@@ -1466,7 +1533,9 @@ class _Decoder:
             return {"message": failure.get("message"), "stack_trace": failure.get("stack_trace")}
         return {"message": failure.get("message"), "stack_trace": failure.get("stackTrace")}
 
-    async def occurrence(self, occ: _Occurrence) -> dict[str, Any]:
+    async def occurrence(self, occ: _Occurrence, pending: object = None) -> dict[str, Any]:
+        """``pending``: the open activity's last failure, as ``DescribeWorkflowExecution``
+        holds it (history has it only once the activity closes)."""
         command = occ.event.attrs
         close = occ.close.attrs if occ.close else {}
         if occ.kind == "local_activity":
@@ -1480,6 +1549,8 @@ class _Decoder:
         failure = close.get("failure")
         if failure is None and occ.start is not None:
             failure = occ.start.attrs.get("lastFailure")
+        if failure is None and occ.close is None:
+            failure = pending
         completed = occ.close is not None and occ.status == "completed"
         return {
             "input": await self.payloads(command.get("input"), single=single),
@@ -1506,9 +1577,17 @@ def _first(values: object) -> object:
     return values
 
 
-async def with_io(graph: Graph, history: HistoryJSON, codec: PayloadCodec) -> Graph:
+async def with_io(
+    graph: Graph,
+    history: HistoryJSON,
+    codec: PayloadCodec,
+    *,
+    pending: Mapping[str, Any] | Sequence[Any] | None = None,
+) -> Graph:
     """``graph`` (parsed from ``history``) with ``io`` -- ``{"input", "result", "failure"}``
     -- on its workflow and on each node's latest occurrence, decoded through ``codec``.
+    ``pending`` is what :func:`parse` took: an activity retrying has its last failure there
+    alone until it closes.
 
     A separate step on purpose (seam ⑤): :func:`parse` emits no payload, encrypted or
     not, so only a caller holding the codec sees one. Values come out as Temporal's
@@ -1523,10 +1602,15 @@ async def with_io(graph: Graph, history: HistoryJSON, codec: PayloadCodec) -> Gr
     decoder = _Decoder(codec)
     run = _read(_events(history), {})
     by_event = {occ.event.id: occ for occ in run.occurrences}
+    last_failure = {
+        occ.event.id: info.get("lastFailure") for occ, info in _pending(run.occurrences, pending)
+    }
     out = copy.deepcopy(graph)
     for node in out.get("nodes") or []:
         occ = by_event.get(_int(_at(node.get("ref"), "event_id")) or 0)
-        node["io"] = await decoder.occurrence(occ) if occ else dict(_NO_IO)
+        node["io"] = (
+            await decoder.occurrence(occ, last_failure.get(occ.event.id)) if occ else dict(_NO_IO)
+        )
     if isinstance(out.get("workflow"), dict):
         out["workflow"]["io"] = await decoder.workflow(run)
     return out

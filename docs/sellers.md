@@ -797,8 +797,9 @@ one parallel group, an `execute_activities_in_parallel` batch is one double-bord
 timer is rounded, and a step this run did not take (or has not reached yet) is dashed and
 muted. While the run is open the page repaints by itself: the codec server asks Temporal
 about once a second whether the run changed, its running activities and their attempts
-included, so a retry shows while it runs rather than once history records it, and the page
-stops once the run has closed. Click a step (or focus it and press Enter) for its attempts,
+included, so a retry shows while it runs rather than once history records it (a step
+waiting for its next attempt says how long it has been backing off since the last one failed,
+and its pane shows that failure's message), and the page stops once the run has closed. Click a step (or focus it and press Enter) for its attempts,
 timing, task queue and failure, its input, result and failure message decoded with this
 machine's key, and its links:
 

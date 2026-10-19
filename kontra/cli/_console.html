@@ -24,6 +24,7 @@
   --ground:#0f1312;--panel:#161b19;--ink:#e0e6e2;--mute:#8c9791;--line:#28302c;--edge:#5d6862;--ghost:#47524c;
   --accent:#7da3ff;--ok:#4cb874;--run:#64a6ff;--wait:#d9a441;--bad:#f06b57;--group:rgba(125,163,255,.08);
   --code:#111614;--shadow:none;color-scheme:dark}
+[hidden]{display:none !important}
 html,body{height:100%}
 body{margin:0;background:var(--ground);color:var(--ink);font:14px/1.45 var(--sans)}
 .wrap{display:flex;flex-direction:column;gap:12px;min-height:100%;box-sizing:border-box;
@@ -217,7 +218,24 @@ function title(n) {
   if (isBatch(n)) { const m = /^execute_activities_in_parallel\((.*)\)$/.exec(n.label); return m ? m[1] : "parallel batch"; }
   return n.label || n.name || n.id;
 }
-function fit(text, px) { const max = Math.max(4, Math.floor(px / 7.6)); return text.length > max ? text.slice(0, max - 1) + "…" : text; }
+// Text cut to fit px, measured in the font it is drawn in (a node's name, mono; its meta line, sans).
+let pen = null;
+function font(kind) {
+  const css = getComputedStyle(document.documentElement);
+  return kind === "name" ? `600 12.5px ${css.getPropertyValue("--mono").trim()}` : `11px ${css.getPropertyValue("--sans").trim()}`;
+}
+function width(text, face) {
+  pen ||= document.createElement("canvas").getContext("2d");
+  if (!pen) return text.length * 7.6;
+  pen.font = face;
+  return pen.measureText(text).width;
+}
+function fit(text, px, face) {
+  if (width(text, face) <= px) return text;
+  let lo = 1, hi = text.length - 1; // the longest start that fits with its ellipsis
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (width(text.slice(0, mid) + "…", face) <= px) lo = mid; else hi = mid - 1; }
+  return text.slice(0, lo) + "…";
+}
 
 // ------------------------------------------------------------------ state
 let G = null, selected = null, closeStream = null, ioCache = new Map(), running = false;
@@ -369,7 +387,7 @@ function draw(g) {
       sv("circle", { r: R }), sv("text", { "text-anchor": "middle", y: 3.5 }, id)));
   }
   // nodes
-  const now = api.now();
+  const now = api.now(), faces = { name: font("name"), meta: font("meta") };
   for (const [id, n] of L.byId) {
     if (!L.pos.has(id)) continue;
     const p = L.pos.get(id), st = stateOf(n);
@@ -390,8 +408,8 @@ function draw(g) {
     if (n.kind === "child") g1.append(sv("rect", { class: "inner", x: -W / 2 + 4, y: -H / 2 + 4, width: W - 8, height: H - 8, rx: 4 }));
     if (n.kind !== "timer") g1.append(sv("rect", { class: "stripe", x: -W / 2 + (n.kind === "child" ? 7 : 4), y: -H / 2 + 9, width: 3.5, height: H - 18, rx: 1.75 }));
     const tx = -W / 2 + (n.kind === "timer" ? 20 : 16);
-    g1.append(sv("text", { class: "name", x: tx, y: -3 }, fit(label, W - (tx + W / 2) - 12)));
-    g1.append(sv("text", { class: "meta", x: tx, y: 14 }, fit(meta, W - (tx + W / 2) - 6)));
+    g1.append(sv("text", { class: "name", x: tx, y: -3 }, fit(label, W - (tx + W / 2) - 12, faces.name)));
+    g1.append(sv("text", { class: "meta", x: tx, y: 14 }, fit(meta, W - (tx + W / 2) - 6, faces.meta)));
     // badges: retries, fan-out width, iterations
     const badges = [];
     if (n.attempt > 1) badges.push([`×${n.attempt}`, st === "failed" || st === "timed_out" ? "bad" : "wait"]);
@@ -423,9 +441,10 @@ function metaLine(n, st, now) {
   const t = n.t || {};
   const kind = isBatch(n) ? "batch · " : n.kind === "child" ? "child · " : "";
   if (st === "running" || st === "scheduled") {
-    const since = ms(t.started) ?? ms(t.scheduled);
-    const d = dur(since, now);
-    return `${kind}${st === "scheduled" && n.attempt > 1 ? "backing off" : st}${d ? ` ${d}` : ""}`;
+    // Backing off: since the attempt that failed ended, not since the step was first scheduled.
+    const backoff = st === "scheduled" && n.attempt > 1;
+    const d = dur(backoff ? ms(t.last_failed) : ms(t.started) ?? ms(t.scheduled), now);
+    return `${kind}${backoff ? "backing off" : st}${d ? ` ${d}` : ""}`;
   }
   // The stripe already says completed: the line is its duration; anything else names itself.
   const d = dur(ms(t.scheduled), ms(t.closed));
@@ -472,6 +491,7 @@ function pane() {
   fact("Duration", closed != null ? dur(start, closed) : start != null && (st === "running" || st === "scheduled") ? `${dur(start, api.now())} so far` : null);
   fact("Scheduled", t.scheduled ? clock(t.scheduled) : null);
   fact("Started", t.started ? clock(t.started) : null);
+  fact("Last attempt failed", t.last_failed ? clock(t.last_failed) : null);
   fact("Closed", t.closed ? clock(t.closed) : null);
   fact("Task queue", ref.task_queue);
   fact("Activity id", ref.activity_id);
@@ -494,7 +514,7 @@ function pane() {
   const links = linkRow(n.links, [["temporal", n.kind === "child" ? "Child run in Temporal UI" : "Event in Temporal UI"], ["logs", "Logs"], ["trace", "Trace"]]);
   if (links) parts.push(links);
   const failSlot = el("div"), ioSlot = el("div", { class: "stack" });
-  if (n.failure) failSlot.append(failureBox(n, null));
+  if (n.failure) failSlot.append(failureBox(n, undefined));
   parts.push(failSlot, ioSlot);
   box.replaceChildren(...parts);
   // Input, result and failure text come decoded from the dev codec server, for this step only.
@@ -520,7 +540,8 @@ function failureBox(n, decoded) {
   else if (decoded && decoded.message) {
     box.append(el("p", {}, decoded.message));
     if (decoded.stack_trace) box.append(el("details", {}, el("summary", {}, "Stack trace"), el("pre", {}, decoded.stack_trace)));
-  } else box.append(el("p", { class: "muted" }, decoded === null ? "Decoding the message…" : "No message."));
+  } else box.append(el("p", { class: "muted" }, decoded === undefined ? "Decoding the message…"
+    : decoded === null && (n.status === "running" || n.status === "scheduled") ? "The message is not available yet." : "No message."));
   if (f.retry_state) box.append(el("p", { class: "muted" }, `Retry state: ${f.retry_state.replace(/_/g, " ")}`));
   return box;
 }

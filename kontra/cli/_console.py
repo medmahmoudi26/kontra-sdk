@@ -52,7 +52,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from importlib import resources
@@ -212,6 +212,9 @@ class _Snapshot:
     #: An open batch child not named yet: it is named from its own history, which grows
     #: while the run's does not (see :meth:`Console.stream`).
     unnamed: bool
+    #: ``DescribeWorkflowExecution``'s pending activities: a retrying activity's last
+    #: failure is there alone until it closes.
+    pending: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
 
 
 def _unnamed_batch(live: graph.Graph) -> bool:
@@ -479,6 +482,7 @@ class Console:
             key=_change_key(desc),
             closed=not _is_open(desc),
             unnamed=_unnamed_batch(live),
+            pending=pending,
         )
 
     async def _changed(
@@ -520,7 +524,9 @@ class Console:
             asked = {**snap.graph, "nodes": nodes, "workflow": None}
         else:
             asked = {**snap.graph, "nodes": []}
-        out = await graph.with_io(asked, snap.history, _Shown(self._codec()))
+        out = await graph.with_io(
+            asked, snap.history, _Shown(self._codec()), pending={"pendingActivities": snap.pending}
+        )
         return dict(out["nodes"][0]["io"] if node else out["workflow"]["io"])
 
     # ------------------------------------------------------------------ the routes

@@ -1155,7 +1155,11 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
   retry, and an activity's Started event (its attempt, its last failure) only when the activity
   closes, so history alone cannot show one running or retrying. `parse(pending=)` takes the
   answer's `pendingActivities`: an open activity whose state is started or cancel-requested is
-  `running`, with the attempt and the last failure's kind.
+  `running`, with the attempt, the last failure's kind and, in `t.last_failed`, when that
+  attempt ended (`lastAttemptCompleteTime`; the pending `scheduledTime` is the next attempt's,
+  and history's is the first). `with_io(pending=)` takes the same answer: a retrying activity's
+  last failure, message included, is there alone until the activity closes (found by #43's
+  review: the page said it was decoding a message that history did not have).
 - **What a closed run left open ended with it** (the spec is silent). No event closes an
   activity, timer or child still open when its run closes, and left `scheduled` with an open
   span, a run closed days ago read as in flight and its log links queried up to now. Temporal
@@ -1177,7 +1181,11 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
   when some run commanded them in one batch (or they are chained by such runs), numbered in
   node order (found by #42's review). `merge(static, live)` paints a live run
   on it: a live node with `reached: true`, a static-only one (a branch not taken, or not yet)
-  with `reached: false`, and each edge `{"from", "to", "reached"}`.
+  with `reached: false`, and each edge `{"from", "to", "reached"}`. A live batch not named yet
+  (its child has scheduled nothing, and its input is encrypted) is painted on the static
+  graph's one batch whose predecessors include all of its, under that batch's name; with two
+  such batches, or none, it stays `kontra.batch.v1` (found live by #43's review: the run drew
+  an unnamed batch beside the static one, which read "not reached yet", for over a second).
 - **Logs and traces are Grafana Explore panes.** A node's `logs` link is Loki,
   `{selector} | workflow_id="..." | run_id="..."` and `| activity_type="..."` for an activity
   (a child's logs are under its own workflow id), over the node's span with a second either
@@ -1454,9 +1462,14 @@ ways:
   most 16 are open at once (503 beyond). A batch node is named from its child's history (its
   input is encrypted, I26), which names nothing until the child schedules an activity and then
   grows while the run's history does not: while one is unnamed the stream reads the graph
-  again at every poll and sends it when it differs (live, the batch showed as an unnamed
-  extra node beside the static one until the run's own history next changed). Closed batch children's histories are kept, 256
-  at most; 64 are read per graph.
+  again at every poll and sends it when it differs, and `merge` paints it on the static batch
+  after the same steps meanwhile (I26). Closed batch children's histories are kept, 256 at
+  most; 64 are read per graph. **Where #43's spec falls short:** it has `/api/io` read
+  `graph.with_io` of history alone, and a step backing off between attempts has no failure in
+  history until it closes, so its pane said "Decoding the message…" for as long as it
+  retried; `/api/io` passes the same `DescribeWorkflowExecution` answer (`with_io(pending=)`),
+  and a step still open with no message yet says so. A step backing off counts from when its
+  last attempt ended (`t.last_failed`), not from its first schedule.
 - **The static graph is `kontra graph`'s, matched by the exact task queue.** Not one cached per
   `name@version` by the page: `load_static(home, task_queue)` with the task queue
   `DescribeWorkflowExecution` reports, which the cache file stores (the file name is only its

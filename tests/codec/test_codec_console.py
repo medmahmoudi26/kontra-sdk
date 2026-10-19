@@ -237,6 +237,14 @@ async def test_the_graph_page_shows_payloads_through_its_io_route_alone(
             break
         await asyncio.sleep(0.5)
     seen["/api/workflows"] = listed.text
+    # The runs, not the batch child each batch is (Temporal lists it, between them).
+    listed_ids = {x["workflow_id"] for x in listed.json()}
+    assert {wf, refused} <= listed_ids
+    child_id = next(
+        n for n in json.loads(seen[f"/api/graph?w={wf}"])["nodes"] if n["kind"] == "child"
+    )["ref"]["workflow_id"]
+    assert [x.id async for x in client.list_workflows(f"WorkflowId = '{child_id}'")] == [child_id]
+    assert child_id not in listed_ids
 
     # Every payload of the runs and of their batch child, as stored, and the heartbeats.
     final = json.loads(seen[f"/api/graph?w={wf}"])
@@ -270,7 +278,8 @@ async def test_the_graph_page_shows_payloads_through_its_io_route_alone(
     assert workflow_io["input"] == [f"input {MARKER}"]
     assert MARKER.upper() in workflow_io["result"]
     batch_io = _get(server, f"/api/io?w={wf}&node={batch['id']}", **page_req).json()
-    assert MARKER in json.dumps(batch_io["input"])
+    assert batch_io != found  # that node's own payloads, not the first node's
+    assert all(f"input {MARKER} {i}" in json.dumps(batch_io["input"]) for i in range(3))
     refused_io = _get(server, f"/api/io?w={refused}&node=", **page_req).json()
     assert refused_io["failure"]["message"] == f"refused refuse {MARKER}"
     same_origin = _get(

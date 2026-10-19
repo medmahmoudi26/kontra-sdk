@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-import os
 import re
 import threading
 import time
@@ -32,14 +31,9 @@ from kontra.cli._graph import save_static
 from kontra.codec import KontraCodec
 from kontra.codec.age import generate_identity
 from kontra.serve.worker import workflow_runner
-from kontra.testing.devserver import (
-    CLI_ENV,
-    DevServer,
-    acquire_shared_dev_server,
-    release_shared_dev_server,
-)
+from kontra.testing.devserver import DevServer
 
-from .console_flows import QuickFlow, RetryFlow, WaitFlow, flaky, quick
+from .console_flows import BackoffFlow, QuickFlow, RetryFlow, WaitFlow, fails_once, flaky, quick
 
 pytestmark = pytest.mark.temporal
 
@@ -47,20 +41,6 @@ SECRET, PUBLIC = generate_identity()
 UI = "http://localhost:8233"
 GRAFANA = "http://localhost:3000"
 PAGE = Path(console_module.__file__).with_name("_console.html")
-
-
-@pytest.fixture(scope="module")
-def dev_server() -> Iterator[DevServer]:
-    try:
-        server = acquire_shared_dev_server()
-    except Exception as e:
-        if os.environ.get(CLI_ENV):
-            raise  # an explicit binary must work
-        pytest.skip(f"no Temporal CLI 1.9.1 dev server: {e}")
-    try:
-        yield server
-    finally:
-        release_shared_dev_server()
 
 
 def _codec() -> KontraCodec:
@@ -109,8 +89,8 @@ async def worker(dev_server: DevServer) -> AsyncIterator[tuple[Client, str]]:
     async with Worker(
         client,
         task_queue=queue,
-        workflows=[RetryFlow, QuickFlow, WaitFlow],
-        activities=[flaky, quick],
+        workflows=[RetryFlow, QuickFlow, WaitFlow, BackoffFlow],
+        activities=[flaky, quick, fails_once],
         workflow_runner=workflow_runner(),
     ):
         yield client, queue
@@ -334,6 +314,230 @@ async def test_the_stream_shows_a_retry_before_history_does_then_ends(
     # A closed run: its graph at once, then the end.
     closed = _events(await asyncio.to_thread(_stream, srv, f"/api/graph/events?w={wf}"))
     assert [name for name, _ in closed] == ["graph", "end"]
+
+
+async def test_a_step_backing_off_shows_its_failure_before_history_has_it(
+    serve: Serve, worker: tuple[Client, str]
+) -> None:
+    """``fails_once`` failed its first attempt and waits a minute for its second: history
+    has nothing of the attempt (its Started event, with the last failure, is written when
+    the activity closes), so the graph's attempt, its wait and ``/api/io``'s failure message
+    come from ``DescribeWorkflowExecution``."""
+    client, queue = worker
+    srv = serve()
+    wf = f"console-{uuid.uuid4().hex}"
+    handle = await client.start_workflow(BackoffFlow.run, "hi", id=wf, task_queue=queue)
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            g = (await asyncio.to_thread(_get, srv, f"/api/graph?w={wf}")).json()
+            found = [n for n in g["nodes"] if n["id"] == "fails_once"]
+            if (found and found[0]["attempt"] == 2) or time.monotonic() > deadline:
+                break
+            await asyncio.sleep(0.2)
+        [step] = found
+        assert (step["status"], step["attempt"]) == ("scheduled", 2)
+        assert step["failure"]["kind"] == "application"
+        t = step["t"]
+        assert (t["started"], t["closed"]) == (None, None)
+        # The wait counts from the failure, not from when the step was first scheduled.
+        assert graph._nanos(t["scheduled"]) < graph._nanos(t["last_failed"])  # pyright: ignore[reportOperatorIssue]
+        history = json.dumps((await handle.fetch_history()).to_json_dict())
+        assert "attempt 1 failed" not in history
+        io = await asyncio.to_thread(
+            _get, srv, f"/api/io?w={wf}&node=fails_once", **{"X-Kontra-Console": "1"}
+        )
+        assert io.status_code == 200, io.text
+        assert io.json()["failure"]["message"] == "attempt 1 failed on hi"
+        assert io.json()["input"] == ["hi"]
+    finally:
+        await handle.terminate()
+
+
+def _described(*pending: tuple[int, int, int | None, bool, bytes], length: int = 7) -> Any:
+    """A ``WorkflowExecutionDescription`` as :func:`_change_key` reads it: pending
+    activities of ``(state, attempt, last started second, has a last failure, heartbeat)``."""
+    from types import SimpleNamespace
+
+    from google.protobuf.timestamp_pb2 import Timestamp
+    from temporalio.api.common.v1 import Payload, Payloads
+    from temporalio.api.failure.v1 import Failure
+    from temporalio.api.workflow.v1 import PendingActivityInfo, WorkflowExecutionInfo
+    from temporalio.api.workflowservice.v1 import DescribeWorkflowExecutionResponse
+
+    raw = DescribeWorkflowExecutionResponse(
+        workflow_execution_info=WorkflowExecutionInfo(history_length=length, status=1)
+    )
+    for state, attempt, started, failed, beat in pending:
+        info = PendingActivityInfo(activity_id="1", state=state, attempt=attempt)  # pyright: ignore[reportArgumentType]
+        if started is not None:
+            info.last_started_time.CopyFrom(Timestamp(seconds=started))
+        if failed:
+            info.last_failure.CopyFrom(Failure(message="m"))
+        info.heartbeat_details.CopyFrom(Payloads(payloads=[Payload(data=beat)]))
+        info.last_heartbeat_time.CopyFrom(Timestamp(seconds=len(beat)))
+        raw.pending_activities.append(info)
+    return SimpleNamespace(raw_description=raw)
+
+
+def test_the_change_key_holds_what_a_retry_changes_and_not_a_heartbeat() -> None:
+    """A retry writes no history until the activity closes: the stream sends the graph
+    again when a pending activity's state, attempt, start or last failure changed, though
+    a poll may miss the backoff between two attempts (same state, a new attempt and start).
+    A heartbeat is no change."""
+    key = console_module._change_key
+    started, scheduled = 2, 1  # PENDING_ACTIVITY_STATE_STARTED, _SCHEDULED
+    base = key(_described((started, 2, 100, True, b"a")))
+    for changed in (
+        _described((started, 3, 102, True, b"a")),  # the next attempt, already started
+        _described((started, 3, 100, True, b"a")),
+        _described((started, 2, 102, True, b"a")),
+        _described((scheduled, 2, 100, True, b"a")),
+        _described((started, 2, 100, False, b"a")),
+        _described((started, 2, None, True, b"a")),
+        _described((started, 2, 100, True, b"a"), length=8),
+        _described(),
+    ):
+        assert key(changed) != base
+    assert key(_described((started, 2, 100, True, b"another heartbeat"))) == base
+
+
+async def test_a_batch_child_s_history_is_kept_once_it_closed(tmp_path: Path) -> None:
+    """An open child's history grows (it is what names its batch): read again each time,
+    and remembered only once it closed."""
+    child = ("parent/batch/item/1", "run-1")
+    parent = {
+        "events": [
+            {
+                "eventType": "EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_STARTED",
+                "childWorkflowExecutionStartedEventAttributes": {
+                    "workflowType": {"name": "kontra.batch.v1"},
+                    "workflowExecution": {"workflowId": child[0], "runId": child[1]},
+                },
+            }
+        ]
+    }
+    opened = {"events": [{"eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED"}]}
+    scheduled = {"events": [*opened["events"], {"eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED"}]}
+    closed = {
+        "events": [*scheduled["events"], {"eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED"}]
+    }
+    script = [opened, scheduled, closed]
+    fetched: list[tuple[str, str | None]] = []
+
+    class History:
+        def __init__(self, value: dict[str, Any]) -> None:
+            self.value = value
+
+        def to_json_dict(self) -> dict[str, Any]:
+            return copy.deepcopy(self.value)
+
+    class Handle:
+        def __init__(self, workflow_id: str, run_id: str | None) -> None:
+            self.at = (workflow_id, run_id)
+
+        async def fetch_history(self) -> History:
+            fetched.append(self.at)
+            return History(script.pop(0))
+
+    class FakeClient:
+        def get_workflow_handle(self, workflow_id: str, *, run_id: str | None = None) -> Handle:
+            return Handle(workflow_id, run_id)
+
+    console = Console(tmp_path, _codec)
+    client: Any = FakeClient()
+    try:
+        seen = [await console._child_histories(client, parent) for _ in range(5)]
+    finally:
+        console.close()
+    assert [h[child[0]] for h in seen] == [opened, scheduled, closed, closed, closed]
+    assert fetched == [child] * 3
+    assert list(console._children) == [child]
+
+
+def test_a_quiet_stream_says_it_is_alive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing changed for :data:`_KEEPALIVE` seconds: a comment line, so that a proxy or
+    the browser does not drop the stream; a frame resets the count."""
+    monkeypatch.setattr(console_module, "_POLL", 0.01)
+    monkeypatch.setattr(console_module, "_KEEPALIVE", 0.05)
+
+    def snap(*, closed: bool) -> Any:
+        g = {
+            "workflow": {"run_id": "r", "status": "completed" if closed else "running"},
+            "nodes": [],
+            "edges": [],
+        }
+        return console_module._Snapshot(g, {}, ("k",), closed, False)
+
+    quiet = 30  # polls with nothing new: about 0.3 s, six keepalives' worth
+    script: list[Any] = [snap(closed=False), *[None] * quiet, snap(closed=True)]
+
+    class Scripted(Console):
+        async def _snapshot(self, *args: Any, **kwargs: Any) -> Any:
+            return script.pop(0)
+
+        async def _changed(self, workflow_id: str, run_id: str, last: Any) -> Any:
+            return script.pop(0)
+
+    console = Scripted(tmp_path, _codec)
+    try:
+        frames = list(console.stream("w", None))
+    finally:
+        console.close()
+    beats = frames.count(b": keepalive\n\n")
+    assert 2 <= beats < quiet, frames
+    assert frames[-1].startswith(b"event: end")
+    assert [f for f in frames if f.startswith(b": ")] == [b": keepalive\n\n"] * beats
+
+
+async def test_the_page_reads_temporal_with_a_dev_login_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whoever reaches the codec server's port reads through it: a real ``kontra login`` in
+    the same ``KONTRA_HOME`` (made after ``up --ui`` started it, which checked the profile
+    then) is refused before any token is asked for, and its session closed."""
+    from datetime import UTC, datetime
+
+    from kontra.auth import Session
+    from kontra.cli._console import ConsoleError, connect_dev
+    from kontra.profile import Profile
+
+    asked: list[str] = []
+    closed: list[str] = []
+    real_close = Session.aclose
+    client = object()
+
+    async def connect_temporal(self: Session, role: str = "worker", **_: Any) -> Any:
+        asked.append(role)
+        return client
+
+    async def aclose(self: Session) -> None:
+        closed.append(self.profile.namespace)
+        await real_close(self)
+
+    monkeypatch.setattr(Session, "connect_temporal", connect_temporal)
+    monkeypatch.setattr(Session, "aclose", aclose)
+    for dev, home in ((False, tmp_path / "real"), (True, tmp_path / "dev")):
+        Profile(
+            gate_url="https://gate.example" if not dev else "http://127.0.0.1:1",
+            temporal_address="temporal.example:7233",
+            party="alice",
+            namespace="alice" if not dev else "devparty",
+            refresh_token="secret-refresh",
+            auth_time=datetime.now(UTC),
+            dev=dev,
+        ).save(home)
+    with pytest.raises(ConsoleError) as refused:
+        await connect_dev(tmp_path / "real")
+    assert refused.value.status == 403
+    assert "not a dev one" in refused.value.message
+    assert (asked, closed) == ([], ["alice"])
+
+    connected = await connect_dev(tmp_path / "dev")
+    assert (connected.client, connected.namespace, asked) == (client, "devparty", ["worker"])
+    assert connected.close is not None
+    await connected.close()
+    assert closed == ["alice", "devparty"]
 
 
 def test_an_unnamed_batch_is_read_again_until_its_child_names_it(
