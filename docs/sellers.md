@@ -628,6 +628,39 @@ serve(ReconAgent.sweep, plugins=[AgentHarnessPlugin()])
   exactly a workflow's result. The harness publishes the reply keyed by field name; Kontra
   re-keys it, checks it against the contract and delivers it, so computed fields, excluded
   fields and serializers come out as the contract describes them.
+- **Two schemas, one contract.** The harness emits its own schema of the same models
+  (`temporal-agent-harness schema recon:ReconAgent`), and its codegen turns that into
+  TypeScript: use it for your own UI, which is generated from your code. Buyers never see it:
+  `kontra pull` generates a buyer's client from the published contract, after checking the
+  catalog's hash -- the only schema a buyer should trust, since your code is exactly what they
+  cannot see. So `kontra publish` and `kontra contract` compare the two for the handler you
+  sell, and warn on stderr where they differ once both are in one canonical form (names,
+  titles, descriptions, key order, `anyOf` against `oneOf` for an optional field, and the
+  other differences that change no valid value are set aside: decisions I33). The command
+  goes on either way; the contract is what is published. With the models above:
+
+  ```text
+  warning: acme/recon@1.0.0 (ReconAgent.sweep): the contract differs from temporal-agent-harness's schema for this handler in 2 places. Buyers get the contract (`kontra pull`); your harness-codegen types follow the harness's:
+    input  $defs.Sweep.additionalProperties: contract false, harness (absent)
+    output $defs.Report.additionalProperties: contract false, harness (absent)
+    (open) the contract closes every model (no keys but its fields) and the harness's schema leaves this one open, as pydantic's default extra="ignore" does; model_config = ConfigDict(extra="forbid") on the model makes both say so
+  ```
+
+  Each line is one place, in the contract's terms, and one of four kinds:
+
+  | Kind | What differs | What to do |
+  |---|---|---|
+  | `open` | the contract closes every model; pydantic's default `extra="ignore"` leaves the harness's open | `model_config = ConfigDict(extra="forbid")`: your agent then refuses unknown keys from any caller, as the gate does |
+  | `defaults` | on the output, the harness requires the fields that have a default (it describes the reply as serialized, where every field is present); the contract lets them be absent | nothing: both describe the reply you send |
+  | `serialization` | on the output, a computed field, an excluded field, a serialization alias or a serializer that changes a field's JSON type | keep them off output models: the job's result is the serialization, and the contract describes the model as validated, so it does not say what the buyer receives |
+  | `drift` | anything else, on the input | report it: the two emitters walked your models differently |
+
+  Nothing is compared, and nothing said, for a workflow entry or when the harness is not
+  installed. The harness's schema comes from its own `schema` command, run by the same Python
+  as `kontra publish`; if it cannot answer (your agent's module fails to import there), the
+  warning says why and publishing goes on. The seam ③ tests hold the comparison to a model
+  zoo and the test agents (`tests/contract/test_harness.py`), so a harness release that walks
+  models differently fails CI.
 - **A hire is one turn.** The job is Kontra's wrapper workflow, `kontra.turn.v1`, started as
   `job-<id>` like any job. It starts your agent as a child (its whole history encrypted to you
   alone), sends the buyer's input as one message to the handler, waits for the handler's
@@ -1103,7 +1136,9 @@ printed (sign-ups are by invitation; see [buyers.md](buyers.md#setup)).
 `kontra publish`:
 
 1. loads `worker.py` and each bound offering's `offering.yaml`;
-2. derives the contract document and seals it with your public key and its hash;
+2. derives the contract document and seals it with your public key and its hash; for one
+   handler of a harness agent, it then compares the contract with the harness's schema for
+   that handler and warns where they differ ([Agents](#agents));
 3. sends it to the gate, which requires your login, **confirmed within the hour** (a worker
    token never qualifies), validates it, assigns the version an opaque Nexus endpoint name and creates the
    endpoint itself, pointed at your namespace and the version's task queue;

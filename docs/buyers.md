@@ -342,6 +342,12 @@ nexgen is `$KONTRA_NEXGEN`, else `nexgen` on `PATH`, else the pinned release, do
 into `$KONTRA_HOME/bin` and checked against its sha256 (on a glibc older than 2.39 it runs in
 a pinned Ubuntu image with Docker, without network).
 
+Generate from the published contract only. A seller whose offering is a handler of an agent
+written with Temporal's agent harness may also have the harness's own schema of it (for their
+own UI); it is never published or hashed, and it comes from the seller's code, which is
+exactly what you cannot see. The contract's hash is the one the catalog, your hold and the
+seller's worker agree on (decisions I33).
+
 ## What happens to your money
 
 | Event | Money |

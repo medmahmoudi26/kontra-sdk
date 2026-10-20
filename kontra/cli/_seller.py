@@ -40,6 +40,50 @@ def _pick(bound: tuple[Any, ...], only: str | None) -> list[Any]:
     return chosen
 
 
+def _check_harness(chosen: list[Any]) -> None:
+    """Warn, on stderr, where a bound handler's contract and temporal-agent-harness's schema
+    for the same handler differ (decisions I33): the contract is what buyers get, the harness's
+    schema what the seller's harness-codegen types come from. Silent for a workflow entry, when
+    the harness is not installed, and when the two agree. Run inside ``load_worker``, so the
+    harness imports the agent's module where worker.py found it."""
+    from kontra.contract import harness
+
+    handlers = [b for b in chosen if b.agent is not None and b.handler is not None]
+    if not handlers or not harness.harness_installed():
+        return
+    schemas: dict[str, dict[str, Any] | str] = {}
+    for b in handlers:
+        label = f"{b.key} ({b.agent.__name__}.{b.handler})"
+        try:
+            target = harness.agent_target(b.agent)
+            if target not in schemas:
+                try:
+                    schemas[target] = harness.harness_schema(target, cwd=b.source.parent)
+                except harness.HarnessSchemaError as e:
+                    schemas[target] = str(e)  # once per agent, however many handlers it sells
+            schema = schemas[target]
+            if isinstance(schema, str):
+                raise harness.HarnessSchemaError(schema)
+            found = harness.compare_handler(b.document(), schema, b.handler)
+        except harness.HarnessSchemaError as e:
+            click.echo(
+                f"warning: {label}: cannot compare the contract with "
+                f"{harness.HARNESS_SCRIPT}'s schema: {printable(str(e))}",
+                err=True,
+            )
+            continue
+        if not found:
+            continue
+        click.echo(
+            f"warning: {label}: the contract differs from {harness.HARNESS_SCRIPT}'s schema "
+            f"for this handler in {len(found)} place{'s' if len(found) > 1 else ''}. Buyers get "
+            "the contract (`kontra pull`); your harness-codegen types follow the harness's:",
+            err=True,
+        )
+        for line in harness.describe(found):
+            click.echo(f"  {printable(line)}", err=True)
+
+
 @click.command()
 @click.argument("name")
 @click.option(
@@ -98,6 +142,7 @@ def contract(
         if output is not None and len(chosen) > 1:
             fail(f"worker.py binds {len(chosen)} offerings; pick one with --offering for -o")
         docs = [b.document() for b in chosen]
+        _check_harness(chosen)
     if nexgen:
         docs = [nexgen_view(d) for d in docs]
     if as_json:
@@ -129,6 +174,7 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
         click.echo(f"warning: {outside}", err=True)
     with load_worker(directory) as worker:
         chosen = _pick(worker.offerings, only)
+        _check_harness(chosen)
 
         async def go() -> list[m.CatalogEntry]:
             async with cli_session() as session:
