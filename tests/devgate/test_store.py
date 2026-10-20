@@ -258,7 +258,7 @@ LEDGER_ROOTS: dict[str, type] = {
     "_postings": Posting,
 }
 #: Kept stores of plain values (strings, bytes, sets of strings, a counter): no record class.
-PLAIN = {"_api_key_ids", "identities", "allowed_emails", "_by_endpoint", "blobs"}
+PLAIN = {"_api_key_ids", "identities", "allowed_emails", "_by_endpoint", "blobs", "blob_scopes"}
 LEDGER_PLAIN = {"_next_event"}
 
 

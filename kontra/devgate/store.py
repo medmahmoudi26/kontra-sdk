@@ -78,7 +78,7 @@ ALLOWED: dict[str, tuple[str, ...]] = {
 KEPT = (
     "parties", "sessions", "_refresh", "devices", "job_key_wraps", "api_keys", "_api_key_ids",
     "identities", "allowed_emails", "offerings", "_by_endpoint", "jobs", "artifacts", "blobs",
-    "_passkey_users", "_passkey_rows",
+    "blob_scopes", "_passkey_users", "_passkey_rows",
 )  # fmt: skip
 LEDGER_KEPT = ("_holds", "_moves", "_accounts", "_postings", "_next_event")
 #: The gate's other stores, deliberately not kept (short-lived, or rebuilt by the constructor):
