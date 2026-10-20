@@ -335,7 +335,10 @@ async def test_progress_shows_100_heartbeats_in_order_decrypted(world: World) ->
     stranger = generate_identity()[0]
     for raw in sealed:
         assert raw.startswith(AGE_MAGIC)
-        assert b"beat" not in raw
+        # "beat " with its space: an age header is base64 and spaces, never a base64 run
+        # followed by a space, so this cannot match a key by chance as "beat" alone can
+        assert b"beat " not in raw
+        assert b'"message"' not in raw
         decrypt(raw, world.seller.identity)  # the job's parties: the seller wrote it
         with pytest.raises(AgeError):
             decrypt(raw, stranger)
