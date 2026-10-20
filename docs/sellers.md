@@ -130,11 +130,19 @@ workflow's result. So in the output a `@computed_field` is a member, a `Field(ex
 field is not, a `serialization_alias` is the member's name, a serializer's return type is the
 member's type, and every field is required, defaulted or not, since the result always
 carries it. A model used both ways whose two descriptions differ is published twice, as
-`ReportInput` and `ReportOutput`. A constraint written on a named type (an enum, a
-`RootModel`) and again where the type is used holds twice, as pydantic enforces it: the
-contract publishes the tighter bound and the values both allow, and refuses, naming the
-field, the two that cannot be written as one (two different `pattern`s), rather than publish
-a contract looser than your model (decisions I38).
+`ReportInput` and `ReportOutput` (your own classes keep their names). A bound written on a
+named type and again where the type is used holds twice: the contract publishes the tighter
+bound and the values both allow, and refuses, naming the field, the two that cannot be
+written as one (two different `pattern`s) or that no value meets, rather than publish a
+contract looser than your model. A `Field` constraint on a model, a `RootModel` or a plain
+`Enum` (`Annotated[Code, Field(max_length=10)]`) is refused: pydantic applies it to the
+instance, not its value, and your model refuses every value; put the constraint inside the
+type. Two outputs are refused because pydantic's schema would not say what it writes: a
+serializer with no return annotation (annotate it), and a `timedelta`, which pydantic writes
+as an ISO duration that `format: duration` refuses whenever it has a fraction of a second
+(write seconds: `model_config = ConfigDict(ser_json_timedelta="float")`). Whatever payload
+converter your client has, your workflow's result is delivered as `model_dump(mode="json",
+by_alias=True)` (decisions I38).
 
 See exactly what you would publish:
 

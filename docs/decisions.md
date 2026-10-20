@@ -1771,13 +1771,16 @@ result.
   `RootModel` of at most 5 characters the contract said `maxLength: 10`, and for
   `json_schema_extra={"enum": ["a", "z"]}` over an enum of `a` and `b` it said `[a, z]`. JSON
   Schema 2020-12 asserts a `$ref`'s definition and its siblings both; the contract accepted
-  `"abcdefg"` and `"z"`, which the gate would pass and the seller's model refuses.
+  `"abcdefg"` and `"z"`, which the gate would pass and the seller's model refuses. (I33 read
+  the first case as pydantic enforcing both bounds. It does not: it applies the use site's
+  `max_length` to the `Code` instance, which it cannot measure, and refuses every value with
+  a `TypeError`; below.)
 - **The output in serialization mode.** `derive_document` makes one `models_json_schema`
   call: the input in `validation` mode, the output in `serialization` mode. In the output,
   computed fields are present and required; excluded fields are absent; the key is the
-  serialization alias; a `@field_serializer`, `PlainSerializer` or `@model_serializer` gives
-  its return type (a serializer without a return annotation is `Any`, refused with the
-  field named); and every field the reply always carries is required: pydantic's
+  serialization alias; a `@field_serializer`, `PlainSerializer`, `WrapSerializer` or
+  `@model_serializer` gives its return type; and every field the reply always carries is
+  required: pydantic's
   `json_schema_serialization_defaults_required`, for every model whatever its config (a
   model's or a dataclass's dump writes every field; an `exclude_if` field may be left out,
   and a TypedDict's keys keep pydantic's rule). No default is written in serialization mode:
@@ -1787,7 +1790,25 @@ result.
   nexgen's subset); a hand-written document with either is still refused. A `Decimal`
   output, written as a JSON string, is now a `string`; as an input it is still refused.
   `extra="allow"` is unchanged: the contract closes every model (§11.3), and #53 reports an
-  open output (I33).
+  open output (I33). Two outputs are refused at derivation, naming the field, because
+  pydantic's schema does not describe what it writes: a serializer **without a return
+  annotation** (pydantic then falls back to the validated type, `date-time` for a serializer
+  that writes an integer; only `-> Any` was refused before, as `Any`), and a **`timedelta`**
+  written as an ISO 8601 duration (pydantic writes `"PT1.5S"`, `"P2D"`, `"-PT1S"`; `format:
+  duration` is nexgen's whole-second, time-only `PT…H…M…S`, so every sub-second, day-long or
+  negative result broke the contract): the fix-it is `ser_json_timedelta="float"`, seconds as
+  a number, which the zoo's `Times` uses. A `timedelta` input is unchanged.
+- **The result is the model's serialization, whatever the converter.** The derivation
+  describes `model_dump(mode="json", by_alias=True)`; temporalio's pydantic converter writes
+  exactly that with its default options, but `KontraPlugin` keeps a seller's own payload
+  converter, and one with `ToJsonOptions(exclude_unset=True)` -- OpenAI Agents' converter,
+  which its plugin requires -- leaves out every defaulted field the workflow did not set,
+  which the output now requires (measured: before the fix, such a delivery failed the buyer's
+  check with `'color' is a required property`). Refusing such converters would refuse the
+  OpenAI Agents plugin, so instead Kontra's workflow interceptor hands the root job
+  workflow's result on as `model_dump(mode="json", by_alias=True)` when it is a pydantic model
+  (`kontra.serve.interceptors`): the converter then writes a dict, which no option changes. A
+  bound handler's result is already one (`as_output`).
 - **Two definitions where the modes differ, named as pydantic names them.** A model used on
   both sides whose two schemas differ is two definitions, `ReportInput` and `ReportOutput`;
   pydantic picks the first name only one schema wants, so a model both modes describe alike
@@ -1795,15 +1816,30 @@ result.
   spells pydantic's `Report-Output` without the `-`, since a contract's definition names are
   identifiers (nexgen, I2): `_Generator.get_defs_ref` rewrites each of pydantic's choices and
   keeps pydantic's own last, which never collides. Construction only; nothing reads a name
-  back. A seller type that takes the split's name (a `ReportOutput` of their own beside a
-  split `Report`) sends both to pydantic's longer, module-qualified choices, distinct and
-  valid. As in pydantic's own schemas, a recursive model used on both sides is two
+  back. pydantic takes the first choice no other definition wants, and a choice two want is
+  neither's; pydantic's own `Report-Output` never collides with a class name, but Kontra's
+  `ReportOutput` can, and with the common naming (`QueryInput` and `QueryOutput` around a
+  shared, defaulted `Query`, in one module) every readable choice of all four was wanted
+  twice, the split fell back to `Report-Output`, and the catalog refused it. So a Kontra
+  spelling that another definition has among pydantic's own choices is not offered: the
+  seller's `QueryInput` keeps its name, and the split takes its module-qualified spelling, or,
+  where the seller's class claims that too, `<module>__Query__1_Input` -- pydantic's
+  occurrence name with the mode after an `_`, whose last segment starts with a digit, which
+  no ordinary class or module name produces (a class literally named so would collide, and
+  the document is then refused, never mis-named). As in pydantic's own schemas, a recursive
+  model used on both sides is two
   definitions even where its modes agree: its bodies name themselves, so they never compare
   equal.
 - **Every consumer agrees with it.**
   - *nexgen and `kontra pull`*: nothing changes in the lowering rules or the command; the
     generated client has `ReportInput` and `ReportOutput` where the two differ, and an
-    output type whose members are all present.
+    output type whose members are all present. Measured with nexgen 0.2.5 on one contract
+    with a member per zoo case: the generated Python types decode the delivery through
+    temporalio's converter (required nullable members read `None`), re-encode it to the same
+    JSON and refuse it without a member; the generated TypeScript client, compiled with
+    `tsc --strict` and run, does the same; Go and Java generate. One case is left out of
+    the Python run: nexgen refuses a member named `from` (I33's `Aliases`) for Python, a
+    reserved word, with no automatic rename -- older than I38; a follow-up.
   - *The buyer's SDK* (`kontra.hire`) validates every delivery against the published output
     schema and wraps it as `Record`s by that schema, unchanged: a delivery is now what the
     schema describes. `job.result(output_type=Model)` takes the buyer's own type, generated
@@ -1823,7 +1859,11 @@ result.
     words, never the value, which is the buyer's), and a result that is not one fails the
     job, non-retryably.
 - **A `$ref`'s siblings conjoined.** `inline_non_object_defs` writes a non-object definition
-  out at each use site as the conjunction of the two: the use site's annotations (`title`,
+  out at each use site as the conjunction of the two -- and a documented alias of one
+  (`{$ref: Color, description}`: a `RootModel[Color]` with a docstring, a PEP 695 alias with a
+  description) with it, transitively, since once its target is written out its body is no
+  longer an alias (first built computing the set once, which refused those documents): the
+  use site's annotations (`title`,
   `description`, `examples`, `default`, `$comment`, `deprecated`, `readOnly`, `writeOnly`)
   replace the definition's; a keyword only one side writes is kept; a keyword both write is
   conjoined where one value says exactly what the two do -- the smaller `maximum`,
@@ -1831,14 +1871,31 @@ result.
   `min*`, the `enum` values both list (in the definition's order), `integer` for `integer`
   and `number`, the least common multiple of two integer `multipleOf`s, `uniqueItems` if
   either says so, and a value both write alike. Anything else is refused at derivation, at
-  the use site's path (`$defs.Overlap.properties.code`, which names the model and the
+  the use site's path (`$defs.M.properties.code`, which names the model and the
   field), with both values and the type's name: two different `pattern`s or `format`s, two
   `items`, a non-integer `multipleOf`; and, as no value satisfies both, an empty `enum`
-  intersection, two `const`s or two `type`s that share nothing. **Refused, not `allOf`:** the
+  intersection, two `const`s, two `type`s that share nothing, or bounds on two keywords
+  that leave no value of the type (the type's `minLength` 5 and the field's `maxLength` 3,
+  `minItems`/`maxItems`, `minContains`/`maxContains` with a `contains`, a `minimum` or
+  `exclusiveMinimum` past a `maximum` or `exclusiveMaximum`, and no integer between two
+  exclusive bounds). **Where the sibling comes from.** pydantic writes a `$ref` with
+  siblings in three cases, and they differ. An annotation (`Field(description=...)`) is
+  replaced, as above. A `json_schema_extra` sibling is published conjoined, although pydantic
+  does not enforce it: the contract is then the stricter of the two, as the seller wrote it.
+  A `Field` constraint (`max_length`, `ge`, ...) pydantic enforces itself, with an
+  after-validator over the type: on a PEP 695 alias of a constrained alias it measures the
+  value and both bounds hold, so the conjunction is exact (checked value by value against
+  the model); but on a model, a `RootModel` (I33's case), a plain `Enum`, a str `Enum`
+  compared with a number, or an `Optional` alias, it applies the constraint to the instance
+  or to null, cannot, and refuses every such value with a `TypeError`. The generator sees
+  that after-validator (pydantic's own constraint check over that type) and the derivation
+  refuses the field, saying where to put the constraint, rather than publish a bound the
+  values meet for a field nobody can fill. **Refused, not `allOf`:** the
   catalog's subset check accepts `allOf`, but nothing shows that nexgen 0.2.5 generates one
   type for an `allOf` of two constrained scalars, identically in four languages: derivation
-  never emitted one, so no test here has fed nexgen one, and nexgen's own tests need nexgen
-  and Docker, which CI does not run (`make slow`). A refusal is exact, and the fix is the
+  never emitted one, so no test here has fed nexgen one, and nexgen's tests here need nexgen
+  (and Docker where its glibc is too old), which CI does not run (`make slow`). A refusal is
+  exact, and the fix is the
   seller's to make in one line: write the constraint once, on the type or on the field. The
   written-out body is itself resolved first, so a `RootModel` over a constrained `RootModel`
   conjoins all the way down (it used to leave a `$ref` to a definition no longer there); a
@@ -1858,23 +1915,39 @@ result.
   fails every job (measured: `{"out_a": ...}` against a model that reads `in_a`), although
   the contract (validation mode) describes the input exactly. Out of #63's scope, which is
   the output; a follow-up.
+  Also older than I38 and left as they are, each a follow-up: a naive `datetime` or `time`
+  output (`datetime.now()`) is written without an offset, which `format: date-time` (and
+  nexgen's) refuses, so such a result fails the job (`AwareDatetime` describes the output
+  exactly; refusing `datetime` outputs would refuse most sellers, an owner's call); a
+  member whose name is a Python keyword (`from`) cannot be generated for Python; and a
+  `json_schema_extra` bound beside a `$ref` to an *object* definition (a `RootModel` of a
+  `dict`) is published as a sibling, not conjoined, since only non-object definitions are
+  written out.
 - **Checked by** `tests/contract/test_serialized.py` (seam ③: for every case of
   `tests/contract/zoo.py` -- computed, aliased computed, excluded, split alias, alias
   generator, type-changing serializer, scalar, factory, `= None` and nested defaults, a
-  tagged union, an enum re-constrained at its use, a model both modes describe alike -- the
-  workflow entry's and the handler's results are the model's `by_alias` dump, validate
-  against the contract and read back through `kontra.hire`'s decoding; the output schema of
-  each case; required without defaults; the names, a collision with a seller's name, and
-  determinism; `Decimal`; re-keying at every depth; `as_output` delivering an excluded
-  field, and failing a reply that is not the output without quoting it), `tests/contract/test_conjoin.py` (seam ③:
-  I33's two cases, published and enforced by the validator; one case per conjoined keyword;
-  annotations replaced; a chain of named types; one case per refusal; a self-referring
-  scalar type), `tests/serve/test_serialized_results.py` (end to end: a workflow entry and
-  a bound handler over the same output publish one output schema, and a real hire of each
-  through the fake gate and a dev server delivers a result that validates against the
-  catalog's contract, reads back through `kontra.hire`'s decoding and parses as the type a
-  buyer generates from that contract, written out in the test), `tests/serve/test_turn.py`
-  (the reply re-keyed and checked against the served contract),
+  tagged union, an enum re-constrained at its use, a model both modes describe alike, and
+  the rest of I33's 23 models: keyword aliases, alias choices, enums, literals, constrained
+  values, collections, times (durations as seconds, a fraction of one computed), artifacts,
+  titles, a recursive tree, closed and open models -- the workflow entry's and the handler's
+  results are the model's `by_alias` dump, validate against the contract and read back
+  through `kontra.hire`'s decoding; the output schema of each case; required without
+  defaults; the names, a seller's `XInput`/`XOutput` beside a split `X` in one module, a
+  collision with a seller's name, and determinism; serializers without a return annotation
+  and ISO `timedelta` outputs refused; `Decimal`; re-keying at every depth; `as_output`
+  delivering an excluded field, and failing a reply that is not the output without quoting
+  it), `tests/contract/test_conjoin.py` (seam ③: a bound on a type and at its use both
+  held, value by value against the model; I33's `Overlap` and each kind of constraint
+  pydantic applies to an instance refused; the enum case; one case per conjoined keyword;
+  annotations replaced; a chain of named types; documented aliases written out; one case
+  per refusal, and per pair of bounds no value meets; a self-referring scalar type),
+  `tests/serve/test_serialized_results.py` (end to end: a workflow entry and a bound handler
+  over the same output publish one output schema, and a real hire of each -- and of the
+  workflow on a client whose converter leaves unset fields out -- through the fake gate and
+  a dev server delivers a result that validates against the catalog's contract, reads back
+  through `kontra.hire`'s decoding and parses as a type written from that contract),
+  `tests/serve/test_turn.py` (the reply re-keyed and checked against the served contract),
   `tests/contract/test_nexgen.py` (slow: nexgen generates for the zoo's contract in all four
-  languages, `XInput`/`XOutput` and required output members included) and
-  `tests/examples/test_golden.py`.
+  languages, `XInput`/`XOutput` and required output members included, and the generated
+  Python and TypeScript types read every delivery; run with nexgen 0.2.5 for this PR, 18
+  passed) and `tests/examples/test_golden.py`.
