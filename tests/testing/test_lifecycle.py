@@ -2,7 +2,7 @@
 fake gate relays quotes to a real Nexus sync handler, starts ``execute`` as a standalone
 operation in the buyer's namespace, watches ``job-<id>`` in the seller's namespace, and
 moves money by kontra.escrow -- delivery and accept, silence and release, failure,
-timeout and cancel refunds, with progress streamed from history."""
+timeout and cancel refunds, with the job's stream (history events: this seller hosts no workflow stream)."""
 
 from __future__ import annotations
 
@@ -112,10 +112,11 @@ async def test_quote_hire_deliver_accept(deal: Deal) -> None:
         q = await deal.buyer.gate.quote(deal.entry.name, wire(json_payload({"text": "hello"})))
         assert (q.status, q.amount_minor, q.price) == (m.QuoteStatus.OK, PRICE_PER_CHAR * 5, "5.00")
         job = await deal.buyer.gate.hire(q.quote_id or "", buyer_key=_A_BUYER_KEY)
-        events: list[m.ProgressEvent] = []
+        events: list[m.StreamEvent] = []
 
         async def follow() -> None:
-            async for e in deal.buyer.gate.progress(job.job_id):
+            # This seller hosts no workflow stream: its job's stream is history alone.
+            async for e in deal.buyer.gate.stream(job.job_id, history=True):
                 events.append(e)
 
         follower = asyncio.create_task(follow())
@@ -131,8 +132,8 @@ async def test_quote_hire_deliver_accept(deal: Deal) -> None:
     assert json.loads(unwire(result.payload).data) == {"text": "HELLO"}
 
     assert events, "no progress from history"
-    assert [e.seq for e in events] == list(range(1, len(events) + 1))
-    assert all(e.source is m.ProgressSource.HISTORY for e in events)
+    assert [e.cursor for e in events] == list(range(1, len(events) + 1))
+    assert all(e.kind is m.StreamEventKind.HISTORY for e in events)
     assert events[-1].state is m.JobState.COMPLETED
     assert events[-1].last_event == "WorkflowExecutionCompleted"
     assert events[-1].activities_completed == 2

@@ -4,7 +4,6 @@ query parameters, every row answers the real GateClient, and every row enforces 
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import re
 from datetime import timedelta
@@ -17,7 +16,7 @@ from fastapi.routing import APIRoute
 from kontra import _jobkeys as jk
 from kontra.artifacts import download, upload
 from kontra.codec import GateBlobStore
-from kontra.codec.age import encrypt, generate_identity
+from kontra.codec.age import generate_identity
 from kontra.contract.names import job_workflow_id
 from kontra.escrow import ObservedStatus
 from kontra.gate_client import GateClient, GateError
@@ -41,7 +40,7 @@ QUERY = {
     "job": {"include"},
     "devices": {"for"},
     "balance": {"currency"},
-    "progress": {"after"},
+    "stream": {"topic", "history", "after"},
     "disputes": {"cursor", "limit"},
     "job_key": {"for"},
     "job_keys": {"lacking", "for", "cursor", "limit"},
@@ -159,13 +158,6 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     one = await hired()
     await buyer.gate.start(one.job_id, wire(json_payload({"text": "hi"})))
     assert control.starts[-1].operation_id == one.operation_id
-    sealed = encrypt(b'{"percent": 10}', [buyer.profile.public_key or ""])
-    await worker.post_progress(
-        one.job_id,
-        m.ProgressPost(
-            at=gate.now(), activity="fetch", ciphertext_b64=base64.b64encode(sealed).decode()
-        ),
-    )
     src = tmp_path / "out.txt"
     src.write_text("records\n")
     art = await upload(
@@ -190,8 +182,10 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     assert got.read_text() == "records\n"
     assert (await worker.seller_job(one.job_id)).buyer_public_key == _A_BUYER_KEY
     assert [j.job_id for j in (await worker.jobs(as_="seller")).items] == [one.job_id]
-    events = [e async for e in buyer.gate.progress(one.job_id)]
-    assert events[0].activity == "fetch"
+    # The job's stream (decisions I31): the scripted control plane relays no items, so its
+    # history events alone, and the stream ends with the closed job.
+    events = [e async for e in buyer.gate.stream(one.job_id, history=True)]
+    assert all(e.kind is m.StreamEventKind.HISTORY for e in events)
     assert (await buyer.gate.result(one.job_id)).size == len(b"cipher")
     await buyer.gate.reject(one.job_id, "wrong case")
     assert [j.job_id for j in (await judge.gate.disputes()).items] == [one.job_id]
