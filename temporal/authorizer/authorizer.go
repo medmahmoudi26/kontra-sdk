@@ -97,8 +97,8 @@ const (
 	// requests to its own workflows as it likes. The cap bounds what a leaked relay
 	// token's requests can make its job's workflow task carry: Temporal holds at most
 	// history.maxInFlightUpdates updates of a workflow in flight at once (10, Temporal's
-	// default; Kontra does not change it), so those stay under 40 KiB, far below the
-	// 4 MiB gRPC message limit a workflow task must fit in (decisions I30).
+	// default, pinned in dynamicconfig/kontra.yaml), so those stay under 40 KiB, far below
+	// the 4 MiB gRPC message limit a workflow task must fit in (decisions I30).
 	RelayRequestMax = 4 << 10
 )
 

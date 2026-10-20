@@ -1923,8 +1923,9 @@ the sentence above) and `docs/security.md`.
   (`WorkflowExecutionUpdateCompletedEventAttributes.Outcome`), up to the stream's poll response
   cap (`_MAX_POLL_RESPONSE_BYTES`, about 1 MB): a genuine relay doubles the stream's volume in
   history (each item once in its publish signal, again in a poll outcome) and spends one of the
-  run's `history.maxTotalUpdates` (2,000, Temporal's default, not pinned) per poll. #52 polls
-  only from the tail, with topics, and has to plan for both.
+  run's `history.maxTotalUpdates` (2,000, Temporal's default, pinned in
+  `dynamicconfig/kontra.yaml`) per poll. #52 polls only from the tail, with topics, and has to
+  plan for both.
 - Residual risk: a relay that presented another update's id would get that update's outcome
   (the server matches an update by id alone); update ids are random ids the relay never sees,
   and outcomes are ciphertext to the job's parties.
@@ -1933,8 +1934,9 @@ the sentence above) and `docs/security.md`.
   4 MiB gRPC message, Temporal terminates a run whose workflow task it cannot deliver, and
   #52's poll guard cannot refuse an oversized poll, because a refused update's request
   travels in the workflow task all the same. With `RelayRequestMax`, what a relay token's
-  requests add to one workflow task of its job is at most `history.maxInFlightUpdates` (10,
-  Temporal's default, not changed by Kontra) times 4 KiB, two orders of magnitude below the
+  requests add to one workflow task of its job is at most `history.maxInFlightUpdates` (10:
+  Temporal's default, pinned in `dynamicconfig/kontra.yaml` so that the bound does not move
+  with Temporal's; `TestUpdateLimitsArePinned`) times 4 KiB, two orders of magnitude below the
   limit. #52's poll guard (polls refused at validation, so not written to history, once the
   run's history is past half of Kontra's pinned limits) bounds what polls add to the job's
   history, and could not bound this; the cap bounds what their requests add to a workflow
@@ -1963,9 +1965,10 @@ the sentence above) and `docs/security.md`.
   follows the pinned chain, and the relay's empty run id follows the current run), which turns
   the termination into churn; #52's relay polls only from the tail, with topics (I31 chose
   offset 0, once per job), which bounds a genuine relay's cost but not a leaked token's, since
-  that token picks its own offset; a per-namespace `history.maxTotalUpdates` pin chosen with
-  `limit.historySize.error` in mind, which bounds it only together with continue-as-new (20 MiB
-  at 1 MB a poll is about twenty updates, a cap a genuine subscription would hit too).
+  that token picks its own offset; a per-namespace `history.maxTotalUpdates` below the pinned
+  2,000, chosen with `limit.historySize.error` in mind, which bounds it only together with
+  continue-as-new (20 MiB at 1 MB a poll is about twenty updates, a cap a genuine subscription
+  would hit too).
 - #51 documents that a seller who turns on Worker Versioning gets no tasks.
 
 Tested: the Go deny matrix, every cell with its typed request, against Kontra's and Temporal's

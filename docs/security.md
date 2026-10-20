@@ -275,9 +275,9 @@ builds is under 900 bytes: nine topics (an offering's eight streams and `kontra.
 at most 64 characters, an offset, the pinned run id and its identity. The cap keeps what a
 relay token's requests can add to one workflow task of its job far below the 4 MiB gRPC
 message every workflow task must fit in (Temporal terminates a run whose workflow task it
-cannot deliver): Temporal holds at most `history.maxInFlightUpdates` (10 by default) of a
-workflow's updates in flight at once, so that is at most 40 KiB. A party's own requests are
-not capped: the cap is the relay rule's.
+cannot deliver): Temporal holds at most `history.maxInFlightUpdates` (10, Temporal's default,
+pinned in `dynamicconfig/kontra.yaml`) of a workflow's updates in flight at once, so that is
+at most 40 KiB. A party's own requests are not capped: the cap is the relay rule's.
 
 The relay needs nothing else. Re-sending its Update with the same update id returns that
 update's outcome, and with an empty run id it targets the current run, so it follows a
@@ -311,17 +311,18 @@ per item is not in v1): an unlisted topic is the seller's alone in what is relay
 **What the relay's polls cost the job, and the guard.** Every poll the relay completes is
 written to the job's history: Temporal stores a completed Update's outcome
 (`WorkflowExecutionUpdateCompleted`), up to the envelope's 512 KiB, and every relay poll
-spends one of the run's updates (`history.maxTotalUpdates`, Temporal's default of 2,000). A
-genuine relay doubles the listed topics' volume in history. Before #52 a leaked relay token
-could spend that on purpose -- polling from offset 0 again and again until the history passed
-`limit.historySize.error` (20 MiB, pinned in `dynamicconfig/kontra.yaml`) and Temporal
-terminated the run, refunded against the seller. Now every job root refuses a poll at
-validation (`KontraStreamFull`) once its history is past half of the pinned limits (10,240
-events or 10 MiB), and Temporal writes nothing to history for a refused update. **The guard
-bounds history growth only:** past it no poll adds to the history (the overshoot is the polls
-in flight, `maxInFlightUpdates`, 10, of at most 512 KiB each). It caps the relay's share of a
-job's history near half of the limits, not the job's total: the relay's events stay, so a job
-someone listens to needs its own history under the other half. The gate's relay paces itself
+spends one of the run's updates (`history.maxTotalUpdates`, Temporal's default of 2,000,
+pinned in `dynamicconfig/kontra.yaml`). A genuine relay doubles the listed topics' volume in
+history. Before #52 a leaked relay token could spend that on purpose -- polling from offset 0
+again and again until the history passed `limit.historySize.error` (20 MiB, pinned in
+`dynamicconfig/kontra.yaml`) and Temporal terminated the run, refunded against the seller. Now
+every job root refuses a poll at validation (`KontraStreamFull`) once its history is past half
+of the pinned limits (10,240 events or 10 MiB), and Temporal writes nothing to history for a
+refused update. **The guard bounds history growth only:** past it no poll adds to the history
+(the overshoot is the polls in flight, `history.maxInFlightUpdates`, 10, pinned, of at most
+512 KiB each). It caps the relay's share of a job's history near half of the limits, not the
+job's total: the relay's events stay, so a job someone listens to needs its own history under
+the other half. The gate's relay paces itself
 from the job's history size too (`kontra._relay.pace_for`) and stops at the same half. The
 seller's own publishing, and Kontra's progress forwarder (at most 1,000 items per job and
 worker process), are the seller's to keep within the limits.
