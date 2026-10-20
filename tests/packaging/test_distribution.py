@@ -59,9 +59,18 @@ def test_the_wheel_has_what_kontra_dev_and_the_contract_read(dist: Path) -> None
     for needed in (
         "kontra/__init__.py",
         "kontra/py.typed",
-        "kontra/_dev/compose.yaml",
-        # What the compose file's profiles mount, where its relative paths name them.
-        "kontra/_dev/observability/prometheus.yml",
+        # The dev gate and its host process (decisions I34): kontra dev up runs these.
+        "kontra/devgate/__init__.py",
+        "kontra/devgate/__main__.py",
+        "kontra/devgate/gate.py",
+        "kontra/devgate/stack.py",
+        "kontra/devgate/temporal.py",
+        "kontra/devgate/temporal_cli.py",
+        "kontra/devgate/state.py",
+        "kontra/devgate/store.py",
+        # The observability stack `kontra dev up --observability` runs (the e2e compose.yaml is
+        # not shipped); the files its relative paths mount beside it.
+        "kontra/_dev/observability/compose.yaml",
         "kontra/_dev/observability/grafana/datasources.yaml",
         "kontra/_dev/observability/grafana/dashboards.yaml",
         "kontra/_dev/observability/otelcol.yaml",
@@ -76,15 +85,6 @@ def test_the_wheel_has_what_kontra_dev_and_the_contract_read(dist: Path) -> None
         "kontra/_spec/offering-streams.v1.json",
         "kontra/templates/offering/worker.py.tmpl",
         "kontra/cli/_console.html",  # kontra dev's graph page, which the codec server serves
-        # The dev gate (decisions I34, OD2): the implementation and its re-export under the old name.
-        "kontra/devgate/__init__.py",
-        "kontra/devgate/gate.py",
-        "kontra/devgate/__main__.py",
-        "kontra/devgate/stack.py",
-        "kontra/devgate/state.py",
-        "kontra/devgate/store.py",
-        "kontra/devgate/temporal.py",
-        "kontra/devgate/temporal_cli.py",
         "kontra/testing/fake_gate/__init__.py",
         # What the platform gate imports, never copies (decisions I24, I25).
         "kontra/_passkeys.py",
@@ -93,10 +93,57 @@ def test_the_wheel_has_what_kontra_dev_and_the_contract_read(dist: Path) -> None
         "kontra/testing/jobkey_contract.py",
     ):
         assert needed in names, needed
+    # The e2e stack's compose.yaml (the prod gate image) is repository tooling, never shipped.
+    assert "kontra/_dev/compose.yaml" not in names
+    assert not [
+        n
+        for n in names
+        if n.endswith("compose.yaml") and n != "kontra/_dev/observability/compose.yaml"
+    ]
     [sdist] = dist.glob("*.tar.gz")
     with tarfile.open(sdist) as tar:
         top = {name.split("/", 2)[1] for name in tar.getnames() if "/" in name}
     assert top == {"kontra", "README.md", "LICENSE", "pyproject.toml", "PKG-INFO", ".gitignore", "hatch_build.py"}  # fmt: skip
+
+
+def test_the_observability_compose_is_the_only_one_shipped_and_names_no_gate(dist: Path) -> None:
+    """The shipped observability compose has exactly its six services and nothing of the prod
+    gate: not a back door to it (decisions I34, §7)."""
+    import yaml
+
+    [wheel] = dist.glob("*.whl")
+    with zipfile.ZipFile(wheel) as z:
+        raw = z.read("kontra/_dev/observability/compose.yaml")
+        names = z.namelist()
+    doc = yaml.safe_load(raw)
+    assert set(doc["services"]) == {
+        "prometheus",
+        "prometheus-agent",
+        "grafana",
+        "otelcol",
+        "loki",
+        "tempo",
+    }
+    text = raw.decode()
+    for forbidden in (
+        "kontra-gate",
+        "kontra-temporal",
+        "KONTRA_GATE_IMAGE",
+        "KONTRA_TEMPORAL_IMAGE",
+    ):
+        assert forbidden not in text, forbidden
+    assert "gate" not in doc["services"]
+    # It runs as itself only (-p/-f): nothing in it can bring another file, image or profile in.
+    assert doc["name"] == "kontra-dev-observability"
+    assert not {"include", "extends"} & set(doc)
+    for name, svc in doc["services"].items():
+        assert not {"profiles", "env_file", "extends", "build"} & set(svc), name
+        # Third-party images by digest: no Temporal image, no image of ours, no variable.
+        image = svc["image"]
+        assert "@sha256:" in image, name
+        assert not image.startswith(("temporalio/", "ghcr.io/", "${")), name
+    # Its old Prometheus file left with compose.yaml's observability profile.
+    assert "kontra/_dev/observability/prometheus.yml" not in names
 
 
 def test_the_metadata_is_what_pypi_shows(dist: Path) -> None:
@@ -118,6 +165,17 @@ def test_the_metadata_is_what_pypi_shows(dist: Path) -> None:
     # Never a bare `kontra` dependency: on PyPI that is someone else's package.
     requires = [line for line in meta.splitlines() if line.startswith("Requires-Dist:")]
     assert not [r for r in requires if r.split()[1].split("[")[0].split("<")[0] == "kontra"]
+    # The [dev] extra is exactly FastAPI and uvicorn, and [testing] includes it (decisions I34).
+    assert "Provides-Extra: dev\n" in meta
+    extras = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"
+    ]
+    dev = {r.split(">")[0].split("<")[0].split("=")[0].strip() for r in extras["dev"]}
+    assert dev == {"fastapi", "uvicorn"}
+    testing = {
+        r.split(">")[0].split("<")[0].split("=")[0].split("[")[0].strip() for r in extras["testing"]
+    }
+    assert dev <= testing, f"dev {dev} must be a subset of testing {testing}"
 
 
 # --------------------------------------------------------------------------- the checker's teeth
@@ -187,3 +245,26 @@ def test_a_file_named_after_it_fails(tmp_path: Path) -> None:
     wheel = {**CLEAN_WHEEL, "kontra/temporal_callback_forgery.py": ""}
     result = _check(_fake_dist(tmp_path / "d", CLEAN_SDIST, wheel))
     assert result.returncode == 1
+
+
+def test_a_compose_file_other_than_observability_fails(tmp_path: Path) -> None:
+    wheel = {**CLEAN_WHEEL, "kontra/_dev/compose.yaml": "services: {gate: {}}"}
+    result = _check(_fake_dist(tmp_path / "d", CLEAN_SDIST, wheel))
+    assert result.returncode == 1
+    assert "compose file" in result.stdout
+
+
+def test_the_observability_compose_is_allowed(tmp_path: Path) -> None:
+    wheel = {**CLEAN_WHEEL, "kontra/_dev/observability/compose.yaml": "services: {prometheus: {}}"}
+    result = _check(_fake_dist(tmp_path / "d", CLEAN_SDIST, wheel))
+    assert result.returncode == 0, result.stdout
+
+
+def test_a_shipped_yaml_naming_the_gate_fails(tmp_path: Path) -> None:
+    wheel = {
+        **CLEAN_WHEEL,
+        "kontra/_dev/observability/compose.yaml": "image: ghcr.io/x/kontra-gate:dev\n",
+    }
+    result = _check(_fake_dist(tmp_path / "d", CLEAN_SDIST, wheel))
+    assert result.returncode == 1
+    assert "kontra-gate" in result.stdout

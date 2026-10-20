@@ -10,6 +10,7 @@ import re
 import signal
 import stat
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -253,7 +254,8 @@ def test_a_command_without_a_profile_prints_one_line(cli: Cli) -> None:
         assert "Traceback" not in result.output
 
 
-def test_describe_known_failures() -> None:
+def test_describe_known_failures(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("KONTRA_HOME", str(tmp_path))  # no profile: the hints for a real login
     err = GateError(403, "stale_session", "this needs a recent login")  # a gate before I23
     line = describe(err)
     assert line is not None
@@ -308,10 +310,14 @@ def test_the_cli_confirms_only_at_a_terminal() -> None:
     assert "confirm" in cli_group.commands
 
 
-def test_describe_names_a_transport_failure_that_has_no_message() -> None:
+def test_describe_names_a_transport_failure_that_has_no_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """httpx's timeouts often carry no text: the line names the failure instead of ending
     in an empty "cannot reach <url>: " (seen when the gate stalled behind a slow Temporal)."""
     import httpx
+
+    monkeypatch.setenv("KONTRA_HOME", str(tmp_path))  # no profile: no dev hint
 
     request = httpx.Request("POST", "http://127.0.0.1:8080/v1/catalog?x=1")
     assert describe(httpx.ReadTimeout("", request=request)) == (
@@ -320,6 +326,38 @@ def test_describe_names_a_transport_failure_that_has_no_message() -> None:
     assert describe(httpx.ConnectError("refused", request=request)) == (
         "cannot reach http://127.0.0.1:8080/v1/catalog: refused"
     )
+
+
+def test_describe_tells_a_dev_profile_kontra_dev_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On a dev profile a forgotten session or an unreachable gate points at ``kontra dev up``,
+    never ``kontra login`` (decisions I34 §11, OD14)."""
+    import httpx
+
+    from kontra.profile import Profile
+
+    monkeypatch.setenv("KONTRA_HOME", str(tmp_path))
+    Profile(
+        gate_url="http://127.0.0.1:8080",
+        temporal_address="127.0.0.1:7233",
+        party="alice",
+        namespace="alice",
+        refresh_token="r0",
+        auth_time=datetime(2026, 10, 20, tzinfo=UTC),
+        tls=False,
+        dev=True,
+    ).save(tmp_path)
+    for code in ("invalid_token", "stale_session"):
+        line = describe(GateError(401, code, "the gate does not know this session"))
+        assert line is not None
+        assert "kontra dev up" in line, code
+        assert "kontra login" not in line, code
+    request = httpx.Request("GET", "http://127.0.0.1:8080/v1/me")
+    line = describe(httpx.ConnectError("refused", request=request))
+    assert line is not None
+    assert line.startswith("cannot reach http://127.0.0.1:8080/v1/me: refused")
+    assert "kontra dev up" in line
 
 
 def test_describe_temporal_refusing_or_absent() -> None:

@@ -312,7 +312,25 @@ def error_of(err: BaseException) -> dict[str, Any]:
     return answer.structured_content["error"]
 
 
-def test_failures_carry_the_gates_code_and_say_whether_to_retry() -> None:
+def _dev_profile(home: Path, *, dev: bool) -> None:
+    from kontra.profile import Profile
+
+    Profile(
+        gate_url="http://127.0.0.1:8080",
+        temporal_address="127.0.0.1:7233",
+        party="alice",
+        namespace="alice",
+        refresh_token="r0",
+        auth_time=datetime(2026, 10, 20, tzinfo=UTC),
+        tls=False,
+        dev=dev,
+    ).save(home)
+
+
+def test_failures_carry_the_gates_code_and_say_whether_to_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KONTRA_HOME", str(tmp_path))  # no profile: no dev hint either way
     assert error_of(GateError(404, "job_not_found", "no such job")) == {
         "code": "job_not_found",
         "message": "no such job",
@@ -340,6 +358,25 @@ def test_failures_carry_the_gates_code_and_say_whether_to_retry() -> None:
     }
     assert error_of(TimeoutError())["code"] == "timeout"
     assert error_of(PermissionError("read-only"))["code"] == "local_io_error"
+
+
+def test_a_dev_profile_is_told_kontra_dev_up_never_kontra_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A dev gate that restarted forgot the session; one that is down does not answer: either
+    way the agent is told ``kontra dev up``, never ``kontra login`` (decisions I34, OD14)."""
+    monkeypatch.setenv("KONTRA_HOME", str(tmp_path))
+    _dev_profile(tmp_path, dev=True)
+    refused = error_of(GateError(401, "invalid_grant", "expired"))["message"]
+    assert "kontra dev up" in refused
+    assert "kontra login" not in refused
+    down = error_of(httpx.ConnectError("refused"))
+    assert down["code"] == "gate_unreachable"
+    assert "kontra dev up" in down["message"]
+    _dev_profile(tmp_path, dev=False)  # a real login: as before
+    refused = error_of(GateError(401, "invalid_grant", "expired"))["message"]
+    assert "kontra login" in refused
+    assert "kontra dev up" not in error_of(httpx.ConnectError("refused"))["message"]
 
 
 def test_money_refusals_say_what_was_and_was_not_done() -> None:
