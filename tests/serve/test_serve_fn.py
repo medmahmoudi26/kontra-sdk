@@ -182,6 +182,38 @@ def test_the_entry_is_bound_and_further_workflows_registered(
         assert worker.options["graceful_shutdown_timeout"].total_seconds() == 3
 
 
+def test_serve_picks_the_engine_from_the_entry_and_an_override_must_agree(
+    tmp_path: Path, no_run: list[Worker]
+) -> None:
+    """Seam ⑥ (decisions I32): ``serve(entry)`` derives the engine from the entry's type --
+    temporalio code runs on ``temporal`` -- and ``engine=`` may only say the same."""
+    root = _project(tmp_path / "p", ONE_LINE)
+    with load_worker(root) as worker:
+        assert worker.offerings[0].engine == "temporal"
+    root = _project(
+        tmp_path / "q",
+        """
+        from kontra import serve
+        from workflows import Flow
+
+        serve(Flow, engine="temporal")
+        """,
+    )
+    with load_worker(root) as worker:
+        assert worker.offerings[0].engine == "temporal"
+    root = _project(
+        tmp_path / "r",
+        """
+        from kontra import serve
+        from workflows import Flow
+
+        serve(Flow, engine="golem")
+        """,
+    )
+    with pytest.raises(ValueError, match="engine"), load_worker(root):
+        pass
+
+
 def test_a_quote_passed_needs_no_quote_py(tmp_path: Path) -> None:
     root = _project(
         tmp_path / "p",

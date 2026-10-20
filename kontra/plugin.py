@@ -292,6 +292,7 @@ class KontraPlugin(SimplePlugin):
         *,
         quote: QuoteFunction | None = None,
         home: str | Path | None = None,
+        engine: str | None = None,
     ) -> KontraPlugin:
         """The plugin for ``offering.yaml`` beside the calling file bound to ``entry`` (a
         ``@workflow.defn`` class or an agent's ``@agent.accepts`` handler), priced by
@@ -299,7 +300,8 @@ class KontraPlugin(SimplePlugin):
         ``serve()``'s rules, for a seller who runs their own worker main. The entry is
         required: the contract, the task queue and the generated Nexus service all come
         from it, and the yaml names no code (D11). No activity is discovered: list them on
-        your worker."""
+        your worker. ``engine``: as :func:`kontra.serve`'s (derived from the entry; an
+        explicit one must agree)."""
         from kontra.serve._serve import OFFERING_FILE, _base, _default_quote
 
         caller = sys._getframe(1).f_globals
@@ -308,6 +310,7 @@ class KontraPlugin(SimplePlugin):
             base / OFFERING_FILE,
             entry=entry,
             quote=quote if quote is not None else _default_quote(caller, base),
+            engine=engine,
         )
         return cls(bound, home=home)
 
@@ -824,8 +827,15 @@ class KontraPlugin(SimplePlugin):
                     )
                 elif profile.dev:
                     try:
-                        entry = await gate.publish(b.document(), streams=b.streams)
+                        entry = await gate.publish(b.document(), streams=b.streams, engine=b.engine)
                     except GateError as e:
+                        if e.code == "engine_fixed":
+                            recorded = (e.detail or {}).get("engine")
+                            problems.append(
+                                f"{b.key} was published for the {recorded!r} engine; this "
+                                f"worker serves the {b.engine!r} engine: publish a new version"
+                            )
+                            continue
                         problems.append(
                             f"{b.key} is not published and publishing it failed ({e.message}); "
                             "run `kontra publish` (it needs your login, confirmed within "

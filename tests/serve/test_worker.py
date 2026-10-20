@@ -375,13 +375,21 @@ class _CatalogGate:
         self.open_jobs = open_jobs or []
         self.hired_hash = hired_hash
         self.published: list[dict[str, Any]] = []
+        self.engines: list[str] = []
+        #: What a publish answers instead (a 409 engine_fixed, say).
+        self.refuse: GateError | None = None
 
     async def get_offering(self, ref: str) -> m.CatalogEntry:
         if self.entry is None:
             raise GateError(404, "offering_not_found", "no such offering")
         return self.entry
 
-    async def publish(self, document: dict[str, Any], *, streams: Any = ()) -> m.CatalogEntry:
+    async def publish(
+        self, document: dict[str, Any], *, streams: Any = (), engine: str = "temporal"
+    ) -> m.CatalogEntry:
+        self.engines.append(engine)
+        if self.refuse is not None:
+            raise self.refuse
         self.published.append(document)
         return _entry(document).model_copy(update={"streams": list(streams)})
 
@@ -465,7 +473,17 @@ async def test_the_hash_lock_publishes_on_a_dev_profile(bound: Any) -> None:
     gate = _CatalogGate(None)
     hashes = await KontraPlugin(bound)._hash_lock(gate, _profile(dev=True))  # type: ignore[arg-type]
     assert gate.published == [bound.document()]
+    assert gate.engines == ["temporal"]  # the engine the entry's type runs on (I32)
     assert hashes == {bound.key: bound.contract_hash()}
+
+
+async def test_the_hash_lock_refuses_a_version_published_for_another_engine(bound: Any) -> None:
+    """Seam ⑥: the engine is fixed per version (409 ``engine_fixed``): this worker's code
+    cannot serve a version the catalog runs on another engine."""
+    gate = _CatalogGate(None)
+    gate.refuse = GateError(409, "engine_fixed", "fixed", {"engine": "golem"})
+    with pytest.raises(ServeError, match="published for the 'golem' engine"):
+        await KontraPlugin(bound)._hash_lock(gate, _profile(dev=True))  # type: ignore[arg-type]
 
 
 class _FlakyGate(_CatalogGate):

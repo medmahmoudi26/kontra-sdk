@@ -22,6 +22,11 @@ Then, for either:
   here, not at publish time. Derivation is :mod:`kontra.contract`'s, from the two models;
   this module only introspects.
 
+The engine the offering runs on (seam ⑥, decisions I32) is derived from the entry's type
+(:func:`engine_for`): everything ``kontra.serve`` binds is ``temporalio`` code, so it is
+``temporal``. An explicit ``engine=`` must agree; it is published beside the contract
+(``PublishRequest.engine``), never in it, so no contract hash depends on it.
+
 Paths are relative to the module that calls :func:`offering` (``worker.py``), so the worker
 runs from any directory.
 """
@@ -50,9 +55,17 @@ from kontra.contract import (
     merge_document,
 )
 from kontra.contract.names import OfferingId
+from kontra.gate_client.models import DEFAULT_ENGINE, ENGINE_NAMES, EngineName
 from kontra.serve.turn import AGENT_ACCEPTS, AGENT_HANDLERS, AGENT_INIT_DATA, TurnJob, TurnWorkflow
 
-__all__ = ["BindingError", "BoundOffering", "EntryKind", "QuoteFunction", "offering"]
+__all__ = [
+    "BindingError",
+    "BoundOffering",
+    "EntryKind",
+    "QuoteFunction",
+    "engine_for",
+    "offering",
+]
 
 #: ``async def quote(inp: Model) -> Quote``.
 QuoteFunction = Callable[[Any], Awaitable[Quote]]
@@ -62,6 +75,31 @@ EntryKind = Literal["workflow", "handler"]
 
 class BindingError(TypeError):
     """``offering(...)`` was given an entry or quote function of the wrong shape."""
+
+
+#: The engine each kind of entry runs on: a ``@workflow.defn`` class and an agent's
+#: ``@agent.accepts`` handler are both temporalio code (decisions I29).
+_ENGINES: Mapping[EntryKind, EngineName] = {"workflow": "temporal", "handler": "temporal"}
+
+
+def engine_for(kind: EntryKind, engine: str | None = None) -> EngineName:
+    """The engine an entry of ``kind`` runs on (seam ⑥, decisions I32): derived from the
+    entry's type, as :func:`serve` picks the adapter. ``engine``: an explicit choice, which
+    must be an engine's name and agree with the entry (a ``ValueError`` otherwise: the code
+    decides what it runs on, a keyword cannot move it)."""
+    derived = _ENGINES[kind]
+    if engine is None:
+        return derived
+    if engine not in ENGINE_NAMES:
+        raise ValueError(
+            f"engine={engine!r} is not an engine; the engines are {list(ENGINE_NAMES)}"
+        )
+    if engine != derived:
+        raise ValueError(
+            f"kontra.serve binds temporalio code, which runs on the {derived!r} engine; got "
+            f"engine={engine!r}"
+        )
+    return derived
 
 
 def _caller_dir(depth: int) -> Path:
@@ -340,9 +378,13 @@ class BoundOffering:
         agent: type | None = None,
         agent_type: str | None = None,
         handler: str | None = None,
+        engine: EngineName = DEFAULT_ENGINE,
     ) -> None:
         if (kind == "handler") != bool(agent is not None and agent_type and handler):
             raise ValueError("a handler binding names its agent, the agent's type and handler")
+        #: The engine the offering runs on (seam ⑥): published beside the contract, never in
+        #: it, and fixed per version by the catalog (decisions I32).
+        self.engine: EngineName = engine_for(kind, engine)
         self.spec = spec
         self.source = source
         #: The workflow the job runs (``job-<id>``): the bound workflow, or Kontra's turn
@@ -444,6 +486,7 @@ def offering(
     entry: type | Callable[..., Any] | None = None,
     workflow: type | None = None,
     contract: str | Path | None = None,
+    engine: str | None = None,
 ) -> BoundOffering:
     """Bind ``entry`` and ``quote`` to the offering in ``path`` (``offering.yaml``).
 
@@ -452,7 +495,8 @@ def offering(
     files written before handlers spell it. ``path`` and ``contract`` are relative to the
     calling module's directory. ``contract`` is a hand-written Nexus document (YAML or JSON)
     for schema-first sellers (§11.1); without it the contract is derived from the entry's
-    input and output models.
+    input and output models. ``engine``: what the offering runs on, derived from the entry
+    when omitted (:func:`engine_for`; an explicit one must agree).
     """
     if (entry is None) == (workflow is None):
         raise TypeError("offering() binds one entry: pass entry= (or workflow=), not both")
@@ -460,6 +504,7 @@ def offering(
     source = _resolve(path, base)
     spec = load_offering(source)
     bound_entry = _entry(entry if entry is not None else workflow)
+    chosen = engine_for(bound_entry.kind, engine)
     inp, out = bound_entry.input_type, bound_entry.output_type
     fn = _check_quote(quote, inp)
     nexus_doc: dict[str, Any] | None = None
@@ -485,6 +530,7 @@ def offering(
         agent=bound_entry.agent,
         agent_type=bound_entry.agent_type,
         handler=bound_entry.handler,
+        engine=chosen,
     )
     # Fail at import, not at the first job: derive (or validate) the document once here.
     bound.build_document()

@@ -192,6 +192,7 @@ def serve_from(
     *,
     quote: QuoteFunction | None,
     options: Mapping[str, Any],
+    engine: str | None = None,
 ) -> Worker:
     """:func:`serve` for the module whose globals are ``caller`` (``kontra.serve(...)``, the
     callable package, calls this with its own caller's)."""
@@ -205,6 +206,7 @@ def serve_from(
         base / OFFERING_FILE,
         entry=entry,
         quote=quote if quote is not None else _default_quote(caller, base),
+        engine=engine,
     )
     kwargs = dict(options)
     kwargs["activities"] = _extend(project_activities(base), options.get("activities"))
@@ -227,13 +229,19 @@ def serve(
     /,
     *,
     quote: QuoteFunction | None = None,
+    engine: str | None = None,
     **worker_kwargs: Unpack[WorkerConfig],
 ) -> Worker:
     """Serve ``offering.yaml`` beside the calling file with ``entry`` -- a ``@workflow.defn``
     class, or an agent's ``@agent.accepts`` handler (see the module docstring): runs the
     worker when the caller is ``__main__``, else returns it unstarted.
 
-    ``worker_kwargs``: ``temporalio.worker.Worker``'s keywords, verbatim (``plugins=`` and
-    ``workflows=`` included; ``activities=`` are added after the project's).
+    ``engine``: the engine the offering runs on (seam ⑥, decisions I32), picked from the
+    entry's type when omitted -- ``temporal`` for everything serve() binds; an explicit one
+    must agree (``ValueError``). ``worker_kwargs``: ``temporalio.worker.Worker``'s keywords,
+    verbatim (``plugins=`` and ``workflows=`` included; ``activities=`` are added after the
+    project's).
     """
-    return serve_from(sys._getframe(1).f_globals, entry, quote=quote, options=worker_kwargs)
+    return serve_from(
+        sys._getframe(1).f_globals, entry, quote=quote, options=worker_kwargs, engine=engine
+    )

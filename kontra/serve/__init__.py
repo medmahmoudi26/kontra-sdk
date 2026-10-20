@@ -94,9 +94,12 @@ class _CallablePackage(types.ModuleType):
         /,
         *,
         quote: QuoteFunction | None = None,
+        engine: str | None = None,
         **worker_kwargs: Unpack[WorkerConfig],
     ) -> Worker:
-        return serve_from(sys._getframe(1).f_globals, entry, quote=quote, options=worker_kwargs)
+        return serve_from(
+            sys._getframe(1).f_globals, entry, quote=quote, options=worker_kwargs, engine=engine
+        )
 
 
 sys.modules[__name__].__class__ = _CallablePackage

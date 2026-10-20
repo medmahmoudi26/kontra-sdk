@@ -145,8 +145,9 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
                 entries: list[m.CatalogEntry] = []
                 for b in chosen:
                     doc = b.document()
-                    # streams: beside the document, never in it (catalog data, I31).
-                    entry = await session.gate.publish(doc, streams=b.streams)
+                    # streams and the engine: beside the document, never in it (catalog
+                    # data, I31, I32).
+                    entry = await session.gate.publish(doc, streams=b.streams, engine=b.engine)
                     ours = contract_hash(doc)
                     if (entry.offering, entry.contract_hash) != (b.key, ours):
                         fail(
