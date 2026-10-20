@@ -29,7 +29,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from kontra.testing.ledger import InMemoryLedger
+from kontra.devgate.ledger import InMemoryLedger
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

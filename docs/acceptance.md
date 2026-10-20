@@ -153,7 +153,7 @@ Each of these deliberate breaks, made one at a time and reverted, made the named
 | `kontra/serve/handler.py`: the contract hash not compared | e2e 18 | the hire succeeded (`DID NOT RAISE JobFailed`) |
 | `kontra/codec`: a payload's first 4 KiB copied into its claim-check reference's metadata | e2e 8 | the marker found in `kontra.deliveries.payload`, `temporal.history_node.data`, `temporal.chasm_node_maps.data` |
 | `kontra/artifacts.py`: the whole file read into memory before uploading | e2e 14, 600 MiB | worker RSS +616.6 MiB |
-| `kontra/testing/ledger.py`: one minor unit too many to the seller on 1 release in 97 | the §9.3 suite | violation at interleaving 10 |
+| `kontra/devgate/ledger.py` (then `kontra/testing/ledger.py`): one minor unit too many to the seller on 1 release in 97 | the §9.3 suite | violation at interleaving 10 |
 | `temporal/authorizer`: the worker-role check skipped | `TestDenyMatrix` | 38 deny cells failed |
 | `temporal/authorizer`: the stream relay's handler-name check skipped (2026-10-20) | `TestDenyMatrix`, `TestSweep` | 7 deny cells failed, and the sweep |
 | `temporal/authorizer`: the stream relay's subject comparison skipped (2026-10-20) | `TestDenyMatrix`, `TestSweep`, `TestTemporalHandsTheDecodedRequest` | 11 deny cells failed, and the sweep |

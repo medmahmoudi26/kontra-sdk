@@ -34,6 +34,7 @@ from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 
 from kontra._control import Control
+from kontra.devgate.temporal import DYNAMIC_CONFIG
 
 __all__ = [
     "CLI_ENV",
@@ -50,8 +51,6 @@ __all__ = [
 #: :data:`kontra.devgate.temporal_cli.CLI_ENV`.
 CLI_ENV = "KONTRA_TEMPORAL_CLI"
 DEV_SERVER_VERSION = "v1.9.1"
-#: What standalone Nexus operations need on server 1.32 (decisions I4).
-DYNAMIC_CONFIG = ("nexusoperation.enableStandalone=true", "history.enableChasm=true")
 
 _T = TypeVar("_T")
 

@@ -18,10 +18,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kontra.testing.devserver import DYNAMIC_CONFIG
+__all__ = ["DYNAMIC_CONFIG", "READY_TIMEOUT", "RESTART_SECONDS", "STOP_GRACE", "TemporalChild"]
 
-__all__ = ["READY_TIMEOUT", "RESTART_SECONDS", "STOP_GRACE", "TemporalChild"]
-
+#: What standalone Nexus operations need on server 1.32 (decisions I4). Here, not in
+#: :mod:`kontra.testing.devserver` (which re-exports it): the host never imports the testing
+#: package (OD2).
+DYNAMIC_CONFIG = ("nexusoperation.enableStandalone=true", "history.enableChasm=true")
 #: Seconds :meth:`TemporalChild.stop` waits after SIGTERM before SIGKILL, then for the exit.
 STOP_GRACE = 10.0
 _KILL_WAIT = 5.0

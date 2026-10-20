@@ -115,6 +115,7 @@ from kontra.contract.names import (
 )
 from kontra.contract.offering import STREAMS_MAX, check_streams, check_topic
 from kontra.contract.quote import MAX_ETA_SECONDS
+from kontra.devgate.ledger import InMemoryLedger
 from kontra.engine import (
     AGE_MAGIC,
     DEFAULT_ENGINE,
@@ -163,7 +164,6 @@ from kontra.ledger import (
     Split,
     UnknownHold,
 )
-from kontra.testing.ledger import InMemoryLedger
 from kontra.workers import offline, workers_view
 
 __all__ = [
@@ -216,8 +216,13 @@ VIA_WORDS = {
     "device:dev": "a development handle",
     "dev-login": "a development handle",
 }
-#: The sign-ins a ``KONTRA_DEV=1`` gate confirms at once (development handles).
+#: The sign-ins a dev gate (``dev=True``) confirms at once (development handles).
 _DEV_VIA = frozenset({"dev-login", "device:dev"})
+#: How a person signs in, as the gate's messages name it: the platform's verb, and on a dev
+#: gate the command that mints a dev sign-in (``kontra dev`` never names a login verb,
+#: decisions I34). The one place this module spells either.
+_SIGN_IN = "`kontra login`"
+_DEV_SIGN_IN = "`kontra dev up`"
 SUBJECT_SIGN_IN = "Your Kontra sign-in link"
 SUBJECT_CONFIRM = "Confirm it's you on Kontra"
 SUBJECT_PASSKEY_ADDED = pk.SUBJECT_ADDED
@@ -1411,7 +1416,7 @@ class DevGate:
                 403,
                 "fresh_login_required",
                 "an API key cannot do this (publish, change recipients, see or manage API "
-                "keys and sign-ins, resolve disputes); a person's sign-in can (`kontra login`)",
+                f"keys and sign-ins, resolve disputes); a person's sign-in can ({self.sign_in})",
             )
         return who
 
@@ -1423,7 +1428,15 @@ class DevGate:
         until = self.confirmed_until(who)
         if until is not None and self.now() < until:
             return who
-        raise self._confirmation_required(who, _confirmation_required_message(self.confirm_ttl))
+        raise self._confirmation_required(
+            who, _confirmation_required_message(self.confirm_ttl, self.sign_in)
+        )
+
+    @property
+    def sign_in(self) -> str:
+        """What this gate's messages tell a person to run to sign in: ``kontra dev up`` on a
+        dev gate, the platform's login verb otherwise."""
+        return _DEV_SIGN_IN if self.dev else _SIGN_IN
 
     #: Deprecated: :meth:`require_confirmed`.
     require_fresh = require_confirmed
@@ -2014,7 +2027,7 @@ class DevGate:
                 409,
                 "confirm_unavailable",
                 "this account cannot confirm it's you by email on this gate; a new sign-in "
-                "confirms it (`kontra login`)",
+                f"confirms it ({self.sign_in})",
                 {"confirm_with": "sign_in"},
             )
         network = _requester_network(client)
@@ -2633,7 +2646,7 @@ class DevGate:
     def add_recipient(self, who: Principal, label: str, public_key: str) -> m.Me:
         """Add one recipient. Adding never replaces, so a second machine is one more
         recipient and ``key_mismatch`` no longer exists; adding the same key again under
-        the same label is a no-op, so `kontra login` twice on one machine is idempotent."""
+        the same label is a no-op, so signing in twice on one machine is idempotent."""
         try:
             check_public_key(public_key)
         except ValueError as e:
@@ -4635,14 +4648,14 @@ def _too_many_passkeys() -> GateHTTPError:
     )
 
 
-def _confirmation_required_message(ttl: timedelta) -> str:
+def _confirmation_required_message(ttl: timedelta, sign_in: str = _SIGN_IN) -> str:
     """The platform's message of 403 ``confirmation_required`` (``once an hour`` at the
-    default ``confirm_ttl``)."""
+    default ``confirm_ttl``); ``sign_in`` is :attr:`DevGate.sign_in`."""
     words = _duration_words(ttl)
     often = f"once {words}" if words in ("an hour", "a minute") else f"once every {words}"
     return (
         f"this change needs you to confirm it's you ({often} per sign-in): the console asks in "
-        "place, and so does kontra-sdk 0.2.2 or later (`kontra confirm`); a new `kontra login` "
+        f"place, and so does kontra-sdk 0.2.2 or later (`kontra confirm`); a new {sign_in} "
         "also counts"
     )
 

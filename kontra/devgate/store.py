@@ -68,7 +68,7 @@ ALLOWED: dict[str, tuple[str, ...]] = {
     "kontra.engine": ("Liveness",),
     "kontra.gate_client.models": ("Escrow", "JobState", "StreamEvent"),
     "kontra.ledger": ("Money", "Account", "Handle", "HandleState", "HoldState", "Op", "Posting", "Split"),
-    "kontra.testing.ledger": ("_Account", "_HoldRow", "_Movement"),
+    "kontra.devgate.ledger": ("_Account", "_HoldRow", "_Movement"),
     "kontra.contract.validate": ("ContractInfo",),
     "kontra.contract.names": ("OfferingId", "Version"),
     "kontra.contract.facts": ("XKontra",),
