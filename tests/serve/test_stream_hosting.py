@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from temporalio.api.common.v1 import Payload
+from temporalio.api.enums.v1 import EventType
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHistory, WorkflowUpdateStage
 from temporalio.common import RawValue
 from temporalio.contrib.workflow_streams import PollInput, WorkflowStreamClient
@@ -367,8 +368,11 @@ async def test_the_history_guard_refuses_polls_and_stops_the_relay(
     monkeypatch.setattr(interceptors, "STREAM_HISTORY_BYTES", 1)
     with pytest.raises(_relay.RelayStopped):
         await collect(rig.relay(job, start=2), 1)
-    after = len((await rig.plain.get_workflow_handle(job_workflow_id(job)).fetch_history()).events)
-    assert after - before <= 3  # a refused poll writes no update events (a workflow task, at most)
+    added = (await rig.plain.get_workflow_handle(job_workflow_id(job)).fetch_history()).events
+    # A refused poll writes no update event. Its speculative workflow task may still be kept
+    # when another event lands during it, so the workflow-task events are not counted: how
+    # many are kept is the server's timing, not the guard's.
+    assert [e for e in added[before:] if "UPDATE" in EventType.Name(e.event_type)] == []
     monkeypatch.undo()
     await handle.signal(HostedJob.finish)
     assert await handle.result() == "ok"
