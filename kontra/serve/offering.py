@@ -368,6 +368,13 @@ class BoundOffering:
         return self.spec.offering_id
 
     @property
+    def streams(self) -> tuple[str, ...]:
+        """The topics of the job's stream a buyer may read (``offering.yaml`` ``streams:``,
+        sorted): catalog data, published beside the contract and never in its hash
+        (decisions I31). A bound handler's are mirrored from its agent's stream."""
+        return self.spec.streams
+
+    @property
     def entry_workflow(self) -> type:
         """The seller's workflow class a worker serving this offering registers: the bound
         workflow, or a handler's agent. :class:`~kontra.plugin.KontraPlugin` claims the

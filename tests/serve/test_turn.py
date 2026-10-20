@@ -14,6 +14,7 @@ the harness itself (the golden pattern: Kontra never imports it at runtime)."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import inspect
 import json
@@ -33,7 +34,10 @@ from temporalio.testing import ActivityEnvironment
 
 from kontra.cli import cli as kontra_cli
 from kontra.cli._project import load_worker
-from kontra.contract.names import agent_workflow_id, job_workflow_id
+from kontra.codec.stream import open_item
+from kontra.contract.names import PROGRESS_TOPIC, agent_workflow_id, job_workflow_id
+from kontra.gate_client import GateError
+from kontra.gate_client import models as m
 from kontra.serve import BindingError, offering
 from kontra.serve import turn as kturn
 from kontra.serve.turn import TURN_ACTIVITY, TURN_WORKFLOW, await_reply
@@ -59,7 +63,7 @@ HERE = Path(__file__).parent
 pytest.importorskip("temporal_agent_harness", reason="the dev group's temporal-agent-harness")
 
 
-def _offering_yaml(directory: Path) -> Path:
+def _offering_yaml(directory: Path, **facts: Any) -> Path:
     spec = {
         "name": "acme/recon",
         "version": f"1.{os.getpid() % 100_000}.{uuid.uuid4().int % 10_000}",
@@ -68,6 +72,7 @@ def _offering_yaml(directory: Path) -> Path:
         "review_window": "1h",
         "max_output_bytes": "1MB",
         "artifact_retention": "1d",
+        **facts,
     }
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "offering.yaml"
@@ -86,8 +91,8 @@ serve(ReconAgent.sweep, quote=quote, plugins=[AgentHarnessPlugin()])
 """
 
 
-def _project(root: Path, worker: str = _WORKER) -> Path:
-    _offering_yaml(root)
+def _project(root: Path, worker: str = _WORKER, **facts: Any) -> Path:
+    _offering_yaml(root, **facts)
     (root / "worker.py").write_text(textwrap.dedent(worker).lstrip())
     return root
 
@@ -318,9 +323,9 @@ async def test_a_worker_stopped_mid_turn_costs_the_job_nothing(
     having ended, that failed the job for good. Now the activity is retried on the new
     worker, its update id gets the first attempt's admission back (the message is not sent
     twice), and the job delivers the handler's reply."""
-    with load_worker(_project(tmp_path / "p", _SLOW_WORKER)) as worker:
+    with load_worker(_project(tmp_path / "p", _SLOW_WORKER, streams=["turn_events"])) as worker:
         [bound] = worker.offerings
-        async with Marketplace(dev_server=dev_server) as mp:
+        async with Marketplace(dev_server=dev_server, relay_interval=0.2) as mp:
             acme = await mp.party("acme")
             bob = await mp.party(f"bob-{uuid.uuid4().hex[:6]}", balance="100.00")
             seller = mp.client(acme.namespace)
@@ -330,6 +335,7 @@ async def test_a_worker_stopped_mid_turn_costs_the_job_nothing(
                 value = {"host": "a.example"}
                 hired = await buyer.hire(entry, value)
                 handle = await buyer.start(hired, value, result_type=Report)
+                listener = asyncio.create_task(_turn_events(bob, hired.job_id))
                 agent = seller.get_workflow_handle(agent_workflow_id(hired.job_id))
 
                 async def reading() -> bool:
@@ -356,6 +362,13 @@ async def test_a_worker_stopped_mid_turn_costs_the_job_nothing(
             ]
             assert attempts == [2]  # the first attempt's start is not kept once it retried
             assert len(await _messages(agent)) == 1  # one message, not two
+            # The turn's events, mirrored onto the job's stream (decisions I31): the retry
+            # mirrored from the first attempt's checkpoint, so none of them twice.
+            events = await asyncio.wait_for(listener, 60)
+            kinds = [e["event"]["type"] for e in events]
+            assert kinds.count("message_accepted") == 1
+            assert kinds.count("message_handler_end") == 1
+            assert len(kinds) == len({json.dumps(e, sort_keys=True) for e in events})
 
 
 _HOP_WORKER = """
@@ -387,6 +400,120 @@ async def test_a_handler_with_aliased_models_is_sold_like_a_workflow(
                 handle = await buyer.start(hired, value, result_type=Hopped)
                 out = await handle.result()
     assert out == Hopped.model_validate({"to": "a+1", "via-hops": 1})
+
+
+_STREAMY_WORKER = """
+from temporal_agent_harness.plugin import AgentHarnessPlugin
+
+from kontra import serve
+from tests.serve.harness_agents import StreamyAgent, quote
+
+serve(StreamyAgent.sweep, quote=quote, plugins=[AgentHarnessPlugin()])
+"""
+
+
+async def _turn_events(party: Any, job_id: str) -> list[dict[str, Any]]:
+    """The job's ``turn_events`` as its buyer reads them through the gate, opened."""
+    out: list[dict[str, Any]] = []
+    async for e in party.gate.stream(job_id, topics=[kturn.TURN_EVENTS_TOPIC]):
+        if e.kind is m.StreamEventKind.ITEM:
+            ct = base64.b64decode(e.ciphertext_b64)
+            p = open_item(ct, [party.identity], topic=e.topic, offset=e.offset)
+            out.append(json.loads(p.data))
+    return out
+
+
+@pytest.mark.temporal
+async def test_listed_topics_are_mirrored_onto_the_jobs_stream_and_nothing_else(
+    dev_server: DevServer, tmp_path: Path
+) -> None:
+    """``streams: [turn_events]``: the agent's events reach the buyer under the same name,
+    from the job's own stream (the relay reaches ``job-<id>``, never the agent child); its
+    ``notes`` topic is never copied; and the events are in the job's stream before the job
+    completes (the turn activity flushes before it returns the reply)."""
+    from .harness_agents import NOTES_TOPIC
+
+    project = _project(tmp_path / "p", _STREAMY_WORKER, streams=["turn_events"])
+    with load_worker(project) as worker:
+        [bound] = worker.offerings
+        assert bound.streams == ("turn_events",)
+        async with Marketplace(dev_server=dev_server, relay_interval=0.2) as mp:
+            acme = await mp.party("acme")
+            bob = await mp.party(f"bob-{uuid.uuid4().hex[:6]}", balance="100.00")
+            async with mp.serve(worker, acme):
+                entry = await bob.gate.get_offering(bound.key)
+                assert entry.streams == ["turn_events"]
+                buyer = Buyer(mp, bob)
+                value = {"host": f"{MARKER}.example"}
+                hired = await buyer.hire(entry, value)
+                handle = await buyer.start(hired, value, result_type=Report)
+                listener = asyncio.create_task(_turn_events(bob, hired.job_id))
+                out = await handle.result()
+                events = await asyncio.wait_for(listener, 60)
+                with pytest.raises(GateError) as refused:
+                    async for _ in bob.gate.stream(hired.job_id, topics=[NOTES_TOPIC]):
+                        pass
+                assert refused.value.code == "unknown_topic"
+
+                async def stored() -> list[m.StreamEvent]:
+                    return list(mp.gate.jobs[hired.job_id].events)
+
+                kept = await mp.gate.run(stored)
+                relay = await mp.gate.run(_relay_state(mp, hired.job_id))
+    assert out.host == f"{MARKER}.example"
+    kinds = [e["event"]["type"] for e in events]
+    assert "message_handler_end" in kinds
+    reply = next(e for e in events if e["event"]["type"] == "message_handler_end")
+    assert reply["event"]["output"] == {"host": f"{MARKER}.example", "open": len(out.host)}
+    assert {e.topic for e in kept if e.topic is not None} <= {"turn_events", PROGRESS_TOPIC}
+    assert relay.dropped == 0  # nothing unlisted in the job's log for the relay to drop
+    assert "private note" not in json.dumps(events)
+
+
+def _relay_state(mp: Marketplace, job_id: str) -> Any:
+    async def get() -> Any:
+        return mp.gate.jobs[job_id].relay
+
+    return get
+
+
+async def test_the_mirror_publishes_only_listed_topics_past_its_checkpoint() -> None:
+    """A unit view of the mirror: listed topics only, nothing at or before the checkpoint
+    (an earlier attempt's), the checkpoint moved by a flush and carried by every beat."""
+    from temporalio.api.common.v1 import Payload
+
+    class Topic:
+        def __init__(self, sink: list[tuple[str, Payload]], name: str) -> None:
+            self.sink, self.name = sink, name
+
+        def publish(self, value: Payload) -> None:
+            self.sink.append((self.name, value))
+
+    class Job:
+        def __init__(self) -> None:
+            self.published: list[tuple[str, Payload]] = []
+            self.flushes = 0
+
+        def topic(self, name: str) -> Topic:
+            return Topic(self.published, name)
+
+        async def flush(self) -> None:
+            self.flushes += 1
+
+    job = Job()
+    mirror = kturn._Mirror(job, frozenset({"turn_events"}), after=4)  # type: ignore[arg-type]  # pyright: ignore[reportPrivateUsage]
+    p = Payload(metadata={"encoding": b"json/plain"}, data=b"{}")
+    for topic, offset in (("turn_events", 3), ("turn_events", 4), ("notes", 5), ("turn_events", 6)):
+        mirror.offer(topic, offset, p)
+    assert [(t, v.data) for t, v in job.published] == [("turn_events", b"{}")]
+    assert mirror.details() == (4,)
+    beats: list[tuple[Any, ...]] = []
+    env = ActivityEnvironment()
+    env.on_heartbeat = lambda *d: beats.append(d)
+    await env.run(mirror.flush)
+    assert (job.flushes, mirror.flushed, beats) == (1, 6, [(6,)])
+    await env.run(mirror.flush)
+    assert job.flushes == 1  # nothing new: no signal
 
 
 # --------------------------------------------------------------------------- the reply

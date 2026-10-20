@@ -145,13 +145,19 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
                 entries: list[m.CatalogEntry] = []
                 for b in chosen:
                     doc = b.document()
-                    entry = await session.gate.publish(doc)
+                    # streams: beside the document, never in it (catalog data, I31).
+                    entry = await session.gate.publish(doc, streams=b.streams)
                     ours = contract_hash(doc)
                     if (entry.offering, entry.contract_hash) != (b.key, ours):
                         fail(
                             f"the catalog recorded {printable(entry.offering)} with contract "
                             f"{printable(entry.contract_hash)} for {b.key} {ours}; `kontra serve` "
                             "would refuse it -- check the gate"
+                        )
+                    if tuple(sorted(entry.streams)) != b.streams:
+                        fail(
+                            f"the catalog recorded streams {printable(str(entry.streams))} for "
+                            f"{b.key}, not {list(b.streams)}; `kontra serve` would refuse it"
                         )
                     entries.append(entry)
                 return entries
@@ -165,6 +171,8 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
         click.echo(f"  contract  {printable(e.contract_hash)}")
         click.echo(f"  endpoint  {printable(e.endpoint)}")
         click.echo(f"  queue     {printable(e.task_queue)}")
+        if e.streams:
+            click.echo(f"  streams   {printable(', '.join(e.streams))}")
 
 
 @click.command()

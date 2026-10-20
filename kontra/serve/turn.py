@@ -45,6 +45,17 @@ stamp. The stream is read with temporalio's own ``workflow_streams`` client.
 
 The activity heartbeats for liveness only: :class:`~kontra.serve.interceptors.KontraInterceptor`
 never forwards ``kontra.turn.v1.deliver``'s heartbeats to the buyer as progress.
+
+**Streams** (decisions I31). The gate's relay reads the job's own stream (``job-<id>``,
+hosted by Kontra's interceptor on the wrapper), never the agent child's, whose payloads are
+sealed to the seller alone. So the activity, which reads the agent's stream anyway, mirrors
+the topics the offering lists (``offering.yaml`` ``streams:``) onto the job's stream, under
+the same names -- ``streams: [turn_events]`` relays the agent's events to the buyer -- as
+the agent published them (each item's ``Payload``, untouched). Unlisted topics are never
+copied. It flushes what it mirrored every half second and before it returns the reply, so
+the events are in the job's stream before the job can complete, and checkpoints the last
+agent offset flushed in its heartbeat details: a retried attempt mirrors from there, so a
+lost worker re-publishes at most one flush window.
 """
 
 from __future__ import annotations
@@ -52,15 +63,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, cast
 
 from pydantic import BaseModel, ValidationError
 from temporalio import activity, workflow
+from temporalio.api.common.v1 import Payload
 from temporalio.client import Client, WorkflowUpdateFailedError
-from temporalio.common import RetryPolicy
+from temporalio.common import RawValue, RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, ChildWorkflowError
 
 with workflow.unsafe.imports_passed_through():
@@ -130,6 +142,8 @@ _UNBOUNDED = timedelta(days=1)
 _FAILURE = "KontraTurn"
 #: How often the stream is polled once caught up.
 _POLL = timedelta(milliseconds=50)
+#: How often mirrored items are flushed to the job's stream (and checkpointed).
+_MIRROR_FLUSH = 0.5
 _ONE_TURN = (
     "a Kontra job is one turn without buyer approvals or callbacks (v1; session jobs are "
     "kontra-sdk#60)"
@@ -238,12 +252,21 @@ class TurnWorkflow:
 class TurnActivities:
     """``kontra.turn.v1.deliver``, bound to the worker's own client (it talks to the agent, a
     child of the job: :class:`~kontra.plugin.KontraPlugin` binds it when it builds a
-    bound-handler offering's worker) and to the handler's output model (the reply is
-    re-keyed by its aliases, :func:`as_output`)."""
+    bound-handler offering's worker), to the handler's output model (the reply is re-keyed
+    by its aliases, :func:`as_output`), and to the topics it mirrors onto the job's stream
+    (``mirror``: the offering's ``streams``)."""
 
-    def __init__(self, client: Client, output: type[BaseModel] | None = None) -> None:
+    def __init__(
+        self,
+        client: Client,
+        output: type[BaseModel] | None = None,
+        mirror: Iterable[str] = frozenset(),
+    ) -> None:
         self._client = client
         self._output = output
+        if isinstance(mirror, str):
+            raise TypeError("mirror is a collection of topic names, not one name")
+        self._mirror = frozenset(mirror)
 
     @activity.defn(name=TURN_ACTIVITY)
     async def deliver(self, req: TurnRequest) -> dict[str, Any]:
@@ -261,23 +284,111 @@ class TurnActivities:
             )
         except WorkflowUpdateFailedError as e:
             raise _failure(f"the agent refused the message: {e.cause}") from None
-        async with _heartbeating():
-            return as_output(self._output, await self._reply(req, reply))
+        mirror = self._mirror_for(reply) if self._mirror else None
+        async with _heartbeating(mirror.details if mirror is not None else tuple):
+            return as_output(self._output, await self._reply(req, reply, mirror))
 
-    async def _reply(self, req: TurnRequest, reply: Mapping[str, Any]) -> dict[str, Any]:
+    def _mirror_for(self, reply: Mapping[str, Any]) -> _Mirror | None:
+        offset = reply.get("accepted_offset")
+        job = activity.info().workflow_id
+        if not isinstance(offset, int) or job is None:
+            return None  # _reply refuses the admission
+        details = activity.info().heartbeat_details
+        resumed = details[0] if details else None
+        after = offset - 1
+        if isinstance(resumed, int) and not isinstance(resumed, bool) and resumed >= after:
+            after = resumed  # a retry: what an earlier attempt flushed is in the job's stream
+        return _Mirror(WorkflowStreamClient.create(self._client, job), self._mirror, after)
+
+    async def _reply(
+        self, req: TurnRequest, reply: Mapping[str, Any], mirror: _Mirror | None = None
+    ) -> dict[str, Any]:
         message_id, offset = reply.get("message_id"), reply.get("accepted_offset")
         if not isinstance(message_id, str) or not isinstance(offset, int):
             raise _failure("the agent's admission names no message (not a harness agent?)")
         stream = WorkflowStreamClient.create(self._client, req.agent_workflow_id)
-        items: AsyncIterator[Any] = stream.subscribe(
-            topics=[TURN_EVENTS_TOPIC],
+        if mirror is None:
+            items: AsyncIterator[Any] = stream.subscribe(
+                topics=[TURN_EVENTS_TOPIC],
+                from_offset=offset,
+                result_type=dict[str, Any],
+                poll_cooldown=_POLL,
+            )
+            return await read_reply(
+                (item.data async for item in items), message_id, reply.get("turn_id")
+            )
+        raw: AsyncIterator[Any] = stream.subscribe(
+            topics=sorted({TURN_EVENTS_TOPIC, *self._mirror}),
             from_offset=offset,
-            result_type=dict[str, Any],
+            result_type=RawValue,
             poll_cooldown=_POLL,
         )
-        return await read_reply(
-            (item.data async for item in items), message_id, reply.get("turn_id")
-        )
+        converter = self._client.data_converter.payload_converter
+
+        async def events() -> AsyncIterator[object]:
+            async for item in raw:
+                payload: Payload = item.data.payload
+                mirror.offer(item.topic, item.offset, payload)
+                if item.topic == TURN_EVENTS_TOPIC:
+                    try:
+                        yield converter.from_payload(payload, dict[str, Any])
+                    except Exception:  # an item is untrusted: one that will not decode is not ours
+                        yield None
+
+        async with mirror.flushing():
+            out = await read_reply(events(), message_id, reply.get("turn_id"))
+            await mirror.flush()  # the events are in the job's stream before the reply
+        return out
+
+
+class _Mirror:
+    """The listed topics of the agent's stream, published onto the job's stream under the
+    same names, each item's ``Payload`` as the agent wrote it. ``after``: the agent offset
+    already in the job's stream (an earlier attempt's checkpoint)."""
+
+    def __init__(self, job: WorkflowStreamClient, topics: frozenset[str], after: int) -> None:
+        self._job = job
+        self._topics = topics
+        self._after = after
+        #: The last agent offset published (buffered) and flushed (checkpointed).
+        self._published = after
+        self.flushed = after
+        self._lock = asyncio.Lock()
+
+    def offer(self, topic: str, offset: int, payload: Payload) -> None:
+        if topic in self._topics and offset > self._after:
+            self._job.topic(topic).publish(payload)
+            self._published = max(self._published, offset)
+
+    def details(self) -> tuple[Any, ...]:
+        """The heartbeat's details: the checkpoint, so a liveness beat never erases it."""
+        return (self.flushed,)
+
+    async def flush(self) -> None:
+        async with self._lock:
+            target = self._published
+            if target <= self.flushed:
+                return
+            await self._job.flush()
+            self.flushed = target
+            activity.heartbeat(*self.details())
+
+    @contextlib.asynccontextmanager
+    async def flushing(self) -> AsyncGenerator[None]:
+        """Flush every :data:`_MIRROR_FLUSH` seconds while the block runs."""
+
+        async def loop() -> None:
+            while True:
+                await asyncio.sleep(_MIRROR_FLUSH)
+                await self.flush()
+
+        task = asyncio.create_task(loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 async def read_reply(
@@ -300,19 +411,18 @@ async def read_reply(
     )
 
 
-async def await_reply(
-    events: AsyncIterator[object], message_id: str, turn_id: object
-) -> dict[str, Any]:
-    """The reply to ``message_id`` among the agent's events (each an ``AgentEvent`` envelope
-    as JSON), or the failure that ends the job: the handler's error, a tool approval or a
-    callback asked for (a job is one turn), or the turn ending without it. The stream
-    ending first is :class:`StreamEnded`, not a failure: :func:`read_reply` says what it
-    means. Events of other messages are not ours and are passed over."""
-    async for event in events:
+class _Reply:
+    """:func:`await_reply`'s logic, one event at a time."""
+
+    def __init__(self, message_id: str, turn_id: object) -> None:
+        self.message_id, self.turn_id = message_id, turn_id
+
+    def feed(self, event: object) -> dict[str, Any] | None:
+        """The reply, if ``event`` is it; raises the failure that ends the job; else None."""
         envelope = _mapping(event)
         body = _mapping(envelope.get(EVENT))
         kind = body.get(EVENT_TYPE)
-        if envelope.get(EVENT_MESSAGE_ID) == message_id:
+        if envelope.get(EVENT_MESSAGE_ID) == self.message_id:
             if kind == MESSAGE_HANDLER_END:
                 output = body.get(EVENT_OUTPUT)
                 if not isinstance(output, dict):
@@ -322,8 +432,24 @@ async def await_reply(
                 raise _failure(str(body.get(EVENT_MESSAGE) or "the handler failed"))
             if isinstance(kind, str) and kind in _ASKED:
                 raise _failure(f"the handler asked for {_ASKED[kind]}: {_ONE_TURN}")
-        elif kind == TURN_END and envelope.get(EVENT_TURN_ID) == turn_id:
+        elif kind == TURN_END and envelope.get(EVENT_TURN_ID) == self.turn_id:
             raise _failure("the agent's turn ended without a reply")
+        return None
+
+
+async def await_reply(
+    events: AsyncIterator[object], message_id: str, turn_id: object
+) -> dict[str, Any]:
+    """The reply to ``message_id`` among the agent's events (each an ``AgentEvent`` envelope
+    as JSON), or the failure that ends the job: the handler's error, a tool approval or a
+    callback asked for (a job is one turn), or the turn ending without it. The stream
+    ending first is :class:`StreamEnded`, not a failure: :func:`read_reply` says what it
+    means. Events of other messages are not ours and are passed over."""
+    reply = _Reply(message_id, turn_id)
+    async for event in events:
+        out = reply.feed(event)
+        if out is not None:
+            return out
     raise StreamEnded
 
 
@@ -357,14 +483,15 @@ def _mapping(value: object) -> Mapping[str, Any]:
 
 
 @contextlib.asynccontextmanager
-async def _heartbeating() -> AsyncGenerator[None]:
-    """Heartbeat (no details) every half heartbeat timeout while the block runs."""
+async def _heartbeating(details: Callable[[], tuple[Any, ...]] = tuple) -> AsyncGenerator[None]:
+    """Heartbeat every half heartbeat timeout while the block runs, with ``details()`` (the
+    mirror's checkpoint, which a beat without it would erase; none without a mirror)."""
     timeout = activity.info().heartbeat_timeout or _HEARTBEAT_TIMEOUT
     interval = timeout.total_seconds() / 2
 
     async def beat() -> None:
         while True:
-            activity.heartbeat()
+            activity.heartbeat(*details())
             await asyncio.sleep(interval)
 
     task = asyncio.create_task(beat())

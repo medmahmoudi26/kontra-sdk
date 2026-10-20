@@ -58,6 +58,8 @@ class UpperFlow:
 
     @workflow.run
     async def run(self, order: Order) -> Shout:
+        if order.hold:
+            await workflow.wait_condition(lambda: self._released)
         loud = await workflow.execute_activity(shout, order.text, start_to_close_timeout=_T)
         length = await workflow.execute_local_activity(count, order.text, start_to_close_timeout=_T)
         job = await workflow.execute_activity("where", start_to_close_timeout=_T, result_type=str)
@@ -75,8 +77,6 @@ class UpperFlow:
             await workflow.execute_activity(
                 sync_beat, Beats(count=order.sync_beats, note=order.text), start_to_close_timeout=_T
             )
-        if order.hold:
-            await workflow.wait_condition(lambda: self._released)
         return Shout(
             text=child.text * order.copies,
             length=length,

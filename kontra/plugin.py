@@ -69,6 +69,7 @@ from kontra._compat import check_temporalio
 from kontra.auth import Session
 from kontra.codec import GateBlobStore, KontraCodec, KontraFailureConverter
 from kontra.codec.age import public_key_of
+from kontra.codec.stream import ENVELOPE_MAX
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
 from kontra.profile import KEY_FILE_ENV, NotLoggedIn, Profile, kontra_home
@@ -168,21 +169,45 @@ def _dedupe(items: Iterable[Any]) -> list[Any]:
     return out
 
 
+def _storage_floor(codec: KontraCodec) -> int:
+    """The payload size external storage must stay above: the codec's claim-check threshold
+    (when it has a blob store) and the stream envelope's limit, whichever is larger, plus
+    framing."""
+    return max(codec.claim_check_threshold or 0, ENVELOPE_MAX) + _INLINE_OVERHEAD
+
+
 def _storage_problem(dc: DataConverter, codec: KontraCodec) -> str | None:
     """What is wrong with ``dc``'s external storage, if anything: a threshold at or below the
     codec's claim-check threshold (plus framing) offloads a job's payload to a store its
-    buyer cannot read. Encoding is converter, codec, then storage: storage only ever sees
-    ciphertext, but the reference it leaves in history resolves only on the seller's side."""
+    buyer cannot read, and one at or below the stream envelope's limit
+    (:data:`~kontra.codec.stream.ENVELOPE_MAX`) would offload a poll's answer the gate's
+    relay must read (decisions I31). Encoding is converter, codec, then storage: storage
+    only ever sees ciphertext, but the reference it leaves in history resolves only on the
+    seller's side."""
     storage = dc.external_storage
-    inline = codec.claim_check_threshold
-    if storage is None or inline is None:
+    if storage is None:
         return None
     threshold = storage.payload_size_threshold
-    if threshold > inline + _INLINE_OVERHEAD:
+    if threshold > _storage_floor(codec):
         return None
+    inline = codec.claim_check_threshold
+    claim = f"claim-check threshold ({inline} bytes of ciphertext) or its " if inline else ""
     return (
         f"external storage offloads payloads from {threshold} bytes, at or below Kontra's "
-        f"claim-check threshold ({inline} bytes of ciphertext)"
+        f"{claim}stream envelope limit ({ENVELOPE_MAX} bytes)"
+    )
+
+
+def _streams_problem(bound: BoundOffering, entry: m.CatalogEntry) -> str | None:
+    """``streams:`` is fixed per published version (decisions I31): the catalog's list and
+    the code's must be the same. The codec seals by the worker's own list, so a topic only
+    the catalog names reaches no buyer; refusing says why before a buyer asks."""
+    theirs = tuple(sorted(entry.streams))
+    if theirs == bound.streams:
+        return None
+    return (
+        f"{bound.key}: offering.yaml lists streams {list(bound.streams)} but the catalog has "
+        f"{list(theirs)} for this version: streams are fixed per version -- publish a new one"
     )
 
 
@@ -397,8 +422,12 @@ class KontraPlugin(SimplePlugin):
             blobs=GateBlobStore(gate),
             services=[b.offering_id.service_name for b in self._offerings],
         )
-        progress = ProgressForwarder(gate, jobs)
+        # Heartbeats are published on each job's own stream (decisions I31), with the
+        # worker's client once a worker is configured (bind).
+        progress = ProgressForwarder()
         stack.push_async_callback(progress.aclose)
+        # The topics a buyer may read of each offering's job stream, by its task queue.
+        streams = {b.offering_id.task_queue: b.streams for b in self._offerings}
         return _Prepared(
             session=session,
             profile=profile,
@@ -407,7 +436,7 @@ class KontraPlugin(SimplePlugin):
             jobs=jobs,
             verifier=HoldVerifier(gate, home=home_dir),
             progress=progress,
-            interceptor=KontraInterceptor(progress),
+            interceptor=KontraInterceptor(progress, streams=streams),
         )
 
     def _prepared(self, hook: str) -> _Prepared:
@@ -488,9 +517,9 @@ class KontraPlugin(SimplePlugin):
         storage = _storage_problem(dc, codec)
         if storage is not None:
             raise ServeError(
-                f"the client's {storage}: a job's payload would go where its buyer cannot "
-                f"read it. Raise its payload_size_threshold above "
-                f"{(codec.claim_check_threshold or 0) + _INLINE_OVERHEAD}, or remove it"
+                f"the client's {storage}: a job's payload would go where its buyer (or the "
+                f"gate's stream relay) cannot read it. Raise its payload_size_threshold above "
+                f"{_storage_floor(codec)}, or remove it"
             )
         converter = dc.payload_converter_class
         if converter is DefaultPayloadConverter:
@@ -599,8 +628,10 @@ class KontraPlugin(SimplePlugin):
         config["nexus_service_handlers"] = [handler, *config.get("nexus_service_handlers", ())]
         config["interceptors"] = [state.interceptor, *config.get("interceptors", ())]
         config["workflow_runner"] = with_kontra_passthrough(config.get("workflow_runner"))
+        state.progress.bind(client)
         if bound.kind == "handler":
-            turn = TurnActivities(client, bound.output_type)
+            # The agent's listed topics are mirrored onto the job's stream (decisions I31).
+            turn = TurnActivities(client, bound.output_type, mirror=frozenset(bound.streams))
             config["activities"] = [*config.get("activities", ()), turn.deliver]
         return config
 
@@ -793,7 +824,7 @@ class KontraPlugin(SimplePlugin):
                     )
                 elif profile.dev:
                     try:
-                        entry = await gate.publish(b.document())
+                        entry = await gate.publish(b.document(), streams=b.streams)
                     except GateError as e:
                         problems.append(
                             f"{b.key} is not published and publishing it failed ({e.message}); "
@@ -807,6 +838,8 @@ class KontraPlugin(SimplePlugin):
                             f"{b.key}: the catalog recorded contract {entry.contract_hash} "
                             f"for this code's {ours}"
                         )
+                    elif (streamed := _streams_problem(b, entry)) is not None:
+                        problems.append(streamed)
                 else:
                     problems.append(
                         f"{b.key} is not published: run `kontra publish` in {b.source.parent}"
@@ -818,6 +851,8 @@ class KontraPlugin(SimplePlugin):
                     f"{entry.contract_hash}; the types or offering.yaml changed after "
                     "publishing -- republish or bump the version"
                 )
+            elif (streamed := _streams_problem(b, entry)) is not None:
+                problems.append(streamed)
             elif entry.retired:
                 open_jobs = await self._open_jobs(gate, b.key)
                 log.warning(

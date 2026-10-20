@@ -7,7 +7,7 @@ gate. The marker-string scan reads both histories the job makes -- Kontra's ``jo
 wrapper (its input and result are encrypted to the buyer and the seller) and the agent child
 ``job-<id>/agent`` (never job-shaped: the seller's alone; the message update, the stream
 polls and their results all live there) -- for the buyer's input, the handler's output and
-a handler's failure message. The gate's own record of the job holds no progress event: the
+a handler's failure message. The gate's own record of the job holds no progress item: the
 turn activity's heartbeats are Kontra's liveness beats, never forwarded."""
 
 from __future__ import annotations
@@ -26,8 +26,7 @@ from temporalio.client import Client, NexusOperationFailureError
 
 from kontra.cli._project import load_worker
 from kontra.codec import ENCODING
-from kontra.contract.names import agent_workflow_id, job_workflow_id
-from kontra.gate_client import models as m
+from kontra.contract.names import PROGRESS_TOPIC, agent_workflow_id, job_workflow_id
 from kontra.testing import Marketplace
 from kontra.testing.devserver import (
     CLI_ENV,
@@ -147,10 +146,10 @@ async def test_one_turn_leaves_no_plaintext_in_either_history(
                 async def events() -> list[Any]:
                     return list(mp.gate.jobs[hired.job_id].events)
 
-                # The gate's own history observations, yes; no heartbeat event: the turn
+                # The gate's own history observations, yes; no progress item: the turn
                 # activity's liveness beats never became the buyer's progress.
-                sources = {e.source for e in await mp.gate.run(events)}
-                assert m.ProgressSource.HEARTBEAT not in sources
+                kept = await mp.gate.run(events)
+                assert not [e for e in kept if e.topic == PROGRESS_TOPIC]
 
                 broken = {"host": f"{MARKER}.broken", "fail": True}
                 hired = await buyer.hire(entry, broken)

@@ -291,6 +291,25 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
             await workflow.wait_condition(lambda: self._answered_to >= end, timeout=DRAIN_TIMEOUT)
         except TimeoutError:
             log.debug("the job's stream was not read to its end within %s", DRAIN_TIMEOUT)
+        await self._release_pollers()
+
+    async def _release_pollers(self) -> None:
+        """Answer the polls still waiting on the job's stream (they get what there is,
+        nothing), so the run does not end under an update handler that is still running:
+        no "unfinished update handlers" warning on every job a buyer listened to. The relay
+        polls again and is told the stream is draining until the job is closed. The run is
+        ending: detaching a stream the seller hosts changes nothing it could still read."""
+        if self._in_flight == 0:
+            return
+        stream: WorkflowStream | None = self._hosted
+        if stream is None:
+            owner = getattr(workflow.get_update_handler(STREAM_POLL_UPDATE), "__self__", None)
+            stream = owner if isinstance(owner, WorkflowStream) else None
+        if stream is None:
+            return
+        stream.detach_pollers()
+        with contextlib.suppress(TimeoutError):
+            await workflow.wait_condition(lambda: self._in_flight == 0, timeout=DRAIN_TIMEOUT)
 
     async def _before_continue_as_new(self) -> None:
         """The seller continues-as-new: what the relay has not read of the stream Kontra
@@ -301,10 +320,8 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
         if hosted is None:
             return
         if self._polled:
-            await self._drain()
+            await self._drain()  # and the pollers released: they follow the chain
             hosted.detach_pollers()
-            with contextlib.suppress(TimeoutError):
-                await workflow.wait_condition(lambda: self._in_flight == 0, timeout=DRAIN_TIMEOUT)
         headers = self._can_headers
         end = self._end()
         if headers is not None and end is not None:

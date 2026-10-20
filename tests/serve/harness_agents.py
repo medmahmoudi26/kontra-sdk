@@ -122,6 +122,33 @@ class SlowAgent:
         return Report(host=req.host, open=len(req.host))
 
 
+#: What :class:`StreamyAgent` publishes on its own stream, under a topic its offerings never
+#: list: it must never reach the job's stream (decisions I31).
+NOTES_TOPIC = "private_notes"
+
+
+@agent.defn
+class StreamyAgent:
+    """Publishes a note on a topic of its own (:data:`NOTES_TOPIC`, never listed), then works
+    four seconds on a durable timer: a buyer listening from the hire sees its turn's events."""
+
+    @agent.init
+    def __init__(self, config: AgentConfig) -> None:
+        self._stream = WorkflowStream()
+        self._runner = AgentWorkflowRunner(
+            config,
+            stream=self._stream,
+            approval_policy_default=ToolApprovalPolicy.allow_inherently_safe(),
+        )
+
+    @agent.accepts
+    async def sweep(self, req: Sweep) -> Report:
+        """Sweep one host, with a private note on the way."""
+        self._stream.topic(NOTES_TOPIC).publish({"note": f"private note on {req.host}"})
+        await workflow.sleep(timedelta(seconds=4))
+        return Report(host=req.host, open=len(req.host))
+
+
 class Hop(BaseModel):
     """A message whose field is a Python keyword: it travels by its alias, ``from``."""
 
