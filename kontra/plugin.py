@@ -17,7 +17,8 @@ Temporal worker, and nothing else:
   encrypts failure messages), and external storage that would offload a job's payload where
   the buyer cannot read it. Headers stay out of the codec;
 * **worker** (``configure_worker``): a worker whose ``workflows`` hold an offering's entry
-  class -- the bound workflow, or the agent of a bound handler -- serves that offering: its
+  class -- the bound workflow, or the agent of a bound handler; for several offerings of one
+  class, the one whose task queue the worker names -- serves that offering: its
   task queue (from the contract's ``name@version``), the generated Nexus service, Kontra's
   interceptor first, Temporal's sandbox with ``kontra`` passed through, and for a bound
   handler the turn wrapper and its activity (:mod:`kontra.serve.turn`). Any other worker of
@@ -119,27 +120,17 @@ async def refused(session: Session | None) -> str | None:
 
 
 def check_offerings(offerings: Sequence[BoundOffering]) -> tuple[BoundOffering, ...]:
-    """The offerings one plugin (one worker process) serves: at least one, each bound once,
-    no two bound to the same entry class -- a worker is claimed by the class it registers,
-    so two offerings of one class could not be told apart."""
+    """The offerings one plugin (one worker process) serves: at least one, each bound once."""
     bound = tuple(offerings)
     if not bound:
         raise ValueError("Kontra needs at least one offering: offering(...) or serve(MyFlow)")
     keys: set[str] = set()
-    classes: dict[int, str] = {}
     for b in bound:
         if not isinstance(b, BoundOffering):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"offerings must come from kontra.serve.offering(...), got {b!r}")
         if b.key in keys:
             raise ValueError(f"{b.key} is bound twice")
         keys.add(b.key)
-        other = classes.setdefault(id(b.entry_workflow), b.key)
-        if other != b.key:
-            raise ValueError(
-                f"{other} and {b.key} are bound to the same class "
-                f"{b.entry_workflow.__name__}: a worker serves the offering whose class it "
-                "registers, so each offering needs a class of its own"
-            )
     return bound
 
 
@@ -495,21 +486,28 @@ class KontraPlugin(SimplePlugin):
 
     # ------------------------------------------------------------------ worker
 
-    def _claim(self, workflows: Iterable[Any]) -> BoundOffering | None:
-        """The offering a worker with these workflows serves: the one whose entry class it
-        registers (bound by code, never by a name), or None (not a Kontra worker)."""
-        given = list(workflows)
+    def _claim(self, config: WorkerConfig) -> BoundOffering | None:
+        """The offering a worker serves: the one whose entry class its ``workflows`` register
+        (bound by code, never by a name), or None (not a Kontra worker). Several offerings
+        bound to one class -- versions of the same code, say -- are told apart by the task
+        queue the worker names, compared with each offering's constructed one
+        (``kontra.serve.Worker`` names it); a worker that names none of them is refused."""
+        given = list(config.get("workflows", ()))
         found = [b for b in self._offerings if any(w is b.entry_workflow for w in given)]
-        if len(found) > 1:
-            keys = ", ".join(b.key for b in found)
-            raise ServeError(
-                f"one worker registers the classes of {keys}; each offering is served by a "
-                "worker of its own (its own task queue)"
-            )
-        return found[0] if found else None
+        if len(found) <= 1:
+            return found[0] if found else None
+        queue = config.get("task_queue")
+        named = [b for b in found if b.offering_id.task_queue == queue]
+        if len(named) == 1:
+            return named[0]
+        keys = ", ".join(b.key for b in found)
+        raise ServeError(
+            f"a worker registers the classes of {keys}: name the one it serves with its "
+            "task queue (task_queue=offering.offering_id.task_queue), one worker per offering"
+        )
 
     def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
-        bound = self._claim(config.get("workflows", ()))
+        bound = self._claim(config)
         if bound is None:
             return config  # another worker of the seller's: not Kontra's
         ours = self._handlers.get(bound.key)
@@ -581,7 +579,7 @@ class KontraPlugin(SimplePlugin):
         next: Callable[[temporalio.worker.Worker], Awaitable[None]],
     ) -> None:
         config = worker.config(active_config=True)
-        bound = self._claim(config.get("workflows", ()))
+        bound = self._claim(config)
         if bound is None:
             await next(worker)
             return

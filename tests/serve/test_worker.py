@@ -79,15 +79,22 @@ def test_unknown_keywords_and_bad_offerings_are_refused(bound: Any) -> None:
         Worker(offerings=["acme/upper@1.0.0"])  # type: ignore[list-item]
 
 
-def test_two_offerings_of_one_class_are_refused(tmp_path: Path) -> None:
-    """A worker serves the offering whose class it registers (bound by code), so two
-    offerings bound to one class could never be told apart: refused when worker.py is
-    imported."""
+def test_offerings_of_one_class_are_told_apart_by_their_task_queue(tmp_path: Path) -> None:
+    """A worker serves the offering whose class it registers (bound by code); several
+    offerings of one class (versions of the same code) are told apart by the task queue the
+    worker names -- kontra.serve.Worker names each offering's -- and a worker naming none of
+    them is refused, never guessed."""
     a, b = (seller.bind(write_offering(tmp_path / n)) for n in "ab")
-    with pytest.raises(ValueError, match="bound to the same class UpperFlow"):
-        Worker(offerings=[a, b])
-    with pytest.raises(ValueError, match="bound to the same class"):
-        KontraPlugin(a, b)
+    plugin = KontraPlugin(a, b)
+    config: Any = {"workflows": [a.workflow], "task_queue": b.offering_id.task_queue}
+    assert plugin._claim(config) is b
+    config["task_queue"] = a.offering_id.task_queue
+    assert plugin._claim(config) is a
+    config["task_queue"] = "kontra"
+    with pytest.raises(ServeError, match="name the one it serves with its task queue"):
+        plugin._claim(config)
+    other = seller.bind_v2(write_offering(tmp_path / "c"))
+    assert KontraPlugin(a, other)._claim({"workflows": [other.workflow]}) is other  # type: ignore[typeddict-item]
 
 
 def test_construction_does_no_io(bound: Any) -> None:
@@ -528,18 +535,16 @@ async def test_sigterm_shuts_the_worker_down_gracefully(
 @pytest.mark.temporal
 async def test_one_worker_serves_several_offerings(dev_server: DevServer, tmp_path: Path) -> None:
     """One inner worker per offering, each on its own derived task queue, all published
-    (each offering bound to a class of its own: that is how a worker knows which it serves)."""
+    (two of them versions of one class, told apart by their task queues)."""
     async with Marketplace(dev_server=dev_server) as mp:
         acme = await mp.party("acme")
-        a, b = (
-            seller.bind(write_offering(tmp_path / "a")),
-            seller.bind_v2(write_offering(tmp_path / "b")),
-        )
-        worker = Worker(offerings=[a, b], activities=[shout])
+        a, b = (seller.bind(write_offering(tmp_path / n)) for n in "ab")
+        c = seller.bind_v2(write_offering(tmp_path / "c"))
+        worker = Worker(offerings=[a, b, c], activities=[shout])
         async with mp.serve(worker, acme):
-            assert [w.task_queue for w in worker.inner_workers] == [a.key, b.key]
-            assert [s.key for s in worker.services] == [a.key, b.key]
-            for bound in (a, b):
+            assert [w.task_queue for w in worker.inner_workers] == [a.key, b.key, c.key]
+            assert [s.key for s in worker.services] == [a.key, b.key, c.key]
+            for bound in (a, b, c):
                 entry = await acme.gate.get_offering(bound.key)
                 assert entry.contract_hash == bound.contract_hash()
                 assert entry.task_queue == bound.key
