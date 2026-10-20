@@ -221,6 +221,7 @@ class Worker:
         self._ready = asyncio.Event()
         self._client: Client | None = None
         self._running = False
+        self._project: Path | None = None
 
     # ------------------------------------------------------------------ introspection
 
@@ -233,6 +234,18 @@ class Worker:
         """The temporalio keywords as given (a copy): ``plugins`` as passed, before they are
         routed between the client and the inner workers."""
         return dict(self._kwargs)
+
+    @property
+    def project(self) -> Path | None:
+        """The directory of the ``worker.py`` that runs this Worker -- ``python worker.py``'s
+        (``serve()`` sets it) or ``kontra serve --dir``'s -- else None. Under a dev profile,
+        the graph page's static graphs are drawn from it as the worker starts (decisions
+        I35); a Worker no one set it on (a test's, a seller's own main) draws none."""
+        return self._project
+
+    @project.setter
+    def project(self, directory: str | Path | None) -> None:
+        self._project = Path(directory).expanduser().resolve() if directory is not None else None
 
     @property
     def plugin(self) -> KontraPlugin | None:
@@ -322,6 +335,7 @@ class Worker:
             stream_upload_budget=(
                 upload_budget_from_env() if stream_upload_budget is None else stream_upload_budget
             ),
+            project=self._project,
         )
         stack = contextlib.AsyncExitStack()
         stack.push_async_callback(kontra.aclose)

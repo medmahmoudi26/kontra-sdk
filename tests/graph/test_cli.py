@@ -117,6 +117,21 @@ def node(g: dict[str, Any], node_id: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- the examples
 
 
+def test_kontra_graph_is_hidden_from_help_and_still_answers_its_own() -> None:
+    """Not a command for users (decisions I35): ``kontra serve`` runs it under a dev profile
+    to draw the graph page's static graphs. Kept, with its flags, as that child's entry point
+    and for the READMEs' graphs below."""
+    top = CliRunner().invoke(cli, ["--help"])
+    assert top.exit_code == 0, top.output
+    assert "graph" not in top.output.lower()
+    own = CliRunner().invoke(cli, ["graph", "--help"])
+    assert own.exit_code == 0, own.output
+    for flag in ("--dir", "--offering", "--runs", "--seed", "--input", "--timeout", "--json"):
+        assert flag in own.output
+    assert "--mermaid" in own.output
+    assert "--no-save" in own.output
+
+
 def test_every_seller_example_is_drawn() -> None:
     assert SELLERS == ["chef-agents", "chef-claude", "enrich", "hello", "legacy-actor", "sweep"]
 
@@ -519,25 +534,32 @@ def make_profile(home: Path) -> None:
 
 def serve_task_queue(directory: Path) -> str:
     """The task queue ``kontra serve`` runs the offering on, as its worker builds it."""
+    return served(directory)[0]
+
+
+def served(directory: Path) -> tuple[str, str]:
+    """The task queue ``kontra serve`` runs the offering on, and its contract hash, as its
+    worker builds them."""
     with load_worker(directory) as worker:
         [bound] = worker.offerings
-        return bound.offering_id.task_queue
+        return bound.offering_id.task_queue, bound.contract_hash()
 
 
 def test_the_static_graph_is_saved_for_kontra_devs_page(home: Path) -> None:
     make_profile(home)
     result = ok(kontra(home, "graph", "--dir", str(EXAMPLES / "hello"), "--json", "--runs", "2"))
     assert result.stderr == f"static graph saved for kontra dev's graph page ({home / 'graphs'})\n"
-    task_queue = serve_task_queue(EXAMPLES / "hello")
+    task_queue, drawn_from = served(EXAMPLES / "hello")
     path = static_path(home, task_queue)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     saved = json.loads(path.read_text())
     [printed] = json.loads(result.stdout)
     assert saved == {
-        "version": 1,
+        "version": 2,
         "task_queue": task_queue,
         "offering": "acme/hello@0.1.0",
+        "contract_hash": drawn_from,  # the code's (BoundOffering.contract_hash()), I35
         "runs": 2,
         "seed": 0,
         "graph": printed["graph"],
@@ -561,13 +583,22 @@ def test_load_static_reads_only_the_graph_of_that_task_queue(tmp_path: Path) -> 
     g: dict[str, Any] = {"version": 1, "workflow": {}, "nodes": [], "edges": []}
     a, b = "acme/a@1.0.0", "acme/b@1.0.0"
     assert load_static(tmp_path, a) is None  # nothing saved
-    save_static(tmp_path, a, offering=a, runs=8, seed=0, graph=g)
+    save_static(tmp_path, a, offering=a, contract_hash="sha256:a", runs=8, seed=0, graph=g)
     assert load_static(tmp_path, a) == g
     # A's file under B's name: the stored task queue is A's, so it is not B's graph.
     shutil.copy(static_path(tmp_path, a), static_path(tmp_path, b))
     assert load_static(tmp_path, b) is None
     path = static_path(tmp_path, a)
-    for broken in (b"{", b"[]", json.dumps({"version": 2, "task_queue": a, "graph": g}).encode()):
+    whole = json.loads(path.read_text())
+    v1 = {k: v for k, v in whole.items() if k != "contract_hash"} | {"version": 1}
+    for broken in (
+        b"{",
+        b"[]",
+        json.dumps(v1).encode(),  # what kontra graph saved before I35: drawn again
+        json.dumps(whole | {"version": 3}).encode(),
+        json.dumps(whole | {"contract_hash": None}).encode(),
+        json.dumps(whole | {"runs": True}).encode(),
+    ):
         path.write_bytes(broken)
         assert load_static(tmp_path, a) is None
     path.unlink()

@@ -29,7 +29,10 @@ Temporal worker, and nothing else:
   publishes an unpublished version), the progress forwarder; then a check that no plugin
   that ran after Kontra (one given to the worker only) undid any of the above. A failed
   check fails the workers starting with it and is then forgotten: a later start checks
-  again.
+  again. Under a dev profile, with the project's directory known (``project``), the graph
+  page's static graph of each workflow offering whose contract hash is not the one it was
+  drawn from is drawn again in the background, in a child process (:mod:`kontra._graphs`,
+  decisions I35): a failure there is a log line, never a refusal to serve.
 
 Put it **last** in ``Client.connect(plugins=[...])``: the last client plugin has the final word
 on the connection, the namespace and the converter. ``kontra.serve.serve`` and
@@ -64,7 +67,7 @@ from temporalio.plugin import SimplePlugin
 from temporalio.service import ConnectConfig, ServiceClient
 from temporalio.worker import WorkerConfig
 
-from kontra import _runtime
+from kontra import _graphs, _runtime
 from kontra._compat import check_temporalio
 from kontra.auth import Session
 from kontra.codec import GateBlobStore, KontraCodec, KontraFailureConverter
@@ -72,7 +75,7 @@ from kontra.codec.age import public_key_of
 from kontra.codec.stream import ENVELOPE_MAX, STREAM_UPLOAD_BUDGET, check_upload_budget
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
-from kontra.profile import KEY_FILE_ENV, NotLoggedIn, Profile, kontra_home
+from kontra.profile import KEY_FILE_ENV, PROFILE_FILE, NotLoggedIn, Profile, kontra_home
 from kontra.serve.errors import ServeError
 from kontra.serve.handler import OfferingService, service_handler
 from kontra.serve.hold import HoldVerifier
@@ -252,6 +255,8 @@ class _Prepared:
     serving: int = 0
     #: The progress flush started when the last of them stopped (see ``_serving``).
     flushing: asyncio.Task[None] | None = None
+    #: The graph page's static graphs being drawn, under a dev profile (decisions I35).
+    graphs: _graphs.Refresh | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -271,6 +276,11 @@ class KontraPlugin(SimplePlugin):
     An item not stored within it reaches the buyer as a gap (``unavailable``): a slow or
     failing bucket costs items, never a workflow task. Keep it well under the workflow task
     timeout (Temporal's 10 s default).
+
+    ``project``: the directory of the ``worker.py`` that binds the offerings, which
+    ``serve()`` and ``kontra serve`` pass (:attr:`kontra.serve.Worker.project`): under a dev
+    profile the graph page's static graphs are drawn from it (decisions I35); without it,
+    none are.
     """
 
     def __init__(
@@ -280,6 +290,7 @@ class KontraPlugin(SimplePlugin):
         home: str | Path | None = None,
         gate: GateClient | None = None,
         stream_upload_budget: float = STREAM_UPLOAD_BUDGET,
+        project: str | Path | None = None,
     ) -> None:
         super().__init__(PLUGIN_NAME)
         self._offerings = check_offerings(offerings)
@@ -287,6 +298,7 @@ class KontraPlugin(SimplePlugin):
         self._home = home
         self._gate = gate
         self._upload_budget = check_upload_budget(stream_upload_budget)
+        self._project = Path(project) if project is not None else None
         self._state: _Prepared | None = None
         self._stack: contextlib.AsyncExitStack | None = None
         self._lock: asyncio.Lock | None = None
@@ -751,11 +763,12 @@ class KontraPlugin(SimplePlugin):
                 if not state.checked:
                     try:
                         await state.verifier.load()
-                        await self._hash_lock(state.gate, state.profile)
+                        hashes = await self._hash_lock(state.gate, state.profile)
                     except Exception as e:  # a cancellation is the cancelled worker's own
                         state.check_failure = e
                         raise
                     state.checked = True
+                    state.graphs = await self._draw_graphs(state.profile, hashes)
                 if state.serving == 0:
                     if state.flushing is not None:  # the previous run's, still sending
                         await asyncio.gather(state.flushing, return_exceptions=True)
@@ -791,6 +804,8 @@ class KontraPlugin(SimplePlugin):
         self._handlers.clear()
         try:
             if state is not None:
+                if state.graphs is not None:  # the child dies with the worker
+                    await asyncio.to_thread(state.graphs.stop)
                 for key in state.keys:
                     await state.session.release(key)
                 if state.flushing is not None:
@@ -798,6 +813,37 @@ class KontraPlugin(SimplePlugin):
         finally:
             if stack is not None:
                 await stack.aclose()
+
+    # ------------------------------------------------------------------ the graph page
+
+    async def _draw_graphs(
+        self, profile: Profile, hashes: dict[str, str]
+    ) -> _graphs.Refresh | None:
+        """Under a dev profile, once the hash lock passed: the graph page's static graphs of
+        the workflow offerings whose stored graph was drawn from another contract hash (or
+        that have none), drawn again in the background (:class:`kontra._graphs.Refresh`), from
+        the project's directory. A handler offering has no static graph; a non-dev profile
+        has no graph page. Never raises: a failure is a log line."""
+        if not profile.dev or self._project is None:
+            return None
+        try:
+            home = _home_dir(profile, self._home)
+            if not (home / PROFILE_FILE).is_file():
+                return None  # an API key's session: nowhere the page reads
+            wanted = [
+                _graphs.Wanted(b.key, b.offering_id.task_queue, hashes[b.key])
+                for b in self._offerings
+                if b.kind == "workflow"
+            ]
+            stale = await asyncio.to_thread(_graphs.out_of_date, home, wanted)
+            if not stale:
+                return None
+            refresh = _graphs.Refresh(home, self._project, stale)
+            refresh.start()
+        except Exception as e:  # a log line, never a refusal to serve
+            log.warning("the graph page's static graphs were not drawn: %s", e)
+            return None
+        return refresh
 
     # ------------------------------------------------------------------ the hash lock
 

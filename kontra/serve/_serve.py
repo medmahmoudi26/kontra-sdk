@@ -30,9 +30,11 @@ It builds the :class:`~kontra.serve.Worker` a seller would otherwise write by ha
   Kontra's own plugin, which comes last (decisions I29).
 
 Run as ``python worker.py`` (the calling module is ``__main__``), serve() runs the worker
-until it stops. Imported -- by ``kontra serve``, ``kontra publish`` or a test -- it only
-builds the worker and returns it; the CLI finds it with :func:`capture`, so neither command
-starts anything by importing ``worker.py``.
+until it stops, its :attr:`~kontra.serve.Worker.project` the calling file's directory (under
+a dev profile the graph page's static graphs are drawn from it, decisions I35). Imported --
+by ``kontra serve``, ``kontra publish`` or a test -- it only builds the worker and returns
+it; the CLI finds it with :func:`capture`, so neither command starts anything by importing
+``worker.py``.
 """
 
 from __future__ import annotations
@@ -212,6 +214,7 @@ def serve_from(
     kwargs["activities"] = _extend(project_activities(base), options.get("activities"))
     worker = Worker(offerings=[bound], **kwargs)
     if caller.get("__name__") == "__main__":
+        worker.project = base  # `python worker.py`: the project it serves (decisions I35)
         worker.run()
         return worker
     built = _captured.get()

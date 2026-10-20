@@ -86,10 +86,10 @@ handle, then `kontra publish` and `kontra serve`, as in `../hello/README.md`.
 
 ## Its graph
 
-`kontra graph --mermaid`, from this directory, draws the workflow from mock runs: Temporal's
-test server runs it eight times, every activity answered with a value of the type it
-declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against the
-command:
+Under a dev profile, `kontra serve` draws the workflow for `kontra dev`'s graph page from mock
+runs: Temporal's test server runs it eight times, every activity answered with a value of the
+type it declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against
+those runs:
 
 ```mermaid
 %% acme/chef-agents@0.1.0

@@ -88,3 +88,24 @@ class BackoffFlow:
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=RetryPolicy(initial_interval=BACKOFF),
         )
+
+
+@workflow.defn(name="AgentLike")
+class AgentLike:
+    """Stands in for the agent a handler offering's job starts as its child."""
+
+    @workflow.run
+    async def run(self, text: str) -> str:
+        return text
+
+
+@workflow.defn(name="kontra.turn.v1")
+class TurnLike:
+    """Stands in for a handler offering's job (``kontra.serve.turn.TURN_WORKFLOW``): the
+    page tells its runs by that type alone."""
+
+    @workflow.run
+    async def run(self, text: str) -> str:
+        return await workflow.execute_child_workflow(
+            AgentLike.run, text, id=f"{workflow.info().workflow_id}-agent"
+        )

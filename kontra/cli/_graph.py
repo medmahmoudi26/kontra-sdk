@@ -1,5 +1,10 @@
 """``kontra graph``: the static graph of worker.py's workflows, from mock runs (decisions
-I27; kontra-sdk#42).
+I27, I35; kontra-sdk#42, #56).
+
+A hidden command: the graph page's static graphs are drawn by ``kontra serve`` under a dev
+profile, which runs this command in a child process when an offering's contract changed
+(:class:`kontra._graphs.Refresh`). It stays, with its flags, as that child's entry point and
+for the examples' README graphs (``tests/graph/test_cli.py``), never in ``kontra --help``.
 
 Temporal keeps no definition of a workflow, only what each run did (I26), so the graph of
 code nobody has run yet comes from runs nobody pays for: :mod:`kontra.cli._mock` runs each
@@ -12,19 +17,16 @@ found for, and, once for the worker, the activities it registers that no run of 
 offering scheduled.
 
 With a profile in ``$KONTRA_HOME``, each offering's graph is also saved where ``kontra dev``'s
-graph page (#43) reads it (:func:`save_static`, :func:`load_static`): that page is served by
-a process that has no access to the seller's project, and paints a live run on this graph.
+graph page (#43) reads it, with the contract hash of the code it was drawn from
+(:func:`kontra._graphs.save_static`): that page is served by a process that has no access to
+the seller's project, and paints a live run on this graph.
 """
 
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
-import os
 import signal
-import stat
-import tempfile
 import threading
 from collections.abc import Generator
 from pathlib import Path
@@ -33,101 +35,21 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from kontra._graphs import GRAPHS_DIR, load_static, read_static, save_static, static_path
 from kontra.cli._common import emit_json, fail, read_input
-from kontra.cli._seller import _DIR, _OFFERING, _pick
+from kontra.cli._seller import _DIR, _pick
 
 if TYPE_CHECKING:
     from kontra.cli._mock import Explored
     from kontra.graph import Graph
 
-__all__ = ["GRAPHS_DIR", "graph", "load_static", "save_static", "static_path"]
+__all__ = ["GRAPHS_DIR", "graph", "load_static", "read_static", "save_static", "static_path"]
 
-#: Where the static graphs live, under ``$KONTRA_HOME``.
-GRAPHS_DIR = "graphs"
-_STATIC_VERSION = 1
-#: The largest static graph :func:`load_static` reads.
-_STATIC_MAX = 16 * 1024 * 1024
 _START, _END = "start", "end"  # kontra.graph.START, END, without importing it for --help
 #: What a project that runs an OpenAI agent imports: its own dependency
 #: (``temporalio-openai-agents``), which ``kontra graph`` needs to run it.
 _AGENT_MODULES = ("agents", "openai")
 _AGENT_DEPENDENCY = "temporalio-openai-agents"
-
-
-def static_path(home: Path, task_queue: str) -> Path:
-    """Where the static graph of the offering served on ``task_queue`` lives: named by the
-    queue's SHA-256, so no part of the name comes from anyone's text."""
-    return home / GRAPHS_DIR / f"{hashlib.sha256(task_queue.encode()).hexdigest()}.json"
-
-
-def save_static(
-    home: Path, task_queue: str, *, offering: str, runs: int, seed: int, graph: Graph
-) -> Path:
-    """Write the static graph of the offering served on ``task_queue`` (``kontra serve``'s
-    task queue for it, exactly), atomically: a temporary file, mode 0600, renamed into place,
-    in a directory made 0700."""
-    path = static_path(home, task_queue)
-    if not path.parent.is_dir():
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)  # mkdir's mode is filtered by the umask
-    document = {
-        "version": _STATIC_VERSION,
-        "task_queue": task_queue,
-        "offering": offering,
-        "runs": runs,
-        "seed": seed,
-        "graph": graph,
-    }
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-")
-    try:
-        os.chmod(tmp, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2, sort_keys=True)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(tmp)
-    return path
-
-
-def load_static(home: Path, task_queue: str) -> Graph | None:
-    """The static graph saved for ``task_queue``, or None: no file, one that is not a
-    regular file, too large, not JSON, not this version, or saved for another task queue
-    (the stored ``task_queue`` must equal the given one exactly; the file name is only its
-    hash)."""
-    path = static_path(home, task_queue)
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(path, flags)  # non-blocking: a FIFO planted there cannot hang the page
-    except OSError:
-        return None
-    try:
-        with os.fdopen(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                return None
-            raw = f.read(_STATIC_MAX + 1)
-    except OSError:
-        return None
-    if len(raw) > _STATIC_MAX:
-        return None
-    try:
-        document: object = json.loads(raw)
-    except (ValueError, RecursionError):
-        return None
-    if not isinstance(document, dict):
-        return None
-    found: dict[str, Any] = document  # pyright: ignore[reportUnknownVariableType]
-    saved_graph = found.get("graph")
-    if (
-        found.get("version") != _STATIC_VERSION
-        or found.get("task_queue") != task_queue
-        or not isinstance(saved_graph, dict)
-    ):
-        return None
-    return saved_graph  # pyright: ignore[reportUnknownVariableType]
 
 
 # --------------------------------------------------------------------------- signals
@@ -247,9 +169,24 @@ def _warnings(e: Explored, timeout: float) -> None:
         )
 
 
-@click.command()
+def _chosen(bound: tuple[Any, ...], only: tuple[str, ...]) -> list[Any]:
+    """The offerings ``--offering`` names (each one at least once), in the worker's order;
+    every bound offering without it."""
+    if not only:
+        return list(bound)
+    picked = [b for name in only for b in _pick(bound, name)]
+    return [b for b in bound if any(b is p for p in picked)]
+
+
+@click.command(hidden=True)
 @_DIR
-@_OFFERING
+@click.option(
+    "--offering",
+    "only",
+    metavar="NAME@VERSION",
+    multiple=True,
+    help="Only this offering of the worker (default: every bound offering); repeatable.",
+)
 @click.option(
     "--runs",
     default=8,
@@ -285,7 +222,7 @@ def _warnings(e: Explored, timeout: float) -> None:
 @click.option("--no-save", is_flag=True, help="Do not save the graph for kontra dev's graph page.")
 def graph(
     directory: Path,
-    only: str | None,
+    only: tuple[str, ...],
     runs: int,
     seed: int,
     source: str | None,
@@ -307,7 +244,8 @@ def graph(
     given = read_input(source) if source is not None else None
     try:
         with load_worker(directory) as worker:
-            chosen = _pick(worker.offerings, only)
+            chosen = _chosen(worker.offerings, only)
+            hashes = {b.key: b.contract_hash() for b in chosen}
             every_offering = len(chosen) == len(worker.offerings)
             inputs = [_inputs(b, given, source, runs, seed) for b in chosen]
             with _stopped_like_ctrl_c():
@@ -356,6 +294,7 @@ def graph(
             home,
             found.task_queue,
             offering=found.offering,
+            contract_hash=hashes[found.offering],
             runs=found.runs,
             seed=seed,
             graph=found.graph,

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import importlib.util
+import logging
 import re
 import runpy
 import textwrap
@@ -29,11 +30,12 @@ from temporalio.converter import (
 )
 from temporalio.plugin import SimplePlugin
 
-from kontra import KontraPlugin
+from kontra import KontraPlugin, _graphs
 from kontra.codec import KontraCodec, KontraFailureConverter
 from kontra.codec.age import generate_identity
 from kontra.codec.stream import STREAM_UPLOAD_BUDGET
 from kontra.plugin import PLUGIN_NAME
+from kontra.profile import PROFILE_FILE
 from kontra.serve import ServeError, Worker
 from kontra.testing import Marketplace, TestParty
 from kontra.testing.devserver import DevServer
@@ -527,6 +529,88 @@ async def test_a_client_plugin_after_kontra_cannot_undo_the_converter(
             assert built.task_queue == plugin.offerings[0].offering_id.task_queue
         finally:
             await plugin.aclose()
+
+
+# --------------------------------------------------------------------------- the graph page
+
+
+async def test_the_graph_page_is_drawn_under_a_dev_profile_when_the_contract_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decisions I35: once the hash lock passed, a dev profile's worker draws the static
+    graph of each workflow offering whose stored one was drawn from another contract hash,
+    or that has none, from the project's directory; a non-dev profile (production has no
+    graph page), a plugin that knows no project, and a home without a profile draw none."""
+    from types import SimpleNamespace
+
+    started: list[_graphs.Refresh] = []
+
+    def start(self: _graphs.Refresh) -> None:
+        started.append(self)
+
+    monkeypatch.setattr(_graphs.Refresh, "start", start)
+    bound = seller.bind(write_offering(tmp_path))
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / PROFILE_FILE).write_text("{}")
+    hashes = {bound.key: bound.contract_hash()}
+    dev = SimpleNamespace(dev=True, home=home)
+    plugin = KontraPlugin(bound, project=tmp_path)
+
+    async def draw(profile: Any, of: KontraPlugin = plugin) -> _graphs.Refresh | None:
+        return await of._draw_graphs(profile, hashes)  # pyright: ignore[reportPrivateUsage]
+
+    assert await draw(SimpleNamespace(dev=False, home=home)) is None
+    assert await draw(dev, KontraPlugin(bound)) is None
+    refresh = await draw(dev)  # nothing stored yet
+    assert refresh is not None
+    assert started == [refresh]
+    queue = bound.offering_id.task_queue
+    assert refresh.wanted == (_graphs.Wanted(bound.key, queue, hashes[bound.key]),)
+    assert (refresh.home, refresh.project) == (home, tmp_path)
+    g: dict[str, Any] = {"workflow": {}, "nodes": [], "edges": []}
+
+    def drawn(contract_hash: str) -> None:
+        _graphs.save_static(
+            home, queue, offering=bound.key, contract_hash=contract_hash, runs=8, seed=0, graph=g
+        )
+
+    drawn(hashes[bound.key])
+    assert await draw(dev) is None  # current: no child
+    drawn("sha256:" + "0" * 64)
+    assert await draw(dev) is not None  # drawn from another contract
+    (home / PROFILE_FILE).unlink()
+    assert await draw(dev) is None  # nowhere the page reads (an API key's session)
+    assert len(started) == 2
+
+
+@pytest.mark.temporal
+async def test_a_dev_worker_serves_while_its_graph_fails_to_draw(
+    dev_server: DevServer, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The refresh never holds up nor refuses serving: here its child cannot even load the
+    project, the worker serves, and the failure is one WARNING."""
+    caplog.set_level(logging.INFO, logger="kontra.serve")
+
+    def warned() -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "static graph" in r.getMessage()
+        ]
+
+    async with Marketplace(dev_server=dev_server) as mp:
+        acme = await mp.party("acme")
+        worker = Worker(offerings=[seller.bind(write_offering(tmp_path))], activities=[shout])
+        worker.project = tmp_path / "not-a-project"
+        async with mp.serve(worker, acme):
+            assert worker.serving
+            async with asyncio.timeout(120):
+                while not warned():  # noqa: ASYNC110 (a log line, no event)
+                    await asyncio.sleep(0.1)
+            assert worker.serving
+        [warning] = warned()
+        assert "was not drawn: the mock runs exited with status 1 (error: no worker.py" in (warning)
 
 
 def test_the_plugin_is_exported_lazily() -> None:

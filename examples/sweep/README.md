@@ -6,7 +6,7 @@ each page misses, graded A to F, with a value to start from for each, and what e
 summary comes back inline. 0.002 USD per URL, 0.01 USD at least.
 
 It is also the example of three shapes a workflow takes besides a straight line, and of the
-graph `kontra graph` draws of them (below): two different activities at once (a fan-out),
+graph `kontra serve` draws of them (below): two different activities at once (a fan-out),
 one activity per item with a bound on how many are open (an `asyncio.Semaphore`, plain
 Temporal), and an `if` on what the activities found.
 
@@ -59,10 +59,10 @@ after redirects; its body is never read.
 
 ## Its graph
 
-`kontra graph --mermaid`, from this directory, draws the workflow from mock runs: Temporal's
-test server runs it eight times, every activity answered with a value of the type it
-declares, so nothing is fetched and nothing is paid. `tests/graph/test_cli.py` checks this
-copy against the command:
+Under a dev profile, `kontra serve` draws the workflow for `kontra dev`'s graph page from mock
+runs: Temporal's test server runs it eight times, every activity answered with a value of the
+type it declares, so nothing is fetched and nothing is paid. `tests/graph/test_cli.py` checks
+this copy against those runs:
 
 ```mermaid
 %% acme/sweep@0.1.0

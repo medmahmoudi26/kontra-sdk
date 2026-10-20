@@ -222,6 +222,9 @@ def serve(directory: Path, metrics: str | None, otlp: str | None) -> None:
         log.warning("%s", outside)
     try:
         with load_worker(directory) as worker:
+            # The project it serves: under a dev profile, the graph page's static graphs
+            # are drawn from it (decisions I35).
+            worker.project = directory
             worker.run(
                 runtime=runtime, interceptors=[tracing.interceptor] if tracing is not None else []
             )

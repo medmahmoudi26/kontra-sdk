@@ -48,10 +48,10 @@ byte for byte. It seals no key (spec v2): the same offering derives the same doc
 
 ## Its graph
 
-`kontra graph --mermaid`, from this directory, draws the workflow from mock runs: Temporal's
-test server runs it eight times, every activity answered with a value of the type it
-declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against the
-command:
+Under a dev profile, `kontra serve` draws the workflow for `kontra dev`'s graph page from mock
+runs: Temporal's test server runs it eight times, every activity answered with a value of the
+type it declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against
+those runs:
 
 ```mermaid
 %% acme/enrich@1.2.0

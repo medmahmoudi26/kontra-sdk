@@ -11,9 +11,6 @@ kontra devices list|add [--new-key]|remove      machines and browsers that read 
 kontra init <name> [--party P]                 scaffold an offering (§6.1)
 kontra dev [up|down|status|logs]               the local stack (no containers)
 kontra publish | serve | contract [--dir D]    sell worker.py's offerings (§11.4, §6.5)
-kontra graph [--dir D] [--runs N] [--mermaid|--json]
-                                               worker.py's workflows as a graph, from mock
-                                               runs (I27)
 kontra status [--workers] [<offering>...]      whether your workers keep up (Temporal's stats)
 kontra pull <offering> --lang go|python|typescript|java
 kontra quote|hire <offering> -f in.json        buy (§7.1)
@@ -22,6 +19,9 @@ kontra jobs | job <id> [--accept|--reject R|--cancel|--progress|--stream TOPIC|-
                                                here too: its key reaches every device
 kontra balance | topup <amount> | mcp
 ```
+
+``kontra graph`` is hidden: ``kontra serve`` runs it under a dev profile, in a child
+process, to draw the dev graph page's static graphs (decisions I35).
 
 Every command is a thin layer over :mod:`kontra.auth`, :mod:`kontra.hire`,
 :mod:`kontra.serve` and :mod:`kontra.contract`: no business rule lives here. A failure

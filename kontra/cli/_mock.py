@@ -1,4 +1,4 @@
-"""``kontra graph``'s mock runs (decisions I27): a seller's workflow run in Temporal's
+"""``kontra graph``'s mock runs (decisions I27, I35): a seller's workflow run in Temporal's
 time-skipping test server, every activity answered by a stub, and the runs' histories read
 back into one static graph (:mod:`kontra.graph`).
 
@@ -15,10 +15,12 @@ agent workflow; the seller's own dependency, ``temporalio-openai-agents``) gets 
 integration with a scripted model instead (:mod:`kontra.cli._scripted`); no other seller
 plugin is run. The data converter is the payload converter ``kontra serve`` ends up with for
 such a worker, without the codec: nothing is encrypted. An offering bound to an agent's
-handler (one hire, one turn: :mod:`kontra.serve.turn`) is not drawn yet (kontra-sdk#56). The test server cannot be bound to the loopback (it takes a port, nothing else),
-so it listens on every interface, unauthenticated, while the command runs: anyone who can
-reach the machine can read the runs' inputs and results -- an ``--input`` given too -- and
-start workflows the mock worker runs. It is downloaded once into a directory only this user
+handler (one hire, one turn: :mod:`kontra.serve.turn`) has no static graph: ``kontra serve``
+never asks for one (decisions I35), and the graph page draws what its runs did. The test
+server cannot be bound to the loopback (it takes a port, nothing else), so it listens on
+every interface, unauthenticated, while the command runs: anyone who can reach the machine
+can read the runs' inputs and results -- an ``--input`` given too -- and start workflows the
+mock worker runs. It is downloaded once into a directory only this user
 can write (:func:`server_dir`), never the shared temp directory temporalio defaults to,
 where whoever creates that file name first chooses what runs.
 
@@ -348,8 +350,9 @@ async def explore(
     for bound in bindings:
         if bound.kind == "handler":
             fail(
-                f"kontra graph does not draw an agent's handler yet: {bound.key} is "
-                f"{bound.agent.__name__}.{bound.handler} (kontra-sdk#56)"
+                f"an agent's handler has no static graph: {bound.key} is "
+                f"{bound.agent.__name__}.{bound.handler}, and the graph page draws what its "
+                "runs did"
             )
     options = worker.options
     plugins = options.get("plugins")

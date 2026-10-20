@@ -1,6 +1,6 @@
 """The graph page's routes in the dev codec server (``kontra dev up --ui``; decisions I28):
-the page and its policy, the run's graph painted on ``kontra graph``'s static graph for its
-task queue, the links, the live stream, the list of runs, and how each route refuses. On a
+the page and its policy, the run's graph painted on the static graph ``kontra serve`` drew
+for its task queue (I35), what the page says without one, the links, the live stream, the list of runs, and how each route refuses. On a
 real dev server, the codec server on a thread; the seam ⑤ scan of the same routes is
 ``tests/codec/test_codec_console.py``."""
 
@@ -33,7 +33,17 @@ from kontra.codec.age import generate_identity
 from kontra.serve.worker import workflow_runner
 from kontra.testing.devserver import DevServer
 
-from .console_flows import BackoffFlow, QuickFlow, RetryFlow, WaitFlow, fails_once, flaky, quick
+from .console_flows import (
+    AgentLike,
+    BackoffFlow,
+    QuickFlow,
+    RetryFlow,
+    TurnLike,
+    WaitFlow,
+    fails_once,
+    flaky,
+    quick,
+)
 
 pytestmark = pytest.mark.temporal
 
@@ -89,7 +99,7 @@ async def worker(dev_server: DevServer) -> AsyncIterator[tuple[Client, str]]:
     async with Worker(
         client,
         task_queue=queue,
-        workflows=[RetryFlow, QuickFlow, WaitFlow, BackoffFlow],
+        workflows=[RetryFlow, QuickFlow, WaitFlow, BackoffFlow, TurnLike, AgentLike],
         activities=[flaky, quick, fails_once],
         workflow_runner=workflow_runner(),
     ):
@@ -214,22 +224,86 @@ async def test_a_run_is_painted_on_the_static_graph_of_its_task_queue(
     assert [n["id"] for n in alone["nodes"]] == ["quick"]
     assert all("reached" not in n for n in alone["nodes"])
 
-    # kontra graph's mock runs took a branch this run did not.
+    assert alone["handler"] is False  # a workflow offering's run: one is drawn for it
+
+    # The mock runs `kontra serve` drew the graph from took a branch this run did not.
     static = copy.deepcopy(alone)
     static["nodes"].append({"id": "never", "kind": "activity", "name": "never", "label": "never"})
     static["edges"].append({"from": "quick", "to": "never"})
-    save_static(tmp_path, queue + " ", offering="acme/x@1.0.0", runs=8, seed=0, graph=static)
+
+    def drawn(task_queue: str) -> None:
+        save_static(
+            tmp_path,
+            task_queue,
+            offering="acme/x@1.0.0",
+            contract_hash="sha256:x",
+            runs=8,
+            seed=0,
+            graph=static,
+        )
+
+    drawn(queue + " ")
     other = (await asyncio.to_thread(_get, srv, f"/api/graph?w={wf}")).json()
     assert other["static_graph"] is False  # saved for another task queue: not this run's
-    save_static(tmp_path, queue, offering="acme/x@1.0.0", runs=8, seed=0, graph=static)
+    drawn(queue)
     painted = (await asyncio.to_thread(_get, srv, f"/api/graph?w={wf}")).json()
     assert painted["static_graph"] is True
+    assert painted["handler"] is False
     assert painted["workflow"]["run_id"] == run  # the latest run, without r=
     assert (_node(painted, "quick")["reached"], _node(painted, "never")["reached"]) == (True, False)
     assert _node(painted, "never")["links"] == {}  # nothing to link: the run never got there
     reached = {(e["from"], e["to"]): e["reached"] for e in painted["edges"]}
     assert reached[("quick", "never")] is False
     assert reached[("start", "quick")] is True
+
+
+async def test_a_handler_offering_s_runs_say_they_have_no_static_graph(
+    serve: Serve, worker: tuple[Client, str]
+) -> None:
+    """A handler offering's job (``kontra.turn.v1``) and the agent it starts have no static
+    graph (decisions I35): told by the types Temporal reports, the job's and its parent's."""
+    client, queue = worker
+    srv = serve()
+    wf = f"console-{uuid.uuid4().hex}"
+    await (await client.start_workflow(TurnLike.run, "hi", id=wf, task_queue=queue)).result()
+    job = (await asyncio.to_thread(_get, srv, f"/api/graph?w={wf}")).json()
+    agent = (await asyncio.to_thread(_get, srv, f"/api/graph?w={wf}-agent")).json()
+    for g in (job, agent):
+        assert (g["static_graph"], g["handler"]) == (False, True)
+    assert agent["workflow"]["type"] == "AgentLike"
+
+
+def test_the_page_tells_no_one_to_run_anything_but_kontra_serve() -> None:
+    """Without a static graph the page says ``kontra serve`` draws one, or, for a handler
+    offering, that only the run is drawn; ``kontra graph`` is hidden (I35) and named in no
+    string of the page or of its server but code comments and docstrings."""
+    import ast
+
+    page = PAGE.read_text("utf-8")
+    assert "kontra graph" not in page
+    assert (
+        '"No static graph for this offering yet: start ", el("code", {}, "kontra serve"), ' in page
+    )
+    assert '" once and it is drawn in the background."' in page
+    assert "This offering's entry is a handler, so only what this run did is drawn." in page
+    assert page.count('the mock runs ", el("code", {}, "kontra serve"), " drew the graph from') == 2
+    tree = ast.parse(Path(console_module.__file__).read_text("utf-8"))
+    docstrings = {
+        id(node.body[0].value)  # pyright: ignore[reportAttributeAccessIssue]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+    said = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    ]
+    assert not [s for s in said if "kontra graph" in s]
 
 
 async def test_the_links_open_the_event_and_the_logs_of_its_span(

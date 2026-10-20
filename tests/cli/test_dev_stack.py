@@ -330,3 +330,143 @@ def test_a_killed_host_is_cleaned_up(tmp_path: Path) -> None:
     assert down.returncode == 0, down.stdout + down.stderr
     assert _port_closed(ports["gate"])
     assert _port_closed(ports["temporal"])
+
+
+# --------------------------------------------------------------------------- I35
+
+
+def _needs_a_test_server() -> None:
+    """The time-skipping test server ``kontra graph`` runs, in its own directory: without it
+    and without the network to download it, nothing can be drawn."""
+    import asyncio
+
+    from temporalio.testing import WorkflowEnvironment
+
+    from kontra.cli._mock import server_dir
+
+    async def start() -> None:
+        async with await WorkflowEnvironment.start_time_skipping(
+            download_dest_dir=str(server_dir())
+        ):
+            pass
+
+    try:
+        asyncio.run(start())
+    except Exception as e:
+        pytest.skip(f"no time-skipping test server: {e}")
+
+
+def _served(project: Path) -> tuple[str, str]:
+    """The offering's task queue and contract hash, as ``kontra serve``'s worker builds them."""
+    from kontra.cli._project import load_worker
+
+    with load_worker(project) as worker:
+        [bound] = worker.offerings
+        return bound.offering_id.task_queue, bound.contract_hash()
+
+
+#: What a serving worker logs as it spawns the child that draws the graph page's graph.
+_SPAWNED = "drawing the graph page's static graph of acme/hello@0.1.0 in the background"
+
+
+class _Serving:
+    """``kontra serve --dir <project>`` for a ``with`` block, its log in ``log``: entered once
+    it serves, left once it stopped (SIGTERM, a graceful stop)."""
+
+    def __init__(self, project: Path, env: Mapping[str, str], log: Path) -> None:
+        self.project, self.env, self.log = project, env, log
+        self.proc: subprocess.Popen[bytes] | None = None
+
+    def __enter__(self) -> _Serving:
+        with self.log.open("wb") as out:
+            self.proc = subprocess.Popen(
+                [str(KONTRA), "serve", "--dir", str(self.project)],
+                env=dict(self.env),
+                stdout=out,
+                stderr=subprocess.STDOUT,
+            )
+        end = time.monotonic() + 120
+        while "serving acme/hello@0.1.0" not in self.text():
+            if self.proc.poll() is not None or time.monotonic() > end:
+                self.__exit__()
+                raise AssertionError(f"kontra serve never served:\n{self.text()}")
+            time.sleep(0.2)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        assert self.proc is not None
+        if self.proc.poll() is None:
+            self.proc.terminate()
+        try:
+            self.proc.wait(60)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+
+    def text(self) -> str:
+        return self.log.read_text(errors="replace")
+
+
+def _drawn(home: Path, queue: str, contract_hash: str, serving: _Serving) -> None:
+    from kontra._graphs import read_static
+
+    end = time.monotonic() + 240
+    while True:
+        found = read_static(home, queue)
+        if found is not None and found.contract_hash == contract_hash:
+            return
+        assert time.monotonic() < end, f"no graph for {contract_hash}:\n{serving.text()}"
+        assert "was not drawn" not in serving.text(), serving.text()
+        time.sleep(0.5)
+
+
+def test_kontra_serve_draws_the_graph_page_s_graph_once_per_contract(tmp_path: Path) -> None:
+    """Decisions I35 on a real ``kontra dev up`` (the in-process dev gate, a fresh home, free
+    ports): ``kontra serve`` draws the graph page's static graph of ``examples/hello`` in the
+    background, recording the code's contract hash; served again unchanged, it runs no
+    child; after a contract change -- republished under the same version, which the dev
+    gate takes while no job is open -- it draws it again."""
+    from kontra._graphs import static_path
+
+    _needs_a_cli()
+    _needs_a_test_server()
+    home = tmp_path / "home"
+    project = tmp_path / "hello"
+    shutil.copytree(
+        ROOT / "examples" / "hello", project, ignore=shutil.ignore_patterns("__pycache__")
+    )
+    env = {**_env(home), "PYTHONDONTWRITEBYTECODE": "1"}
+    ports = {k: _free() for k in ("gate", "temporal", "ui", "codec")}
+    try:
+        up = _run(["dev", "up", "--handle", "acme", *_port_flags(ports)], env)
+        assert up.returncode == 0, up.stdout + up.stderr
+        queue, first = _served(project)
+
+        with _Serving(project, env, tmp_path / "serve-1.log") as one:
+            _drawn(home, queue, first, one)
+        assert one.text().count(_SPAWNED) == 1, one.text()
+        assert "drew the graph page's static graph of acme/hello@0.1.0" in one.text()
+        drawn_at = static_path(home, queue).stat().st_mtime_ns
+
+        with _Serving(project, env, tmp_path / "serve-2.log") as two:
+            time.sleep(2)  # the check runs before "serving": nothing more is coming
+        assert _SPAWNED not in two.text(), two.text()
+        assert static_path(home, queue).stat().st_mtime_ns == drawn_at
+
+        models = project / "models.py"
+        models.write_text(
+            models.read_text().replace('"Who to greet."', '"Who to greet, by their name."')
+        )
+        same_queue, second = _served(project)
+        assert (same_queue, second != first) == (queue, True)
+        published = _run(["publish", "--dir", str(project)], env)
+        assert published.returncode == 0, published.stdout + published.stderr
+        with _Serving(project, env, tmp_path / "serve-3.log") as three:
+            _drawn(home, queue, second, three)
+        assert three.text().count(_SPAWNED) == 1, three.text()
+        assert "was not drawn" not in one.text() + two.text() + three.text()
+    finally:
+        down = _run(["dev", "down"], env)
+    assert down.returncode == 0, down.stdout + down.stderr
+    assert _port_closed(ports["gate"])
+    assert _port_closed(ports["temporal"])

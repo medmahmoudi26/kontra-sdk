@@ -195,8 +195,34 @@ def test_kontra_graph_refuses_a_handler_offering(tmp_path: Path) -> None:
     env = {"KONTRA_HOME": str(tmp_path / "home"), "KONTRA_GATE": None, "KONTRA_API_KEY": None}
     result = CliRunner().invoke(kontra_cli, ["graph", "--dir", str(root), "--runs", "1"], env=env)
     assert result.exit_code == 1, result.output
-    assert "does not draw an agent's handler yet" in result.stderr
+    assert "an agent's handler has no static graph" in result.stderr
     assert "ReconAgent.sweep" in result.stderr
+
+
+async def test_a_handler_offering_has_no_static_graph_to_draw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dev worker serving a handler draws no graph page's static graph (decisions I35),
+    and says nothing about it: the page draws what its runs did."""
+    from types import SimpleNamespace
+
+    from kontra import KontraPlugin, _graphs
+    from kontra.profile import PROFILE_FILE
+
+    started: list[_graphs.Refresh] = []
+
+    def start(self: _graphs.Refresh) -> None:
+        started.append(self)
+
+    monkeypatch.setattr(_graphs.Refresh, "start", start)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / PROFILE_FILE).write_text("{}")
+    bound = offering(_offering_yaml(tmp_path), entry=HopAgent.hop, quote=hop_quote)
+    plugin = KontraPlugin(bound, project=tmp_path)
+    dev = SimpleNamespace(dev=True, home=home)
+    drawn = await plugin._draw_graphs(dev, {bound.key: bound.contract_hash()})  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+    assert (drawn, started) == (None, [])
 
 
 # --------------------------------------------------------------------------- one turn, one job
