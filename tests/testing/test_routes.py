@@ -14,6 +14,7 @@ import pytest
 from fastapi.routing import APIRoute
 
 from kontra import _jobkeys as jk
+from kontra._control import HistorySummary
 from kontra.artifacts import download, upload
 from kontra.codec import GateBlobStore
 from kontra.codec.age import generate_identity
@@ -174,6 +175,12 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     control.observe_as(
         seller.profile.party, job_workflow_id(one.job_id), ObservedStatus.COMPLETED, b"cipher"
     )
+    # What the observer reads of the run's history: the stream's history events below.
+    control.summaries[(seller.profile.party, job_workflow_id(one.job_id))] = HistorySummary(
+        state=ObservedStatus.COMPLETED,
+        last_event="WorkflowExecutionCompleted",
+        activities_completed=2,
+    )
     await gate.sweep()
     assert (await buyer.gate.job(one.job_id)).state is m.JobState.COMPLETED
     got = await download(
@@ -183,9 +190,16 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     assert (await worker.seller_job(one.job_id)).buyer_public_key == _A_BUYER_KEY
     assert [j.job_id for j in (await worker.jobs(as_="seller")).items] == [one.job_id]
     # The job's stream (decisions I31): the scripted control plane relays no items, so its
-    # history events alone, and the stream ends with the closed job.
+    # history events alone, ending with the closed job's.
     events = [e async for e in buyer.gate.stream(one.job_id, history=True)]
+    assert events
     assert all(e.kind is m.StreamEventKind.HISTORY for e in events)
+    last = events[-1]
+    assert (last.state, last.last_event, last.activities_completed) == (
+        m.JobState.COMPLETED,
+        "WorkflowExecutionCompleted",
+        2,
+    )
     assert (await buyer.gate.result(one.job_id)).size == len(b"cipher")
     await buyer.gate.reject(one.job_id, "wrong case")
     assert [j.job_id for j in (await judge.gate.disputes()).items] == [one.job_id]

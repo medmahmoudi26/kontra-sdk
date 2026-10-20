@@ -350,6 +350,49 @@ async def test_too_large_items_and_spent_budgets_are_gaps(tmp_path: Path) -> Non
 
 
 @pytest.mark.timeout(60)
+async def test_a_spent_budget_is_one_gap_and_the_relay_reads_no_more_of_it(
+    tmp_path: Path,
+) -> None:
+    """Past a topic's budget the gate stores one gap and polls that topic no more; past the
+    job's, one gap and the relay stops: the store does not grow by a row per item the
+    seller goes on publishing (each relayed poll would also cost the seller's history)."""
+    # Each item is 206 or 207 bytes of ciphertext: four fit a topic, six the job.
+    async for live in make_live(tmp_path, stream_topic_budget=1_000, stream_job_budget=1_300):
+        live.temporal.publish(LISTED, 6)
+        live.running()
+        seen: list[m.StreamEvent] = []
+        task = _follow(live, seen)
+        await _until(_count(seen, 5))  # four items and the topic's gap
+        polls = len(live.temporal.polls)
+        live.temporal.publish(LISTED, 50)
+        live.temporal.publish(PROGRESS_TOPIC, 2)
+        await _until(_count(seen, 7))
+        assert all(topics == [PROGRESS_TOPIC] for topics, _, _ in live.temporal.polls[polls:])
+        live.temporal.publish(PROGRESS_TOPIC, 200)  # past the job's budget
+        relay = live.gate.jobs[live.job.job_id].relay
+        await _until(lambda: relay.done)  # noqa: B023 -- the loop runs once
+        polls = len(live.temporal.polls)
+        live.temporal.publish(PROGRESS_TOPIC, 50)
+        await asyncio.sleep(0.3)
+        assert len(live.temporal.polls) == polls  # stopped: no more polls
+        live.completed()
+        await asyncio.wait_for(task, 20)
+        gaps = [(e.topic, e.reason) for e in seen if e.kind is m.StreamEventKind.GAP]
+        assert gaps == [
+            (LISTED, m.StreamGapReason.TOPIC_BUDGET),
+            (PROGRESS_TOPIC, m.StreamGapReason.JOB_BUDGET),
+        ]
+        stored = await live.stored()
+        assert len(stored) < 20  # not one row per item published (300 of them)
+        state = await live.gate.run(_relay_of(live))
+        assert (state.stopped, state.spent_topics, state.job_spent) == (
+            "job_budget",
+            {LISTED},
+            True,
+        )
+
+
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize(
     ("failure", "raw", "reason"),
     [

@@ -227,8 +227,9 @@ _PAYLOAD_B64_MAX = 4 * -(-(4 * 1024 * 1024) // 3)
 #: records a ``too_large`` gap instead. Base64 in an event.
 STREAM_ITEM_MAX = 256 * 1024
 _STREAM_B64_MAX = 4 * -(-STREAM_ITEM_MAX // 3)
-#: Relayed ciphertext a gate stores per topic of a job, and per job; past either, a
-#: ``topic_budget`` or ``job_budget`` gap.
+#: Relayed ciphertext a gate stores per topic of a job, and per job; past either, one
+#: ``topic_budget`` or ``job_budget`` gap (the first item that did not fit), and nothing
+#: more of that topic, or of the job, is relayed.
 STREAM_TOPIC_BUDGET = 16 * 1024 * 1024
 STREAM_JOB_BUDGET = 64 * 1024 * 1024
 #: Concurrent stream listeners of one job (429 ``too_many_listeners`` past it).

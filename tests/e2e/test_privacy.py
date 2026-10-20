@@ -315,8 +315,17 @@ async def test_ac13_heartbeats_reach_the_buyer_in_order_and_the_gate_keeps_ciphe
     assert scan.hits == {}
     assert bucket.hits == {}
     assert on_disk == []
-    # The gate's store of the job's stream was among what was scanned.
-    assert any(p.startswith("kontra.") and ("stream" in p or "progress" in p) for p in scan.scanned)
+    # The gate's store of the job's stream was among what was scanned, holding at least the
+    # heartbeats relayed (a row per item, kontra-cloud#44). A table named for the stream: the
+    # old progress table, which the gate may keep read-only until its retention ends, holds
+    # none of this job's and does not count.
+    stored = {
+        place: rows
+        for place, rows in scan.scanned.items()
+        if place.startswith("kontra.") and "stream" in place.split(".")[2]
+    }
+    assert stored, sorted(scan.scanned)
+    assert max(stored.values()) >= len(beats), stored
 
 
 # --------------------------------------------------------------------------- acceptance 14

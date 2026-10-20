@@ -877,6 +877,10 @@ class _RelayState:
     pause: asyncio.TimerHandle | None = None
     topic_bytes: dict[str, int] = field(default_factory=dict[str, int])
     job_bytes: int = 0
+    #: Topics whose stored budget is spent (one gap said so; the relay polls them no more),
+    #: and the job's (one gap; the relay stopped).
+    spent_topics: set[str] = field(default_factory=set[str])
+    job_spent: bool = False
     #: Polls answered and items dropped (defence in depth), for tests.
     batches: int = 0
     dropped: int = 0
@@ -950,7 +954,8 @@ class FakeGate:
     ``relay_interval``: the shortest wait between two polls (the platform's 2 s);
     ``relay_rpc_timeout``: one poll RPC's deadline; ``history_limits``: the server's
     history limits it paces against (Kontra's pinned ones). ``stream_item_max``,
-    ``stream_topic_budget``, ``stream_job_budget``: what it stores (above them, a gap);
+    ``stream_topic_budget``, ``stream_job_budget``: what it stores (an item above the first
+    is a gap; past a budget, one gap, and the relay polls that topic no more, or stops);
     ``stream_listeners_max``: listeners per job.
 
     The clock offset (:meth:`advance`) moves token ``iat``/``exp`` too: a seller's
@@ -3828,19 +3833,35 @@ class FakeGate:
             return self.relay_interval if paced == MIN_INTERVAL else paced
 
         try:
-            async for batch in relay(
-                service,
-                namespace=namespace,
-                job_id=job.job_id,
-                topics=self.stream_topics(job),
-                closed=closed,
-                start=state.offset,
-                first_execution_run_id=lambda: job.record.run_id or "",
-                pace=pace,
-                min_interval=self.relay_interval,
-                rpc_timeout=self.relay_rpc_timeout,
-            ):
-                self._store_batch(job, batch)
+            # A spent budget is one gap, not one per item: a topic whose budget is spent is
+            # polled no more (the relay starts again without it, from the persisted
+            # offset), and a spent job budget ends the relay.
+            while not state.job_spent:
+                topics = [t for t in self.stream_topics(job) if t not in state.spent_topics]
+                if not topics:
+                    break
+                again = False
+                batches = relay(
+                    service,
+                    namespace=namespace,
+                    job_id=job.job_id,
+                    topics=topics,
+                    closed=closed,
+                    start=state.offset,
+                    first_execution_run_id=lambda: job.record.run_id or "",
+                    pace=pace,
+                    min_interval=self.relay_interval,
+                    rpc_timeout=self.relay_rpc_timeout,
+                )
+                async with contextlib.aclosing(batches):
+                    async for batch in batches:
+                        if self._store_batch(job, batch):
+                            again = True
+                            break
+                if not again:
+                    break  # the job closed
+            if state.job_spent:
+                state.stopped = "job_budget"
         except RelayStopped as e:
             state.stopped = e.reason
             log.info("the relay of job %s stopped: %s", job.job_id, e)
@@ -3866,14 +3887,18 @@ class FakeGate:
         state.done = True
         job.notify()
 
-    def _store_batch(self, job: _Job, batch: RelayBatch) -> None:
-        """Store a batch's items -- ciphertext only, within the caps -- then its offset."""
+    def _store_batch(self, job: _Job, batch: RelayBatch) -> bool:
+        """Store a batch's items -- ciphertext only, within the caps -- then its offset.
+        True when a budget was spent here: the relay must poll fewer topics, or stop."""
         state = job.relay
         state.batches += 1
         state.dropped += batch.dropped
+        spent = False
         for item in batch.items:
             if item.offset < state.offset:
                 continue  # stored already (a poll re-read after a pause)
+            if item.topic in state.spent_topics:
+                continue  # its budget's gap is stored; nothing more of it is
             gap: m.StreamGapReason | None = None
             if item.ciphertext is None or item.size > self.stream_item_max:
                 gap = m.StreamGapReason.TOO_LARGE
@@ -3894,6 +3919,12 @@ class FakeGate:
                     reason=gap,
                     state=job.record.state,
                 )
+                if gap is m.StreamGapReason.TOPIC_BUDGET:
+                    state.spent_topics.add(item.topic)
+                    spent = True
+                elif gap is m.StreamGapReason.JOB_BUDGET:
+                    state.job_spent = spent = True
+                    break
                 continue
             assert item.ciphertext is not None
             state.topic_bytes[item.topic] = state.topic_bytes.get(item.topic, 0) + item.size
@@ -3908,6 +3939,7 @@ class FakeGate:
                 state=job.record.state,
             )
         state.offset = max(state.offset, batch.next_offset)
+        return spent
 
     # ------------------------------------------------------------------ transitions & effects
 
