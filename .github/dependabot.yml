@@ -5,8 +5,10 @@
 # version on its first day. Security updates are not delayed.
 #
 # Held back on purpose, to be upgraded by hand with the tests that guard them:
-# - temporalio (Python) beyond its pinned minor: standalone Nexus operations and the
-#   serialization context are experimental there (pyproject.toml).
+# - temporalio (Python) beyond the minor the lock holds: pyproject.toml declares the range
+#   kontra-sdk is tested on (>=1.34,<1.38, decisions I29), and the lock stays on the minor the
+#   suite last ran green on; moving it (and widening the range) is a deliberate PR, because
+#   the codec relies on experimental APIs (serialization context, Nexus operation info).
 # - go.temporal.io/server and go.temporal.io/api beyond a patch: an upgrade must re-run the
 #   callback guard's carrier sweep (TestCallbackCarriers) and the wire suite, and be read
 #   against the upstream Nexus completion fix (docs/security.md).

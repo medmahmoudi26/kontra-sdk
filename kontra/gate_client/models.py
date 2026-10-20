@@ -24,6 +24,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, cast
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -37,6 +38,8 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+
+from kontra.contract.offering import STREAMS_MAX, TOPIC_PATTERN, check_streams
 
 __all__ = [
     "ANSWER_CONTEXT",
@@ -67,6 +70,10 @@ __all__ = [
     "RECENT_CONFIRMATION_SECONDS",
     "REVOCATION_WINDOW_MAX",
     "SHARE_ITEMS_MAX",
+    "STREAM_ITEM_MAX",
+    "STREAM_JOB_BUDGET",
+    "STREAM_LISTENERS_MAX",
+    "STREAM_TOPIC_BUDGET",
     "USER_CODE_ALPHABET",
     "USER_CODE_PATTERN",
     "WEBAUTHN_JSON_MAX",
@@ -127,8 +134,6 @@ __all__ = [
     "PasskeyTransport",
     "PasskeyView",
     "PollerInfo",
-    "ProgressEvent",
-    "ProgressPost",
     "ProgressSource",
     "PublishRequest",
     "QuoteRequest",
@@ -146,6 +151,9 @@ __all__ = [
     "ShareRefusalCode",
     "SharedJobKeys",
     "StartRequest",
+    "StreamEvent",
+    "StreamEventKind",
+    "StreamGapReason",
     "TaskQueueStats",
     "TaskQueueType",
     "TaskQueueTypeInfo",
@@ -214,8 +222,18 @@ _PAGE_MAX = 1000
 #: A serialized Temporal payload: twice the 2 MiB blob limit of Temporal's default and of
 #: Kontra's server (``limit.blobSize.error``), base64. A gate's own limit is lower.
 _PAYLOAD_B64_MAX = 4 * -(-(4 * 1024 * 1024) // 3)
-#: A progress event's ciphertext: twice the gates' 64 KiB heartbeat limit, base64.
-_PROGRESS_B64_MAX = 4 * -(-(128 * 1024) // 3)
+#: The largest item ciphertext a gate relays from a job's stream (decisions I31): the codec
+#: claim-checks anything larger (``kontra.codec.stream.ITEM_INLINE_MAX``), and the gate
+#: records a ``too_large`` gap instead. Base64 in an event.
+STREAM_ITEM_MAX = 256 * 1024
+_STREAM_B64_MAX = 4 * -(-STREAM_ITEM_MAX // 3)
+#: Relayed ciphertext a gate stores per topic of a job, and per job; past either, one
+#: ``topic_budget`` or ``job_budget`` gap (the first item that did not fit), and nothing
+#: more of that topic, or of the job, is relayed.
+STREAM_TOPIC_BUDGET = 16 * 1024 * 1024
+STREAM_JOB_BUDGET = 64 * 1024 * 1024
+#: Concurrent stream listeners of one job (429 ``too_many_listeners`` past it).
+STREAM_LISTENERS_MAX = 8
 #: Pending activities of a run and their type names, at Temporal's default limits (2000
 #: and 1000 characters; Kontra's server sets 1000 and 255).
 _PENDING_ACTIVITIES_MAX = 2000
@@ -228,6 +246,8 @@ _TEMPORAL_ID_MAX = 1000
 POLLERS_MAX = 1000
 
 _Name = Annotated[str, StringConstraints(max_length=_NAME_MAX)]
+#: A workflow-stream topic (``offering.yaml`` ``streams:``, ``kontra.contract.offering``).
+_Topic = Annotated[str, StringConstraints(max_length=64, pattern=f"^{TOPIC_PATTERN}$")]
 _Long = Annotated[str, StringConstraints(max_length=_LONG_MAX)]
 _Text = Annotated[str, StringConstraints(max_length=_TEXT_MAX)]
 _Activity = Annotated[str, StringConstraints(max_length=_ACTIVITY_MAX)]
@@ -1013,14 +1033,30 @@ class SharedJobKeys(_M):
 # --------------------------------------------------------------------------- catalog
 
 
+def _streams(value: list[str]) -> list[str]:
+    try:
+        return list(check_streams(value))
+    except ValueError as e:
+        raise ValueError(str(e)) from None
+
+
+_Streams = Annotated[list[_Topic], Field(max_length=STREAMS_MAX), AfterValidator(_streams)]
+
+
 class PublishRequest(_M):
     """``POST /v1/catalog``: the full contract document (with ``x-kontra``), as JSON. A
     change: it needs a person's session confirmed within the gate's ``KONTRA_CONFIRM_TTL``
     (a sign-in counts; §10.4, decisions I23); the gate then creates the Nexus endpoint
     itself, targeting the caller's namespace and the offering's task queue, under a fresh
-    random name (decisions I1)."""
+    random name (decisions I1).
+
+    ``streams``: ``offering.yaml``'s ``streams:``, the topics of a job's workflow stream a
+    buyer may read (decisions I31) -- beside the document, never in it: catalog data, not in
+    the contract hash. Canonical (sorted, distinct; ``kontra.contract.offering.check_streams``)
+    and fixed per version: a republish of the same version with other streams is 409."""
 
     document: dict[str, Any] = Field(max_length=_MEMBERS_MAX)
+    streams: _Streams = Field(default_factory=list[str])
 
 
 class CatalogEntry(_M):
@@ -1041,6 +1077,9 @@ class CatalogEntry(_M):
     recipients: list[_Name] = Field(default_factory=list, max_length=RECIPIENTS_MAX)
     published_at: datetime
     retired: bool = False
+    #: The topics of a job's stream a buyer may read (``offering.yaml`` ``streams:``),
+    #: fixed when the version was published: catalog data, as ``recipients`` is (I31).
+    streams: _Streams = Field(default_factory=list[str])
 
 
 class CatalogSummary(_M):
@@ -1321,25 +1360,69 @@ class ResolveRequest(_M):
     note: Annotated[str, StringConstraints(max_length=_NOTE_MAX)] = ""
 
 
-# --------------------------------------------------------------------------- progress
+# --------------------------------------------------------------------------- streams & progress
 
 
 class ProgressSource(StrEnum):
+    """Where a buyer's ``Progress`` came from (``kontra.hire.Progress``): the seller's
+    heartbeat (the job stream's ``kontra.progress`` topic), or history liveness."""
+
     HEARTBEAT = "heartbeat"
     HISTORY = "history"
 
 
-class ProgressEvent(_M):
-    """One event of ``GET /v1/jobs/{id}/progress`` (SSE, ``data:`` is this JSON).
+class StreamEventKind(StrEnum):
+    """What one event of ``GET /v1/jobs/{id}/stream`` is: a relayed ``item`` of the job's
+    stream, a ``gap`` (an item not relayed, or the relay stopped), or platform liveness
+    read from history (``history``)."""
 
-    ``heartbeat`` events carry the seller's heartbeat details encrypted to the buyer
-    (``ciphertext_b64``, age). ``history`` events carry platform-observable metadata."""
+    ITEM = "item"
+    GAP = "gap"
+    HISTORY = "history"
 
-    seq: int
+
+class StreamGapReason(StrEnum):
+    """Why a gap: an item above :data:`STREAM_ITEM_MAX` (``too_large``), past the topic's or
+    the job's stored budget (``topic_budget``, ``job_budget``) -- these carry the item's
+    topic and offset --; or the relay stopped: the job's history budget
+    (``history_budget``), an answer that was not a stream envelope (``relay_failed``), an
+    item the gate refused (``invalid``)."""
+
+    TOO_LARGE = "too_large"
+    TOPIC_BUDGET = "topic_budget"
+    JOB_BUDGET = "job_budget"
+    HISTORY_BUDGET = "history_budget"
+    RELAY_FAILED = "relay_failed"
+    INVALID = "invalid"
+
+
+_HISTORY_FIELDS = (
+    "last_event",
+    "activities_completed",
+    "activities_running",
+    "continue_as_new_count",
+)
+
+
+class StreamEvent(_M):
+    """One event of ``GET /v1/jobs/{id}/stream`` (SSE: ``id:`` is ``cursor``, ``event:`` is
+    ``kind``, ``data:`` is this JSON), decisions I31.
+
+    ``cursor`` is the gate's per-job, monotonic position: what ``after`` / ``Last-Event-ID``
+    resume from. An ``item`` carries the topic and offset in the clear and the item's age
+    ciphertext (the item's own ``Payload``, with its topic and offset sealed inside; only
+    the job's parties read it). A ``gap`` carries its ``reason``, and the item's ``topic``,
+    ``offset`` and ``size`` when it stands for one. A ``history`` event is the platform's
+    liveness summary of the job's chain."""
+
+    cursor: int = Field(ge=1)
+    kind: StreamEventKind
     at: datetime
-    source: ProgressSource
-    activity: _Activity | None = None
-    ciphertext_b64: Annotated[str, StringConstraints(max_length=_PROGRESS_B64_MAX)] | None = None
+    topic: _Topic | None = None
+    offset: int | None = Field(default=None, ge=0)
+    ciphertext_b64: Annotated[str, StringConstraints(max_length=_STREAM_B64_MAX)] | None = None
+    size: int | None = Field(default=None, ge=0)
+    reason: StreamGapReason | None = None
     state: JobState | None = None
     last_event: _Name | None = None
     activities_completed: int | None = None
@@ -1348,13 +1431,32 @@ class ProgressEvent(_M):
     )
     continue_as_new_count: int | None = None
 
-
-class ProgressPost(_M):
-    """``POST /v1/jobs/{id}/progress`` from the seller's worker."""
-
-    at: datetime
-    activity: _Activity
-    ciphertext_b64: Annotated[str, StringConstraints(max_length=_PROGRESS_B64_MAX)]
+    @model_validator(mode="after")
+    def _per_kind(self) -> StreamEvent:
+        history = [f for f in _HISTORY_FIELDS if getattr(self, f) is not None]
+        if self.kind is StreamEventKind.ITEM:
+            if self.topic is None or self.offset is None or self.ciphertext_b64 is None:
+                raise ValueError("an item carries topic, offset and ciphertext_b64")
+            if self.reason is not None or self.size is not None or history:
+                raise ValueError("an item carries no reason, size or history fields")
+        elif self.kind is StreamEventKind.GAP:
+            if self.reason is None:
+                raise ValueError("a gap carries its reason")
+            if self.ciphertext_b64 is not None or history:
+                raise ValueError("a gap carries no ciphertext or history fields")
+            if (self.topic is None) != (self.offset is None):
+                raise ValueError("a gap names both its item's topic and offset, or neither")
+            if self.offset is None and self.size is not None:
+                raise ValueError("a gap's size is its item's")
+        else:
+            if self.state is None:
+                raise ValueError("a history event carries the job's state")
+            if any(
+                v is not None
+                for v in (self.topic, self.offset, self.ciphertext_b64, self.size, self.reason)
+            ):
+                raise ValueError("a history event carries no topic, offset, ciphertext or gap")
+        return self
 
 
 # --------------------------------------------------------------------------- artifacts & blobs

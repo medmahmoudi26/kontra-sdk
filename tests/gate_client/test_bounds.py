@@ -26,7 +26,7 @@ from kontra import _jobkeys as jk
 from kontra.codec import age
 from kontra.contract import agent_card, from_yaml
 from kontra.contract.names import HANDLE_MAX
-from kontra.contract.offering import DESCRIPTION_MAX, PRICING_HINT_MAX
+from kontra.contract.offering import DESCRIPTION_MAX, PRICING_HINT_MAX, STREAMS_MAX
 from kontra.contract.quote import KontraQuote
 from kontra.contract.validate import MAX_CANONICAL_BYTES
 from kontra.gate_client import models as m
@@ -46,9 +46,9 @@ AGE_KEY = "age1" + "q" * 58
 API_KEY = m.API_KEY_PREFIX + "k" * 43
 #: The longest address the gate takes: a 64-character local part, 254 in all.
 EMAIL = "e" * 64 + "@" + "d" * 61 + "." + "d" * 61 + "." + "d" * 57 + ".example"
-#: The gates' relayed-payload limit (2 MiB) and heartbeat limit (64 KiB), as base64.
+#: The gates' relayed-payload limit (2 MiB) and relayed stream item limit (256 KiB), base64.
 PAYLOAD_B64 = base64.b64encode(b"\0" * (2 * MiB)).decode()
-HEARTBEAT_B64 = base64.b64encode(b"\0" * (64 * 1024)).decode()
+ITEM_B64 = base64.b64encode(b"\0" * m.STREAM_ITEM_MAX).decode()
 #: A presigned URL with a session token runs past 2 KiB.
 URL = "https://bucket.example/" + "p" * 4096
 JWT = "e" * 4096
@@ -231,7 +231,6 @@ def test_a_few_short_stray_keys_are_reported_where_they_are() -> None:
         (m.QuoteRequest, "offering", 255),
         (m.HireRequest, "quote_id", 255),
         (m.ResolveRequest, "note", 8 * 1024),
-        (m.ProgressPost, "activity", 1000),
         (m.ArtifactCreate, "content_type", 255),
         (m.ArtifactComplete, "ciphertext_sha256", 255),
         (m.Topup, "currency", 255),
@@ -264,13 +263,15 @@ def _largest_request(model: type[BaseModel]) -> dict[str, Any]:
         m.ApiKeyCreate: {"label": "l" * 64},
         m.DevLogin: {"handle": HANDLE},
         m.AddKey: {"label": "l" * 255, "public_key": AGE_KEY},
-        m.PublishRequest: {"document": CONTRACT},
+        m.PublishRequest: {
+            "document": CONTRACT,
+            "streams": sorted(f"t{i}." + "x" * 60 for i in range(STREAMS_MAX)),
+        },
         m.QuoteRequest: {"offering": REF, "input": {"b64": PAYLOAD_B64}},
         m.HireRequest: {"quote_id": "0" * 32, "max_price_minor": 2**53, "buyer_key": AGE_KEY},
         m.StartRequest: {"input": {"b64": PAYLOAD_B64}},
         m.RejectRequest: {"reason": "r" * 2000},
         m.ResolveRequest: {"buyer_minor": 1, "seller_minor": 1, "note": "n" * 2000},
-        m.ProgressPost: {"at": NOW, "activity": "a" * 255, "ciphertext_b64": HEARTBEAT_B64},
         m.ArtifactCreate: {"size": 5 * 1024**4, "content_type": "c" * 255, "job_id": "0" * 32},
         m.ArtifactComplete: {
             "upload_id": UPLOAD_ID,
@@ -323,7 +324,6 @@ _BODY_LIMIT = {
     m.StartRequest: 4 * MiB,
     m.PublishRequest: 2 * MiB,
     m.ArtifactComplete: 1 * MiB,
-    m.ProgressPost: 128 * 1024,
     # A hundred jobs, or one job wrapped to thirty-two devices, with room.
     m.ShareJobKeys: 256 * 1024,
 }
@@ -343,7 +343,6 @@ _BODY_LIMIT = {
         m.StartRequest,
         m.RejectRequest,
         m.ResolveRequest,
-        m.ProgressPost,
         m.ArtifactCreate,
         m.ArtifactComplete,
         m.BlobCreate,
@@ -395,6 +394,7 @@ def test_the_largest_legitimate_responses_are_accepted() -> None:
         task_queue=REF,
         recipients=[AGE_KEY] * m.RECIPIENTS_MAX,
         published_at=NOW,  # type: ignore[arg-type]
+        streams=sorted(f"t{i}." + "x" * 60 for i in range(STREAMS_MAX)),
     )
     assert len(card) < 64
     summary = m.CatalogSummary.model_validate(
@@ -445,22 +445,24 @@ def test_the_largest_legitimate_responses_are_accepted() -> None:
             "expires_at": NOW,
         }
     )
-    m.ProgressEvent.model_validate(
+    m.StreamEvent.model_validate(
         {
-            "seq": 1,
+            "cursor": 1,
+            "kind": "history",
             "at": NOW,
-            "source": "history",
+            "state": "working",
             "last_event": "WorkflowExecutionContinuedAsNew",
             "activities_running": ["a" * 1000] * 2000,
         }
     )
-    m.ProgressEvent.model_validate(
+    m.StreamEvent.model_validate(
         {
-            "seq": 2,
+            "cursor": 2,
+            "kind": "item",
             "at": NOW,
-            "source": "heartbeat",
-            "activity": "a" * 255,
-            "ciphertext_b64": HEARTBEAT_B64,
+            "topic": "t" + "x" * 63,
+            "offset": 10**18,
+            "ciphertext_b64": ITEM_B64,
         }
     )
     m.ResultView.model_validate(
@@ -620,3 +622,70 @@ def test_bounds_follow_the_limits_they_name() -> None:
     assert m._PRICING_HINT_MAX == PRICING_HINT_MAX  # pyright: ignore[reportPrivateUsage]
     assert len(REF) <= m._NAME_MAX  # pyright: ignore[reportPrivateUsage]
     assert len(AGE_KEY) <= m._NAME_MAX  # pyright: ignore[reportPrivateUsage]
+
+
+# --------------------------------------------------------------------------- streams (I31)
+
+_AT = "2026-10-20T00:00:00Z"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"kind": "item", "topic": "turn_events", "offset": 0, "ciphertext_b64": "QQ=="},
+        {"kind": "item", "topic": "kontra.progress", "offset": 5, "ciphertext_b64": "QQ==", "state": "working"},
+        {"kind": "gap", "topic": "t", "offset": 3, "size": 300_000, "reason": "too_large"},
+        {"kind": "gap", "topic": "t", "offset": 3, "reason": "topic_budget"},
+        {"kind": "gap", "reason": "history_budget"},
+        {"kind": "gap", "reason": "relay_failed", "state": "working"},
+        {"kind": "history", "state": "working", "activities_completed": 2},
+    ],
+)  # fmt: skip
+def test_a_stream_event_of_each_kind(event: dict[str, Any]) -> None:
+    m.StreamEvent.model_validate({"cursor": 1, "at": _AT, **event})
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"kind": "item", "topic": "t", "offset": 0},  # no ciphertext
+        {"kind": "item", "offset": 0, "ciphertext_b64": "QQ=="},  # no topic
+        {"kind": "item", "topic": "t", "ciphertext_b64": "QQ=="},  # no offset
+        {"kind": "item", "topic": "t", "offset": 0, "ciphertext_b64": "QQ==", "reason": "invalid"},
+        {"kind": "item", "topic": "t", "offset": 0, "ciphertext_b64": "QQ==", "last_event": "x"},
+        {"kind": "item", "topic": "bad topic", "offset": 0, "ciphertext_b64": "QQ=="},
+        {"kind": "item", "topic": "t", "offset": -1, "ciphertext_b64": "QQ=="},
+        {"kind": "gap"},  # no reason
+        {"kind": "gap", "reason": "too_large", "ciphertext_b64": "QQ=="},
+        {"kind": "gap", "reason": "too_large", "topic": "t"},  # topic without offset
+        {"kind": "gap", "reason": "history_budget", "size": 3},  # a size is an item's
+        {"kind": "gap", "reason": "nope"},
+        {"kind": "history"},  # no state
+        {"kind": "history", "state": "working", "topic": "t"},
+        {"kind": "other", "state": "working"},
+    ],
+)  # fmt: skip
+def test_a_stream_event_that_breaks_its_kinds_rules(event: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        m.StreamEvent.model_validate({"cursor": 1, "at": _AT, **event})
+
+
+def test_a_stream_event_has_a_cursor_and_a_bounded_ciphertext() -> None:
+    item = {"kind": "item", "topic": "t", "offset": 0, "at": _AT}
+    with pytest.raises(ValidationError):
+        m.StreamEvent.model_validate({**item, "cursor": 0, "ciphertext_b64": "QQ=="})
+    m.StreamEvent.model_validate({**item, "cursor": 1, "ciphertext_b64": ITEM_B64})
+    with pytest.raises(ValidationError) as e:
+        m.StreamEvent.model_validate({**item, "cursor": 1, "ciphertext_b64": ITEM_B64 + "AAAA"})
+    assert [err["type"] for err in e.value.errors()] == ["string_too_long"]
+
+
+def test_streams_are_bounded_and_canonical_on_both_catalog_models() -> None:
+    req = m.PublishRequest.model_validate({"document": {}, "streams": ["b", "a"]})
+    assert req.streams == ["a", "b"]
+    assert m.PublishRequest.model_validate({"document": {}}).streams == []
+    for bad in (["kontra.progress"], ["a", "a"], ["bad topic"], [f"t{i}" for i in range(9)]):
+        with pytest.raises(ValidationError):
+            m.PublishRequest.model_validate({"document": {}, "streams": bad})
+    assert "streams" in m.CatalogEntry.model_fields
+    assert m.CatalogEntry.model_fields["streams"].default_factory is not None

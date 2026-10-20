@@ -9,7 +9,8 @@ namespaces, the devices that read a party's jobs and the job-key wraps copied to
 opaque endpoint names,
 the endpoint created through the control plane), the Workers view (Temporal's task-queue
 stats of a seller's own version), the quote relay, hire with a signed hold
-token, the escrow lifecycle, progress over SSE, artifacts and claim-check blobs behind
+token, the escrow lifecycle, each job's workflow stream relayed over SSE (with
+:mod:`kontra._relay`, as the platform gate relays it), artifacts and claim-check blobs behind
 signed URLs, balances and disputes. Its rules are the platform's: the job rules are
 :mod:`kontra.escrow` (shared with the real gate), money is a
 :func:`~kontra.testing.fake_ledger`, and Temporal is reached through
@@ -22,7 +23,7 @@ at their deadline.
 Two ways to run it:
 
 * ``FakeGate.app`` is the ASGI app, for ``httpx.ASGITransport``. Use ``async with gate:``
-  to run the sweeper on the current loop. A progress stream only ends when its job does
+  to run the sweeper on the current loop. A job's stream only ends when its job does
   (``ASGITransport`` buffers whole responses).
 * ``await gate.serve()`` runs uvicorn on ``127.0.0.1:0`` in a background thread and returns
   the base URL, so SSE streams for real; ``await gate.stop()`` ends it. The gate's state
@@ -60,7 +61,6 @@ import secrets
 import socket
 import sys
 import threading
-import time
 import types
 import warnings
 from collections import deque
@@ -82,14 +82,16 @@ from urllib.parse import parse_qs, urlsplit
 import jwt
 import uvicorn
 from cryptography.hazmat.primitives.asymmetric import ec
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google.protobuf.message import DecodeError
 from jwt.algorithms import ECAlgorithm
 from pydantic import JsonValue, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from temporalio.api.common.v1 import Payload
+from temporalio.api.common.v1 import Payload, WorkflowExecution
+from temporalio.api.workflowservice.v1 import DescribeWorkflowExecutionRequest
+from temporalio.service import RPCError
 
 from kontra import _jobkeys as jk
 from kontra import _passkeys as pk
@@ -106,10 +108,12 @@ from kontra._control import (
     hold_digest,
     input_size,
 )
+from kontra._relay import MIN_INTERVAL, RelayBatch, RelayStopped, pace_for, relay
 from kontra.codec import InvalidPayload
 from kontra.contract import ContractError, ContractInfo, KontraQuote, agent_card, validate_document
 from kontra.contract.facts import check_public_key
 from kontra.contract.names import (
+    PROGRESS_TOPIC,
     NameError_,
     OfferingId,
     OfferingRef,
@@ -121,6 +125,7 @@ from kontra.contract.names import (
     new_job_id,
     validate_handle,
 )
+from kontra.contract.offering import STREAMS_MAX, check_streams, check_topic
 from kontra.contract.quote import MAX_ETA_SECONDS
 from kontra.escrow import (
     Effect,
@@ -231,11 +236,20 @@ KEYS_LISTED = 100
 SESSIONS_LISTED = 100
 #: A relayed Nexus payload (quote or start input): Temporal's own default blob limit.
 MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
-MAX_PROGRESS_BYTES = 64 * 1024
-#: Heartbeat ciphertext kept per job, in total (later heartbeats are dropped).
-HEARTBEAT_BUDGET_BYTES = 64 * 1024 * 1024
-#: Every age v1 file starts with this line: progress the gate keeps must be ciphertext.
+#: Every age v1 file starts with this line: what the gate keeps of a job's stream must be
+#: ciphertext (``kontra.codec.stream.parse_envelope`` refuses anything else first).
 AGE_MAGIC = b"age-encryption.org/v1\n"
+#: Kontra's pinned ``limit.historyCount.error`` and ``limit.historySize.error``
+#: (``temporal/authorizer/dynamicconfig/kontra.yaml``): what the relay paces against.
+HISTORY_LIMITS = (20_480, 20 * 1024 * 1024)
+#: How long a job's relay keeps polling after its last listener left.
+RELAY_GRACE = 30.0
+_CURSOR = re.compile(r"0|[1-9][0-9]{0,18}", re.ASCII)
+_GAP_REASONS: dict[str, m.StreamGapReason] = {
+    "history_budget": m.StreamGapReason.HISTORY_BUDGET,
+    "protocol": m.StreamGapReason.RELAY_FAILED,
+    "denied": m.StreamGapReason.RELAY_FAILED,
+}
 MAX_BLOB_BYTES = 64 * 1024 * 1024
 NOTE_MAX = 2000
 WORKER_TTL = timedelta(minutes=15)
@@ -264,7 +278,6 @@ _SECRET_LEN = 43  # secrets.token_urlsafe(32)
 _SECRET = re.compile(r"[A-Za-z0-9_-]{43}", re.ASCII)
 _PATH_VERSION_MAX = 29
 _JSON_PLAIN = b"json/plain"
-_ACTIVITY = re.compile(r"[^\x00-\x1f\x7f]{1,255}")
 _SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 #: Printable ASCII, no control characters (it becomes a header value downstream).
 _CONTENT_TYPE = re.compile(r"[\x21-\x7e][\x20-\x7e]{0,254}", re.ASCII)
@@ -691,6 +704,8 @@ class _Offering:
     card: dict[str, Any]
     published_at: datetime
     retired: bool = False
+    #: ``offering.yaml``'s ``streams:``, fixed when the version was first published.
+    streams: tuple[str, ...] = ()
 
     @property
     def id(self) -> OfferingId:
@@ -726,6 +741,7 @@ class _Offering:
             recipients=list(recipients),
             published_at=self.published_at,
             retired=self.retired,
+            streams=list(self.streams),
         )
 
 
@@ -763,14 +779,16 @@ class _Job:
     resolution_note: str = ""
     escrow_closed_at: datetime | None = None
     output_reserved: int = 0
-    events: list[m.ProgressEvent] = field(default_factory=list[m.ProgressEvent])
-    #: Set once no more progress can arrive (the job closed and its last history summary,
-    #: if any, is recorded): a stream that has sent everything then ends.
+    #: The job's stream as the gate stores it: relayed items, gaps and history events, by
+    #: cursor (``events[i].cursor == i + 1``). Ciphertext only.
+    events: list[m.StreamEvent] = field(default_factory=list[m.StreamEvent])
+    #: Set once no more history events can arrive (the job closed and its last history
+    #: summary, if any, is recorded): a stream that has sent everything, and whose relay
+    #: finished, then ends.
     progress_final: bool = False
     #: The job state and history summary of the last history event recorded.
     last_progress: tuple[m.JobState, HistorySummary] | None = None
-    heartbeats: deque[float] = field(default_factory=deque[float])
-    heartbeat_bytes: int = 0
+    relay: "_RelayState" = field(default_factory=lambda: _RelayState())
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     #: :func:`~kontra._control.hold_digest` of every hold token issued for the job: a run
     #: of ``job-<id>`` counts only if the buyer's call carried one of them (decisions I15).
@@ -810,7 +828,7 @@ class _Job:
         return datetime.fromtimestamp(exp, UTC)
 
     def notify(self) -> None:
-        """Wake every progress stream of this job."""
+        """Wake every stream listener of this job."""
         event, self.changed = self.changed, asyncio.Event()
         event.set()
 
@@ -842,6 +860,34 @@ class _Job:
             workflow_id=self.workflow_id,
             buyer_key=self.buyer_key if buyer_key else None,
         )
+
+
+@dataclass
+class _RelayState:
+    """One job's relay (decisions I31): one task per job, from offset 0 at its first
+    listener (owner, OD2), the persisted offset kept across pauses, the stored budgets."""
+
+    task: asyncio.Task[None] | None = None
+    #: The next offset to poll from: persisted after each stored batch.
+    offset: int = 0
+    listeners: int = 0
+    #: The relay ended: the job closed (drained), or it stopped (``stopped`` says why).
+    done: bool = False
+    stopped: str | None = None
+    pause: asyncio.TimerHandle | None = None
+    topic_bytes: dict[str, int] = field(default_factory=dict[str, int])
+    job_bytes: int = 0
+    #: Topics whose stored budget is spent (one gap said so; the relay polls them no more),
+    #: and the job's (one gap; the relay stopped).
+    spent_topics: set[str] = field(default_factory=set[str])
+    job_spent: bool = False
+    #: Polls answered and items dropped (defence in depth), for tests.
+    batches: int = 0
+    dropped: int = 0
+
+    @property
+    def running(self) -> bool:
+        return self.task is not None and not self.task.done()
 
 
 @dataclass
@@ -901,6 +947,17 @@ class FakeGate:
     show. ``passkey_origins``: the console's origins (``KONTRA_CONSOLE_ORIGINS``; default
     :attr:`base_url`), of which only those on the RP ID are taken (:attr:`passkey_origins`).
 
+    A job's workflow stream is relayed with :func:`kontra._relay.relay` on the control
+    plane's client, as the platform relays it on a relay token's (decisions I31): one relay
+    per job, started once the job is pinned and its first listener attaches, from offset 0;
+    paused ``relay_grace`` seconds after its last listener leaves, its offset kept.
+    ``relay_interval``: the shortest wait between two polls (the platform's 2 s);
+    ``relay_rpc_timeout``: one poll RPC's deadline; ``history_limits``: the server's
+    history limits it paces against (Kontra's pinned ones). ``stream_item_max``,
+    ``stream_topic_budget``, ``stream_job_budget``: what it stores (an item above the first
+    is a gap; past a budget, one gap, and the relay polls that topic no more, or stops);
+    ``stream_listeners_max``: listeners per job.
+
     The clock offset (:meth:`advance`) moves token ``iat``/``exp`` too: a seller's
     handler verifying a hold token issued *after* an advance on the machine's clock sees
     an ``iat`` in the future, which PyJWT refuses by default. Advance after the start.
@@ -939,7 +996,14 @@ class FakeGate:
         part_size: int = 16 * 1024 * 1024,
         max_input_bytes: int = 5 * 1000**3,
         url_ttl: timedelta = timedelta(hours=1),
-        progress_rate_per_s: int = 5,
+        relay_interval: float = MIN_INTERVAL,
+        relay_grace: float = RELAY_GRACE,
+        relay_rpc_timeout: float = 30.0,
+        history_limits: tuple[int, int] = HISTORY_LIMITS,
+        stream_item_max: int = m.STREAM_ITEM_MAX,
+        stream_topic_budget: int = m.STREAM_TOPIC_BUDGET,
+        stream_job_budget: int = m.STREAM_JOB_BUDGET,
+        stream_listeners_max: int = m.STREAM_LISTENERS_MAX,
         input_retention: timedelta = timedelta(days=7),
         orphan_upload_ttl: timedelta = timedelta(hours=24),
         keepalive: float = 5.0,
@@ -997,7 +1061,14 @@ class FakeGate:
         self.part_size = part_size
         self.max_input_bytes = max_input_bytes
         self.url_ttl = url_ttl
-        self.progress_rate_per_s = progress_rate_per_s
+        self.relay_interval = relay_interval
+        self.relay_grace = relay_grace
+        self.relay_rpc_timeout = relay_rpc_timeout
+        self.history_limits = history_limits
+        self.stream_item_max = stream_item_max
+        self.stream_topic_budget = stream_topic_budget
+        self.stream_job_budget = stream_job_budget
+        self.stream_listeners_max = stream_listeners_max
         self.input_retention = input_retention
         self.orphan_upload_ttl = orphan_upload_ttl
         self.keepalive = keepalive
@@ -1093,8 +1164,16 @@ class FakeGate:
 
     async def _shutdown(self) -> None:
         self._stopping = True
+        relays: list[asyncio.Task[None]] = []
         for job in self.jobs.values():
             job.notify()
+            if job.relay.pause is not None:
+                job.relay.pause.cancel()
+                job.relay.pause = None
+            if job.relay.task is not None and not job.relay.task.done():
+                job.relay.task.cancel()
+                relays.append(job.relay.task)
+        await asyncio.gather(*relays, return_exceptions=True)
         task, self._sweeper = self._sweeper, None
         if task is not None:
             task.cancel()
@@ -1131,7 +1210,7 @@ class FakeGate:
         return self.base_url
 
     async def stop(self) -> None:
-        """Stop :meth:`serve` (open progress streams end)."""
+        """Stop :meth:`serve` (open stream listeners end)."""
         server, thread = self._server, self._thread
         if server is None or thread is None:
             return
@@ -2803,16 +2882,24 @@ class FakeGate:
     def _open_jobs(self, offering: str) -> list[_Job]:
         return [j for j in self.jobs.values() if j.record.offering == offering and j.record.open]
 
-    async def publish(self, who: Principal, document: dict[str, Any]) -> m.CatalogEntry:
+    async def publish(
+        self, who: Principal, document: dict[str, Any], streams: Sequence[str] = ()
+    ) -> m.CatalogEntry:
         """Publishing (§11.4, decisions I1/I3): validate, check ownership, assign an opaque
         endpoint name once per version, and create the endpoint through the control plane
-        targeting the caller's namespace and the version's task queue."""
+        targeting the caller's namespace and the version's task queue. ``streams`` (the
+        topics a buyer may read, decisions I31) are kept with the version, and fixed: a
+        republish of the version with others is 409 ``streams_fixed``."""
         try:
             info = validate_document(document)
         except ContractError as e:
             raise GateHTTPError(
                 422, "invalid_contract", f"{e.path}: {e.message}", {"path": e.path}
             ) from None
+        try:
+            topics = check_streams(list(streams))
+        except ValueError as e:
+            raise GateHTTPError(422, "invalid_streams", f"streams: {e}") from None
         oid = info.offering
         if oid.party != who.party:
             raise GateHTTPError(
@@ -2824,6 +2911,14 @@ class FakeGate:
         card = agent_card(info.document, url=self.entry_url(oid))
         now = self.now()
         row = self.offerings.get(oid.key)
+        if row is not None and row.streams != topics:
+            raise GateHTTPError(
+                409,
+                "streams_fixed",
+                f"{oid.key} was published with streams {list(row.streams)}; streams are "
+                "fixed per version: publish a new version",
+                {"streams": list(row.streams)},
+            )
         if row is None:
             row = _Offering(
                 info=info,
@@ -2831,6 +2926,7 @@ class FakeGate:
                 endpoint_ready=False,
                 card=card,
                 published_at=now,
+                streams=topics,
             )
             self.offerings[oid.key] = row
             self._by_endpoint[row.endpoint] = oid.key
@@ -3572,86 +3668,278 @@ class FakeGate:
             raise GateHTTPError(422, "invalid_amount", str(e)) from None
         return m.TopupResult(credited=True, balance=await self.balance(party, req.currency))
 
-    # ------------------------------------------------------------------ progress
+    # ------------------------------------------------------------------ streams
 
-    def _record_event(self, job: _Job, **fields: Any) -> m.ProgressEvent:
-        event = m.ProgressEvent.model_validate({"seq": len(job.events) + 1, **fields})
+    def _record_event(self, job: _Job, **fields: Any) -> m.StreamEvent:
+        event = m.StreamEvent.model_validate({"cursor": len(job.events) + 1, **fields})
         job.events.append(event)
         job.notify()
         return event
 
-    def post_progress(self, who: Principal, job_id: str, post: m.ProgressPost) -> None:
-        """A seller's heartbeat details, encrypted to the buyer. At most
-        ``progress_rate_per_s`` per second per job are kept (latest-wins is the sender's
-        job); the excess is dropped without an error, as a throttle should."""
+    def stream_topics(self, job: _Job) -> tuple[str, ...]:
+        """What a job's relay reads and a listener may ask for: the offering version's
+        ``streams`` and ``kontra.progress``."""
+        row = self.offerings.get(job.record.offering)
+        return tuple(sorted({*(row.streams if row is not None else ()), PROGRESS_TOPIC}))
+
+    def open_stream(
+        self,
+        who: Principal,
+        job_id: str,
+        topics: Sequence[str],
+        history: bool,
+        after: int | None,
+        last_event_id: str | None,
+    ) -> AsyncIterator[bytes]:
+        """``GET /v1/jobs/{id}/stream``, for the job's buyer or seller: the checks, then the
+        events (:meth:`stream_events`)."""
         job = self.job_for(job_id, who.party)
-        if who.party != job.record.seller:
-            raise GateHTTPError(403, "forbidden", "only the job's seller posts progress")
-        if not job.record.open:
-            raise GateHTTPError(409, "not_open", f"job is {job.record.state.value}")
-        if _ACTIVITY.fullmatch(post.activity) is None:
+        allowed = self.stream_topics(job)
+        chosen: list[str] = []
+        for topic in topics:
+            try:
+                check_topic(topic)
+            except ValueError:
+                raise GateHTTPError(422, "unknown_topic", "a topic is not a topic name") from None
+            if topic not in allowed:
+                raise GateHTTPError(
+                    422,
+                    "unknown_topic",
+                    f"{topic!r} is not one of this job's topics {list(allowed)}",
+                )
+            if topic not in chosen:
+                chosen.append(topic)
+        if after is None and last_event_id is not None:
+            if _CURSOR.fullmatch(last_event_id) is None:
+                raise GateHTTPError(422, "invalid_cursor", "Last-Event-ID is not a cursor")
+            after = int(last_event_id)
+        if job.relay.listeners >= self.stream_listeners_max:
             raise GateHTTPError(
-                422,
-                "invalid_progress",
-                "activity must be 1 to 255 characters without control characters",
+                429,
+                "too_many_listeners",
+                f"at most {self.stream_listeners_max} listeners per job",
             )
-        if len(post.ciphertext_b64) > 4 * math.ceil(MAX_PROGRESS_BYTES / 3):
-            raise GateHTTPError(
-                413, "too_large", f"a progress event is at most {MAX_PROGRESS_BYTES} bytes"
-            )
+        job.relay.listeners += 1
+        return self.stream_events(job, frozenset(chosen or allowed), history, after or 0)
+
+    async def stream_events(
+        self, job: _Job, topics: frozenset[str], history: bool, after: int
+    ) -> AsyncIterator[bytes]:
+        """Replay the stored events after ``after``, then follow; keepalive comments while
+        idle; end once the job is closed, its relay finished and every event was sent. The
+        relay is started here (once the job is pinned) and paused when its last listener
+        has been gone a while."""
+        last = after
         try:
-            raw = base64.b64decode(post.ciphertext_b64, validate=True)
-        except (binascii.Error, ValueError):
-            raise GateHTTPError(
-                422, "invalid_progress", "ciphertext_b64 is not standard base64"
-            ) from None
-        if len(raw) > MAX_PROGRESS_BYTES:
-            raise GateHTTPError(
-                413, "too_large", f"a progress event is at most {MAX_PROGRESS_BYTES} bytes"
-            )
-        if not raw.startswith(AGE_MAGIC):
-            # As the platform gate does: a client bug must not leave plaintext here.
-            raise GateHTTPError(
-                422,
-                "not_ciphertext",
-                "progress details must be encrypted to the buyer (an age v1 file)",
-            )
-        mono = time.monotonic()
-        beats = job.heartbeats
-        while beats and mono - beats[0] >= 1.0:
-            beats.popleft()
-        if len(beats) >= self.progress_rate_per_s:
+            if job.record.run_id is None and job.record.open:
+                # Pinned as soon as someone listens, not at the next sweep: the relay
+                # never polls an unpinned job-<id> (I30).
+                with contextlib.suppress(Exception):
+                    await self._observe(job.job_id)
+            while True:
+                waiter = job.changed
+                self._ensure_relay(job)
+                for event in job.events[last:]:
+                    last = event.cursor
+                    if not _wanted(event, topics, history):
+                        continue
+                    data = event.model_dump_json(exclude_none=True)
+                    yield f"id: {event.cursor}\nevent: {event.kind.value}\ndata: {data}\n\n".encode()
+                if self._stopping:
+                    return
+                if job.progress_final and self._relay_settled(job) and last >= len(job.events):
+                    return
+                try:
+                    async with asyncio.timeout(self.keepalive):
+                        await waiter.wait()
+                except TimeoutError:
+                    yield b": keepalive\n\n"
+        finally:
+            self._left(job)
+
+    def _left(self, job: _Job) -> None:
+        state = job.relay
+        state.listeners = max(state.listeners - 1, 0)
+        if state.listeners or not state.running or self._loop is None:
             return
-        if job.heartbeat_bytes + len(raw) > HEARTBEAT_BUDGET_BYTES:
-            return  # the job's budget is spent; history events still show liveness
-        beats.append(mono)
-        job.heartbeat_bytes += len(raw)
-        self._record_event(
-            job,
-            at=post.at if post.at.tzinfo is not None else post.at.replace(tzinfo=UTC),
-            source=m.ProgressSource.HEARTBEAT,
-            activity=post.activity,
-            ciphertext_b64=post.ciphertext_b64,
-            state=job.record.state,
+        if state.pause is not None:
+            state.pause.cancel()
+        state.pause = asyncio.get_running_loop().call_later(
+            self.relay_grace, self._maybe_pause, job
         )
 
-    async def progress_stream(self, job: _Job, after: int) -> AsyncIterator[bytes]:
-        """Replay events after ``after``, then follow; keepalive comments while idle; end
-        once the job is closed and every event has been sent."""
-        last = after
-        while True:
-            waiter = job.changed
-            for event in job.events[last:]:
-                last = event.seq
-                data = event.model_dump_json()
-                yield f"id: {event.seq}\nevent: progress\ndata: {data}\n\n".encode()
-            if (job.progress_final and last >= len(job.events)) or self._stopping:
-                return
+    def _maybe_pause(self, job: _Job) -> None:
+        """The last listener has been gone ``relay_grace`` seconds: stop polling, keep the
+        offset (the platform revokes the relay session here)."""
+        state = job.relay
+        state.pause = None
+        if state.listeners == 0 and state.task is not None:
+            state.task.cancel()
+
+    def _relay_settled(self, job: _Job) -> bool:
+        """Nothing more will be relayed: the relay finished, or never started and the job
+        is closed (a relay attaching after a job closed reads nothing)."""
+        state = job.relay
+        return state.done or not state.running
+
+    def _ensure_relay(self, job: _Job) -> None:
+        state = job.relay
+        if state.running or state.done or state.listeners == 0:
+            return
+        if not job.record.open or job.record.run_id is None:
+            return  # never an unpinned job-<id>; a closed job's stream is gone
+        client: Any = getattr(self.control, "client", None)
+        if client is None:
+            return
+        if state.pause is not None:
+            state.pause.cancel()
+            state.pause = None
+        state.task = asyncio.get_running_loop().create_task(
+            self._relay(job, client.workflow_service), name=f"fake-gate-relay-{job.job_id}"
+        )
+
+    async def _relay(self, job: _Job, service: Any) -> None:
+        """One job's relay: :func:`kontra._relay.relay`, each batch stored, the offset
+        persisted after it; a stop recorded as a gap without an item."""
+        state = job.relay
+        namespace = job.record.seller_ns
+        events_limit, bytes_limit = self.history_limits
+
+        async def closed() -> bool:
+            return self._stopping or not job.record.open
+
+        async def pace() -> float | None:
+            # The internal frontend's view of the job's history, as the gate's observer has.
             try:
-                async with asyncio.timeout(self.keepalive):
-                    await waiter.wait()
-            except TimeoutError:
-                yield b": keepalive\n\n"
+                d = await service.describe_workflow_execution(
+                    DescribeWorkflowExecutionRequest(
+                        namespace=namespace,
+                        execution=WorkflowExecution(workflow_id=job.workflow_id),
+                    ),
+                    retry=True,
+                    timeout=timedelta(seconds=10),
+                )
+            except RPCError:
+                return self.relay_interval
+            info = d.workflow_execution_info
+            paced = pace_for(
+                info.history_length,
+                info.history_size_bytes,
+                events_limit=events_limit,
+                bytes_limit=bytes_limit,
+            )
+            if paced is None:
+                return None
+            return self.relay_interval if paced == MIN_INTERVAL else paced
+
+        try:
+            # A spent budget is one gap, not one per item: a topic whose budget is spent is
+            # polled no more (the relay starts again without it, from the persisted
+            # offset), and a spent job budget ends the relay.
+            while not state.job_spent:
+                topics = [t for t in self.stream_topics(job) if t not in state.spent_topics]
+                if not topics:
+                    break
+                again = False
+                batches = relay(
+                    service,
+                    namespace=namespace,
+                    job_id=job.job_id,
+                    topics=topics,
+                    closed=closed,
+                    start=state.offset,
+                    first_execution_run_id=lambda: job.record.run_id or "",
+                    pace=pace,
+                    min_interval=self.relay_interval,
+                    rpc_timeout=self.relay_rpc_timeout,
+                )
+                async with contextlib.aclosing(batches):
+                    async for batch in batches:
+                        if self._store_batch(job, batch):
+                            again = True
+                            break
+                if not again:
+                    break  # the job closed
+            if state.job_spent:
+                state.stopped = "job_budget"
+        except RelayStopped as e:
+            state.stopped = e.reason
+            log.info("the relay of job %s stopped: %s", job.job_id, e)
+            self._record_event(
+                job,
+                kind=m.StreamEventKind.GAP,
+                at=self.now(),
+                reason=_GAP_REASONS[e.reason],
+                state=job.record.state,
+            )
+        except asyncio.CancelledError:
+            raise  # paused: the offset is kept for the next listener
+        except Exception:
+            log.exception("the relay of job %s failed", job.job_id)
+            state.stopped = "failed"
+            self._record_event(
+                job,
+                kind=m.StreamEventKind.GAP,
+                at=self.now(),
+                reason=m.StreamGapReason.RELAY_FAILED,
+                state=job.record.state,
+            )
+        state.done = True
+        job.notify()
+
+    def _store_batch(self, job: _Job, batch: RelayBatch) -> bool:
+        """Store a batch's items -- ciphertext only, within the caps -- then its offset.
+        True when a budget was spent here: the relay must poll fewer topics, or stop."""
+        state = job.relay
+        state.batches += 1
+        state.dropped += batch.dropped
+        spent = False
+        for item in batch.items:
+            if item.offset < state.offset:
+                continue  # stored already (a poll re-read after a pause)
+            if item.topic in state.spent_topics:
+                continue  # its budget's gap is stored; nothing more of it is
+            gap: m.StreamGapReason | None = None
+            if item.ciphertext is None or item.size > self.stream_item_max:
+                gap = m.StreamGapReason.TOO_LARGE
+            elif not item.ciphertext.startswith(AGE_MAGIC):
+                gap = m.StreamGapReason.INVALID  # parse_envelope refuses it first
+            elif state.topic_bytes.get(item.topic, 0) + item.size > self.stream_topic_budget:
+                gap = m.StreamGapReason.TOPIC_BUDGET
+            elif state.job_bytes + item.size > self.stream_job_budget:
+                gap = m.StreamGapReason.JOB_BUDGET
+            if gap is not None:
+                self._record_event(
+                    job,
+                    kind=m.StreamEventKind.GAP,
+                    at=self.now(),
+                    topic=item.topic,
+                    offset=item.offset,
+                    size=item.size,
+                    reason=gap,
+                    state=job.record.state,
+                )
+                if gap is m.StreamGapReason.TOPIC_BUDGET:
+                    state.spent_topics.add(item.topic)
+                    spent = True
+                elif gap is m.StreamGapReason.JOB_BUDGET:
+                    state.job_spent = spent = True
+                    break
+                continue
+            assert item.ciphertext is not None
+            state.topic_bytes[item.topic] = state.topic_bytes.get(item.topic, 0) + item.size
+            state.job_bytes += item.size
+            self._record_event(
+                job,
+                kind=m.StreamEventKind.ITEM,
+                at=self.now(),
+                topic=item.topic,
+                offset=item.offset,
+                ciphertext_b64=base64.b64encode(item.ciphertext).decode("ascii"),
+                state=job.record.state,
+            )
+        state.offset = max(state.offset, batch.next_offset)
+        return spent
 
     # ------------------------------------------------------------------ transitions & effects
 
@@ -3915,8 +4203,8 @@ class FakeGate:
         job.last_progress = progress
         self._record_event(
             job,
+            kind=m.StreamEventKind.HISTORY,
             at=self.now(),
-            source=m.ProgressSource.HISTORY,
             state=job.record.state,
             last_event=summary.last_event,
             activities_completed=summary.activities_completed,
@@ -4137,6 +4425,14 @@ class FakeGate:
 
 
 # --------------------------------------------------------------------------- helpers
+
+
+def _wanted(event: m.StreamEvent, topics: frozenset[str], history: bool) -> bool:
+    """Whether a listener asked for ``event``: an item or a gap of one of its topics, a gap
+    that is not an item's (the relay stopped), a history event when it asked for them."""
+    if event.kind is m.StreamEventKind.HISTORY:
+        return history
+    return event.topic is None or event.topic in topics
 
 
 def _frontend_of(control: TemporalControl | None) -> str:
@@ -4591,7 +4887,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
     # ---------------------------------------------------------------- catalog
 
     async def publish(who: Fresh, body: m.PublishRequest) -> m.CatalogEntry:
-        return await gate.publish(who, body.document)
+        return await gate.publish(who, body.document, body.streams)
 
     async def search(
         q: Annotated[str | None, Query(max_length=SEARCH_Q_MAX)] = None,
@@ -4679,19 +4975,20 @@ def _build_app(gate: FakeGate) -> FastAPI:
     async def share_job_keys(who: Party, body: m.ShareJobKeys) -> m.SharedJobKeys:
         return gate.share_job_keys(who, body)
 
-    async def progress(
-        who: Party, job_id: str, after: Annotated[int, Query(ge=0)] = 0
+    async def stream(
+        who: Party,
+        job_id: str,
+        topic: Annotated[list[str] | None, Query(max_length=STREAMS_MAX + 1)] = None,
+        history: bool = False,
+        after: Annotated[int | None, Query(ge=0)] = None,
+        last_event_id: Annotated[str | None, Header(alias="Last-Event-ID", max_length=32)] = None,
     ) -> StreamingResponse:
-        target = gate.job_for(job_id, who.party)
+        events = gate.open_stream(who, job_id, topic or [], history, after, last_event_id)
         return StreamingResponse(
-            gate.progress_stream(target, after),
+            events,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
-
-    async def post_progress(who: PartyOrWorker, job_id: str, body: m.ProgressPost) -> Response:
-        gate.post_progress(who, job_id, body)
-        return Response(status_code=204)
 
     add("quote", quote)
     add("hire", hire)
@@ -4706,8 +5003,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
     add("job_key", job_key)
     add("job_keys", job_keys)
     add("share_job_keys", share_job_keys)
-    add("progress", progress, response_class=StreamingResponse)
-    add("post_progress", post_progress)
+    add("stream", stream, response_class=StreamingResponse)
 
     # ---------------------------------------------------------------- artifacts & blobs
 

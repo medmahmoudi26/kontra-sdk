@@ -1,4 +1,4 @@
-# sweep: a fan-out, a batch and a branch
+# sweep: a fan-out, one activity per item, and a branch
 
 A seller offering, `acme/sweep@0.1.0`: give it up to 200 URLs, get back which security headers
 each page misses, graded A to F, with a value to start from for each, and what each site's
@@ -7,17 +7,17 @@ summary comes back inline. 0.002 USD per URL, 0.01 USD at least.
 
 It is also the example of three shapes a workflow takes besides a straight line, and of the
 graph `kontra graph` draws of them (below): two different activities at once (a fan-out),
-one activity per item in a batch (`execute_activities_in_parallel`), and an `if` on what the
-activities found.
+one activity per item with a bound on how many are open (an `asyncio.Semaphore`, plain
+Temporal), and an `if` on what the activities found.
 
 | File | Owner of |
 |---|---|
 | `offering.yaml` | name, version, limits, display text: declarative, no code names |
 | `models.py` | `SweepInput` (`urls`) and `SweepOutput` (`report`, `summary`), from which the contract is derived; and what the activities hand each other |
-| `workflows.py` | `SweepFlow`: the five steps below, and `tally`, the batch's reducer; Temporal through `from kontra import workflow` |
-| `activities.py` | the work: normalising the input, fetching each site's two files, checking one URL's headers, the report |
+| `workflows.py` | `SweepFlow`: the five steps below, and `tally`, which folds the checks; vanilla Temporal (`from temporalio import workflow`), no `kontra` import |
+| `activities.py` | the work: normalising the input, fetching each site's two files, checking one URL's headers, the report; plain `temporalio` activities |
 | `quote.py` | the price, from the number of URLs |
-| `worker.py` | `serve(SweepFlow, ...)`: the binding of workflow and quote to the offering, and all worker tuning |
+| `worker.py` | `serve(SweepFlow, ...)`: the binding of workflow and quote to the offering, and all worker tuning; the one file that imports `kontra` |
 | `contract.yaml` | the derived contract document, kept as a golden file (seam ③) |
 
 ```sh
@@ -38,10 +38,14 @@ Change `acme` to your own handle before publishing. With `kontra dev` (no invita
    sites at a time. `robots.txt`'s `Disallow:` paths, for any user agent, are where a site asks
    crawlers not to look, which is worth a look; `/.well-known/security.txt` (RFC 9116) says
    who to tell about a vulnerability.
-3. **A batch**: `check_headers` once per URL, at most 50 at a time, each retried on its own,
-   folded by `tally` as each one completes: a page that sends every header leaves only a
-   count, the others their URL and what they miss. It runs as a child workflow,
-   `kontra.batch.v1`, that `serve()` registers.
+3. **One activity per URL**: `check_headers` once per URL, at most 50 open at a time (an
+   `asyncio.Semaphore` in the workflow), each retried on its own; then `tally` folds the
+   results: a page that sends every header leaves only a count, the others their URL and
+   what they miss. Each check is an activity of the job's own workflow, so its history grows
+   with the URLs: about six events per URL, and the URL in each direction, which for 200 URLs
+   is at most about 1,200 events and 1 MB, far inside Temporal's limits on one history
+   (51,200 events, 50 MB). A job of tens of thousands of items would not fit: it would split
+   them across child workflows, or continue as new.
 4. **A branch** on what that found: `score` when some page misses a header or did not answer
    (each page that misses one graded, worst first: B misses one header, C two, D three, F
    four or more; and the pages that did not answer listed), else `all_clear` (every page A).
@@ -67,16 +71,17 @@ flowchart TD
     n0["plan"]
     n1["fetch_robots"]
     n2["fetch_security_txt"]
-    n3[["execute_activities_in_parallel(check_headers)"]]
+    n3["check_headers"]
     n4["all_clear"]
     n5["write_report"]
     n6["score"]
     e((end))
     n4 --> n5
+    n3 --> n4
+    n3 --> n3
+    n3 --> n6
     n1 --> n3
     n2 --> n3
-    n3 --> n4
-    n3 --> n6
     n0 --> n1
     n0 --> n2
     n6 --> n5
@@ -85,10 +90,13 @@ flowchart TD
 ```
 
 The fan-out is one parallel group: the two fetches share their predecessor and both lead to
-the batch, which waits for them. The batch is one node, however many URLs it checks and
-however many times it continues as new. And both branches are there because the runs drew
-both answers: the first run's check finds nothing wrong (`all_clear`); the second's carries an
-`error`, so its page counts as unreachable, and the run takes `score`.
+`check_headers`, which waits for them. `check_headers` is one node however many URLs it
+checks: the checks one workflow task starts are one parallel group, and the edge to itself is
+the third run's, whose `plan` drew 201 URLs: 50 start at once, and each that completes lets
+the next one start, in the workflow task its result wakes. And both branches are there
+because the runs drew both answers: the first run's check finds nothing wrong (`all_clear`);
+the second's carries an `error`, so its page counts as unreachable, and the run takes
+`score`.
 
 ## The URLs are the buyer's
 
@@ -113,8 +121,8 @@ To let buyers sweep a private network on purpose (an intranet you sell audits of
 
 ## Limits
 
-Every value crosses Temporal as one payload, 2 MB at most: the URLs go into the batch's
-input, the flagged ones into its accumulator, and every site's files into the report. So a
+Every value crosses Temporal as one payload, 2 MB at most: the URLs come back from `plan` in
+one, the flagged ones go to `score` in one, and every site's files into the report. So a
 job is at most 200 URLs of at most 2,048 characters, written as RFC 3986 writes a URL (ASCII:
 anything else percent-encoded, `%C3%BC` for `ü`), and each site keeps its first 10
 `Disallow:` paths and 5 contacts, each cut at 100 bytes as JSON writes it (a site's files are
@@ -131,7 +139,8 @@ counts.
 `kontra.testing`'s marketplace and a Temporal dev server, no containers, over local sites: a
 hire whose pages miss headers (scored) and one where none does (all clear), the report
 downloaded and checked, the job's own history read back into its path through the graph
-above, and the price paid on accept. `tests/examples/test_ssrf.py` and `test_deadlines.py` hold the activities to
+above (its checks one parallel group: fewer than 50 URLs start at once), and the price paid
+on accept. `tests/examples/test_ssrf.py` and `test_deadlines.py` hold the activities to
 the two paragraphs above.
 
 `contract.yaml` is the derived contract, a golden file (see `../enrich/README.md`).

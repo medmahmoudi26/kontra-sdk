@@ -74,7 +74,7 @@ async def market(
     dev_server: DevServer, sites: Sites, tmp_path_factory: pytest.TempPathFactory
 ) -> AsyncIterator[Market]:
     # Every heartbeat reaches the buyer (the gate's per-job rate is the real gate's concern).
-    async with Marketplace(dev_server=dev_server, progress_rate_per_s=10_000) as mp:
+    async with Marketplace(dev_server=dev_server) as mp:
         acme = await mp.party("acme")
         logs = tmp_path_factory.mktemp("sellers")
         env = seller_env(acme.home, sites)

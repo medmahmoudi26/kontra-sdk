@@ -47,7 +47,7 @@ from kontra import __version__
 from kontra._devices import notice_text
 from kontra.auth import api_key_from_env
 from kontra.contract.errors import join_path
-from kontra.contract.names import is_job_id
+from kontra.contract.names import PROGRESS_TOPIC, is_job_id
 from kontra.contract.units import format_duration
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
@@ -239,7 +239,7 @@ HIRE_NOTE = (
 
 @dataclass
 class _Seen:
-    """What ``status`` has read of one job's progress stream."""
+    """What ``status`` has read of one job's stream (its progress topic and history)."""
 
     seq: int = 0
     latest: Progress | None = None
@@ -505,7 +505,7 @@ class KontraTools:
         tool call would go on reading (and the server's shutdown would wait for it)."""
         k = self.kontra()
         seen = self._seen.setdefault(job_id, _Seen())
-        events = k.gate.progress(job_id, after=seen.seq)
+        events = k.gate.stream(job_id, topics=[PROGRESS_TOPIC], history=True, after=seen.seq)
         loop = asyncio.get_running_loop()
         end = loop.time() + _PROGRESS_BUDGET
         wait = _PROGRESS_FIRST
@@ -516,8 +516,11 @@ class KontraTools:
                         event = await anext(events)
                 except (StopAsyncIteration, TimeoutError):
                     break
-                progress = k._progress(event)  # decrypted with our key
-                seen.seq, seen.latest = event.seq, progress
+                seen.seq = event.cursor
+                progress = k._progress(event, job_id)  # decrypted with our key
+                if progress is None:
+                    continue  # a gap, or an item not for us
+                seen.latest = progress
                 if progress.source is m.ProgressSource.HEARTBEAT:
                     seen.heartbeat = progress
                 wait = _PROGRESS_IDLE

@@ -52,30 +52,46 @@ NOW = datetime(2026, 10, 11, tzinfo=UTC)
 KEY = "0123456789abcdef" * 2
 
 
-def event(seq: int, source: m.ProgressSource = m.ProgressSource.HEARTBEAT) -> m.ProgressEvent:
-    return m.ProgressEvent(seq=seq, at=NOW, source=source, activity="work")
+def event(seq: int, source: m.ProgressSource = m.ProgressSource.HEARTBEAT) -> m.StreamEvent:
+    """One event of a job's stream: a progress item (a heartbeat) or a history event."""
+    if source is m.ProgressSource.HEARTBEAT:
+        return m.StreamEvent(
+            cursor=seq,
+            kind=m.StreamEventKind.ITEM,
+            at=NOW,
+            topic="kontra.progress",
+            offset=seq,
+            ciphertext_b64="QQ==",
+        )
+    return m.StreamEvent(
+        cursor=seq, kind=m.StreamEventKind.HISTORY, at=NOW, state=m.JobState.WORKING
+    )
 
 
 @dataclass
 class StubGate:
-    """``progress`` replays ``events`` after ``after``, then stays open (a running job),
+    """``stream`` replays ``events`` after ``after``, then stays open (a running job),
     ends (``closed``), fails, or keeps producing events (``chatty``)."""
 
-    events: list[m.ProgressEvent]
+    events: list[m.StreamEvent]
     closed: bool = False
     fail: bool = False
     chatty: bool = False
     asked: list[int] = field(default_factory=list[int])
     finished: int = 0
 
-    def progress(self, job_id: str, *, after: int = 0) -> AsyncIterator[m.ProgressEvent]:
+    def stream(
+        self, job_id: str, *, topics: Any = (), history: bool = False, after: int = 0
+    ) -> AsyncIterator[m.StreamEvent]:
+        assert list(topics) == ["kontra.progress"]
+        assert history
         self.asked.append(after)
         return self._stream(after)
 
-    async def _stream(self, after: int) -> AsyncIterator[m.ProgressEvent]:
+    async def _stream(self, after: int) -> AsyncIterator[m.StreamEvent]:
         try:
             for e in self.events:
-                if e.seq > after:
+                if e.cursor > after:
                     yield e
             if self.fail:
                 raise GateError(503, "unavailable", "the gate is restarting")
@@ -95,12 +111,18 @@ class StubKontra:
         self.gate = gate or StubGate([])
         self.closed = False
 
-    def _progress(self, e: m.ProgressEvent) -> Progress:
-        if e.source is m.ProgressSource.HEARTBEAT:
+    def _progress(self, e: m.StreamEvent, job_id: str = "") -> Progress | None:
+        if e.kind is m.StreamEventKind.ITEM:
             return Progress(
-                seq=e.seq, at=e.at, source=e.source, activity=e.activity, percent=float(e.seq)
+                seq=e.cursor,
+                at=e.at,
+                source=m.ProgressSource.HEARTBEAT,
+                activity="work",
+                percent=float(e.cursor),
             )
-        return Progress(seq=e.seq, at=e.at, source=e.source, activities_running=("work",))
+        return Progress(
+            seq=e.cursor, at=e.at, source=m.ProgressSource.HISTORY, activities_running=("work",)
+        )
 
     async def aclose(self) -> None:
         self.closed = True

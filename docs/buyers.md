@@ -139,6 +139,7 @@ kontra hire acme/enrich -f in.json --max-price 1 --wait --accept
 kontra jobs [--state working] [--as seller]
 kontra job <job id>                                     # state, escrow, price, deadlines
 kontra job <job id> --progress                          # follow progress until the job closes
+kontra job <job id> --stream events                     # one listed topic of its stream, JSON lines
 kontra job <job id> --result out/                       # wait; write result.json and every artifact
                                                         # (a job hired in the console too)
 kontra job <job id> --accept | --reject "why" | --cancel
@@ -195,6 +196,48 @@ asyncio.run(main(["https://example.com/"]))
   closes. `job.reject(reason)` within the window opens a dispute.
 - Large inputs: `artifact = await k.upload("acme/enrich", "big.csv")` encrypts a file to the
   seller and to you, uploads it, and returns an `Artifact` to pass as an input field.
+
+### Streams
+
+An offering may list topics of its job's workflow stream (`streams` in its catalog entry:
+`(await k.offering("acme/agent")).streams`). Read one while the job runs, validated as your
+own model -- Kontra never needs the seller's code:
+
+```python
+from pydantic import BaseModel
+
+from kontra.hire import Kontra, StreamInterrupted
+
+
+class Event(BaseModel):  # what the seller publishes on "turn_events", as you model it
+    type: str | None = None
+
+
+async def follow(k: Kontra, job_id: str) -> None:
+    job = await k.job(job_id)
+    stream = job.stream("turn_events", type=dict)  # type=Event, or dict to take any JSON
+    try:
+        async for event in stream:
+            print(event)
+    except StreamInterrupted as e:  # the gate stopped relaying it (e.reason); the job goes on
+        print("stream stopped:", e.reason, "resume after", stream.cursor)
+```
+
+- Each item is decrypted with the job's key and checked against the topic and position the
+  gate says it has (both are sealed inside it), so the gate cannot relabel or reorder items.
+- Items are deduplicated; `stream.cursor` is the last one consumed: pass it as
+  `job.stream(topic, after=cursor)` to resume elsewhere.
+- Streams are live: the gate relays a job's stream once you listen, from its start, and keeps
+  it for later listeners. Listen before the job ends, or there is nothing to read but its
+  progress from history.
+- An item too large to relay (above 256 KiB) is skipped with a log line; an item that is not
+  your `type` raises `StreamItemInvalid` (use `type=dict` to see it).
+- `job.progress()` is the same mechanism on Kontra's own topic, `kontra.progress`, with the
+  platform's liveness events mixed in, and so are `kontra job --progress` and the MCP
+  `status` tool: a job nobody listened to before it closed shows its liveness events, not its
+  heartbeats.
+- Once the gate has stored a topic's budget (16 MiB, 64 MiB for the whole job), it records
+  one gap and relays no more of that topic (or of the job).
 
 The script needs no Temporal worker of its own: the job runs as a standalone Nexus operation in
 your namespace, started with the hold token in a header.
@@ -284,7 +327,7 @@ Register it with your agent's MCP configuration, for example:
 | `describe` | an offering's contract: input and output schema, limits, price hint |
 | `quote` | ask the seller's price for an input |
 | `hire` | lock at most `max_price` (required) and start the job, from a `quote_id` or an offering and input |
-| `status` | the job's state, escrow and latest progress |
+| `status` | the job's state, escrow and latest progress (heartbeats only once someone listened while the job ran: asking for its status while it runs is listening; else liveness from history) |
 | `result` | wait for the delivery (up to `wait_seconds`) and write it into `download_dir` |
 | `accept` / `reject` | release the escrow, or dispute the delivery with a reason |
 

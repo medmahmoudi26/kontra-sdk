@@ -13,10 +13,15 @@ from temporalio import activity, workflow
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from temporalio.contrib.workflow_streams import WorkflowStreamClient
+
     from .models import (
         Artifact,
         EnrichInput,
         EnrichOutput,
+        FeedEvent,
+        FeedJob,
+        FeedOut,
         Head,
         Part,
         ProbeInput,
@@ -60,6 +65,10 @@ async def read_doc(doc: Artifact) -> str:
     return (await doc.read_bytes()).decode()
 
 
+#: Seconds the ``beats`` mode waits before it heartbeats.
+BEATS_AFTER = 2
+
+
 @workflow.defn
 class TextFlow:
     @workflow.run
@@ -80,6 +89,9 @@ class TextFlow:
                 )
         text = await workflow.execute_activity(upper, job.text, start_to_close_timeout=_T)
         if job.mode == "beats":
+            # Progress is live (decisions I31): the gate relays the job's stream once its
+            # buyer listens. A moment for the test's listener to attach before the beats.
+            await workflow.sleep(timedelta(seconds=BEATS_AFTER))
             await workflow.execute_activity(beat, job.beats, start_to_close_timeout=_T)
         if job.mode == "quiet":  # ``beats`` seconds of work, 2 by default
             await workflow.execute_activity(quiet, float(job.beats or 2), start_to_close_timeout=_T)
@@ -127,3 +139,25 @@ class EnrichFlow:
         if any("fail" in u or "slow" in u for u in inp.urls):
             await workflow.wait_condition(lambda: False)
         return EnrichOutput(domains=sorted({u.split("/")[2] for u in inp.urls}))
+
+
+@activity.defn
+async def feed(job: FeedJob) -> int:
+    """Publish with temporalio's own API, as any seller does: nothing of Kontra's."""
+    stream = WorkflowStreamClient.from_within_activity(batch_interval=timedelta(milliseconds=50))
+    async with stream:
+        for n in range(job.count):
+            stream.topic("events").publish(FeedEvent(n=n, note=job.note))
+            stream.topic("secret").publish({"n": n, "secret": f"secret {job.note}"})
+            activity.heartbeat({"percent": (n + 1) * 100 // max(job.count, 1)})
+    return job.count
+
+
+@workflow.defn
+class FeedFlow:
+    @workflow.run
+    async def run(self, job: FeedJob) -> FeedOut:
+        # Streams are live (decisions I31): a moment for the buyer to start listening.
+        await workflow.sleep(timedelta(seconds=2))
+        published = await workflow.execute_activity(feed, job, start_to_close_timeout=_T)
+        return FeedOut(published=published)

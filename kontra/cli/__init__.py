@@ -17,7 +17,7 @@ kontra graph [--dir D] [--runs N] [--mermaid|--json]
 kontra status [--workers] [<offering>...]      whether your workers keep up (Temporal's stats)
 kontra pull <offering> --lang go|python|typescript|java
 kontra quote|hire <offering> -f in.json        buy (§7.1)
-kontra jobs | job <id> [--accept|--reject R|--cancel|--progress|--result DIR]
+kontra jobs | job <id> [--accept|--reject R|--cancel|--progress|--stream TOPIC|--result DIR]
                                                a job hired in the console or elsewhere reads
                                                here too: its key reaches every device
 kontra balance | topup <amount> | mcp

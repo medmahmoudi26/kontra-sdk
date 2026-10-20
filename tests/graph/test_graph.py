@@ -990,7 +990,7 @@ def batch_child(*scheduled: str, spec: Any = None, encrypted: bool = False) -> d
 
 
 def spec(activity: str, pages: str | None = None, items: list[Any] | None = None) -> dict[str, Any]:
-    """``kontra._parallel._Spec`` as the pydantic converter writes it."""
+    """``kontra.contrib.parallel._Spec`` as the pydantic converter writes it."""
     return {
         "activity": activity,
         "activity_ref": {"module": "activities", "qualname": activity},
@@ -1036,7 +1036,7 @@ def test_a_batch_is_named_from_what_its_input_asked_for_when_that_is_plain() -> 
 
 
 def test_the_batch_workflow_name_is_kontras() -> None:
-    from kontra._parallel import BATCH_WORKFLOW
+    from kontra.contrib.parallel import BATCH_WORKFLOW
 
     assert BATCH_WORKFLOW == kontra.graph._BATCH_WORKFLOW
 

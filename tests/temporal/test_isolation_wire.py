@@ -3,7 +3,9 @@
 Every denied cell must come back ``PERMISSION_DENIED`` from the PUBLIC frontend; the
 control plane (the INTERNAL frontend) must be able to do the operator calls a token
 cannot; and a real seller/buyer Nexus round trip must succeed. The outcomes are collected
-into one table and printed at the end of the session (``-s`` to see it).
+into one table (``wire_ledger``) and printed at the end of the session. The stream relay,
+the worker controller, seller self-access and the denials escrow depends on are in
+``test_streams_and_platform_wire.py``.
 
 The deny cells here mirror the Go deny matrix (``temporal/authorizer/authorizer_test.go``),
 which proves the same cells fail-by-default against Temporal's own authorizers. This file
@@ -51,40 +53,9 @@ from temporalio.api.workflowservice.v1 import (
 from temporalio.client import Client
 from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker
+from wire_ledger import assert_allowed, assert_denied, assert_refused, record
 
 pytestmark = pytest.mark.temporal
-
-
-# A session-wide ledger of every cell's outcome, printed by the terminal_summary hook.
-OUTCOMES: list[tuple[str, str, str]] = []
-
-
-def record(cell: str, expectation: str, outcome: str) -> None:
-    OUTCOMES.append((cell, expectation, outcome))
-
-
-async def assert_denied(cell: str, coro: Any) -> None:
-    """A call that must be refused with PERMISSION_DENIED."""
-    try:
-        await coro
-    except RPCError as e:
-        if e.status == RPCStatusCode.PERMISSION_DENIED:
-            record(cell, "deny", "PERMISSION_DENIED")
-            return
-        record(cell, "deny", f"other: {e.status.name}")
-        pytest.fail(f"{cell}: expected PERMISSION_DENIED, got {e.status.name}: {e.message}")
-    record(cell, "deny", "ALLOWED")
-    pytest.fail(f"{cell}: the call was allowed")
-
-
-async def assert_allowed(cell: str, coro: Any) -> Any:
-    try:
-        result = await coro
-    except RPCError as e:
-        record(cell, "allow", f"DENIED: {e.status.name}")
-        pytest.fail(f"{cell}: expected success, got {e.status.name}: {e.message}")
-    record(cell, "allow", "OK")
-    return result
 
 
 # --- no token / broken tokens ----------------------------------------------------------
@@ -367,23 +338,6 @@ async def test_worker_of_c_cannot_poll_a(cluster: Cluster) -> None:
             )
         ),
     )
-
-
-# --- the namespace a request names is the namespace it acts on -------------------------
-
-
-async def assert_refused(cell: str, status: RPCStatusCode, coro: Any) -> None:
-    """A call that must fail with exactly ``status`` (a refusal that is not the
-    authorizer's: Temporal's own validation after the authorizer allowed the namespace)."""
-    try:
-        await coro
-    except RPCError as e:
-        record(cell, "refuse", e.status.name)
-        if e.status != status:
-            pytest.fail(f"{cell}: expected {status.name}, got {e.status.name}: {e.message}")
-        return
-    record(cell, "refuse", "ALLOWED")
-    pytest.fail(f"{cell}: the call was allowed")
 
 
 # --- the control plane can do what a token cannot --------------------------------------
@@ -687,12 +641,3 @@ async def test_callers_cannot_set_nexus_transport_headers(cluster: Cluster, head
             schedule_to_close_timeout=timedelta(minutes=1),
         ),
     )
-
-
-def test_zzz_print_outcomes() -> None:
-    """Prints the matrix of every cell's outcome. Ordered last by name."""
-    width = max((len(c) for c, _, _ in OUTCOMES), default=0)
-    print("\n\n=== deny-matrix / positive-path wire outcomes ===")
-    for cell, expectation, outcome in OUTCOMES:
-        print(f"  [{expectation:5}] {cell:<{width}}  {outcome}")
-    print(f"=== {len(OUTCOMES)} cells ===")
