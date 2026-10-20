@@ -32,6 +32,11 @@ A handle is opaque bytes. Only the adapter that minted it parses it, strictly an
 I/O (:class:`InvalidHandle`); it is never shown to a party and never used to authorize
 (provenance compares engine records with the gate's own ``holds``).
 
+An observation also says how far the buyer's start got (:class:`Reach`, decisions I40), so a
+gate can tell whether a job that never ran is its seller's fault without an engine call of
+its own. It is reputation only: escrow is handed the :class:`~kontra.escrow.Observation`
+alone, and a reach the engine cannot read is None, never an error.
+
 The guardrail: this Protocol never grows a workflow-authoring member. Every member is a call a
 gate already makes to its engine; none runs, defines or schedules seller code. The day someone
 wants ``engine.execute_activity(...)``, that is the facade crawling back, and the answer is no.
@@ -63,6 +68,7 @@ __all__ = [
     "MEMBERS",
     "PIN_MAX",
     "STOPS",
+    "BuyerStart",
     "Engine",
     "EngineError",
     "EngineName",
@@ -79,6 +85,7 @@ __all__ = [
     "Pin",
     "QuoteAnswer",
     "QuoteKind",
+    "Reach",
     "RouteConflict",
     "Sealed",
     "SealedPayload",
@@ -264,6 +271,63 @@ class Fenced(StrEnum):
     STARTED = "started"
 
 
+class Reach(StrEnum):
+    """How far the buyer's start of a job got toward the seller's code (decisions I40): what a
+    gate's reputation reads for a job that ended with no verified lineage, to tell whether its
+    refund counts against the seller (kontra-cloud's FIXUPS #22). Reputation only: escrow never
+    reads it, and no money moves on it.
+
+    Read from what the engine recorded of the buyer's start, never from a party's report, and
+    a fact, not a judgement: whether an :attr:`UNANSWERED` start waited long enough to blame
+    the seller is the gate's to decide, from :class:`BuyerStart`'s times. Only
+    :attr:`STARTED`, :attr:`FAILED` and a long enough :attr:`UNANSWERED` can cost the seller
+    anything; :attr:`Observed.reach` is None when the engine cannot say, which costs no one."""
+
+    #: No start of this job is seen to have been handed to the seller's side: none was made
+    #: where the engine can see it (on Temporal, a buyer workflow's own call is not seen), none
+    #: is this job's (its route, its offering, one of its holds), or none of its attempts to
+    #: reach the seller's code has finished yet. A run the seller started itself is no start of
+    #: the buyer's: a job with only such a run is NEVER_DISPATCHED.
+    NEVER_DISPATCHED = "never_dispatched"
+    #: The buyer withdrew its start before the seller's side took it: it ended the start, or
+    #: asked to cancel it and the start ended canceled.
+    WITHDRAWN = "withdrawn"
+    #: The start was handed over and nothing on the seller's side answered it: no worker of the
+    #: seller's took it, or the seller's code took longer than one attempt (an engine cannot
+    #: tell the two apart; on Temporal both are an upstream timeout).
+    UNANSWERED = "unanswered"
+    #: The seller's code refused the start before anything ran (its hold, its input or its
+    #: price), or ended it canceled though the buyer never asked.
+    REFUSED = "refused"
+    #: The seller's code failed the start and declared the failure final: its own.
+    FAILED = "failed"
+    #: The start reached the seller's code and failed in a way either side, or the platform,
+    #: may have caused (an input the buyer never uploaded, a store that did not answer).
+    INCONCLUSIVE = "inconclusive"
+    #: The seller's side took the start: a lineage began (every verified observation's reach),
+    #: or the seller's code accepted the start and none of its runs verified.
+    STARTED = "started"
+
+
+@dataclass(frozen=True, slots=True)
+class BuyerStart:
+    """The buyer's start of a job, as the engine recorded it, beside :attr:`Observed.reach`
+    (decisions I40): what a gate reads to judge an :attr:`Reach.UNANSWERED` start (did it wait
+    long enough for the seller to have been away, not restarting?) and to word a refund the
+    seller is not blamed for (did the buyer withdraw it, or never start?). The buyer's own
+    client chooses both times for a start it makes itself.
+
+    ``made_at``: when the start was made (None: not recorded; such a start never waited).
+    ``gives_up_at``: when it stops waiting for the seller's side (None: never).
+    ``withdrawal_asked``: the buyer asked to withdraw it (only the buyer can; always False
+    where buyers have no presence in the engine). A request is not a withdrawal: a start the
+    buyer asked to cancel that nothing took stays live, and still waits."""
+
+    made_at: datetime | None = None
+    gives_up_at: datetime | None = None
+    withdrawal_asked: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class Observed:
     """One observation (:meth:`Engine.observe`). ``observation`` is escrow's own type.
@@ -272,15 +336,30 @@ class Observed:
     with no bytes reports UNSEALED, or raises :class:`EngineError`). The observation's
     ``result_sha256`` and ``result_size`` are over exactly ``result.data``, and absent
     without a result. Checked on construction, so an adapter cannot hand over a delivery
-    escrow would not count, or count one it did not get."""
+    escrow would not count, or count one it did not get.
+
+    ``reach`` (decisions I40): how far the buyer's start got, for reputation only -- escrow
+    is handed ``observation`` and never sees it. None: the engine cannot say (the buyer's
+    records could not be read), which blames no one; never an exception, so a failed read for
+    reputation never holds up money. A verified lineage was begun by the buyer's start, so its
+    reach is STARTED (or None); an observation of a pinned lineage likewise. ``buyer_start``:
+    the start's own record, when the engine found one (never without a reach)."""
 
     observation: Observation
     result: SealedPayload | None = None
+    reach: Reach | None = None
+    buyer_start: BuyerStart | None = None
 
     def __post_init__(self) -> None:
         o = self.observation
         if o.pin is not None and _PIN.fullmatch(o.pin) is None:
             raise ValueError(f"a pin is printable ASCII, at most {PIN_MAX} characters")
+        if self.reach is not None and not isinstance(self.reach, Reach):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise ValueError("a reach is a Reach")
+        if self.buyer_start is not None and self.reach is None:
+            raise ValueError("a buyer's start record comes with its reach")
+        if o.provenance is Provenance.VERIFIED and self.reach not in (Reach.STARTED, None):
+            raise ValueError("a verified lineage was begun by the buyer's start: STARTED")
         delivered = o.status is ObservedStatus.COMPLETED and o.provenance is Provenance.VERIFIED
         if self.result is None:
             if delivered:
@@ -475,17 +554,24 @@ class Engine(Protocol):
         * ``buyer_canceled``: the buyer withdrew its own start (I16; always False where
           buyers have no presence in the engine);
         * for a verified completion only, the result as :class:`SealedPayload`, with its
-          sha256 and size.
+          sha256 and size;
+        * for reputation only, how far the buyer's start got (:class:`Reach`, decisions I40):
+          STARTED for a verified or pinned lineage, else read from the engine's records of
+          the buyer's start of the job (:class:`BuyerStart`), never from the job's runs.
 
         Before any start the status is NOT_FOUND, never an exception and never RUNNING. With
         ``pin``, the observation is of that lineage only, never of another run of the job. A
         verified completion whose result is not Kontra ciphertext, or that has none, is
         reported UNSEALED and its bytes are withheld (:class:`Observed` refuses a verified
         completion without its result). "Cannot say" is an exception, never a status:
-        :class:`EngineError`, :class:`PartyLookupError`, :class:`ObservationIncomplete`.
+        :class:`EngineError`, :class:`PartyLookupError`, :class:`ObservationIncomplete` --
+        except for ``reach``, whose "cannot say" is None: a read for reputation never fails an
+        observation escrow needs.
 
         Temporal: ``Control.observe`` (describe; the request id, callbacks and links resolved
-        in the buyer's namespace; the first run id; the chain walk)."""
+        in the buyer's namespace; the first run id; the chain walk); ``reach`` from
+        ``Control.describe_call`` (the standalone Nexus operation ``job-<id>`` in the buyer's
+        namespace, described)."""
         ...
 
     async def liveness(self, handle: JobHandle, *, pin: Pin) -> Liveness | None:

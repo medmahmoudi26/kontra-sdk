@@ -41,6 +41,9 @@ RULE = {
     "UnlistedTopics": "E14",
     "RewindsOnBuyerWord": "E14",
     "PlaintextItems": "E14",
+    "ReachFromAnyRun": "E19",
+    "BlamesWhenUnsure": "E19",
+    "ForgetsTheStart": "E19",
 }
 
 

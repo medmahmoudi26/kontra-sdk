@@ -7,7 +7,16 @@ import pytest
 from engine_harness import FakeHarness, party, seal_text
 
 from kontra.contract.names import OfferingId, new_endpoint_name, new_job_id
-from kontra.engine import EngineError, InvalidHandle, JobPlan, NotSealed, Stop
+from kontra.engine import (
+    BuyerStart,
+    EngineError,
+    InvalidHandle,
+    JobPlan,
+    NotSealed,
+    Reach,
+    Stop,
+    hold_digest,
+)
 from kontra.escrow import ObservedStatus, Provenance
 from kontra.testing import FakeEngine, fake_engine
 from kontra.testing.engine_contract import CHECKS, run_engine_contract
@@ -76,6 +85,44 @@ async def test_the_seller_side_refuses_plaintext_items_and_one_open_run() -> Non
     ctx = RunContext(_Run("pin-1", by_gate=False, hold=None, started_at=_far()))
     with pytest.raises(NotSealed):
         ctx.publish("events", b"plaintext")
+
+
+async def test_the_fake_models_and_scripts_reach() -> None:
+    """Decisions I40: how far the buyer's start got, from the start alone -- NEVER_DISPATCHED
+    before it (a run of the seller's own changes nothing), REFUSED when the fake refused it,
+    STARTED once it began a lineage -- and whatever a test scripts while no lineage is
+    verified (an unanswered start, an engine that cannot say). A verified lineage stays
+    STARTED."""
+    h = await FakeHarness().setup()
+    fake = h.fake
+    job_id = new_job_id()
+    handle = fake.bind(JobPlan(job_id, h.offering, h.route, h.buyer, h.seller))
+    holds = frozenset({hold_digest(h.hold(job_id))})
+    assert (await fake.observe(handle, pin=None, holds=holds)).reach is Reach.NEVER_DISPATCHED
+    assert fake.seller_start(handle, seal_text("mine", h.recipient))
+    assert (await fake.observe(handle, pin=None, holds=holds)).reach is Reach.NEVER_DISPATCHED
+    deadline = _far()
+    await fake.start(handle, b"{}", hold=h.hold(job_id), deadline=deadline)
+    refused = await fake.observe(handle, pin=None, holds=holds)
+    assert refused.reach is Reach.REFUSED
+    assert refused.buyer_start is not None
+    assert refused.buyer_start.gives_up_at == deadline
+    unanswered = BuyerStart(made_at=_far(), gives_up_at=None)
+    fake.script_reach(handle, Reach.UNANSWERED, unanswered)
+    seen = await fake.observe(handle, pin=None, holds=holds)
+    assert (seen.reach, seen.buyer_start) == (Reach.UNANSWERED, unanswered)
+    fake.script_reach(handle, None)
+    assert (await fake.observe(handle, pin=None, holds=holds)).reach is None
+
+    job_id = new_job_id()
+    handle = fake.bind(JobPlan(job_id, h.offering, h.route, h.buyer, h.seller))
+    holds = frozenset({hold_digest(h.hold(job_id))})
+    fake.script_reach(handle, Reach.NEVER_DISPATCHED)
+    await fake.start(handle, h.input("hang", "m"), hold=h.hold(job_id), deadline=_far())
+    verified = await fake.observe(handle, pin=None, holds=holds)
+    assert verified.observation.provenance is Provenance.VERIFIED
+    assert verified.reach is Reach.STARTED  # whatever was scripted
+    await fake.cancel(handle, stop=Stop.END, pin=None, reason="done")
 
 
 def _far():  # type: ignore[no-untyped-def]

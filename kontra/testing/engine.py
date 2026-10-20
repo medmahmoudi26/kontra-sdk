@@ -16,9 +16,12 @@ anything else, which the fake then reports :attr:`~kontra.escrow.ObservedStatus.
 adapter must. The test controls the seller's side, tricks included: :meth:`FakeEngine.serve`,
 :meth:`~FakeEngine.serve_quote`, :meth:`~FakeEngine.offline`, :meth:`~FakeEngine.seller_start`
 (a run the buyer's start did not begin, I15), :meth:`~FakeEngine.seller_revive` (always
-refused after END), :meth:`~FakeEngine.buyer_withdraws` (I16), and the isolation probes
-:meth:`~FakeEngine.reaches` and :meth:`~FakeEngine.stops`. ``unreachable = True`` makes every
-async member raise :class:`~kontra.engine.EngineError`.
+refused after END), :meth:`~FakeEngine.buyer_withdraws` (I16), the isolation probes
+:meth:`~FakeEngine.reaches` and :meth:`~FakeEngine.stops`, and
+:meth:`~FakeEngine.script_reach`, how far a job's start got as an engine would have recorded
+it (decisions I40: an unanswered start, a refused one, a withdrawn one, or an engine that
+cannot say). ``unreachable = True`` makes every async member raise
+:class:`~kontra.engine.EngineError`.
 
 What it models, each a rule of the contract: a lineage per buyer start, with a random pin that
 a restart within it keeps; provenance by the hold the gate issued (only a run the gate's start
@@ -26,7 +29,9 @@ began, with one of ``holds``, is verified); a start idempotent by job, refused b
 a run the seller started first; ASK as a request the code may ignore, END as final; deliveries
 only as :class:`~kontra.engine.SealedPayload`; per-run stream logs of age files; credentials
 confined to their party's side of a job (the seller's run is reached and stopped by the
-seller's credential alone; the buyer's side is its start).
+seller's credential alone; the buyer's side is its start); and the start's reach (I40):
+STARTED once the gate's start began a run, REFUSED when it was refused (a fence, or a run of
+the seller's own first), NEVER_DISPATCHED before it, whatever runs of the seller's own exist.
 """
 
 from __future__ import annotations
@@ -49,6 +54,7 @@ from kontra.contract.names import (
 )
 from kontra.engine import (
     HANDLE_MAX,
+    BuyerStart,
     EngineError,
     EngineName,
     Fenced,
@@ -62,6 +68,7 @@ from kontra.engine import (
     Pin,
     QuoteAnswer,
     QuoteKind,
+    Reach,
     RouteConflict,
     Sealed,
     SealedPayload,
@@ -152,6 +159,10 @@ class _Job:
     gate_started: bool = False
     #: Closed to starts by a fence; the placeholder's pin.
     fence_pin: str | None = None
+    #: The gate's start as the engine recorded it (I40): when, until when, a withdrawal.
+    start: BuyerStart | None = None
+    #: The gate's start was refused: the job was fenced, or a run took it first.
+    refused: bool = False
 
 
 def _canonical(fields: Mapping[str, str]) -> bytes:
@@ -226,6 +237,8 @@ class FakeEngine:
         self._programs: dict[str, Program] = {}
         self._quotes: dict[str, QuoteProgram] = {}
         self._jobs: dict[str, _Job] = {}
+        #: job id -> the reach :meth:`script_reach` set
+        self._reaches: dict[str, tuple[Reach | None, BuyerStart | None]] = {}
 
     @property
     def name(self) -> EngineName:
@@ -275,6 +288,8 @@ class FakeEngine:
             if run.by_gate and run.status is _OPEN:
                 run.buyer_withdrew = True
                 run.asked.set()
+        if job is not None and job.start is not None:
+            job.start = replace(job.start, withdrawal_asked=True)
 
     def reaches(self, credential: str, handle: JobHandle) -> bool:
         """Whether ``credential`` reaches the job's run, in the seller's home: only the
@@ -288,6 +303,16 @@ class FakeEngine:
         or a stranger's."""
         plan = _parse(handle)
         return self.credentials.get(credential) == plan["seller"]
+
+    def script_reach(
+        self, handle: JobHandle, reach: Reach | None, start: BuyerStart | None = None
+    ) -> None:
+        """What :meth:`observe` reports as the job's reach (and its start's record) while no
+        lineage of it is verified (decisions I40): a seller whose worker never answered
+        (UNANSWERED, with the start's times), a start the seller's code refused or failed, a
+        buyer that withdrew, or None, an engine that cannot read the buyer's records. A
+        verified lineage stays STARTED whatever is scripted, as on every engine."""
+        self._reaches[_parse(handle)["job"]] = (reach, start)
 
     def runs(self, handle: JobHandle) -> int:
         """How many runs the job has had (for tests: one start, one lineage)."""
@@ -315,6 +340,21 @@ class FakeEngine:
     def _verified(self, run: _Run, holds: Collection[str]) -> bool:
         """Provenance (I15): only a run the gate's start began, carrying one of ``holds``."""
         return run.by_gate and run.hold is not None and hold_digest(run.hold) in set(holds)
+
+    def _reach(
+        self, job_id: str, job: _Job | None, *, verified: bool, pinned: bool
+    ) -> tuple[Reach | None, BuyerStart | None]:
+        """How far the job's start got (I40), from the buyer's start alone: never from a run
+        of the seller's own."""
+        if verified or pinned:
+            return Reach.STARTED, None
+        if job_id in self._reaches:
+            return self._reaches[job_id]
+        if job is None or not job.gate_started:
+            return Reach.NEVER_DISPATCHED, None
+        if any(r.by_gate for r in job.runs):
+            return Reach.STARTED, job.start
+        return (Reach.REFUSED if job.refused else Reach.NEVER_DISPATCHED), job.start
 
     async def _run(self, run: _Run, program: Program, data: bytes) -> None:
         try:
@@ -404,8 +444,11 @@ class FakeEngine:
         plan = _parse(handle)
         self._up()
         job = self._job(plan)
+        if job.start is None:
+            job.start = BuyerStart(self._clock(), deadline)
         if job.gate_started or job.fence_pin is not None or job.runs:
             # Idempotent by job; a fenced job, or one whose id a run took first, starts none.
+            job.refused = job.refused or not job.gate_started
             job.gate_started = True
             return
         job.gate_started = True
@@ -426,16 +469,17 @@ class FakeEngine:
         job = self._jobs.get(plan["job"])
         run = self._lineage(job, pin) if job is not None else None
         if run is None:
+            reach, start = self._reach(plan["job"], job, verified=False, pinned=pin is not None)
             if job is not None and job.fence_pin is not None and pin is None:
-                return Observed(
-                    Observation(
-                        ObservedStatus.TERMINATED,
-                        provenance=Provenance.OCCUPIED,
-                        pin=job.fence_pin,
-                    )
+                placeholder = Observation(
+                    ObservedStatus.TERMINATED, provenance=Provenance.OCCUPIED, pin=job.fence_pin
                 )
-            return Observed(Observation(ObservedStatus.NOT_FOUND, pin=pin))
+                return Observed(placeholder, reach=reach, buyer_start=start)
+            return Observed(
+                Observation(ObservedStatus.NOT_FOUND, pin=pin), reach=reach, buyer_start=start
+            )
         verified = self._verified(run, holds)
+        reach, start = self._reach(plan["job"], job, verified=verified, pinned=pin is not None)
         obs = Observation(
             status=run.status,
             started_at=run.started_at,
@@ -447,13 +491,15 @@ class FakeEngine:
             and run.buyer_withdrew,
         )
         if run.status is not ObservedStatus.COMPLETED or not verified:
-            return Observed(obs)
+            return Observed(obs, reach=reach, buyer_start=start)
         try:
             sealed = SealedPayload(run.result if run.result is not None else b"")
         except NotSealed:
-            return Observed(replace(obs, status=ObservedStatus.UNSEALED))
+            unsealed = replace(obs, status=ObservedStatus.UNSEALED)
+            return Observed(unsealed, reach=reach, buyer_start=start)
         digest = sha256(sealed.data).hexdigest()
-        return Observed(replace(obs, result_sha256=digest, result_size=len(sealed.data)), sealed)
+        delivered = replace(obs, result_sha256=digest, result_size=len(sealed.data))
+        return Observed(delivered, sealed, reach=reach, buyer_start=start)
 
     async def liveness(self, handle: JobHandle, *, pin: Pin) -> Liveness | None:
         plan = _parse(handle)

@@ -18,6 +18,7 @@ from temporalio.api.common.v1 import Payload
 from kontra.codec import age
 from kontra.contract.names import OfferingId
 from kontra.engine import (
+    BuyerStart,
     EngineError,
     EngineName,
     Fenced,
@@ -27,6 +28,7 @@ from kontra.engine import (
     Pin,
     QuoteAnswer,
     QuoteKind,
+    Reach,
     Sealed,
     SealedPayload,
     Stop,
@@ -34,7 +36,7 @@ from kontra.engine import (
     StreamItem,
 )
 from kontra.escrow import Observation, ObservedStatus
-from kontra.testing.engine import FakeEngine, _parse, _Run  # pyright: ignore[reportPrivateUsage]
+from kontra.testing.engine import FakeEngine, _Job, _parse, _Run  # pyright: ignore[reportPrivateUsage]
 
 
 def _forged(data: bytes) -> SealedPayload:
@@ -44,11 +46,18 @@ def _forged(data: bytes) -> SealedPayload:
     return bad
 
 
-def _forged_observed(observation: Observation, result: SealedPayload | None) -> Observed:
+def _forged_observed(
+    observation: Observation,
+    result: SealedPayload | None,
+    reach: Reach | None = None,
+    buyer_start: BuyerStart | None = None,
+) -> Observed:
     """An Observed that skipped its own check."""
     bad = object.__new__(Observed)
     object.__setattr__(bad, "observation", observation)
     object.__setattr__(bad, "result", result)
+    object.__setattr__(bad, "reach", reach)
+    object.__setattr__(bad, "buyer_start", buyer_start)
     return bad
 
 
@@ -384,6 +393,45 @@ class PlaintextItems(FakeEngine):
             yield replace(batch, items=tuple(items))
 
 
+class ReachFromAnyRun(FakeEngine):
+    """Reads how far the job's start got from the job's runs, not from the buyer's start: a run
+    the seller started itself is reported STARTED, and the seller is blamed for a job its
+    buyer never started (a buyer colluding with a third party could produce such a run)."""
+
+    def _reach(
+        self, job_id: str, job: _Job | None, *, verified: bool, pinned: bool
+    ) -> tuple[Reach | None, BuyerStart | None]:
+        if job is not None and job.runs:
+            return Reach.STARTED, None
+        return super()._reach(job_id, job, verified=verified, pinned=pinned)
+
+
+class BlamesWhenUnsure(FakeEngine):
+    """With no start of the buyer's seen, defaults to a reach that blames the seller: the
+    start went unanswered."""
+
+    def _reach(
+        self, job_id: str, job: _Job | None, *, verified: bool, pinned: bool
+    ) -> tuple[Reach | None, BuyerStart | None]:
+        reach, start = super()._reach(job_id, job, verified=verified, pinned=pinned)
+        if reach is Reach.NEVER_DISPATCHED:
+            return Reach.UNANSWERED, BuyerStart()
+        return reach, start
+
+
+class ForgetsTheStart(FakeEngine):
+    """Reports a verified lineage as never handed to the seller (by forging the type): the
+    buyer's own start began it."""
+
+    async def observe(
+        self, handle: JobHandle, *, pin: Pin | None, holds: Collection[str]
+    ) -> Observed:
+        seen = await super().observe(handle, pin=pin, holds=holds)
+        if seen.reach is not Reach.STARTED:
+            return seen
+        return _forged_observed(seen.observation, seen.result, Reach.NEVER_DISPATCHED)
+
+
 BROKEN: tuple[type[FakeEngine], ...] = (
     UnknownName,
     OneCredentialPerParty,
@@ -413,4 +461,7 @@ BROKEN: tuple[type[FakeEngine], ...] = (
     UnlistedTopics,
     RewindsOnBuyerWord,
     PlaintextItems,
+    ReachFromAnyRun,
+    BlamesWhenUnsure,
+    ForgetsTheStart,
 )

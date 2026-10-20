@@ -60,6 +60,12 @@ The checks (each raises :class:`EngineContractViolation` naming the rule):
   stranger's does, neither of theirs can stop it or fence the job (start under its id), and
   no party's can provision a home or expose a route. (The seller's own runs of its job are
   E9's: never the buyer's delivery.)
+* E19 reach (decisions I40), how far the buyer's start got, which a gate's reputation reads:
+  STARTED in every observation of a verified or pinned lineage the suite made, and for the
+  buyer's start that began one, before and after its end; NEVER_DISPATCHED before any start,
+  and while only a run of the seller's own exists (it is no start of the buyer's); and for the
+  gate's start of a job such a run took first, or of a fenced job, a reach that blames no one
+  (refused, or never handed over).
 
 :func:`run_engine_contract` returns one line per check, ``ok`` or ``SKIPPED`` with why.
 """
@@ -83,6 +89,7 @@ from kontra.engine import (
     ENGINE_NAMES,
     HANDLE_MAX,
     MEMBERS,
+    BuyerStart,
     Engine,
     EngineError,
     Fenced,
@@ -93,6 +100,7 @@ from kontra.engine import (
     Pin,
     QuoteAnswer,
     QuoteKind,
+    Reach,
     RouteConflict,
     Sealed,
     SealedPayload,
@@ -153,6 +161,7 @@ CHECKS = (
     "E16",
     "E17",
     "E18",
+    "E19",
     "E12",
 )
 
@@ -161,6 +170,9 @@ _WAIT = 30.0
 _POLL = 0.05
 _QUOTE_TIMEOUT = 3.0
 _RACES = 6
+#: What the gate's start of a job a run of the seller's own took first, or of a fenced job, may
+#: reach (E19): refused, or never handed over -- nothing that could cost the seller.
+_UNBLAMED = frozenset({Reach.NEVER_DISPATCHED, Reach.REFUSED})
 
 
 class EngineContractViolation(AssertionError):
@@ -325,6 +337,8 @@ class _Run:
         self.seen = _Seen()
         self.deadline = datetime.now(UTC) + _DEADLINE
         self.credentials: dict[str, str] = {}
+        #: Every observation the suite made, with the pin it asked for (E19 reads them all).
+        self.observed: list[tuple[Observed, Pin | None]] = []
         #: E4's delivered job: (job id, handle, holds, observation).
         self.delivered: tuple[str, JobHandle, frozenset[str], Observed] | None = None
 
@@ -351,6 +365,7 @@ class _Run:
     ) -> Observed:
         seen = await self.e.observe(handle, pin=pin, holds=holds)
         self.seen.add(seen)
+        self.observed.append((seen, pin))
         return seen
 
     async def until(
@@ -571,6 +586,7 @@ async def _e4(r: _Run) -> str:
     fresh = await h.fresh_engine()
     restarted = await fresh.observe(handle, pin=pin, holds=holds)
     r.seen.add(restarted)
+    r.observed.append((restarted, pin))
     if restarted.result != result:
         raise _violation("E4", "a second instance of the adapter reads another delivery")
     foreign = await r.observe(handle, frozenset({"0" * 64}))
@@ -978,6 +994,59 @@ async def _e18(r: _Run) -> str:
     )
 
 
+def _reach_of(rule: str, what: str, seen: Observed, want: Collection[Reach | None]) -> None:
+    """``seen``'s reach is one of ``want``, and a start's record comes only with a reach."""
+    record = seen.buyer_start
+    if seen.reach not in want or (record is not None and seen.reach is None):
+        names = " or ".join(sorted("None" if x is None else x.name for x in want))
+        raise _violation(rule, f"{what}: the reach is {seen.reach}, not {names}: {seen}")
+    if record is not None and not isinstance(record, BuyerStart):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise _violation(rule, f"{what}: a start's record that is not a BuyerStart: {record!r}")
+
+
+async def _e19(r: _Run) -> str:
+    e = r.e
+    for seen, pin in r.observed:  # again: a type can be forged
+        o = seen.observation
+        if o.provenance is Provenance.VERIFIED or pin is not None:
+            _reach_of("E19", "a verified or pinned lineage", seen, {Reach.STARTED, None})
+    job_id, handle, holds = r.new()
+    _reach_of("E19", "before any start", await r.observe(handle, holds), {Reach.NEVER_DISPATCHED})
+    await r.h.seller_start(handle, job_id, r.marker)
+    own = await r.until(
+        "E19",
+        "the seller's own run",
+        handle,
+        holds,
+        lambda o: o.observation.status is not ObservedStatus.NOT_FOUND,
+    )
+    _reach_of("E19", "a run the seller started itself", own, {Reach.NEVER_DISPATCHED})
+    with contextlib.suppress(EngineError):  # refusing a start a run beat is correct
+        await r.start(job_id, handle, "ok")
+    await asyncio.sleep(r.settle * 1.5)
+    taken = await r.observe(handle, holds)
+    _reach_of("E19", "the gate's start of a job the seller's run took first", taken, _UNBLAMED)
+    job_id, handle, holds = r.new()
+    await e.fence(handle, reason="a cancel before any run")
+    with contextlib.suppress(EngineError):  # refusing a fenced job's start is correct
+        await r.start(job_id, handle, "ok")
+    await asyncio.sleep(r.settle * 1.5)
+    _reach_of("E19", "the gate's start of a fenced job", await r.observe(handle, holds), _UNBLAMED)
+    job_id, handle, holds = r.new()
+    await r.start(job_id, handle, "hang")
+    began = await r.until("E19", "a verified run", handle, holds, _running_verified)
+    _reach_of("E19", "the buyer's start that began a lineage", began, {Reach.STARTED})
+    pin = _pin_of("E19", began)
+    await e.cancel(handle, stop=Stop.END, pin=pin, reason="done")
+    ended = await r.until("E19", "the end", handle, holds, _closed, pin=pin)
+    _reach_of("E19", "an ended lineage, pinned", ended, {Reach.STARTED})
+    _reach_of("E19", "an ended lineage", await r.observe(handle, holds), {Reach.STARTED})
+    return (
+        "reach: STARTED for every verified lineage; NEVER_DISPATCHED before a start and for a "
+        "run of the seller's own; a start a run beat, or a fence, blames no one"
+    )
+
+
 async def _e12(r: _Run) -> str:
     job_id, handle, holds = r.new()
     await r.start(job_id, handle, "plain")
@@ -1010,6 +1079,7 @@ _RUNNERS: dict[str, Callable[[_Run], Awaitable[str]]] = {
     "E16": _e16,
     "E17": _e17,
     "E18": _e18,
+    "E19": _e19,
 }
 
 

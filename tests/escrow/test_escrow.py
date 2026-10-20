@@ -470,3 +470,53 @@ def test_the_job_record_is_engine_neutral() -> None:
     assert not fields & {"run_id", "seller_ns", "workflow_id", "namespace"}
     assert "pin" in Observation.__dataclass_fields__
     assert "run_id" not in Observation.__dataclass_fields__
+
+
+#: What reputation reads beside escrow's own observation (decisions I40), by name.
+_REACH_NAMES = frozenset({"reach", "Reach", "buyer_start", "BuyerStart", "Observed"})
+
+
+def test_reach_is_reputation_only_and_escrow_never_reads_it() -> None:
+    """Decisions I40: how far a job's start got (``Observed.reach``) may cost a seller
+    reputation, never money. Escrow is handed the engine's ``Observation`` alone, which
+    carries no reach, and its source names none of it (nor imports the engine's types) -- so
+    no rule here can move a cent on it -- and the same observation moves money the same way
+    whatever reach came with it."""
+    import ast
+    from pathlib import Path
+
+    from kontra.engine import BuyerStart, Observed, Reach
+
+    tree = ast.parse(Path(escrow.__file__).read_text(encoding="utf-8"))
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    names |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    names |= {
+        n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+    assert not names & _REACH_NAMES
+    imported = {
+        node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+    } | {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert not {m for m in imported if m.split(".")[:2] == ["kontra", "engine"]}
+    for record in (Observation, JobRecord):
+        assert not set(record.__dataclass_fields__) & {"reach", "buyer_start"}
+
+    nothing = Observation(ObservedStatus.NOT_FOUND)
+    late = T0 + timedelta(hours=2)
+    outcomes = {
+        repr(
+            escrow.observe(
+                job(), Observed(nothing, reach=reach, buyer_start=start).observation, late
+            )
+        )
+        for reach in (*Reach, None)
+        for start in ((BuyerStart(T0, None, True),) if reach is not None else (None,))
+    }
+    assert len(outcomes) == 1
+    (only,) = outcomes
+    assert "seller never started the job" in only  # escrow's own wording, whoever was at fault

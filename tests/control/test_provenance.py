@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
@@ -53,11 +53,16 @@ from kontra import _control as control_module
 from kontra import escrow
 from kontra._control import (
     EXECUTE_OPERATION,
+    HANDLER_BAD_REQUEST,
+    HANDLER_UPSTREAM_TIMEOUT,
     HOLD_HEADER,
     OCCUPY_TASK_QUEUE,
     OCCUPY_WORKFLOW_TYPE,
     BuyerCall,
     BuyerLookupError,
+    CallFailure,
+    CallRecord,
+    CallStatus,
     Control,
     ObservationIncomplete,
     Occupation,
@@ -65,6 +70,8 @@ from kontra._control import (
     hold_digest,
 )
 from kontra.contract.names import new_endpoint_name
+from kontra.engine import BuyerStart, Reach
+from kontra.engine.temporal import reach_of
 from kontra.escrow import (
     BUYER_CANCEL_REASON,
     NOT_FROM_BUYER_REASON,
@@ -1207,3 +1214,104 @@ async def test_a_buyers_unreadable_namespace_is_its_own_error(market: Market) ->
     with pytest.raises(TemporalError) as err:
         await busy_seller.observe(market.seller_ns, script, market.call(token), None)
     assert not isinstance(err.value, BuyerLookupError)
+
+
+# --------------------------------------------------------------------------- how far a call got
+
+
+async def _call_until(market: Market, op: str, done: Callable[[CallRecord], bool]) -> CallRecord:
+    """The buyer's standalone call ``op`` as the frontend records it, once ``done`` holds."""
+    record: CallRecord | None = None
+    for _ in range(300):
+        record = await market.control.describe_call(market.buyer_ns, op)
+        if record is not None and done(record):
+            return record
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"{op} never got there: {record}")
+
+
+async def test_how_far_a_buyers_call_got_is_read_from_its_own_record(market: Market) -> None:
+    """Decisions I40, kontra-cloud's ``describe_operation`` ported into the control plane:
+    :meth:`Control.describe_call` reads the buyer's standalone call as server 1.32 records
+    it, and ``reach_of`` maps it -- none at all; a call the handler took, with its times and
+    the buyer's cancel request; a refusal (``BAD_REQUEST``, final); a call no worker answers
+    (``UPSTREAM_TIMEOUT``, about 10 s in); one the buyer terminated before any attempt
+    finished. A namespace that does not exist cannot say."""
+    control = market.control
+    assert await control.describe_call(market.buyer_ns, unique("op")) is None
+    with pytest.raises(BuyerLookupError):
+        await control.describe_call(unique("nobody"), unique("op"))
+
+    token, op = unique("hold"), unique("op")
+    call = market.call(token)
+    wf = await market.script_hire(token, "slow", operation_id=op)
+    await market.wait(wf, WorkflowExecutionStatus.RUNNING)
+    taken = await _call_until(market, op, lambda r: r.started)
+    assert taken.is_call_of(call)
+    assert not taken.is_call_of(market.call("another job's hold"))
+    assert (taken.status, taken.failure, taken.cancel_requested) == (
+        CallStatus.RUNNING,
+        None,
+        False,
+    )
+    assert taken.scheduled_at is not None
+    assert taken.expires_at is not None
+    assert abs(taken.expires_at - taken.scheduled_at - timedelta(minutes=5)) < timedelta(seconds=5)
+    assert reach_of(taken, call)[0] is Reach.STARTED
+    await market.buyer.workflow_service.request_cancel_nexus_operation_execution(
+        RequestCancelNexusOperationExecutionRequest(
+            namespace=market.buyer_ns, operation_id=op, request_id=str(uuid.uuid4())
+        )
+    )
+    asked = await _call_until(market, op, lambda r: r.cancel_requested)
+    assert reach_of(asked, call) == (
+        Reach.STARTED,
+        BuyerStart(asked.scheduled_at, asked.expires_at, withdrawal_asked=True),
+    )
+
+    async def start(op: str, endpoint: str, operation: str = EXECUTE_OPERATION) -> None:
+        await control.start_operation(
+            market.buyer_ns,
+            op,
+            endpoint,
+            market.service,
+            operation,
+            plan_payload("x"),
+            {HOLD_HEADER: token},
+            timedelta(minutes=5),
+        )
+
+    bad = unique("op")
+    await start(bad, market.endpoint, "bad")  # the handler refuses it: BAD_REQUEST
+    refused = await _call_until(market, bad, lambda r: r.status is not CallStatus.RUNNING)
+    # This handler leaves the retry behaviour unset (kontra.serve's says final): a refusal
+    # either way, as judge_call read it.
+    assert (refused.status, refused.started, refused.failure) == (
+        CallStatus.FAILED,
+        False,
+        CallFailure(HANDLER_BAD_REQUEST, final=False),
+    )
+    assert reach_of(refused, call)[0] is Reach.NEVER_DISPATCHED  # not the job's ``execute``
+    assert reach_of(replace(refused, operation=EXECUTE_OPERATION), call)[0] is Reach.REFUSED
+
+    absent = new_endpoint_name()  # an endpoint whose task queue no worker polls
+    await control.create_endpoint(absent, market.seller_ns, f"{market.seller_ns}/absent@1.0.0")
+    nobody = BuyerCall(market.buyer_ns, absent, market.service, call.holds)
+    lost, gone = unique("op"), unique("op")
+    await start(lost, absent)
+    await start(gone, absent)
+    await market.buyer.workflow_service.terminate_nexus_operation_execution(
+        TerminateNexusOperationExecutionRequest(
+            namespace=market.buyer_ns, operation_id=gone, request_id=str(uuid.uuid4())
+        )
+    )
+    withdrawn = await _call_until(market, gone, lambda r: r.status is CallStatus.TERMINATED)
+    assert (withdrawn.started, withdrawn.failure) == (False, None)
+    assert reach_of(withdrawn, nobody)[0] is Reach.WITHDRAWN
+    unanswered = await _call_until(market, lost, lambda r: r.failure is not None)
+    assert (unanswered.status, unanswered.started, unanswered.failure) == (
+        CallStatus.RUNNING,
+        False,
+        CallFailure(HANDLER_UPSTREAM_TIMEOUT),
+    )
+    assert reach_of(unanswered, nobody)[0] is Reach.UNANSWERED

@@ -11,6 +11,7 @@ import sys
 import typing
 from collections.abc import Callable
 from dataclasses import is_dataclass
+from enum import Enum
 from hashlib import sha256
 
 import pytest
@@ -23,10 +24,12 @@ from kontra.engine import (
     AGE_MAGIC,
     MEMBERS,
     STOPS,
+    BuyerStart,
     Engine,
     JobPlan,
     NotSealed,
     Observed,
+    Reach,
     Sealed,
     SealedPayload,
     Stop,
@@ -135,10 +138,21 @@ def _dataclasses_in(hint: object) -> set[type]:
     return found
 
 
+def _enums_in(hint: object) -> set[type[Enum]]:
+    found: set[type[Enum]] = set()
+    for arg in (hint, *typing.get_args(hint)):
+        if isinstance(arg, type) and issubclass(arg, Enum):
+            found.add(arg)
+        elif arg is not hint:
+            found |= _enums_in(arg)
+    return found
+
+
 def test_no_temporal_concept_is_in_the_protocols_types() -> None:
     """Designed against Golem: no namespace, task queue, run id, Nexus endpoint or history in
     a member, a parameter, or a public attribute (field, property or method) of anything the
-    Protocol hands over or takes, or of the types inside those -- but :data:`EXEMPT`."""
+    Protocol hands over or takes, or of the types inside those -- but :data:`EXEMPT` -- nor
+    in a value of an enum among them (:class:`~kontra.engine.Reach`'s included)."""
     types: set[type] = {Observation, engine.StreamItem, engine.Liveness, engine.Isolation}
     for member in sorted(MEMBERS - {"name"}):
         fn = getattr(Engine, member)
@@ -146,6 +160,10 @@ def test_no_temporal_concept_is_in_the_protocols_types() -> None:
             assert not _words(param) & TEMPORAL_WORDS, (member, param)
         for hint in typing.get_type_hints(fn).values():
             types |= _dataclasses_in(hint)
+    enums: set[type[Enum]] = set()
+    for member in sorted(MEMBERS - {"name"}):
+        for hint in typing.get_type_hints(getattr(Engine, member)).values():
+            enums |= _enums_in(hint)
     todo, seen = list(types), set[type]()
     while todo:
         cls = todo.pop()
@@ -154,7 +172,13 @@ def test_no_temporal_concept_is_in_the_protocols_types() -> None:
         seen.add(cls)
         for hint in typing.get_type_hints(cls).values():
             todo.extend(_dataclasses_in(hint))
-    assert {OfferingId, Version, JobPlan, Observation, SealedPayload} <= seen
+            enums |= _enums_in(hint)
+    assert {OfferingId, Version, JobPlan, Observation, SealedPayload, BuyerStart} <= seen
+    assert {Reach, ObservedStatus, Provenance, Stop} <= enums
+    for enum in enums:
+        assert not _words(enum.__name__.lower()) & TEMPORAL_WORDS, enum.__name__
+        for value in enum:
+            assert not _words(value.name) & TEMPORAL_WORDS, (enum.__name__, value.name)
     hits = {
         (cls.__name__, name)
         for cls in seen
@@ -321,6 +345,36 @@ def test_an_observation_carries_a_result_only_as_a_delivery() -> None:
     for make in bad:
         with pytest.raises(ValueError, match=r"result|digest|pin"):
             make()
+
+
+def test_reach_is_a_field_checked_against_the_observation() -> None:
+    """Decisions I40: ``reach`` is a field of what ``observe`` hands over, not a member (the
+    pin above is unchanged), and a verified lineage -- begun by the buyer's start -- cannot be
+    handed over as anything but STARTED (or None: the engine cannot say)."""
+    assert "observe" in MEMBERS
+    assert not {"reach", "describe", "blame"} & MEMBERS
+    data = _envelope(b"binary/kontra-age", AGE)
+    delivered = Observation(
+        ObservedStatus.COMPLETED,
+        provenance=Provenance.VERIFIED,
+        pin="run-1",
+        result_sha256=sha256(data).hexdigest(),
+        result_size=len(data),
+    )
+    nothing = Observation(ObservedStatus.NOT_FOUND)
+    start = BuyerStart(made_at=None, gives_up_at=None, withdrawal_asked=True)
+    assert Observed(nothing).reach is None  # the default blames no one
+    assert Observed(delivered, SealedPayload(data), reach=Reach.STARTED).reach is Reach.STARTED
+    assert Observed(delivered, SealedPayload(data)).reach is None
+    for reach in Reach:
+        assert Observed(nothing, reach=reach, buyer_start=start).buyer_start == start
+    for bad in set(Reach) - {Reach.STARTED}:
+        with pytest.raises(ValueError, match="verified"):
+            Observed(delivered, SealedPayload(data), reach=bad)
+    with pytest.raises(ValueError, match="with its reach"):
+        Observed(nothing, buyer_start=start)
+    with pytest.raises(ValueError, match="a Reach"):
+        Observed(nothing, reach="started")  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
 
 
 def replace_(obs: Observation, **changes: object) -> Observation:

@@ -24,8 +24,14 @@ from temporalio.api.workflowservice.v1 import (
 )
 
 from kontra._control import (
+    HANDLER_BAD_REQUEST,
+    HANDLER_INTERNAL,
+    HANDLER_UPSTREAM_TIMEOUT,
     BuyerCall,
     BuyerLookupError,
+    CallFailure,
+    CallRecord,
+    CallStatus,
     EndpointConflict,
     EndpointInfo,
     HistorySummary,
@@ -40,6 +46,7 @@ from kontra.codec import stream as s
 from kontra.codec.age import encrypt, generate_identity
 from kontra.contract.names import OfferingId, job_workflow_id, relay_subject
 from kontra.engine import (
+    BuyerStart,
     EngineError,
     Fenced,
     InvalidHandle,
@@ -49,12 +56,20 @@ from kontra.engine import (
     PartyLookupError,
     Pin,
     QuoteKind,
+    Reach,
     RouteConflict,
     Stop,
     StreamBatch,
     StreamStopped,
+    hold_digest,
 )
-from kontra.engine.temporal import AUD_TEMPORAL, HANDLE_PREFIX, TemporalEngine, worker_token
+from kontra.engine.temporal import (
+    AUD_TEMPORAL,
+    HANDLE_PREFIX,
+    TemporalEngine,
+    reach_of,
+    worker_token,
+)
 from kontra.escrow import Observation, ObservedStatus, Provenance
 from kontra.gate_client import models as m
 
@@ -113,6 +128,10 @@ class Recorder:
     fail: Exception | None = None
     #: What history_size answers: (events, bytes) of the run's history (the relay's pace).
     history: tuple[int, int] | None = (10, 1000)
+    #: What describe_call answers: the buyer's standalone call of the job, or none.
+    call: CallRecord | None = None
+    #: What describe_call raises (it alone: the observation it follows stands).
+    fail_call: Exception | None = None
 
     def _call(self, *call: Any) -> None:
         self.calls.append(call)
@@ -202,6 +221,12 @@ class Recorder:
             dict(headers),
             schedule_to_close,
         )
+
+    async def describe_call(self, namespace: str, operation_id: str) -> CallRecord | None:
+        self._call("describe_call", namespace, operation_id)
+        if self.fail_call is not None:
+            raise self.fail_call
+        return self.call
 
 
 def engine(control: Recorder | None = None, **kw: Any) -> tuple[TemporalEngine, Recorder, Signer]:
@@ -361,6 +386,7 @@ async def test_observe_reads_the_sellers_run_against_the_buyers_call() -> None:
     assert seen.result.data == data
     o = seen.observation
     assert (o.result_sha256, o.result_size) == (sha256(data).hexdigest(), len(data))
+    assert (seen.reach, seen.buyer_start) == (Reach.STARTED, None)  # the pinned lineage: no read
 
 
 async def test_an_unsealed_delivery_is_withheld() -> None:
@@ -424,6 +450,255 @@ async def test_only_a_verified_completion_hands_over_bytes() -> None:
         control.observation = (Observation(status, provenance=provenance, pin="r"), sealed_result())
         seen = await e.observe(GOLDEN, pin=None, holds=())
         assert (seen.result, seen.observation.status) == (None, status)
+
+
+# --------------------------------------------------------------------------- reach (I40)
+
+#: The job's hold, as the buyer's start carries it, and another job's (other signed bytes).
+TOKEN = "eyJhbGciOiJFUzI1NiJ9.eyJqb2JfaWQiOiIxIn0.c2lnbmF0dXJl"
+OTHER_TOKEN = "eyJhbGciOiJFUzI1NiJ9.eyJqb2JfaWQiOiIyIn0.c2lnbmF0dXJl"
+CALL = BuyerCall("bob", ROUTE, "acme.enrich", frozenset({hold_digest(TOKEN)}))
+#: When the job's hold expires (an hour after the hire) and the window kontra-cloud's gate
+#: judges an unanswered call by (``CallWindow.of(hold expiry, max_duration 1 h)``: made at
+#: least ten minutes before the hold expires, live until it does).
+HOLD_EXPIRES = datetime(2026, 10, 1, 13, 0, tzinfo=UTC)
+WINDOW = (HOLD_EXPIRES - timedelta(minutes=10), HOLD_EXPIRES)
+#: A call made right after the hire that waits until the job's deadline, as ``start`` makes it.
+FULL: dict[str, Any] = {
+    "scheduled_at": HOLD_EXPIRES - timedelta(hours=1),
+    "expires_at": HOLD_EXPIRES + timedelta(seconds=30),
+}
+#: A buyer's own call during a seller's worker restart, ended by its own 15 s
+#: schedule-to-close: ``TIMED_OUT`` with the last attempt's ``UPSTREAM_TIMEOUT`` (measured).
+EARLY_END: dict[str, Any] = {
+    "scheduled_at": HOLD_EXPIRES - timedelta(minutes=50),
+    "expires_at": HOLD_EXPIRES - timedelta(minutes=50) + timedelta(seconds=15),
+}
+#: A call made in the hold's last minutes, waiting until the deadline.
+LATE: dict[str, Any] = {
+    "scheduled_at": HOLD_EXPIRES - timedelta(minutes=10) + timedelta(seconds=1),
+    "expires_at": HOLD_EXPIRES + timedelta(seconds=30),
+}
+TIMEOUT = CallFailure(HANDLER_UPSTREAM_TIMEOUT)
+
+
+def _call(
+    status: CallStatus = CallStatus.RUNNING,
+    *,
+    started: bool = False,
+    failure: CallFailure | None = None,
+    **fields: Any,
+) -> CallRecord:
+    values: dict[str, Any] = {
+        "endpoint": CALL.endpoint,
+        "service": CALL.service,
+        "operation": "execute",
+        "headers": {"kontra-hold": TOKEN},
+        **FULL,
+    }
+    values.update(fields)
+    return CallRecord(status=status, started=started, failure=failure, **values)
+
+
+def _gate(reach: Reach | None, start: BuyerStart | None) -> tuple[str, str]:
+    """What kontra-cloud's gate makes of a reach once it reads ``observed.reach`` instead of
+    ``judge_call`` (the tracking issue's port): who the refund is blamed on
+    (``BuyerCallSeen``) and how the job's reason words it (``call_reason``). The window and
+    the wording are the gate's; the facts are the engine's."""
+    made_by, live_until = WINDOW
+    waited = (
+        start is not None
+        and start.made_at is not None
+        and start.made_at <= made_by
+        and (start.gives_up_at is None or start.gives_up_at >= live_until)
+    )
+    if reach in (Reach.STARTED, Reach.FAILED) or (reach is Reach.UNANSWERED and waited):
+        return "reached", "seller never started the job"
+    if reach is Reach.REFUSED:
+        return "refused", "seller refused the buyer's call"
+    if reach is Reach.INCONCLUSIVE:
+        return "inconclusive", "the buyer's call failed before the job started"
+    if start is not None and start.withdrawal_asked:
+        return "unseen", "canceled by buyer"
+    return "unseen", "buyer never started the job"
+
+
+REACHED = ("reached", "seller never started the job")
+REFUSED = ("refused", "seller refused the buyer's call")
+INCONCLUSIVE = ("inconclusive", "the buyer's call failed before the job started")
+UNSEEN = ("unseen", "buyer never started the job")
+WITHDRAWN = ("unseen", "canceled by buyer")
+
+
+#: kontra-cloud's ``tests/jobs/test_attribution.py::test_judge_call`` table, row for row (the
+#: wording from ``call_reason``): the reach each record maps to, and what the gate makes of it.
+JUDGE_CALL: list[tuple[CallRecord | None, Reach, tuple[str, str]]] = [
+    # Nothing to see.
+    (None, Reach.NEVER_DISPATCHED, UNSEEN),
+    # Not this job's call: another endpoint, service, operation or hold.
+    (_call(failure=TIMEOUT, endpoint="k" + "2" * 32), Reach.NEVER_DISPATCHED, UNSEEN),
+    (_call(failure=TIMEOUT, service="acme.other"), Reach.NEVER_DISPATCHED, UNSEEN),
+    (_call(failure=TIMEOUT, operation="quote"), Reach.NEVER_DISPATCHED, UNSEEN),
+    (
+        _call(failure=TIMEOUT, headers={"kontra-hold": OTHER_TOKEN}),
+        Reach.NEVER_DISPATCHED,
+        UNSEEN,
+    ),
+    (_call(failure=TIMEOUT, headers={}), Reach.NEVER_DISPATCHED, UNSEEN),
+    # Any spelling the seller's handler accepts is the job's call, as for escrow.
+    (
+        _call(failure=TIMEOUT, headers={"Kontra-Hold": f" {TOKEN}\t"}),
+        Reach.UNANSWERED,
+        REACHED,
+    ),
+    (_call(failure=TIMEOUT, headers={"kontra-hold": TOKEN + "x"}), Reach.UNANSWERED, REACHED),
+    # The seller's handler took the call, and no run of it verified.
+    (_call(started=True), Reach.STARTED, REACHED),
+    (_call(CallStatus.TERMINATED, started=True), Reach.STARTED, REACHED),
+    (_call(CallStatus.COMPLETED), Reach.STARTED, REACHED),
+    # No worker of the seller's answered a call that waited from early on until the hold
+    # expired: while the call was live, or until it timed out.
+    (_call(failure=TIMEOUT), Reach.UNANSWERED, REACHED),
+    (_call(CallStatus.TIMED_OUT, failure=TIMEOUT), Reach.UNANSWERED, REACHED),
+    (_call(failure=TIMEOUT, expires_at=None), Reach.UNANSWERED, REACHED),
+    (_call(failure=TIMEOUT, scheduled_at=WINDOW[0]), Reach.UNANSWERED, REACHED),
+    (
+        _call(CallStatus.TIMED_OUT, failure=TIMEOUT, expires_at=HOLD_EXPIRES),
+        Reach.UNANSWERED,
+        REACHED,
+    ),
+    # ... but not one the buyer let end itself before the hold expired, one made in the
+    # hold's last minutes, or one whose times are unknown.
+    (_call(CallStatus.TIMED_OUT, failure=TIMEOUT, **EARLY_END), Reach.UNANSWERED, UNSEEN),
+    (
+        _call(
+            CallStatus.TIMED_OUT, failure=TIMEOUT, expires_at=HOLD_EXPIRES - timedelta(seconds=1)
+        ),
+        Reach.UNANSWERED,
+        UNSEEN,
+    ),
+    (_call(failure=TIMEOUT, **LATE), Reach.UNANSWERED, UNSEEN),
+    (_call(failure=TIMEOUT, scheduled_at=None), Reach.UNANSWERED, UNSEEN),
+    # The window is about unanswered calls only.
+    (_call(CallStatus.TERMINATED, started=True, **EARLY_END), Reach.STARTED, REACHED),
+    (
+        _call(CallStatus.FAILED, failure=CallFailure(HANDLER_INTERNAL, final=True), **LATE),
+        Reach.FAILED,
+        REACHED,
+    ),
+    # The handler declared its own (the seller's code's) failure final.
+    (
+        _call(CallStatus.FAILED, failure=CallFailure(HANDLER_INTERNAL, final=True)),
+        Reach.FAILED,
+        REACHED,
+    ),
+    # Refused: the hold, the input or its price. No blame, by design.
+    (
+        _call(CallStatus.FAILED, failure=CallFailure(HANDLER_BAD_REQUEST, final=True)),
+        Reach.REFUSED,
+        REFUSED,
+    ),
+    # A retryable handler error may be the buyer's doing (a claim-check it never uploaded).
+    (_call(failure=CallFailure(HANDLER_INTERNAL)), Reach.INCONCLUSIVE, INCONCLUSIVE),
+    (_call(failure=CallFailure("UNAVAILABLE")), Reach.INCONCLUSIVE, INCONCLUSIVE),
+    (_call(failure=CallFailure("")), Reach.INCONCLUSIVE, INCONCLUSIVE),
+    # Withdrawn by the buyer before the seller took it: the brief-outage grief.
+    (_call(CallStatus.TERMINATED, failure=TIMEOUT), Reach.WITHDRAWN, UNSEEN),
+    (
+        _call(CallStatus.CANCELED, failure=TIMEOUT, cancel_requested=True),
+        Reach.WITHDRAWN,
+        WITHDRAWN,
+    ),
+    # ... but a call the seller's handler ended canceled, unasked, is its refusal.
+    (_call(CallStatus.CANCELED, failure=CallFailure("")), Reach.REFUSED, REFUSED),
+    (_call(CallStatus.CANCELED), Reach.REFUSED, REFUSED),
+    # A buyer's cancel of a call no worker took leaves it live, retried: a seller away for
+    # the whole window is still the one that never answered.
+    (_call(failure=TIMEOUT, cancel_requested=True), Reach.UNANSWERED, REACHED),
+    (_call(failure=TIMEOUT, cancel_requested=True, **LATE), Reach.UNANSWERED, WITHDRAWN),
+    # No attempt finished (started a moment before its deadline).
+    (_call(CallStatus.TIMED_OUT), Reach.NEVER_DISPATCHED, UNSEEN),
+    (_call(), Reach.NEVER_DISPATCHED, UNSEEN),
+    # call_reason's wording: a withdrawal the buyer asked for, by any record that blames no one.
+    (_call(CallStatus.TERMINATED, cancel_requested=True), Reach.WITHDRAWN, WITHDRAWN),
+    (_call(cancel_requested=True), Reach.NEVER_DISPATCHED, WITHDRAWN),
+]
+
+
+@pytest.mark.parametrize(("record", "reach", "gate"), JUDGE_CALL)
+def test_reach_is_judge_calls_case_analysis(
+    record: CallRecord | None, reach: Reach, gate: tuple[str, str]
+) -> None:
+    """Decisions I40: the mapping from the buyer's standalone call, as the frontend records
+    it, is kontra-cloud's ``judge_call`` case for case (FIXUPS #22), and the record that goes
+    with it is enough for the gate to reach the same verdict and the same wording."""
+    got, start = reach_of(record, CALL)
+    assert got is reach
+    if record is None or not record.is_call_of(CALL):
+        assert start is None
+    else:
+        assert start == BuyerStart(record.scheduled_at, record.expires_at, record.cancel_requested)
+    assert _gate(got, start) == gate
+
+
+async def test_observe_reads_how_far_the_buyers_start_got() -> None:
+    """A job with no verified run: the buyer's standalone operation ``job-<id>`` is described
+    in the buyer's namespace, after the observation, and mapped (decisions I40)."""
+    e, control, _ = engine()
+    control.call = _call(failure=TIMEOUT)
+    seen = await e.observe(GOLDEN, pin=None, holds=CALL.holds)
+    wf = job_workflow_id(JOB)
+    assert control.calls == [
+        ("observe", "acme", wf, CALL, None),
+        ("describe_call", "bob", wf),
+    ]
+    assert seen.observation == Observation(ObservedStatus.NOT_FOUND)
+    assert (seen.reach, seen.buyer_start) == (
+        Reach.UNANSWERED,
+        BuyerStart(FULL["scheduled_at"], FULL["expires_at"], False),
+    )
+    control.call = None
+    assert (await e.observe(GOLDEN, pin=None, holds=CALL.holds)).reach is Reach.NEVER_DISPATCHED
+    # A run the seller started itself is no start of the buyer's: read from the call alone.
+    control.observation = (
+        Observation(ObservedStatus.COMPLETED, provenance=Provenance.NOT_FROM_BUYER, pin="r"),
+        sealed_result(),
+    )
+    own = await e.observe(GOLDEN, pin=None, holds=CALL.holds)
+    assert (own.reach, own.buyer_start, own.result) == (Reach.NEVER_DISPATCHED, None, None)
+
+
+async def test_a_verified_or_pinned_lineage_started_and_nothing_is_read() -> None:
+    """The buyer's start began a verified lineage (and a pinned one, which escrow pinned when
+    it was verified): STARTED, with no read of the buyer's namespace."""
+    e, control, _ = engine()
+    control.observation = (
+        Observation(ObservedStatus.RUNNING, provenance=Provenance.VERIFIED, pin="run-1"),
+        None,
+    )
+    seen = await e.observe(GOLDEN, pin=None, holds=CALL.holds)
+    control.observation = (Observation(ObservedStatus.NOT_FOUND, pin="run-1"), None)
+    gone = await e.observe(GOLDEN, pin=Pin("run-1"), holds=CALL.holds)
+    assert [c[0] for c in control.calls] == ["observe", "observe"]
+    for lineage in (seen, gone):
+        assert (lineage.reach, lineage.buyer_start) == (Reach.STARTED, None)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [BuyerLookupError("RESOURCE_EXHAUSTED"), TemporalError("down"), RuntimeError("anything")],
+)
+async def test_a_reach_that_cannot_be_read_is_none_and_the_observation_stands(
+    failure: Exception,
+) -> None:
+    """Reach is reputation: a buyer's namespace that cannot be read is "cannot say" (None,
+    which blames no one), never an error that would hold up the observation escrow needs."""
+    e, control, _ = engine()
+    obs = Observation(ObservedStatus.RUNNING, provenance=Provenance.NOT_FROM_BUYER, pin="r")
+    control.observation = (obs, None)
+    control.fail_call = failure
+    seen = await e.observe(GOLDEN, pin=None, holds=CALL.holds)
+    assert (seen.observation, seen.result, seen.reach, seen.buyer_start) == (obs, None, None, None)
 
 
 @pytest.mark.parametrize(

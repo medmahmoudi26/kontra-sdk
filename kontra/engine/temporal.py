@@ -19,6 +19,12 @@ adds what the Protocol asks of an adapter and nothing of its own about money.
   :func:`~kontra.contract.names.relay_subject`, I30) minted inside :meth:`TemporalEngine.stream`
   and never handed out -- minted again, and the frontend dialled with it, once half its life
   is spent, so a job's relay outlives any one token.
+* How far a job's start got (:attr:`~kontra.engine.Observed.reach`, decisions I40) is
+  STARTED for a verified or pinned lineage, and otherwise read from the buyer's standalone
+  operation ``job-<id>`` (:meth:`~kontra._control.Control.describe_call`) and mapped by
+  :func:`reach_of`, the case analysis kontra-cloud's ``judge_call`` made (FIXUPS #22); a read
+  that fails is None, never an error, so reputation never holds up an observation escrow
+  needs.
 * The internal frontend is reached only through :class:`kontra._control.Control` (the relay's
   pace too: :meth:`~kontra._control.Control.history_size`); the relay reads where
   ``relay_service`` dials (the public frontend, or a dev server's own:
@@ -27,9 +33,10 @@ adds what the Protocol asks of an adapter and nothing of its own about money.
   I39), handing the gate the same :class:`~kontra.engine.Sealed` items as before.
 
 Nexus, namespaces, task queues and run ids stay in this module: the Protocol names none of
-them. Two reads are Temporal by definition and stay outside it, as extensions of this class:
-the Workers view (:meth:`TemporalEngine.workers`, I21) and, in kontra-cloud, the blame read
-for a job that never started (owner decision OD7 of #55).
+them. One read is Temporal by definition and stays outside it, as an extension of this
+class: the Workers view (:meth:`TemporalEngine.workers`, I21). The blame read for a job that
+never started, kontra-cloud's ``describe_operation`` / ``judge_call`` until #55's OD7, is
+behind :meth:`TemporalEngine.observe` now (``reach``, decisions I40).
 """
 
 from __future__ import annotations
@@ -52,9 +59,14 @@ from temporalio.api.workflowservice.v1 import (
 
 from kontra._control import (
     EXECUTE_OPERATION,
+    HANDLER_BAD_REQUEST,
+    HANDLER_INTERNAL,
+    HANDLER_UPSTREAM_TIMEOUT,
     HOLD_HEADER,
     BuyerCall,
     BuyerLookupError,
+    CallRecord,
+    CallStatus,
     EndpointConflict,
     NexusSyncKind,
     Occupation,
@@ -74,6 +86,7 @@ from kontra.contract.names import (
 )
 from kontra.engine import (
     HANDLE_MAX,
+    BuyerStart,
     EngineError,
     EngineName,
     Fenced,
@@ -89,6 +102,7 @@ from kontra.engine import (
     Pin,
     QuoteAnswer,
     QuoteKind,
+    Reach,
     RouteConflict,
     Sealed,
     SealedPayload,
@@ -98,7 +112,7 @@ from kontra.engine import (
     StreamItem,
     StreamStopped,
 )
-from kontra.escrow import ObservedStatus, Provenance
+from kontra.escrow import Observation, ObservedStatus, Provenance
 from kontra.gate_client import models as m
 
 __all__ = [
@@ -110,6 +124,7 @@ __all__ = [
     "Signer",
     "StreamBlobs",
     "TemporalEngine",
+    "reach_of",
     "worker_token",
 ]
 
@@ -260,6 +275,56 @@ def _parse(raw: object) -> _Handle:
     ):
         raise _invalid("bad field")
     return _Handle(fields["buyer"], fields["job"], offering, fields["route"], fields["seller"])
+
+
+def reach_of(record: CallRecord | None, call: BuyerCall) -> tuple[Reach, BuyerStart | None]:
+    """How far the buyer's start got (decisions I40), from the standalone operation
+    ``job-<id>`` in the buyer's namespace as the frontend described it (``record``; None:
+    there is none) for a job with no verified run: kontra-cloud's ``judge_call`` (FIXUPS
+    #22), case for case, with its window and its wording left to the gate (the
+    :class:`~kontra.engine.BuyerStart` of the call is handed over for both). ``call``: the
+    job's own record of the buyer's call (its route, service and holds).
+
+    Only an operation that *is* this job's call counts (:meth:`CallRecord.is_call_of`, as
+    escrow matches a run's call). Then, in judge_call's order:
+
+    * the handler took the call, or it completed: STARTED (judge_call: reached);
+    * the buyer terminated it, or asked to cancel it and it ended canceled: WITHDRAWN
+      (unseen; the buyer must not call during a seller's brief outage, withdraw, and leave
+      the seller blamed);
+    * it ended canceled with no request of the buyer's: REFUSED (the seller's handler failed
+      its start with a canceled error);
+    * no attempt has finished: NEVER_DISPATCHED (unseen);
+    * ``BAD_REQUEST``: REFUSED (the hold, the input or its price; no blame, by design);
+    * ``UPSTREAM_TIMEOUT``: UNANSWERED (reached only if it waited through the gate's window,
+      from :class:`~kontra.engine.BuyerStart`'s times; else unseen);
+    * ``INTERNAL``, declared final: FAILED (the seller's code; reached);
+    * any other failure: INCONCLUSIVE (it may be the buyer's doing).
+
+    The call's :class:`~kontra.engine.BuyerStart` goes with every reach of a call of the
+    job's (None with no such call): the window reads its times, and the wording of every
+    unseen call its ``cancel_requested``."""
+    if record is None or not record.is_call_of(call):
+        return Reach.NEVER_DISPATCHED, None
+    start = BuyerStart(record.scheduled_at, record.expires_at, record.cancel_requested)
+    if record.started or record.status is CallStatus.COMPLETED:
+        return Reach.STARTED, start
+    if record.status is CallStatus.TERMINATED or (
+        record.status is CallStatus.CANCELED and record.cancel_requested
+    ):
+        return Reach.WITHDRAWN, start
+    if record.status is CallStatus.CANCELED:
+        return Reach.REFUSED, start
+    failure = record.failure
+    if failure is None:
+        return Reach.NEVER_DISPATCHED, start
+    if failure.type == HANDLER_BAD_REQUEST:
+        return Reach.REFUSED, start
+    if failure.type == HANDLER_UPSTREAM_TIMEOUT:
+        return Reach.UNANSWERED, start
+    if failure.type == HANDLER_INTERNAL and failure.final:
+        return Reach.FAILED, start
+    return Reach.INCONCLUSIVE, start
 
 
 def _payload(raw: bytes) -> Payload:
@@ -439,13 +504,16 @@ class TemporalEngine:
         self, handle: JobHandle, *, pin: Pin | None, holds: Collection[str]
     ) -> Observed:
         h = _parse(handle)
+        call = h.call(holds)
         try:
-            obs, result = await self._control.observe(h.seller, h.workflow_id, h.call(holds), pin)
+            obs, result = await self._control.observe(h.seller, h.workflow_id, call, pin)
         except Exception as e:
             raise _engine_error(e) from e
+        reach, start = await self._reach(h, call, obs, pin)
         if obs.status is not ObservedStatus.COMPLETED or obs.provenance is not Provenance.VERIFIED:
             # Only a verified completion delivers: no bytes leave for anything else.
-            return Observed(replace(obs, result_sha256=None, result_size=None))
+            cleared = replace(obs, result_sha256=None, result_size=None)
+            return Observed(cleared, reach=reach, buyer_start=start)
         try:
             # A verified completion the control plane gave no bytes for is no delivery
             # either (``Control`` itself answers b"" for a completion with no payload).
@@ -455,10 +523,27 @@ class TemporalEngine:
             unsealed = replace(
                 obs, status=ObservedStatus.UNSEALED, result_sha256=None, result_size=None
             )
-            return Observed(unsealed)
+            return Observed(unsealed, reach=reach, buyer_start=start)
         # The digest is of exactly the bytes handed over, computed here, not taken on trust.
         digest = sha256(sealed.data).hexdigest()
-        return Observed(replace(obs, result_sha256=digest, result_size=len(sealed.data)), sealed)
+        delivered = replace(obs, result_sha256=digest, result_size=len(sealed.data))
+        return Observed(delivered, sealed, reach=reach, buyer_start=start)
+
+    async def _reach(
+        self, h: _Handle, call: BuyerCall, obs: Observation, pin: Pin | None
+    ) -> tuple[Reach | None, BuyerStart | None]:
+        """How far the job's start got (decisions I40). A verified lineage, or the pinned one
+        (verified when escrow pinned it), was begun by the buyer's start: STARTED, with no
+        read. Otherwise the buyer's standalone operation ``job-<id>`` is described and mapped
+        (:func:`reach_of`); a read that fails is None ("cannot say"), never raised: reach is
+        reputation, and the observation is escrow's."""
+        if pin or obs.provenance is Provenance.VERIFIED:
+            return Reach.STARTED, None
+        try:
+            record = await self._control.describe_call(h.buyer, h.workflow_id)
+        except Exception:
+            return None, None
+        return reach_of(record, call)
 
     async def liveness(self, handle: JobHandle, *, pin: Pin) -> Liveness | None:
         h = _parse(handle)

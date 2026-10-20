@@ -4,9 +4,10 @@ The gate (``kontra-cloud``) and the fake gate (:mod:`kontra.testing.fake_gate`) 
 same handful of operations that no party's token may perform (decisions I3, I4, I6):
 register a party's namespace, create and look up the Nexus endpoint of a published
 version, relay a quote as a synchronous Nexus call, watch the seller's handler workflow
-``job-<id>``, stop it when escrow says so, and start a standalone Nexus operation in a
-buyer's namespace on its behalf. :class:`Control` is that set, in one place, so the two
-gates cannot drift.
+``job-<id>``, stop it when escrow says so, start a standalone Nexus operation in a
+buyer's namespace on its behalf, and describe that operation for how far a job that never
+ran got (:meth:`Control.describe_call`, decisions I40). :class:`Control` is that set, in one
+place, so the two gates cannot drift.
 
 Every call names its namespace explicitly in a raw ``workflow_service`` /
 ``operator_service`` request: the client's own default namespace is never used, so one
@@ -60,15 +61,23 @@ from temporalio.api.common.v1 import Link, Memo, Payload, WorkflowExecution, Wor
 from temporalio.api.enums.v1 import (
     EventType,
     HistoryEventFilterType,
+    NexusHandlerErrorRetryBehavior,
+    NexusOperationExecutionStatus,
     NexusOperationIdConflictPolicy,
     NexusOperationIdReusePolicy,
+    PendingNexusOperationState,
     TaskQueueType,
     WorkflowExecutionStatus,
     WorkflowIdConflictPolicy,
     WorkflowIdReusePolicy,
 )
 from temporalio.api.history.v1 import HistoryEvent
-from temporalio.api.nexus.v1 import Endpoint, EndpointSpec, EndpointTarget
+from temporalio.api.nexus.v1 import (
+    Endpoint,
+    EndpointSpec,
+    EndpointTarget,
+    NexusOperationExecutionInfo,
+)
 from temporalio.api.operatorservice.v1 import (
     CreateNexusEndpointRequest,
     ListNexusEndpointsRequest,
@@ -111,6 +120,9 @@ __all__ = [
     "DEFAULT_RETENTION",
     "EXECUTE_OPERATION",
     "FRONTEND_RESERVE",
+    "HANDLER_BAD_REQUEST",
+    "HANDLER_INTERNAL",
+    "HANDLER_UPSTREAM_TIMEOUT",
     "HOLD_HEADER",
     "IDENTITY",
     "OCCUPY_TASK_QUEUE",
@@ -118,6 +130,9 @@ __all__ = [
     "RETENTION_MARGIN",
     "BuyerCall",
     "BuyerLookupError",
+    "CallFailure",
+    "CallRecord",
+    "CallStatus",
     "Control",
     "EndpointConflict",
     "EndpointInfo",
@@ -128,6 +143,7 @@ __all__ = [
     "Occupation",
     "TemporalControl",
     "TemporalError",
+    "call_record",
     "hold_digest",
     "input_size",
     "internal_relay_service",
@@ -321,6 +337,140 @@ class BuyerCall:
     holds: frozenset[str]
 
 
+#: Nexus handler error types (``nexus_handler_failure_info.type``) that tell how far a buyer's
+#: call of a job that never started got (decisions I40; kontra-cloud's FIXUPS #22).
+#:
+#: ``BAD_REQUEST``: ``kontra.serve`` refuses a call with it, final, before any workflow
+#: exists (the hold, the input or its price): "refused now, it refunds with no blame".
+HANDLER_BAD_REQUEST = "BAD_REQUEST"
+#: ``UPSTREAM_TIMEOUT``: no handler answered the attempt in time: no worker of the seller's
+#: polls the endpoint's task queue, or its handler took too long (server 1.32, measured:
+#: ``{message: "upstream timeout", nexus_handler_failure_info {type: UPSTREAM_TIMEOUT}}``
+#: about 10 s after the attempt, in both cases).
+HANDLER_UPSTREAM_TIMEOUT = "UPSTREAM_TIMEOUT"
+#: ``INTERNAL``: the handler failed. ``kontra.serve`` declares it final when the seller's own
+#: code is at fault (its quote function), and leaves it retryable when the cause may be
+#: anyone's (a claim-check the bucket or the gate did not serve, a Temporal RPC).
+HANDLER_INTERNAL = "INTERNAL"
+
+
+class CallStatus(StrEnum):
+    """A standalone Nexus operation's status (``NexusOperationExecutionStatus``)."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELED = "canceled"
+    TERMINATED = "terminated"
+    TIMED_OUT = "timed_out"
+
+
+_CALL_STATUS: Mapping[int, CallStatus] = {
+    NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_RUNNING: CallStatus.RUNNING,
+    NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_COMPLETED: (
+        CallStatus.COMPLETED
+    ),
+    NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_FAILED: CallStatus.FAILED,
+    NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_CANCELED: CallStatus.CANCELED,
+    NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_TERMINATED: (
+        CallStatus.TERMINATED
+    ),
+    NexusOperationExecutionStatus.NEXUS_OPERATION_EXECUTION_STATUS_TIMED_OUT: (
+        CallStatus.TIMED_OUT
+    ),
+}
+_FINAL = NexusHandlerErrorRetryBehavior.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_NON_RETRYABLE
+
+
+@dataclass(frozen=True, slots=True)
+class CallFailure:
+    """How the last finished attempt of a Nexus call failed, as the server recorded it
+    (``last_attempt_failure``): the handler error's ``type`` ("" for a failure that is not a
+    handler error) and whether the handler declared it ``final`` (non-retryable)."""
+
+    type: str
+    final: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CallRecord:
+    """A standalone Nexus operation in a buyer's namespace, as the frontend describes it:
+    structured fields the server wrote, nothing decoded. What the Temporal adapter reads to
+    tell how far the buyer's ``execute`` call of a job got when no run of it verified
+    (``kontra.engine.Reach``, decisions I40; ported unchanged from kontra-cloud's
+    ``BuyerOperation``, FIXUPS #22).
+
+    ``started``: the handler took the call (it answered with an asynchronous start: the
+    operation has a token, or is in state ``STARTED``). ``failure``: how the last finished
+    attempt to deliver the call failed, or None when none failed (none finished yet, or the
+    call was taken). What each outcome looked like on server 1.32 (measured): no worker or a
+    handler slower than an attempt's ~10 s -- ``RUNNING`` / ``TIMED_OUT`` with an
+    ``UPSTREAM_TIMEOUT`` failure (also when a buyer's own schedule-to-close of 12 s or more ran
+    out: the last attempt's failure stays); a schedule-to-close shorter than one attempt --
+    ``TIMED_OUT`` with a failure that is no handler error; a refusal -- ``FAILED``,
+    ``BAD_REQUEST`` final; a retryable handler error -- ``RUNNING``, ``INTERNAL``; a buyer
+    that terminated its call before any attempt finished -- ``TERMINATED`` with no failure.
+
+    ``scheduled_at`` / ``expires_at``: when the call was made and when its schedule-to-close
+    runs out (None: no limit), on the server's clock. The buyer chooses both for a call its
+    own client starts.
+
+    ``cancel_requested``: the operation's ``cancellation_info`` is set -- someone asked to
+    cancel the call, which only the buyer can (nobody else acts in its namespace; the gate
+    never cancels a buyer's call), as :meth:`Control.observe` reads it for
+    ``buyer_canceled``. Not the same as ``status`` ``CANCELED``: the seller's handler ends a
+    call ``CANCELED`` by failing its start with a canceled ``OperationError``, with no
+    cancellation info; and a call the buyer cancels before any worker took it stays
+    ``RUNNING`` (then ``TIMED_OUT``) with the info set (server 1.32, measured)."""
+
+    endpoint: str
+    service: str
+    operation: str
+    headers: Mapping[str, str]
+    status: CallStatus
+    started: bool = False
+    failure: CallFailure | None = None
+    scheduled_at: datetime | None = None
+    expires_at: datetime | None = None
+    cancel_requested: bool = False
+
+    def is_call_of(self, call: BuyerCall) -> bool:
+        """Whether this is ``call``'s job's ``execute`` call: its endpoint and service, and one
+        of its hold tokens in the header, matched exactly as :meth:`Control.observe` matches
+        a run's call (:func:`_carries_hold`)."""
+        return (
+            self.endpoint == call.endpoint
+            and self.service == call.service
+            and self.operation == EXECUTE_OPERATION
+            and _carries_hold(self.headers, call.holds)
+        )
+
+
+def call_record(info: NexusOperationExecutionInfo) -> CallRecord:
+    """The facts of a ``DescribeNexusOperationExecution`` answer the adapter reads."""
+    failure: CallFailure | None = None
+    if info.HasField("last_attempt_failure"):
+        f = info.last_attempt_failure
+        if f.HasField("nexus_handler_failure_info"):
+            h = f.nexus_handler_failure_info
+            failure = CallFailure(h.type, final=h.retry_behavior == _FINAL)
+        else:
+            failure = CallFailure("")
+    return CallRecord(
+        endpoint=info.endpoint,
+        service=info.service,
+        operation=info.operation,
+        headers=dict(info.nexus_header),
+        status=_CALL_STATUS.get(info.status, CallStatus.RUNNING),
+        started=bool(info.operation_token)
+        or info.state == PendingNexusOperationState.PENDING_NEXUS_OPERATION_STATE_STARTED,
+        failure=failure,
+        scheduled_at=_time(info.schedule_time, info.HasField("schedule_time")),
+        expires_at=_time(info.expiration_time, info.HasField("expiration_time")),
+        cancel_requested=info.HasField("cancellation_info"),
+    )
+
+
 class NexusSyncKind(StrEnum):
     #: The handler answered; ``payload`` is its result.
     OK = "ok"
@@ -432,6 +582,8 @@ class TemporalControl(Protocol):
         headers: Mapping[str, str],
         schedule_to_close: timedelta,
     ) -> None: ...
+
+    async def describe_call(self, namespace: str, operation_id: str) -> CallRecord | None: ...
 
 
 def internal_relay_service(
@@ -1991,3 +2143,36 @@ class Control:
                 raise TemporalError(
                     f"start {operation} operation {operation_id} in {namespace}: {e.message}"
                 ) from e
+
+    async def describe_call(self, namespace: str, operation_id: str) -> CallRecord | None:
+        """The standalone operation ``operation_id`` in ``namespace`` (a buyer's; its latest
+        run), or None when there is none: how far a job's buyer's call got
+        (``kontra.engine.Reach``, decisions I40; kontra-cloud's ``describe_operation``, ported
+        with the same answers). A missing namespace, or any other refusal, is "cannot say"
+        (:class:`BuyerLookupError`, as for the other reads of a buyer's namespace), never "the
+        buyer never called". Ids the frontend refuses as malformed name nothing (None), as in
+        the other lookups: an error there would be asked again forever.
+
+        Not retried (one RPC): the Temporal adapter reads it on every observation of a job
+        with no verified run, and a buyer can keep its own namespace refusing reads -- a retry
+        loop there would hold up every other job's observation. What it cannot read is
+        "cannot say", asked again at the next observation."""
+        try:
+            resp: DescribeNexusOperationExecutionResponse = (
+                await self._wf.describe_nexus_operation_execution(
+                    DescribeNexusOperationExecutionRequest(
+                        namespace=namespace, operation_id=operation_id
+                    ),
+                    retry=False,
+                    timeout=_RPC_TIMEOUT,
+                )
+            )
+        except RPCError as e:
+            if e.status == RPCStatusCode.NOT_FOUND and not _namespace_missing(e):
+                return None
+            if e.status == RPCStatusCode.INVALID_ARGUMENT:
+                return None
+            raise BuyerLookupError(
+                f"describe operation {operation_id} in {namespace}: {e.status.name}: {e.message}"
+            ) from e
+        return call_record(resp.info)

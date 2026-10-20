@@ -22,6 +22,7 @@ from temporalio.api.common.v1 import Payload
 from kontra._control import (
     DEFAULT_RETENTION,
     BuyerCall,
+    CallRecord,
     EndpointConflict,
     EndpointInfo,
     HistorySummary,
@@ -208,6 +209,14 @@ class ScriptedControl:
     #: every describe_task_queue call: (namespace, task queue)
     described: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
     fail_describe: Exception | None = None
+    #: what describe_call answers, by (namespace, operation id): a buyer's standalone call
+    #: as the frontend would describe it (decisions I40); else there is none
+    calls: dict[tuple[str, str], CallRecord] = field(
+        default_factory=dict[tuple[str, str], CallRecord]
+    )
+    #: every describe_call call: (namespace, operation id)
+    described_calls: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
+    fail_describe_call: Exception | None = None
 
     def observe_as(
         self,
@@ -364,3 +373,9 @@ class ScriptedControl:
                 schedule_to_close,
             )
         )
+
+    async def describe_call(self, namespace: str, operation_id: str) -> CallRecord | None:
+        self.described_calls.append((namespace, operation_id))
+        if self.fail_describe_call is not None:
+            raise self.fail_describe_call
+        return self.calls.get((namespace, operation_id))
