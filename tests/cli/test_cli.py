@@ -393,6 +393,7 @@ def test_topup_refuses_nonsense_amounts(cli: Cli) -> None:
 def test_job_refuses_two_actions_and_bad_ids(cli: Cli) -> None:
     job_id = "0" * 32
     assert "pick one" in cli("job", job_id, "--accept", "--cancel").stderr
+    assert "--stream" in cli("job", job_id, "--progress", "--stream", "events").stderr
     assert "not a job id" in cli("job", "../x").stderr
 
 

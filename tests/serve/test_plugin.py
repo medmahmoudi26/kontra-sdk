@@ -118,6 +118,47 @@ def test_external_storage_must_not_take_a_payload_the_buyer_could_not_read() -> 
     assert fine.payload_codec is codec
 
 
+def test_external_storage_must_not_take_a_stream_envelope() -> None:
+    """A job stream's poll answer is an envelope of up to 512 KiB the gate's relay must read
+    (decisions I31): external storage at or below it (plus framing) is refused, with or
+    without a blob store."""
+    from kontra.codec.stream import ENVELOPE_MAX
+
+    identity, recipient = generate_identity()
+    plain = KontraCodec(identity, [recipient], role="seller")  # no blob store
+    for codec in (_codec(), plain):
+        for threshold in (300 * 1024, ENVELOPE_MAX, ENVELOPE_MAX + 4096):
+            with pytest.raises(ServeError, match="stream envelope limit"):
+                KontraPlugin._data_converter(
+                    DataConverter(external_storage=_storage(threshold)), codec
+                )
+        assert (
+            KontraPlugin._data_converter(
+                DataConverter(external_storage=_storage(ENVELOPE_MAX + 4097)), codec
+            ).payload_codec
+            is codec
+        )
+
+
+async def test_the_hash_lock_refuses_streams_the_catalog_does_not_have(tmp_path: Path) -> None:
+    """``streams:`` is fixed per published version (decisions I31, owner OD5): code whose
+    list differs from the catalog's is refused at start, naming both lists."""
+    from types import SimpleNamespace
+
+    from kontra.plugin import _streams_problem  # pyright: ignore[reportPrivateUsage]
+
+    bound = seller.bind(write_offering(tmp_path, streams=["events", "audit"]))
+    assert bound.streams == ("audit", "events")
+    same = SimpleNamespace(streams=["events", "audit"])
+    assert _streams_problem(bound, same) is None  # type: ignore[arg-type]
+    other = SimpleNamespace(streams=["events"])
+    problem = _streams_problem(bound, other)  # type: ignore[arg-type]
+    assert problem is not None
+    assert "['audit', 'events']" in problem
+    assert "['events']" in problem
+    assert "publish a new one" in problem
+
+
 def test_a_client_hook_before_prepare_says_what_to_do(tmp_path: Path) -> None:
     """``Client(service_client, plugins=[...])`` skips the connection hook, where the plugin
     prepares itself: configuring a client unprepared is refused, saying how."""

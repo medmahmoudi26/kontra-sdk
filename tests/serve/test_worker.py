@@ -381,9 +381,9 @@ class _CatalogGate:
             raise GateError(404, "offering_not_found", "no such offering")
         return self.entry
 
-    async def publish(self, document: dict[str, Any]) -> m.CatalogEntry:
+    async def publish(self, document: dict[str, Any], *, streams: Any = ()) -> m.CatalogEntry:
         self.published.append(document)
-        return _entry(document)
+        return _entry(document).model_copy(update={"streams": list(streams)})
 
     async def jobs(
         self, *, as_: str, state: str | None, cursor: str | None, limit: int

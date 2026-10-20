@@ -6,9 +6,8 @@ import asyncio
 from models import PulseInput
 from temporalio import activity
 
-#: Slower than the forwarder's default interval (1 s, latest wins: PRD §8.4), with room
-#: for a slow post, so that under the settings a seller ships with every heartbeat is its
-#: own event; and below the gate's per-job heartbeat rate (5 per second).
+#: Faster than the forwarder's default interval (5 s, latest wins: decisions I31), so the
+#: buyer sees the pacing: about one heartbeat in three, in order, and the last one.
 SPACING_SECONDS = 1.5
 
 
