@@ -38,8 +38,9 @@ difference that does not change which JSON values are valid, each by a rule I33 
   ``extra="ignore"``, which drops other keys on input and never emits one on output, so no
   value exchanged differs. ``additionalProperties: true`` is its absence, on either side,
   except against the contract's ``false``: there it is ``extra="allow"`` (the model keeps
-  other keys and serializes them), kept, and reported ``open``. A schema there (typed
-  extras) is no ``true``, and is compared like any other member;
+  other keys and serializes them), kept, and reported ``open``; and so is a schema there,
+  typed extras (``__pydantic_extra__: dict[str, int]``), which is ``extra="allow"`` with the
+  extras' type;
 * ``anyOf: [T, {type: null}]`` is ``oneOf: [T, {type: null}]`` when ``T`` cannot be null;
 * a ``default`` of ``null``, a list or an object is no default (decisions I2: null is the
   absence of one, and nexgen materialises only scalar defaults), and neither is a default on
@@ -48,9 +49,11 @@ difference that does not change which JSON values are valid, each by a rule I33 
   (I38). Any other scalar default is compared: a buyer's generated code fills it in.
 
 What remains is reported, each a :class:`Difference`: ``open`` where the harness's schema
-says ``additionalProperties: true`` (``extra="allow"``) and the contract closes the model,
-which the seller can act on; anything else is the two emitters describing the same model
-differently, a bug in one of them, reported as it is.
+leaves a model open (``additionalProperties: true`` or a schema, ``extra="allow"``) and the
+contract closes it, which the seller can act on -- in the output, a reply that carries
+another key fails the job; in the input, only the seller's harness-codegen types are wider
+than what the contract and the gate let a buyer send; anything else is the two emitters
+describing the same model differently, a bug in one of them, reported as it is.
 
 The harness's schema comes from its own CLI, ``temporal-agent-harness schema module:Class``,
 run by :func:`harness_schema` as a subprocess of this interpreter: the same document
@@ -82,7 +85,8 @@ from kontra.contract.validate import validate_document
 __all__ = [
     "ABSENT",
     "HARNESS_SCRIPT",
-    "OPEN_NOTE",
+    "OPEN_INPUT_NOTE",
+    "OPEN_OUTPUT_NOTE",
     "OTHER_NOTE",
     "SCHEMA_COMMAND",
     "SCHEMA_DEFS",
@@ -267,13 +271,23 @@ def _last_line(stderr: bytes) -> str:
 
 Side = Literal["input", "output"]
 
-#: What an ``open`` difference means, and what any other one does.
-OPEN_NOTE: Final = (
+#: What an ``open`` difference means, on each side, and what any other one does. An open
+#: output's other keys are serialized into the reply, which the contract refuses; an open
+#: input only widens the seller's harness-codegen types: the contract and the gate refuse
+#: other keys in an input, so no job fails for it.
+OPEN_OUTPUT_NOTE: Final = (
     "the contract closes every model (no keys but its fields) and the harness's schema "
     'leaves this one open, as extra="allow" does: the model keeps other keys and serializes '
     "them into its reply, which the contract refuses, so a reply that carries one fails the "
     'job; pydantic\'s default (extra="ignore", which drops them) or extra="forbid" on the '
     "model makes the two agree"
+)
+OPEN_INPUT_NOTE: Final = (
+    "the contract closes every model (no keys but its fields) and the harness's schema "
+    'leaves this one open, as extra="allow" does: your harness-codegen types accept other '
+    "keys here, which the contract and the gate refuse in an input, so no buyer can send "
+    'one and no job fails for it; pydantic\'s default (extra="ignore") or extra="forbid" on '
+    "the model makes the two agree"
 )
 OTHER_NOTE: Final = (
     "the two emitters describe the same model differently, which neither should (a bug in "
@@ -298,8 +312,8 @@ class Difference:
     """One place where the contract and the harness's schema still differ after both are in
     the canonical form. ``path`` is in the contract's terms (``$defs.Report.required``);
     ``contract``/``harness`` are the values there, or :data:`ABSENT`. ``open`` is the
-    harness's ``additionalProperties: true`` (``extra="allow"``) against the contract's
-    ``false``; any other difference is the emitters disagreeing."""
+    harness's ``additionalProperties: true`` or a schema (``extra="allow"``, typed extras)
+    against the contract's ``false``; any other difference is the emitters disagreeing."""
 
     side: Side
     path: str
@@ -315,13 +329,16 @@ class Difference:
 
 
 def describe(differences: Iterable[Difference]) -> list[str]:
-    """Lines for a person: one per difference, then what they mean."""
+    """Lines for a person: one per difference, then what they mean: ``open``'s note for each
+    side that has one (an open output fails a job whose reply carries another key, an open
+    input fails none), then where to report any other line."""
     found = list(differences)
     lines = [str(d) for d in found]
-    opened = sum(d.open for d in found)
-    if opened:
-        lines.append(f"(open) {OPEN_NOTE}")
-    if opened < len(found):
+    opened = {d.side for d in found if d.open}
+    for side, note in (("input", OPEN_INPUT_NOTE), ("output", OPEN_OUTPUT_NOTE)):
+        if side in opened:
+            lines.append(f"(open {side}) {note}")
+    if any(not d.open for d in found):
         lines.append(("the other lines: " if opened else "") + OTHER_NOTE)
     return lines
 
@@ -525,8 +542,9 @@ def _closed_alike(c: Any, h: Any) -> bool:
     member's absence; and the contract's ``false`` against the harness's absence is Kontra's
     policy, not a difference: the contract closes every model (section 11.3), and a model
     pydantic writes without one (its default ``extra="ignore"``) drops other keys on input
-    and never emits one on output. ``false`` against ``true`` (``extra="allow"``: the model
-    keeps other keys and serializes them) is not alike, and a schema is compared as any."""
+    and never emits one on output. ``false`` against ``true`` or a schema (``extra="allow"``,
+    with typed extras or not: the model keeps other keys and serializes them) is not alike,
+    and is ``open``."""
     if c is False and h is ABSENT:
         return True
     return (c is True or c is ABSENT) and (h is True or h is ABSENT)
@@ -625,7 +643,7 @@ class _Walk:
             where = join_path(path, key)
             if key == _EXTRA and _closed_alike(cv, hv):
                 continue
-            if key == _EXTRA and cv is False and hv is True:
+            if key == _EXTRA and cv is False and (hv is True or isinstance(hv, dict)):
                 self.found.append(Difference(self.side, where, cv, hv, open=True))
             elif cv is ABSENT or hv is ABSENT:
                 self._differ(where, self._shown(cv, key), self._shown(hv, key, harness=True))

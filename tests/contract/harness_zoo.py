@@ -40,6 +40,7 @@ with workflow.unsafe.imports_passed_through():
         EnumOverlap,
         Enums,
         Excluded,
+        ExcludedIf,
         Factories,
         Files,
         Forbid,
@@ -54,6 +55,7 @@ with workflow.unsafe.imports_passed_through():
         Times,
         Titled,
         Tree,
+        TypedAllow,
     )
 
 # PEP 695 aliases (``type Short = ...`` from Python 3.12), spelled for 3.11.
@@ -96,6 +98,11 @@ class Zoo:
 
     @agent.accepts
     async def excluded(self, req: Excluded) -> Excluded:
+        """Echo."""
+        return req
+
+    @agent.accepts
+    async def excluded_if(self, req: ExcludedIf) -> ExcludedIf:
         """Echo."""
         return req
 
@@ -210,6 +217,11 @@ class Zoo:
         return req
 
     @agent.accepts
+    async def typed_allow(self, req: TypedAllow) -> TypedAllow:
+        """Echo."""
+        return req
+
+    @agent.accepts
     async def outer(self, req: OuterAllow) -> OuterAllow:
         """Echo."""
         return req
@@ -225,6 +237,7 @@ MODELS: dict[str, type[BaseModel]] = {
     "computed": Computed,
     "computed_alias": ComputedAlias,
     "excluded": Excluded,
+    "excluded_if": ExcludedIf,
     "split_alias": SplitAlias,
     "camel": Camel,
     "serialized": Serialized,
@@ -247,6 +260,7 @@ MODELS: dict[str, type[BaseModel]] = {
     "tree": Tree,
     "forbid": Forbid,
     "allow": Allow,
+    "typed_allow": TypedAllow,
     "outer": OuterAllow,
     "bounded": Bounded,
 }

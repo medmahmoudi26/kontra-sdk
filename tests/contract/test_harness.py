@@ -7,12 +7,13 @@ harness-codegen), read here as ``kontra publish`` reads it: through
 :func:`kontra.contract.harness.harness_schema`, a subprocess, so Kontra never imports the
 harness. For the test agents (``tests/serve/harness_agents.py``) and the model zoo
 (``harness_zoo.py``, the models of ``zoo.py``) the verdict is asserted as equality: no
-difference at all once both are in the canonical form, but the zoo's two ``extra="allow"``
-handlers, which are exactly ``open``. Then Kontra's copy of the harness's schema shape
-against the harness, and the warning ``kontra contract`` prints.
+difference at all once both are in the canonical form, but the zoo's three ``extra="allow"``
+handlers (open, with typed extras, nested), which are exactly ``open``. Then Kontra's copy of
+the harness's schema shape against the harness, and the warning ``kontra contract`` prints.
 
-Skipped only when the harness is not installed; kontra-sdk's dev group installs it, so CI
-runs all of it."""
+Never skipped: the harness is a locked dependency of the dev group, which installs pytest
+too, so it is imported unconditionally, and a missing or broken harness is a collection
+error rather than a green run without the exact assert."""
 
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import temporal_agent_harness  # noqa: F401 -- none installed: a collection error, never a skip
 from click.testing import CliRunner, Result
 
 from kontra.cli import cli as kontra_cli
@@ -31,9 +33,6 @@ from kontra.contract import harness as h
 from kontra.contract.harness import Difference
 from kontra.serve import offering
 from kontra.serve.turn import AGENT_HANDLERS
-
-pytest.importorskip("temporal_agent_harness", reason="the dev group's temporal-agent-harness")
-
 from tests.serve import harness_agents as agents
 
 from . import harness_zoo as zoo
@@ -63,11 +62,11 @@ def schemas() -> dict[type, dict[str, Any]]:
         return dict(zip(AGENTS, pool.map(schema, AGENTS), strict=True))
 
 
-def _open(model: str) -> tuple[Difference, ...]:
+def _open(model: str, harness: Any = True) -> tuple[Difference, ...]:
     """``open`` on both sides: the contract closes ``model``, and the harness's schema says
-    ``additionalProperties: true`` (``extra="allow"``)."""
+    ``additionalProperties: true`` (``extra="allow"``), or the extras' schema."""
     return tuple(
-        Difference(side, f"$defs.{model}.additionalProperties", False, True, open=True)
+        Difference(side, f"$defs.{model}.additionalProperties", False, harness, open=True)
         for side in ("input", "output")
     )
 
@@ -146,11 +145,16 @@ def test_a_bound_handlers_document_is_what_is_compared(
 # --------------------------------------------------------------------------- the model zoo
 
 #: The zoo's only differences: ``Allow`` (``extra="allow"``), alone or nested in ``Outer``,
-#: is the harness's ``additionalProperties: true`` against the contract's ``false``. Every
-#: other handler is equal: computed, excluded and re-keyed fields, serializers and defaults
-#: on the output (both in serialization mode, decisions I38), and bounds on a named type
-#: and its use (both conjoined).
-OPEN: dict[str, tuple[Difference, ...]] = {"allow": _open("Allow"), "outer": _open("Allow")}
+#: is the harness's ``additionalProperties: true`` against the contract's ``false``, and
+#: ``TypedAllow``'s typed extras the extras' schema there. Every other handler is equal:
+#: computed, excluded and re-keyed fields, serializers and defaults on the output (both in
+#: serialization mode, decisions I38), an ``exclude_if`` field's default beside it, and
+#: bounds on a named type and its use (both conjoined).
+OPEN: dict[str, tuple[Difference, ...]] = {
+    "allow": _open("Allow"),
+    "typed_allow": _open("TypedAllow", {"type": "integer"}),
+    "outer": _open("Allow"),
+}
 
 
 def test_the_zoo_covers_every_handler(schemas: dict[type, dict[str, Any]]) -> None:
@@ -238,7 +242,8 @@ def _contract(root: Path, home: Path) -> Result:
 
 def test_kontra_contract_warns_where_they_differ(tmp_path: Path) -> None:
     """On stderr: one warning naming the offering and the handler, a line per difference and
-    what each kind means. The document on stdout is unchanged, and the command succeeds."""
+    what they mean, for each side. The document on stdout is unchanged, and the command
+    succeeds."""
     root = _project(tmp_path / "p", "Zoo.allow", "allow_quote", module="tests.contract.harness_zoo")
     result = _contract(root, tmp_path / "home")
     assert result.exit_code == 0, result.output
@@ -250,7 +255,8 @@ def test_kontra_contract_warns_where_they_differ(tmp_path: Path) -> None:
     assert lines[1:] == [
         "  input  $defs.Allow.additionalProperties: contract false, harness true",
         "  output $defs.Allow.additionalProperties: contract false, harness true",
-        f"  (open) {h.OPEN_NOTE}",
+        f"  (open input) {h.OPEN_INPUT_NOTE}",
+        f"  (open output) {h.OPEN_OUTPUT_NOTE}",
     ]
 
 

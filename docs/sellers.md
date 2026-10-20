@@ -641,26 +641,27 @@ serve(ReconAgent.sweep, plugins=[AgentHarnessPlugin()])
   catalog's hash -- the only schema a buyer should trust, since your code is exactly what they
   cannot see. So `kontra publish` and `kontra contract` compare the two for the handler you
   sell. Both describe the input as validated and the output as your reply is serialized
-  (decisions I38), so once both are in one canonical form they are equal, and nothing is
-  printed: names, titles, descriptions, key order, `anyOf` against `oneOf` for an optional
-  field, a default beside an output field that is always there, a constraint on a type and
-  again where it is used written as one, and the other differences that change no valid
-  value are set aside, as is the contract closing a model that keeps pydantic's default
-  `extra="ignore"`, which changes no value exchanged (decisions I33). What remains is
-  printed on stderr, and the command goes on either way; the contract is what is published.
+  (decisions I38), so once both are in one canonical form they are equal for every kind of
+  field Kontra's tests compare, and nothing is printed: names, titles, descriptions, key
+  order, `anyOf` against `oneOf` for an optional field, a default beside an output field
+  that is always there, a constraint on a type and again where it is used written as one,
+  and the other differences that change no valid value are set aside, as is the contract
+  closing a model that keeps pydantic's default `extra="ignore"`, which changes no value
+  exchanged (decisions I33). What remains is printed on stderr, and the command goes on
+  either way; the contract is what is published.
   The models above agree; with `model_config = ConfigDict(extra="allow")` on `Report`:
 
   ```text
   warning: acme/recon@1.0.0 (ReconAgent.sweep): the contract differs from temporal-agent-harness's schema for this handler in 1 place. Buyers get the contract (`kontra pull`); your harness-codegen types follow the harness's:
     output $defs.Report.additionalProperties: contract false, harness true
-    (open) the contract closes every model (no keys but its fields) and the harness's schema leaves this one open, as extra="allow" does: the model keeps other keys and serializes them into its reply, which the contract refuses, so a reply that carries one fails the job; pydantic's default (extra="ignore", which drops them) or extra="forbid" on the model makes the two agree
+    (open output) the contract closes every model (no keys but its fields) and the harness's schema leaves this one open, as extra="allow" does: the model keeps other keys and serializes them into its reply, which the contract refuses, so a reply that carries one fails the job; pydantic's default (extra="ignore", which drops them) or extra="forbid" on the model makes the two agree
   ```
 
   Each line is one place, in the contract's terms:
 
   | Line | What differs | What to do |
   |---|---|---|
-  | `open` | the harness's schema leaves a model open to other keys (`additionalProperties: true`, from `extra="allow"`: the model keeps them, and serializes them into your reply, which then fails the job), and the contract closes every model to its fields | drop `extra="allow"`: keep pydantic's default, or set `model_config = ConfigDict(extra="forbid")`, with which your agent also refuses unknown keys from any caller, as the gate does |
+  | `open` | the harness's schema leaves a model open to other keys (`additionalProperties: true`, or the extras' type with typed extras: `extra="allow"`), and the contract closes every model to its fields. On an `output` line the model keeps those keys and serializes them into your reply, which then fails the job; on an `input` line the contract and the gate refuse them before your model sees one, so no job fails, and only your harness-codegen types accept more than a buyer can send | drop `extra="allow"`: keep pydantic's default, or set `model_config = ConfigDict(extra="forbid")`, with which your agent also refuses unknown keys from any caller, as the gate does |
   | any other | the two emitters describe the same model differently, which neither should: a bug in Kontra's derivation or in the harness's | report it, with the model, at the address the warning gives. Buyers still get the contract |
 
   Nothing is compared, and nothing said, for a workflow entry or when the harness is not

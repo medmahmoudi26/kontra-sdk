@@ -657,14 +657,18 @@ def _extra(contract: Any, harness: Any) -> list[tuple[Any, Any, bool]]:
         (False, True, [(False, True, True)]),
         (True, False, [(True, False, False)]),
         (ABSENT, False, [(ABSENT, False, False)]),
-        # A schema (typed extras) is no true: compared like any other member.
-        (False, {"type": "integer"}, [(False, {"type": "integer"}, False)]),
+        # A schema there is typed extras (__pydantic_extra__: dict[str, int]): extra="allow".
+        (False, {"type": "integer"}, [(False, {"type": "integer"}, True)]),
+        (False, {}, [(False, {}, True)]),
+        # A map's values: compared like any other member.
         ({"type": "integer"}, {"type": "integer"}, []),
+        ({"type": "integer"}, {"type": "string"}, [("integer", "string", False)]),
     ],
 )
 def test_additional_properties_pair_by_pair(contract: Any, harness: Any, found: list[Any]) -> None:
     """Each pair of ``additionalProperties``, the contract's against the harness's: ``true``
-    survives the canonical form on both sides, and only the comparison reads it."""
+    survives the canonical form on both sides, and only the comparison reads it; against
+    the contract's ``false`` it is ``open``, and so is a schema (typed extras)."""
     assert _extra(contract, harness) == found
 
 
@@ -752,12 +756,38 @@ def test_describe_says_each_difference_then_what_they_mean(enrich_spec: Offering
         "input  $defs.AllowedInput.additionalProperties: contract false, harness true",
         "output $defs.AllowedOutput.additionalProperties: contract false, harness true",
         'output $defs.AllowedOutput.properties.hops.type: contract "integer", harness "string"',
-        f"(open) {h.OPEN_NOTE}",
+        f"(open input) {h.OPEN_INPUT_NOTE}",
+        f"(open output) {h.OPEN_OUTPUT_NOTE}",
         f"the other lines: {h.OTHER_NOTE}",
     ]
-    assert h.describe(found[:2]) == [*h.describe(found)[:2], f"(open) {h.OPEN_NOTE}"]
+    assert h.describe(found[:2]) == [*h.describe(found)[:2], *h.describe(found)[3:5]]
     assert h.describe(found[2:]) == [h.describe(found)[2], h.OTHER_NOTE]
     assert h.describe(()) == []
+
+
+def test_an_open_model_says_what_it_does_on_its_side(enrich_spec: OfferingSpec) -> None:
+    """An open output fails a job whose reply carries another key; an open input fails
+    none, since the contract and the gate refuse other keys before the model sees them, and
+    only the seller's harness-codegen types are wider. Each side's note is printed only for
+    a line of that side."""
+    defs = {"Allowed": _open(additionalProperties=True), "Open": _open(output=True)}
+    found = compare_handler(
+        _doc(enrich_spec, Allowed, Open), _harness("Allowed", "Open", defs), "run"
+    )
+    assert h.describe(found) == [
+        "input  $defs.Allowed.additionalProperties: contract false, harness true",
+        f"(open input) {h.OPEN_INPUT_NOTE}",
+    ]
+    assert "fails the job" in h.OPEN_OUTPUT_NOTE
+    assert "no job fails" in h.OPEN_INPUT_NOTE
+    defs = {"Open": _open(), "Allowed": _open(output=True, additionalProperties=True)}
+    found = compare_handler(
+        _doc(enrich_spec, Open, Allowed), _harness("Open", "Allowed", defs), "run"
+    )
+    assert h.describe(found) == [
+        "output $defs.Allowed.additionalProperties: contract false, harness true",
+        f"(open output) {h.OPEN_OUTPUT_NOTE}",
+    ]
 
 
 def test_a_long_value_is_cut_and_control_characters_are_escaped() -> None:

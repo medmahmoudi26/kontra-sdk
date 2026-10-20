@@ -6,7 +6,7 @@ and a bound handler's -- is what the contract describes.
 
 The same models are what the harness check compares (decisions I33): ``harness_zoo.py`` sells
 each as one handler of an agent, all but ``Overlap``, and asserts the contract equal to
-temporal-agent-harness's schema of it but for ``Allow``'s ``extra="allow"``.
+temporal-agent-harness's schema of it but for ``extra="allow"`` (``Allow``, ``TypedAllow``).
 
 ``Times`` writes its durations as seconds (``ser_json_timedelta="float"``): an ISO duration
 output is refused (I38), and ``Overlap`` has no value at all (see :data:`CASES`)."""
@@ -296,6 +296,16 @@ class Allow(BaseModel):
     x: int
 
 
+class TypedAllow(BaseModel):
+    """Open to other keys of one type (typed extras): ``extra="allow"`` too, which the
+    contract closes all the same."""
+
+    model_config = ConfigDict(extra="allow")
+    __pydantic_extra__: dict[str, int] = Field(init=False)
+
+    x: int
+
+
 class OuterAllow(BaseModel):
     """pydantic's default (``extra="ignore"``) around ``Allow`` (I33's ``Outer``)."""
 
@@ -337,9 +347,9 @@ class Plain(BaseModel):
 ARTIFACT = {"key": "0" * 32, "size": 3, "sha256": "a" * 64, "content_type": "text/plain"}
 
 #: name -> (model, an input value for it). Every I33 model is here but ``Overlap``, which has
-#: no valid value (see its docstring). ``Allow``'s value has no other key: one is a member the
-#: closed contract does not declare, refused (§11.3; #53 reports the open output).
-#: ``ExcludedIf``'s has every member: ``test_serialized.py`` leaves them out.
+#: no valid value (see its docstring). ``Allow``'s and ``TypedAllow``'s values have no other
+#: key: one is a member the closed contract does not declare, refused (§11.3; #53 reports the
+#: open output). ``ExcludedIf``'s has every member: ``test_serialized.py`` leaves them out.
 CASES: dict[str, tuple[type[BaseModel], dict[str, Any]]] = {
     "computed": (Computed, {"w": 2, "h": 3}),
     "computed_alias": (ComputedAlias, {"w": 4}),
@@ -387,5 +397,6 @@ CASES: dict[str, tuple[type[BaseModel], dict[str, Any]]] = {
         },
     ),
     "allow": (Allow, {"x": 1}),
+    "typed_allow": (TypedAllow, {"x": 1}),
     "outer": (OuterAllow, {"inner": {"x": 1}, "many": [{"x": 2}], "maybe": None}),
 }

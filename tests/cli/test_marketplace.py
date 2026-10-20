@@ -170,7 +170,6 @@ async def test_publish_warns_where_a_handlers_contract_and_the_harness_schema_di
     offering, after one warning on stderr naming where the contract buyers get and the
     harness's schema for that handler differ: here an ``extra="allow"`` model, which the
     contract closes (``tests/contract/test_harness.py`` has the comparison itself)."""
-    pytest.importorskip("temporal_agent_harness", reason="the dev group's temporal-agent-harness")
     project = shop.root / "recon"
     project.mkdir()
     facts = {
