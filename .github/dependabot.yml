@@ -75,11 +75,12 @@ updates:
     commit-message:
       prefix: deps(image)
 
-  # compose.yaml pins Postgres (twice: postgres and postgres-relay), SeaweedFS and the dev
-  # profiles' Temporal UI, Prometheus, Grafana, OpenTelemetry Collector, Loki and Tempo by
-  # digest; without this entry those digests would never move, security fixes included.
+  # compose.yaml (the e2e stack) pins Postgres (twice: postgres and postgres-relay), SeaweedFS
+  # and its ui profile's Temporal UI by digest; observability/compose.yaml (`kontra dev up
+  # --observability`) pins Prometheus, Grafana, the OpenTelemetry Collector, Loki and Tempo.
+  # Without this entry those digests would never move, security fixes included.
   - package-ecosystem: docker-compose
-    directory: /
+    directories: ["/", "/observability"]
     target-branch: dev
     schedule:
       interval: weekly

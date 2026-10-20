@@ -22,7 +22,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -279,12 +279,14 @@ def _observability_up(ports: Ports) -> None:
     )
 
 
-def _observability_down(ports: Ports) -> None:
-    # Best-effort: nothing to take down without Docker or the shipped file.
+def _observability_down(ports: Ports, *, volumes: bool = False) -> None:
+    """Take the observability project down; ``volumes`` (``down --reset``) also deletes what
+    Loki, Tempo and Prometheus kept. Best-effort: nothing to take down without Docker or the
+    shipped file."""
     if _docker() is None or _observability_file() is None:
         return
     subprocess.run(  # noqa: S603 -- argv, no shell
-        _observability_cmd("down", "--remove-orphans"),
+        _observability_cmd("down", "--remove-orphans", *(["--volumes"] if volumes else [])),
         check=False,
         env=_observability_env(ports),
     )
@@ -321,31 +323,78 @@ def _process_alive(pid: int) -> bool:
     return True
 
 
-def _group_is_ours(pid: int, pgid: int, cli_path: str) -> bool:
-    """Whether the recorded process group is still this stack's: the leader is alive in it, or
-    (a dead leader) a member's command line is the recorded Temporal CLI (Linux /proc)."""
-    if _process_alive(pid):
-        try:
-            return os.getpgid(pid) == pgid
-        except ProcessLookupError:
-            return False
+def _group_members(pgid: int) -> list[list[str]]:
+    """The command lines (argv) of the processes in process group ``pgid``: ``/proc`` on Linux,
+    ``ps`` elsewhere (whitespace-split: a path with a space never matches, which only means
+    nothing is signalled). Never raises."""
+    found: list[list[str]] = []
     proc = Path("/proc")
-    if not proc.is_dir():
-        return False
-    for entry in proc.iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            if os.getpgid(int(entry.name)) != pgid:
+    if proc.is_dir():
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
                 continue
-            cmdline = (
-                (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
-            )
-        except (OSError, ProcessLookupError):
-            continue
-        if cli_path in cmdline:
-            return True
-    return False
+            try:
+                if os.getpgid(int(entry.name)) != pgid:
+                    continue
+                raw = (entry / "cmdline").read_bytes()
+            except (OSError, ProcessLookupError):
+                continue
+            found.append([a.decode("utf-8", "replace") for a in raw.split(b"\x00") if a])
+        return found
+    ps = shutil.which("ps")
+    if ps is None:
+        return found
+    try:
+        out = subprocess.run(  # noqa: S603 -- fixed argv, no shell
+            [ps, "-A", "-o", "pgid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return found
+    for line in out.splitlines():
+        group, _, command = line.strip().partition(" ")
+        if group == str(pgid):
+            found.append(command.split())
+    return found
+
+
+def _flag(argv: list[str], name: str) -> str | None:
+    """The value after ``name`` in ``argv``, or None."""
+    for i, arg in enumerate(argv[:-1]):
+        if arg == name:
+            return argv[i + 1]
+    return None
+
+
+def _serves_home(argv: list[str], home: Path, cli_path: str) -> bool:
+    """Whether ``argv`` is this home's host (``python -m kontra.devgate --home <home>``, the
+    label ``_spawn_host`` puts there) or its Temporal child (the recorded CLI running
+    ``server start-dev`` on this home's db file)."""
+    if argv[-4:] == ["-m", "kontra.devgate", "--home", str(home)]:
+        return True
+    db = str(home / "dev" / "data" / "temporal.db")
+    return (
+        bool(cli_path)
+        and argv[:3] == [cli_path, "server", "start-dev"]
+        and _flag(argv, "--db-filename") == db
+    )
+
+
+def _group_is_ours(record: StackRecord, home: Path) -> bool:
+    """Whether the recorded process group is still this home's stack, so ``down`` and a stale
+    ``up`` may signal it. A recorded pid outlives its process (a crash, a reboot): by now it
+    may be anyone's, a group leader included. So the group must be the one ``up`` made (the
+    host leads it: pgid == pid), never this command's own, and a member's command line must
+    name this home -- the host's ``--home`` label, or the Temporal child's db file. Anything
+    else, a forged or a recycled record, is never signalled."""
+    pgid = record.pgid
+    if pgid != record.pid or pgid <= 1 or pgid == os.getpgrp():
+        return False
+    cli_path = record.cli.get("path", "")
+    return any(_serves_home(argv, home, cli_path) for argv in _group_members(pgid))
 
 
 def _signal_group(pgid: int, *, grace: float = 5.0) -> None:
@@ -373,9 +422,9 @@ class _suppress_process_errors:
 
 
 def _cleanup_stack(record: StackRecord, *, persist: bool, home: Path) -> None:
-    """Stop the recorded stack's process group if it is still ours, then forget it and (unless
-    persist) wipe the in-memory data."""
-    if _group_is_ours(record.pid, record.pgid, record.cli.get("path", "")):
+    """Stop the recorded stack's process group if it is still ours (:func:`_group_is_ours`),
+    then forget it and (unless persist) wipe the in-memory data."""
+    if _group_is_ours(record, home):
         _signal_group(record.pgid)
     state.remove_stack_record(home)
     state.unregister_port(record.port_set.gate)
@@ -410,8 +459,10 @@ def _spawn_host(
         "persist": persist,
         "ready_fd": write_fd,
     }
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "kontra.devgate"],
+    proc = subprocess.Popen(  # noqa: S603 -- argv, no shell
+        # `--home` is a label: it lets a later `up`/`down` tell this host's orphaned group
+        # from a stranger's by its command line (_group_is_ours).
+        [sys.executable, "-m", "kontra.devgate", "--home", str(home)],
         stdin=subprocess.PIPE,
         # The detached host must not hold this command's stdout/stderr: a caller that captures
         # `kontra dev up`'s output (a test, CI, `$(...)`) would otherwise block on the open pipe
@@ -429,7 +480,7 @@ def _spawn_host(
     signal_line = _await_ready(read_fd, proc, timeout)
     if signal_line != "ready":
         with _suppress_process_errors():
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)  # the group it leads (start_new_session)
         tails = _log_tails(home)
         detail = signal_line or "the host did not become ready"
         fail(f"kontra dev up failed: {detail}\n{tails}")
@@ -580,6 +631,7 @@ def up(
     from kontra.contract.names import validate_handle
     from kontra.profile import kontra_home
 
+    _require_dev_extra()  # at once: before a profile is checked or a port is bound
     handle = handle if handle is not None else (ctx.obj or {}).get("handle")
     if handle is not None:
         validate_handle(handle)
@@ -605,46 +657,146 @@ def up(
 
     with state.lock(home):
         record = state.read_stack_record(home)
-        running = record is not None and _ready_doc(record.port_set.gate, record.token) is not None
-        if running:
-            assert record is not None
+        doc = None if record is None else _ready_doc(record.port_set.gate, record.token)
+        if record is not None and doc is not None:
             if record.port_set != ports and any(v is not None for v in overrides.values()):
                 fail(
                     f"kontra dev is already up on 127.0.0.1:{record.port_set.gate}; "
                     "`kontra dev down` first (it drops its in-memory state), then up with new ports"
                 )
             ports = record.port_set
+            # What this `up` turns on must be free first: a Temporal restart onto a taken
+            # port would leave the stack without its Temporal.
+            if ui and not doc.get("ui"):
+                _check_free(ports, ("ui",))
+            if observability and not doc.get("metrics"):
+                _check_free(ports, ("temporal_metrics",))
             _control_post(
                 ports.gate,
                 record.token,
                 "config",
                 {"ui": ui, "metrics": observability, "persist": want_persist},
             )
-        else:
-            if record is not None:  # a stale record: a crash or a reboot
-                _cleanup_stack(record, persist=want_persist, home=home)
-            _start_fresh(
-                home,
-                ports,
-                overrides,
-                want_persist,
-                ui,
-                observability,
-                timeout,
-                foreground,
-                handle,
-                existing,
-            )
-            if foreground:
-                return  # _start_fresh ran it in the foreground and has returned on Ctrl-C
+            # Remembered at once: `down` keeps the snapshot (or wipes it) by this setting.
+            settings.persist = want_persist
+            state.write_settings(settings, home)
+            _finish(home, ports, handle, existing, ui, observability, want_persist, fresh=False)
+            return
+        if record is not None:  # a stale record: a crash or a reboot
+            _cleanup_stack(record, persist=want_persist, home=home)
+        owner = _joinable(home, ports.gate)
+        if owner is not None:
+            owner_home, owner_record = owner
+            _join(home, owner_home, owner_record, ui, observability, persist)
+            joined_ports = replace(owner_record.port_set, codec=ports.codec)
+            state.remember_ports(joined_ports, home)  # a later plain `up` here joins again
+            _finish(home, joined_ports, handle, existing, ui, False, False, fresh=False)
+            return
+        state.joined_path(home).unlink(missing_ok=True)  # the stack it joined is gone
+        _start_fresh(
+            home,
+            ports,
+            want_persist,
+            ui,
+            observability,
+            timeout,
+            foreground,
+            handle,
+            existing,
+        )
+        if foreground:
+            return  # _start_fresh ran it in the foreground and has returned on Ctrl-C
 
-    _finish(home, ports, handle, existing, ui, observability, want_persist, fresh=not running)
+    _finish(home, ports, handle, existing, ui, observability, want_persist, fresh=True)
+
+
+def _require_dev_extra() -> None:
+    """``kontra dev up`` runs the dev gate under FastAPI and uvicorn, the ``[dev]`` extra (OD3).
+    Without them it stops before anything else, with the line that installs them; ``down``,
+    ``status`` and ``logs`` never need them."""
+    import importlib
+
+    for name in ("fastapi", "uvicorn"):
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            fail(
+                f"`kontra dev up` runs the dev gate, which needs {name}: "
+                'pip install "kontra-sdk[dev]" ([testing] includes it)'
+            )
+
+
+def _check_free(ports: Ports, fields: tuple[str, ...]) -> None:
+    """Exit 1 naming the first of ``fields`` whose loopback port is taken, its holder when it
+    can be told, and the flag that moves it."""
+    for field in fields:
+        port = getattr(ports, field)
+        if state.port_taken(port):
+            holder = state.port_holder(port)
+            flag = "metrics" if field == "temporal_metrics" else field
+            fail(
+                f"127.0.0.1:{port} is taken{f' ({holder})' if holder else ''}; "
+                f"free it or pass --{flag}-port"
+            )
+
+
+def _joinable(home: Path, gate_port: int) -> tuple[Path, StackRecord] | None:
+    """Another home of this user whose stack runs on ``gate_port`` and answers its own token
+    there (OD7): the per-user registry names it, its ``stack.json`` (0600, ours) holds the
+    token. None when there is no such stack; a stale registry entry is not one."""
+    owner = state.registry_owner(gate_port)
+    if owner is None or owner == home:
+        return None
+    record = state.read_stack_record(owner)
+    if record is None or record.port_set.gate != gate_port:
+        return None
+    if _ready_doc(gate_port, record.token) is None:
+        return None
+    return owner, record
+
+
+def _join(
+    home: Path,
+    owner: Path,
+    record: StackRecord,
+    ui: bool,
+    observability: bool,
+    persist: bool | None,
+) -> None:
+    """Record that ``home`` joined ``owner``'s stack (nothing is started; ``down`` from here
+    names the owner). The stack's own settings stay the owner's."""
+    doc = json.dumps({"owner_home": str(owner), "gate_port": record.port_set.gate})
+    state._atomic_private(state.joined_path(home), doc.encode())  # 0600, atomic
+    click.echo(
+        f"joining the dev stack of KONTRA_HOME={owner} on 127.0.0.1:{record.port_set.gate} "
+        "(it is already up for your user)",
+        err=True,
+    )
+    if observability or persist is not None or (ui and not record.ui):
+        click.echo(
+            "note: --ui's Temporal UI, --observability and --persist are the stack's own: run "
+            f"them in KONTRA_HOME={owner}. This home's --ui starts only its own codec server.",
+            err=True,
+        )
+
+
+def _joined_owner(home: Path) -> Path | None:
+    """The home whose stack ``home`` joined (``dev/joined.json``, read as a private file), or
+    None when it joined none (or the record cannot be trusted)."""
+    from kontra.profile import ProfileError, _read_private
+
+    path = state.dev_dir(home) / "joined.json"
+    try:
+        doc: Any = json.loads(_read_private(path))
+    except (FileNotFoundError, ProfileError, ValueError):
+        return None
+    owner = doc.get("owner_home") if isinstance(doc, dict) else None
+    return Path(owner) if isinstance(owner, str) else None
 
 
 def _start_fresh(
     home: Path,
     ports: Ports,
-    overrides: dict[str, int | None],
     persist: bool,
     ui: bool,
     observability: bool,
@@ -653,24 +805,22 @@ def _start_fresh(
     handle: str | None,
     existing: Profile | None,
 ) -> None:
-    """Bind-check the ports, ensure the CLI, and start the host (detached, or in the
-    foreground). Joins a sibling home's stack if this user already runs one on the gate port."""
+    """Bind-check the ports this ``up`` will bind, ensure the CLI, and start the host
+    (detached, or in the foreground)."""
     from kontra.devgate import temporal_cli
 
-    for field in ("gate", "temporal", "ui", "codec"):
-        port = getattr(ports, field)
-        if state.port_taken(port):
-            owner = state.registry_owner(ports.gate) if field == "gate" else None
-            if field == "gate" and owner is not None and owner != home:
-                fail(
-                    f"127.0.0.1:{ports.gate} is another dev stack of yours (KONTRA_HOME={owner}); "
-                    "`kontra dev up` there, or `kontra dev down` there first"
-                )
-            holder = state.port_holder(port)
-            fail(
-                f"127.0.0.1:{port} is taken{f' ({holder})' if holder else ''}; "
-                f"free it or pass --{field.replace('_', '-')}-port"
-            )
+    _check_free(
+        ports,
+        (
+            "gate",
+            "temporal",
+            *(("ui", "codec") if ui else ()),
+            *(("temporal_metrics",) if observability else ()),
+        ),
+    )
+    if not persist:
+        # In memory: nothing of an earlier stack's Temporal db survives into this one.
+        shutil.rmtree(state.dev_dir(home) / "data", ignore_errors=True)
     cli = temporal_cli.ensure(say=lambda m: click.echo(m, err=True))
     if foreground:
         _run_foreground(
@@ -698,11 +848,11 @@ def _start_fresh(
     doc = _ready_doc(ports.gate, token)
     if doc is None:
         with _suppress_process_errors():
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            os.killpg(pid, signal.SIGKILL)
         fail("the dev gate did not answer its control token after starting")
     record = state.StackRecord(
         pid=pid,
-        pgid=os.getpgid(pid),
+        pgid=pid,  # it leads its own group (start_new_session)
         token=token,
         started_at=datetime.now(UTC).isoformat(),
         sdk_version=_sdk_version(),
@@ -912,13 +1062,12 @@ def down(reset: bool, volumes: bool) -> None:
     reset = reset or volumes
     home = kontra_home()
     _stop_codec(home)
-    joined = state.joined_path(home)
-    if joined.exists():
-        try:
-            owner = json.loads(joined.read_text(encoding="utf-8")).get("owner_home")
-        except (OSError, ValueError):
-            owner = None
-        fail(f"this home joined the stack of KONTRA_HOME={owner}; run `kontra dev down` there")
+    owner = _joined_owner(home)
+    if owner is not None:
+        theirs = state.read_stack_record(owner)
+        if theirs is not None and _ready_doc(theirs.port_set.gate, theirs.token) is not None:
+            fail(f"this home joined the stack of KONTRA_HOME={owner}; run `kontra dev down` there")
+        state.joined_path(home).unlink(missing_ok=True)  # that stack is gone: forget it
 
     with state.lock(home):
         record = state.read_stack_record(home)
@@ -930,7 +1079,7 @@ def down(reset: bool, volumes: bool) -> None:
             _cleanup_stack(record, persist=settings.persist and not reset, home=home)
         # Only touch Docker when a previous `up --observability` left a project (T1/OD11).
         if settings.observability:
-            _observability_down(state.resolve_ports(home))
+            _observability_down(state.resolve_ports(home), volumes=reset)
             settings.observability = False
             state.write_settings(settings, home)
         if reset:
@@ -958,11 +1107,13 @@ def status(as_json: bool) -> None:
     from kontra.profile import Profile, ProfileError, kontra_home
 
     home = kontra_home()
-    record = state.read_stack_record(home)
+    owner = _joined_owner(home)
+    joined = owner is not None
+    # A joined home shows the stack it joined (the owner's record holds its token).
+    record = state.read_stack_record(owner if owner is not None else home)
     doc = None if record is None else _ready_doc(record.port_set.gate, record.token)
     running = doc is not None
     stale = record is not None and not running
-    joined = state.joined_path(home).exists()
     codec = _codec_state(home)
     codec_view = (
         None
@@ -987,8 +1138,10 @@ def status(as_json: bool) -> None:
                 "running": running,
                 "stale": stale,
                 "joined": joined,
+                "owner_home": str(owner) if owner is not None else None,
                 "pid": record.pid if record else None,
                 "ports": record.ports if record else None,
+                "temporal_pid": doc.get("temporal_pid") if doc else None,
                 "temporal_http": doc.get("temporal_http") if doc else None,
                 "ui": doc.get("ui") if doc else None,
                 "metrics": doc.get("metrics") if doc else None,
@@ -999,6 +1152,8 @@ def status(as_json: bool) -> None:
             }
         )
         return
+    if owner is not None:
+        click.echo(f"this home joined the dev stack of KONTRA_HOME={owner}")
     if record is None:
         click.echo("kontra dev is not running (no stack recorded for this home)")
     elif stale:
