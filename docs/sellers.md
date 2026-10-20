@@ -1144,15 +1144,16 @@ and its pane shows that failure's message), and the page stops once the run has 
 timing, task queue and failure, its input, result and failure message decoded with this
 machine's key, and its links:
 
-- **Temporal UI**: the step's own event in the run's history (a child workflow's own run);
-- **Logs**: Grafana's Explore on Loki, the step's lines over its time range (a second either
+- **temporal ui**: the step's own event in the run's history (a child workflow's own run);
+- **loki**: Grafana's Explore on Loki, the step's lines over its time range (a second either
   side), `{service_name="kontra-worker"} | workflow_id="job-..." | run_id="..." |
   activity_type="..."`;
-- **Trace**: Explore on Tempo, the job's trace.
+- **tempo**: Explore on Tempo, the job's trace.
 
-The header has the same three for the whole run. Logs and Trace need `--observability` and a
-worker serving with `kontra serve --otlp http://127.0.0.1:4317`, which also writes the trace
-context the Trace link reads into the run's history. The Logs link selects `kontra-worker`,
+The header has the same three for the whole run (**Temporal UI**, **Grafana**, **Trace**). The
+Loki and Tempo links need `--observability` and a worker serving with `kontra serve --otlp
+http://127.0.0.1:4317`, which also writes the trace context the Tempo link reads into the run's
+history. The Loki link selects `kontra-worker`,
 or `OTEL_SERVICE_NAME` as `kontra dev up` saw it: give the worker the same one.
 
 The whole workflow, branches this run never takes included, is the graph `kontra serve` draws
@@ -1172,6 +1173,96 @@ nothing but its own script and loads nothing from elsewhere, and its data routes
 own origin alone. The codec server reads Temporal as you, with your dev login's worker token,
 from the first time the page asks (so it starts, and decodes for the UI, without Temporal);
 like the decoding, it runs for a dev profile only.
+
+### The agent session pane
+
+A run of an agent gets a second column on the same page, beside its graph: **SESSION**, the
+agent's turns as it ran them, above the **NODE** pane of the step you selected (on a narrow
+screen the session goes under the graph and the node pane under it). Each turn is a header
+(`── turn 1 · sweep(domains)`) over its rows, in the order the agent published them:
+
+```text
+▸ turn.started    input: 12 domains          +00:00
+○ model.call      gpt-4o                     +00:01
+○ model.response  "plan first"     820→36    +00:01
+▣ tool.call       plan                       +00:02
+▣ tool.result     plan 12 targets            +00:02
+◆ handoff         → cert-checker             +00:04
+  └ ○ model.call      gpt-4o
+  └ ▣ tool.call       fetch_cert ×12
+  └ ▸ response        {expired:1, weak:2}
+▢ approval.requested post_findings
+▸ response        {domains:12, targets:12, …}
+```
+
+A `tool.call` or `tool.result` row is the tool's activity on the graph: click it and its node is
+selected and flashes, with the node pane's links; click a node and its rows are highlighted. A
+bound handler's job (`serve(Agent.handler)`) draws its agent child as a box inside its node,
+with the agent's own steps (each tool's activity, the subagents it started) as real nodes in
+it. A row is linked by the `tool_id` the harness carries in each tool activity's input,
+decrypted with this machine's key; when an input is sealed to another key, by the tool's name
+and order, and the row says so. A `handoff` row is the subagent's child node, with the
+subagent's own rows nested under it, read from its own history (three subagents deep, sixteen
+in one view; past that the row links to the subagent's own page and says why). Any other row
+opens its event's body in the pane, decoded here.
+
+The footer counts the events and gives the last `seq`: an event's offset on the stream, the
+one counter it has, and the one the pane dedupes by. The rows and their short summaries come
+from the same snapshot as the graph, through the same header-gated route as a step's payloads;
+the live stream only says that something changed. An approval or a callback the agent waits
+on shows as its row, answered here by you as the seller (a hired turn ends the job on one: one
+hire is one turn).
+
+**Where the events come from.** An agent publishes its events into its workflow's in-memory
+stream; they are in history only once something reads it. A hired turn's wrapper reads its
+agent for the whole turn, so its session is always there. An agent you run as its own workflow
+shows "not in history yet" until a client of yours has read its `turn_events`.
+
+**The schema the console understands** is `temporal-agent-harness/0.6`: the harness's
+`AgentEvent` (`agent_id`, `turn_id`, `turn_number`, `message_id`, `timestamp`, and the typed
+`event`) on the `turn_events` topic, as `temporal-agent-harness==0.6.0` writes it. The
+dependency is the schema, not the package: any agent that publishes these events there -- the
+harness, a hand-rolled loop, a subprocess -- gets the pane. Every type maps to one row, or
+folds into one, or is counted without a row; a type the console does not know is a row of its
+own, with its raw type, never dropped:
+
+| `AgentEvent.event.type` | in the pane |
+|---|---|
+| `message_accepted` | the turn's header: its handler and input line |
+| `message_handler_start` | no row (counted) |
+| `message_handler_end` | `▸ response` |
+| `message_handler_error` | `▸ response` (failed) |
+| `turn_started` | `▸ turn.started` |
+| `turn_end` | closes the turn (its status) |
+| `model_interaction_started` | `○ model.call` |
+| `model_interaction_ended` | `○ model.response`, with its token usage |
+| `reply_delta` | its text folds into the next `model.response` |
+| `thought_summary` | folds into the next `model.response`, off its line |
+| `text_annotation` | folds into the next `model.response` (a citation, not text) |
+| `tool_requested` | `▣ tool.call` |
+| `tool_start` | folds into its `tool.call` (running) |
+| `tool_progress_delta` | folds into its `tool.call` |
+| `tool_end` | `▣ tool.result` |
+| `tool_error` | `▣ tool.result` (failed) |
+| `tool_approval_requested` | `▢ approval.requested` |
+| `tool_approval_resolved` | folds into its `approval.requested` (allowed or denied) |
+| `auto_approval_evaluation_ended` | folds into its `approval.requested` (the auto verdict) |
+| `auto_approval_evaluation_started` | no row (counted) |
+| `auto_approval_evaluation_superseded` | no row (counted) |
+| `auto_approval_evaluation_error` | no row (counted) |
+| `callback_requested` | `▢ callback.requested` |
+| `callback_resolved` | folds into its `callback.requested` (ok, error or timeout) |
+| `subagent_started` | `◆ handoff` |
+| `subagent_message_sent` | nested under its `handoff`, until the subagent's own rows are read |
+| `subagent_reply_received` | `▸ response`, nested likewise |
+| `subagent_stopped` | closes its `handoff` |
+| `subagent_stream_unavailable` | a note under its `handoff` |
+| `state_snapshot` | no row (counted) |
+| `state_patch` | no row (counted) |
+
+A summary is at most 120 characters, never a whole body; a stream item over 256 KiB is a row
+that says it is too large; past 5000 rows or 4 MiB of summaries, one row says how many more
+there are.
 
 ## Publishing and serving
 

@@ -2973,3 +2973,78 @@ command #42's (merged as #46).
      spawn and the file is untouched; with `workflows.py` edited to call no activity (types,
      contract and hash kept, nothing republished) it draws again, without the `greet` step;
      with `models.py` changed and republished it draws again; `down`.
+
+## I36. The dev console's agent session pane is read from history, beside the graph (kontra-sdk#54; decision 8 of #50)
+
+1. **The problem.** One dev console (#50/8): the graph page (I28) gains a pane that renders an
+   agent run -- turns, model calls, tool calls and results, approvals, callbacks, the subagent
+   tree -- from the agent's own `AgentEvent` stream, beside the graph and linked to it. The
+   harness owns no UI; it writes a typed stream (`turn_events`) into a `WorkflowStream`, and an
+   event never becomes a history event of its own.
+
+2. **The source is history, like the graph.** Items reach history only as the results of
+   stream-poll Updates (`__temporal_workflow_stream_poll`, I31), so the pane is derived from those
+   poll outcomes, decoded with this machine's codec through `kontra.codec` alone: the whole age
+   `PollResult` on an agent child, the `binary/kontra-stream` envelope on a job root -- one path.
+   The agent of a viewed run is (case **a**) a `kontra.turn.v1` job's child
+   `names.agent_workflow_id(job_id)`, constructed and read only when the job's own history says
+   it started that child, whose turn activity polls it for the whole turn; else (case **b**) the
+   run itself. A case-b run nobody polled has its events in its in-memory log alone: the pane says
+   so (**OD1: opt-in** -- a one-shot dev-party poll from offset 0, `[Pull once]`, offered in that
+   empty state alone, lands with the approvals, item 7). A job root's stream items are in the
+   bucket by reference (I39), which the console, holding no gate session, does not fetch: its
+   pane says that. No harness import (`kontra/cli/_agent.py`
+   reads, `kontra/cli/_session.py` renders, pure), no second server or connection.
+
+3. **One fetch for both panes (OD2).** `/api/graph/events` is renamed `/api/events` and carries
+   `session-stat` frames alone: `{history_length, count, last_offset, status, turn, rev}`, a change
+   signal with no payload and no summary, sent when the snapshot would show differently (`rev`
+   moves). On each, the page makes one `X-Kontra-Console` fetch of `/api/session`, which answers
+   `{graph, session}` from the same snapshot (kept while nothing it read changed: the run's change
+   key, plus the history length of each open agent child or subagent it read, which grow while
+   the run's does not). The graph the SSE used to carry moved behind that fetch; the tests that
+   read it read it there. Verbatim bodies stay on `/api/io` (`event=<offset>` for one event).
+
+4. **The vocabulary is pinned (OD8).** The harness's wire shape and the 31 `AgentEventType`s
+   live once, in `kontra/serve/_agent_events.py`, shared by `turn.py` and the console; one test
+   checks every constant against the installed harness (`temporal-agent-harness==0.6.0`, the dev
+   group's pin), and fails if the harness has a type the table does not map. The console
+   advertises `AGENT_EVENTS_SCHEMA = "temporal-agent-harness/0.6"`; `docs/sellers.md` documents the
+   table (type → row, fold or counted) as the schema it understands, provider-agnostic. An unknown
+   type is a generic row with its raw type, never dropped. The wireframe's eight labels and glyphs
+   (`▸ turn.started`, `○ model.call`, `○ model.response`, `▣ tool.call`, `▣ tool.result`,
+   `◆ handoff`, `▢ approval.requested`, `▸ response`) plus one, **OD6**: `▢ callback.requested`,
+   its own row (it returns a value, not a yes or no). "seq" is the stream offset, the one
+   monotonic counter an item has; dedupe is by offset. Every fixture is an event the installed
+   harness's own model reads back unchanged.
+
+5. **Linking is structural (OD4).** A turn job's agent child is drawn as a nested subgraph:
+   `graph.parse(children=…, nested={child_id: pending})` adds the child's own nodes (`parent`,
+   `within`, ids `graph.nested_id` builds) and edges (`parent`), and `graph.parse_indexed` names
+   the node each command event became; without `nested`, every output is what it was (the goldens
+   pass unchanged). A tool row links to the activity that ran that call, exactly, by the `tool_id`
+   the harness carries in each tool activity's input (`AgentToolContext`), decrypted and kept per
+   event; when an input is sealed to another key, the k-th call of a name to the k-th unclaimed
+   activity of that name, marked as a fallback in the row's title. Rows carry the node and the
+   activity's scheduled event id; a row selects and flashes its node, a node lights its rows.
+
+6. **Subagents nest inline (OD5, changed from the design: the wireframe nests them).** A
+   `handoff` row is the subagent's child node, its own rows nested under it, read with the
+   console's history fetches from the subagent's own history -- the workflow id the event names,
+   whole and opaque, and only one the agent's history says it started (never parsed). Bounded:
+   three deep, sixteen subagent histories per snapshot, the row and byte caps; past a bound the
+   row links out (`?w=<that id>`) and says why. **OD3**: a batch child's `pages= · n/N` is read
+   from its own history (its item activity's completions of its schedulings).
+
+7. **Approvals and callbacks (OD7).** No live Allow/Deny on a `kontra.turn.v1` job: its wrapper
+   ends the turn on an approval or a callback (one hire is one turn; sessions are #60), so its row
+   is informational and says so. Live controls, dev-only Updates to the agent workflow behind the
+   full set of protections `docs/security.md` lists, and replay (client-side, from seq 0 at 10×,
+   never re-sending) are the second half of #54.
+
+8. **Bounds.** A summary is at most 120 characters; an item over 256 KiB (#52's inline cap) is a
+   row that says so; past 5000 rows or 4 MiB of summaries, one row says how many more there are.
+
+9. **No browser in `make check` (OD9).** The lifecycle test (`tests/cli/test_session_lifecycle.py`,
+   `ReconHarnessAgent` in `tests/serve/recon_harness.py`, a scripted model and a real subagent,
+   no LLM) checks behaviour over HTTP; PR screenshots are scratch tooling, and no extra is added.

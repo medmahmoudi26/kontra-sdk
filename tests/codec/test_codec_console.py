@@ -1,8 +1,10 @@
 """The marker-string scan, extended to the graph page of ``kontra dev up --ui`` (seam ⑤,
-decisions I28): the page, ``/api/graph``, ``/api/workflows`` and the live stream carry no
-input, result, failure message or heartbeat -- not the marker, in any case, nor any
-payload's ciphertext or its base64 -- and ``/api/io`` is the one route that answers payload
-content, decoded with this machine's key, only to the page's own requests.
+decisions I28, I36): the page, ``/api/graph``, ``/api/workflows``, ``/api/session`` and the
+live stream (``/api/events``, change signals alone) carry no input, result, failure message or
+heartbeat -- not the marker, in any case, nor any payload's ciphertext or its base64 -- and
+``/api/io`` is the one route that answers payload content, decoded with this machine's key,
+only to the page's own requests. (An agent's session, whose rows carry short summaries, is
+scanned in ``tests/cli/test_session_lifecycle.py``.)
 
 A seller's worker (Kontra's payload codec, this machine's key, Kontra's sandbox and the batch
 child ``serve()`` registers) runs on a real dev server a workflow whose input carries the
@@ -199,9 +201,7 @@ async def test_the_graph_page_shows_payloads_through_its_io_route_alone(
             LeakFlow.run, f"input {MARKER}", id=wf, task_queue=queue
         )
         run = handle.result_run_id or ""
-        stream = asyncio.create_task(
-            asyncio.to_thread(_stream, server, f"/api/graph/events?w={wf}")
-        )
+        stream = asyncio.create_task(asyncio.to_thread(_stream, server, f"/api/events?w={wf}"))
         # While it runs: the graph, and the heartbeat as DescribeWorkflowExecution holds it.
         polls = 0
         while not stream.done():
@@ -283,6 +283,13 @@ async def test_the_graph_page_shows_payloads_through_its_io_route_alone(
     assert all(f"input {MARKER} {i}" in json.dumps(batch_io["input"]) for i in range(3))
     refused_io = _get(server, f"/api/io?w={refused}&node=", **page_req).json()
     assert refused_io["failure"]["message"] == f"refused refuse {MARKER}"
+    # /api/session: the same graph, and LeakFlow's session -- no agent, so no rows (OD2).
+    sess = _get(server, f"/api/session?w={wf}&r={run}", **page_req)
+    assert sess.status_code == 200, sess.text
+    assert sess.json()["graph"] == final
+    assert (sess.json()["session"]["empty"], sess.json()["session"]["reason"]) == (True, "no-agent")
+    _assert_clean("/api/session", sess.text, sealed)
+    assert _get(server, f"/api/io?w={wf}&r={run}&event=0", **page_req).status_code == 404
     same_origin = _get(
         server,
         io,
@@ -305,9 +312,10 @@ async def test_the_graph_page_shows_payloads_through_its_io_route_alone(
         "a same-site fetch": {**page_req, "Sec-Fetch-Site": "same-site"},
     }
     for why, headers in refusals.items():
-        r = _get(server, io, **headers)
-        assert r.status_code == 403, why
-        _assert_clean(why, r.text, sealed)
+        for route in (io, f"/api/session?w={wf}&r={run}", f"/api/io?w={wf}&event=0"):
+            r = _get(server, route, **headers)
+            assert r.status_code == 403, (route, why)
+            _assert_clean(why, r.text, sealed)
     for origin in (UI, f"http://127.0.0.1:{server.port}", "https://evil.example"):
         pre = _preflight(server, io, origin)
         assert pre.status_code == 403, origin

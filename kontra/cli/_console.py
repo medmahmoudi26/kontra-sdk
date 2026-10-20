@@ -13,19 +13,26 @@ on the same port and behind the same ``Host`` check.
                                ``static_graph: false`` when there is none, and
                                ``handler: true`` when the run is a handler offering's (its
                                job, ``kontra.turn.v1``, or the agent that job started), which
-                               has none
-``GET /api/graph/events?...``  the same graph as server-sent events (``event: graph``) each
-                               time ``DescribeWorkflowExecution`` says the run changed, about
-                               once a second, then ``event: end`` once it closed; at most
-                               :data:`MAX_STREAMS` at once
+                               has none. A ``kontra.turn.v1`` job's agent child is drawn
+                               nested, its tool activities real nodes (I36)
+``GET /api/session?w=&r=``     ``{"graph", "session"}`` from one snapshot: that graph and the
+                               run's agent session (:mod:`kontra.cli._session`), rows and
+                               short summaries; only with ``X-Kontra-Console: 1``
+``GET /api/events?w=&r=``      server-sent ``event: session-stat`` frames, a change signal and
+                               nothing else (``history_length``, ``count``, ``last_offset``,
+                               ``status``, ``turn``, ``rev``), each time the snapshot changed,
+                               about once a second, then ``event: end`` once the run closed; at
+                               most :data:`MAX_STREAMS` at once. The page fetches
+                               ``/api/session`` on each (OD2)
 ``GET /api/io?w=&r=&node=``    a node's (``node=`` empty: the workflow's) input, result and
                                failure, decoded here; only with ``X-Kontra-Console: 1``
+``GET /api/io?w=&r=&event=``   one agent event's verbatim body, by its stream offset; the same
 =============================  ==============================================================
 
 The page is served to the console's own origin alone (``http://127.0.0.1:P`` and
 ``http://localhost:P``), with a policy that runs nothing but its own nonce'd script and style.
-Every answer is ``no-store`` and ``nosniff``. Payloads reach the page through ``/api/io``
-alone (seam ⑤): :func:`kontra.graph.parse` emits none, so the graph routes carry no input,
+Every answer is ``no-store`` and ``nosniff``. Payloads reach the page through the
+header-gated routes alone (seam ⑤), verbatim through ``/api/io`` alone: :func:`kontra.graph.parse` emits none, so the graph routes carry no input,
 result, failure message or heartbeat, encrypted or not; ``/api/io`` decodes the node asked
 for in this process, with this machine's codec, and shows what it cannot open as a
 placeholder -- ``{"encrypted": true}`` for a payload encrypted to other keys,
@@ -70,7 +77,9 @@ from temporalio.converter import PayloadCodec
 from temporalio.service import RPCError
 
 from kontra import graph
+from kontra.cli import _agent, _session
 from kontra.codec import CLAIM_CHECK_ENCODING, ENCODING, CodecError, KontraCodec
+from kontra.serve import _agent_events as ae
 
 if TYPE_CHECKING:
     from temporalio.client import Client, WorkflowExecutionDescription
@@ -93,9 +102,11 @@ __all__ = [
 ]
 
 PAGE_ROUTE = "/graph"
-API_ROUTES = frozenset({"/api/workflows", "/api/graph", "/api/graph/events", "/api/io"})
+#: ``/api/events`` was ``/api/graph/events`` (I28); the graph is ``/api/session``'s now (OD2).
+API_ROUTES = frozenset({"/api/workflows", "/api/graph", "/api/session", "/api/events", "/api/io"})
 ROUTES = frozenset({PAGE_ROUTE, *API_ROUTES})
-#: What ``/api/io`` requires: a header no cross-origin page sends without a preflight.
+#: What ``/api/io`` and ``/api/session`` require: a header no cross-origin page sends without
+#: a preflight.
 IO_HEADER = "X-Kontra-Console"
 #: Server-sent event streams open at once; one more is refused (503).
 MAX_STREAMS = 16
@@ -126,6 +137,8 @@ _RETRY_MS = 3000
 #: Batch children whose histories one graph reads, and closed ones remembered.
 _CHILDREN_MAX = 64
 _CHILD_CACHE = 256
+#: Snapshots kept for ``/api/session`` to reuse the stream's (one fetch for both panes).
+_SNAPSHOTS = 64
 #: Temporal's default limit for a workflow id, and a node id is a name of one.
 _ID_MAX = 1000
 _RUN_ID = re.compile(r"[0-9A-Fa-f-]{1,64}", re.ASCII)
@@ -223,6 +236,25 @@ class _Snapshot:
     #: ``DescribeWorkflowExecution``'s pending activities: a retrying activity's last
     #: failure is there alone until it closes.
     pending: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+    #: The run's agent session (:mod:`kontra.cli._session`), from the same reads.
+    session: dict[str, Any] = field(default_factory=dict[str, Any])
+    #: A child drawn nested, by its node id: its history and pending activities, which
+    #: ``/api/io`` reads that child's nodes' payloads from.
+    nested: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = field(
+        default_factory=dict[str, tuple[dict[str, Any], list[dict[str, Any]]]]
+    )
+    #: The agent's decoded events, by offset (``/api/io?event=``).
+    items: dict[int, dict[str, Any]] = field(default_factory=dict[int, dict[str, Any]])
+    #: Events in every history this snapshot read.
+    history_length: int = 0
+    #: The static graph it was painted on (a file ``kontra serve`` redraws at will).
+    static: graph.Graph | None = None
+
+
+#: A snapshot's key: the run's :func:`_change_key`, and each open workflow it read besides
+#: (the agent child, a subagent) with its history's length -- those grow while the run's
+#: history does not.
+_Key = tuple[tuple[Any, ...], tuple[tuple[str, str, int], ...]]
 
 
 def _unnamed_batch(live: graph.Graph) -> bool:
@@ -369,6 +401,9 @@ class Console:
         self._connecting: asyncio.Lock | None = None
         self._children: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
         self._turns: OrderedDict[tuple[str, str], bool] = OrderedDict()
+        #: What the session pane reads of a run's agent (decisions I36), with this codec.
+        self._reader = _agent.Reader(lambda: self._codec())
+        self._snapshots: OrderedDict[tuple[str, str], _Snapshot] = OrderedDict()
 
     # ------------------------------------------------------------------ the loop
 
@@ -487,6 +522,9 @@ class Console:
         run_id: str | None,
         desc: WorkflowExecutionDescription | None = None,
     ) -> _Snapshot:
+        """The run's graph and its agent session, from one read of each history they need
+        (the run's, its batch children's, its agent's and its subagents'). Kept for
+        ``/api/session`` to reuse while nothing it read changed."""
         from kontra._graphs import load_static
 
         temporal = await self._client()
@@ -497,35 +535,145 @@ class Console:
         handle = client.get_workflow_handle(desc.id, run_id=run_id)
         history = (await handle.fetch_history()).to_json_dict()
         pending = [json_format.MessageToDict(p) for p in desc.raw_description.pending_activities]
-        live = graph.parse(
+        children = await self._child_histories(client, history)
+        agent = await self._reader.agent_of(client, desc, history)
+        watched: list[tuple[str, str, int]] = []
+        nested: dict[str, Any] | None = None
+        read = len(history.get("events") or [])
+        if agent.case == "a" and agent.started:
+            # The agent child is drawn inside its node, its tool activities real nodes a
+            # row links to (OD4); its own batch children are named as the run's are.
+            children = {
+                **children,
+                **await self._child_histories(client, agent.history),
+                agent.workflow_id: agent.history,
+            }
+            nested = {agent.workflow_id: {"pendingActivities": agent.pending}}
+            read += len(agent.history.get("events") or [])
+            if agent.open and agent.run_id is not None:
+                watched.append(
+                    (agent.workflow_id, agent.run_id, len(agent.history.get("events") or []))
+                )
+        live, index = graph.parse_indexed(
             history,
             workflow_id=desc.id,
             run_id=run_id,
             pending={"pendingActivities": pending},
-            children=await self._child_histories(client, history),
+            children=children,
+            nested=nested,
         )
         # The cache stores the task queue it was saved for; the file name is only its hash.
         static = load_static(self.home, desc.task_queue)
         painted = graph.merge(static, live) if static is not None else live
         painted["static_graph"] = static is not None
         painted["handler"] = static is None and await self._handler_run(client, desc)
-        return _Snapshot(
+        _agent.batch_progress(painted, children)
+        subagents: list[tuple[str, str, int]] = []
+        session, items = await self._session_of(client, desc, agent, index, subagents)
+        hosts = {n["parent"] for n in live["nodes"] if isinstance(n.get("parent"), str)}
+        snap = _Snapshot(
             graph=graph.links(painted, self._links(temporal.namespace)),
             history=history,
-            key=_change_key(desc),
+            key=(_change_key(desc), (*watched, *subagents)),
             closed=not _is_open(desc),
             unnamed=_unnamed_batch(live),
             pending=pending,
+            session=session,
+            nested={host: (agent.history, agent.pending) for host in hosts},
+            items=dict(items),
+            history_length=read + sum(n for _, _, n in subagents),
+            static=static,
         )
+        self._snapshots[(desc.id, run_id)] = snap
+        self._snapshots.move_to_end((desc.id, run_id))
+        while len(self._snapshots) > _SNAPSHOTS:
+            self._snapshots.popitem(last=False)
+        return snap
 
-    async def _changed(
-        self, workflow_id: str, run_id: str, last: tuple[Any, ...] | None
-    ) -> _Snapshot | None:
+    async def _session_of(
+        self,
+        client: Client,
+        desc: WorkflowExecutionDescription,
+        agent: _agent.AgentRun,
+        index: Mapping[graph.CommandAt, str],
+        watched: list[tuple[str, str, int]],
+    ) -> tuple[dict[str, Any], list[tuple[int, dict[str, Any]]]]:
+        """The run's agent session (:mod:`kontra.cli._session`), or an empty one saying why:
+        no agent, no events yet, or events in no history event (a case-``b`` run nobody
+        polled; OD1). An open subagent it read is added to ``watched``."""
+        meta: dict[str, Any] = {
+            "workflow_id": agent.workflow_id,
+            "run_id": agent.run_id,
+            "type": agent.desc.workflow_type if agent.desc is not None else None,
+            "name": None,
+            "offering": desc.task_queue,
+            "task_queue": desc.task_queue,
+            "status": agent.status if agent.started else "pending",
+            "case": agent.case,
+            # Approvals and callbacks are the seller's to answer here: the page shows their
+            # rows read-only and says so (OD7).
+            "interactive": False,
+        }
+        if not agent.started:
+            return _empty(meta, "no-events"), []
+        items = await self._reader.items(agent.workflow_id, agent.run_id, agent.history)
+        if not items:
+            polled = bool(_session.stream_poll_outcomes(agent.history))
+            if self._reader.in_bucket(agent.history):
+                return _empty(meta, "in-bucket"), []
+            if agent.case == "b" and not polled:
+                is_agent = _session.has_update(agent.history, ae.SEND_AGENT_MESSAGE_UPDATE)
+                return _empty(meta, "not-in-history" if is_agent else "no-agent"), []
+            return _empty(meta, "no-events"), []
+        nodes = await self._reader.tool_links(agent, items, index)
+        handoffs, subagents = await self._reader.subagents(
+            client, agent, items, index, watched=watched
+        )
+        session = _session.build(
+            items, agent=meta, nodes=nodes, handoffs=handoffs, subagents=subagents
+        )
+        handler = next((t["handler"] for t in session["turns"] if t["handler"]), None)
+        if handler and meta["type"]:
+            session["agent"]["name"] = f"{meta['type']}.{handler}"
+        session["empty"] = False
+        return session, items
+
+    async def _same(self, client: Client, desc: WorkflowExecutionDescription, key: _Key) -> bool:
+        """Whether nothing a snapshot of ``key`` read has changed: the run (its
+        :func:`_change_key`), and each open workflow it read besides (its history's length)."""
+        if _change_key(desc) != key[0]:
+            return False
+        for workflow_id, run_id, length in key[1]:
+            seen = await client.get_workflow_handle(workflow_id, run_id=run_id).describe()
+            if seen.raw_description.workflow_execution_info.history_length != length:
+                return False
+        return True
+
+    async def _changed(self, workflow_id: str, run_id: str, last: _Key | None) -> _Snapshot | None:
         """The run's snapshot if it changed since ``last`` (None: in any case)."""
         temporal = await self._client()
         desc = await temporal.client.get_workflow_handle(workflow_id, run_id=run_id).describe()
-        if _change_key(desc) == last:
+        if last is not None and await self._same(temporal.client, desc, last):
             return None
+        return await self._snapshot(workflow_id, run_id, desc)
+
+    async def _view(self, workflow_id: str, run_id: str | None) -> _Snapshot:
+        """The run's snapshot: the one a stream (or an earlier request) built while nothing it
+        read has changed since -- so the page's ``/api/session`` after a ``session-stat``
+        reads nothing again -- else a fresh one."""
+        from kontra._graphs import load_static
+
+        temporal = await self._client()
+        desc = await temporal.client.get_workflow_handle(workflow_id, run_id=run_id).describe()
+        cached = self._snapshots.get((desc.id, desc.run_id))
+        if (
+            cached is not None
+            and not cached.unnamed
+            and cached.static == load_static(self.home, desc.task_queue)
+            and await self._same(temporal.client, desc, cached.key)
+        ):
+            self._snapshots.move_to_end((desc.id, desc.run_id))
+            return cached
         return await self._snapshot(workflow_id, run_id, desc)
 
     async def _workflows(self) -> list[dict[str, Any]]:
@@ -548,19 +696,32 @@ class Console:
         return found
 
     async def _io(self, workflow_id: str, run_id: str | None, node: str) -> dict[str, Any]:
-        snap = await self._snapshot(workflow_id, run_id)
+        snap = await self._view(workflow_id, run_id)
+        history, pending = snap.history, snap.pending
         if node:
             nodes = [n for n in snap.graph.get("nodes") or [] if n.get("id") == node]
             if not nodes:
                 raise ConsoleError(HTTPStatus.NOT_FOUND, "no such node in this run's graph")
+            parent = nodes[0].get("parent")
+            if isinstance(parent, str) and parent in snap.nested:
+                # A node of the agent child drawn nested: its event is in the child's history.
+                history, pending = snap.nested[parent]
             # That node's payloads alone: no other node's, nor the workflow's.
             asked = {**snap.graph, "nodes": nodes, "workflow": None}
         else:
             asked = {**snap.graph, "nodes": []}
         out = await graph.with_io(
-            asked, snap.history, _Shown(self._codec()), pending={"pendingActivities": snap.pending}
+            asked, history, _Shown(self._codec()), pending={"pendingActivities": pending}
         )
         return dict(out["nodes"][0]["io"] if node else out["workflow"]["io"])
+
+    async def _io_event(self, workflow_id: str, run_id: str | None, offset: int) -> dict[str, Any]:
+        """One agent event's verbatim body, kept off ``/api/session`` (seam ⑤)."""
+        snap = await self._view(workflow_id, run_id)
+        event = snap.items.get(offset)
+        if event is None:
+            raise ConsoleError(HTTPStatus.NOT_FOUND, "no agent event at that offset")
+        return {"offset": offset, "body": event.get(ae.EVENT)}
 
     # ------------------------------------------------------------------ the routes
 
@@ -573,26 +734,37 @@ class Console:
         return self._run(self._workflows())
 
     def graph(self, workflow_id: str, run_id: str | None) -> graph.Graph:
-        return self._run(self._snapshot(workflow_id, run_id)).graph
+        return self._run(self._view(workflow_id, run_id)).graph
+
+    def session(self, workflow_id: str, run_id: str | None) -> dict[str, Any]:
+        """``{"graph", "session"}``: both panes from one snapshot (OD2)."""
+        snap = self._run(self._view(workflow_id, run_id))
+        return {"graph": snap.graph, "session": snap.session}
 
     def io(self, workflow_id: str, run_id: str | None, node: str) -> dict[str, Any]:
         return self._run(self._io(workflow_id, run_id, node))
 
+    def io_event(self, workflow_id: str, run_id: str | None, offset: int) -> dict[str, Any]:
+        return self._run(self._io_event(workflow_id, run_id, offset))
+
     def stream(self, workflow_id: str, run_id: str | None) -> Iterator[bytes]:
-        """The frames of ``/api/graph/events``: the run's graph (computed before anything
-        is sent, so an error is still an answer of its own), again each time the run
-        changes, a keepalive comment when nothing did for :data:`_KEEPALIVE` seconds, and
-        ``end`` after a closed run's graph. An error midway ends the stream (EventSource
+        """The frames of ``/api/events`` (OD2): a ``session-stat`` -- a change signal, no
+        payload and no summary, so the page's one ``X-Kontra-Console`` fetch of
+        ``/api/session`` is where content reaches it -- for the run's snapshot (computed
+        before anything is sent, so an error is still an answer of its own), again each time
+        it changes, a keepalive comment when nothing did for :data:`_KEEPALIVE` seconds, and
+        ``end`` after a closed run's. An error midway ends the stream (EventSource
         reconnects).
 
         A batch child is named from its own history (its input is encrypted), which names
         nothing until the child schedules its first activity, and then grows while the
-        run's does not: while one is unnamed, the graph is read again at every poll, and
-        sent when it differs."""
+        run's does not: while one is unnamed, the snapshot is read again at every poll, and
+        signalled when it differs. An agent child's or a subagent's growth is in the
+        snapshot's key."""
         snap = self._run(self._snapshot(workflow_id, run_id))
         run_id = str(snap.graph["workflow"]["run_id"])
-        sent = _event("graph", snap.graph)
-        yield f"retry: {_RETRY_MS}\n\n".encode() + sent
+        rev, sent = 0, _shown(snap)
+        yield f"retry: {_RETRY_MS}\n\n".encode() + _event("session-stat", _stat(snap, rev))
         last, beat, closed, unnamed = snap.key, time.monotonic(), snap.closed, snap.unnamed
         while not closed:
             if self._closing.wait(_POLL):
@@ -600,15 +772,45 @@ class Console:
             fresh = self._run(self._changed(workflow_id, run_id, None if unnamed else last))
             if fresh is not None:
                 last, closed, unnamed = fresh.key, fresh.closed, fresh.unnamed
-                frame = _event("graph", fresh.graph)
-                if frame != sent:
-                    sent, beat = frame, time.monotonic()
-                    yield frame
+                shown = _shown(fresh)
+                if shown != sent:
+                    rev, sent, beat = rev + 1, shown, time.monotonic()
+                    yield _event("session-stat", _stat(fresh, rev))
                     continue
             if time.monotonic() - beat >= _KEEPALIVE:
                 beat = time.monotonic()
                 yield b": keepalive\n\n"
         yield _event("end", {})
+
+
+def _shown(snap: _Snapshot) -> bytes:
+    """What the page would be shown of ``snap``: a stat is sent when this differs."""
+    return _dumps({"graph": snap.graph, "session": snap.session})
+
+
+def _stat(snap: _Snapshot, rev: int) -> dict[str, Any]:
+    """A ``session-stat`` frame (OD2): how much there is, never what -- the events in the
+    histories read, the stream's event count and last offset, the run's status, the last
+    turn's number, and ``rev``, which moves each time the snapshot does."""
+    footer = snap.session.get("footer") or {}
+    turns = snap.session.get("turns") or []
+    return {
+        "history_length": snap.history_length,
+        "count": footer.get("count", 0),
+        "last_offset": footer.get("last_offset"),
+        "status": (snap.graph.get("workflow") or {}).get("status"),
+        "turn": turns[-1].get("turn_number") if turns else None,
+        "rev": rev,
+    }
+
+
+def _empty(agent: dict[str, Any], reason: str) -> dict[str, Any]:
+    """A session with no rows, and why: ``no-agent`` (the run is no agent), ``no-events``
+    (none yet), ``not-in-history`` (a run nobody polled: its events are in its in-memory log
+    alone), ``in-bucket`` (a job root's stream: its items are in the bucket, I39)."""
+    session = _session.build([], agent=agent)
+    session.update(empty=True, reason=reason)
+    return session
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -673,6 +875,17 @@ def _run_args(query: Mapping[str, str]) -> tuple[str, str | None]:
     return workflow_id, run_id
 
 
+#: A stream offset: a small non-negative integer, nothing else.
+_OFFSET = re.compile(r"0|[1-9][0-9]{0,17}", re.ASCII)
+
+
+def _offset(query: Mapping[str, str]) -> int:
+    given = query.get("event", "")
+    if _OFFSET.fullmatch(given) is None:
+        raise ConsoleError(HTTPStatus.BAD_REQUEST, "event is a stream offset")
+    return int(given)
+
+
 def handle(handler: BaseHTTPRequestHandler, console: Console, path: str, query: str) -> None:
     """Answer ``GET path?query`` for one of :data:`ROUTES`; the codec server has checked the
     ``Host`` and that an ``Origin``, if any, is the console's own."""
@@ -698,13 +911,19 @@ def handle(handler: BaseHTTPRequestHandler, console: Console, path: str, query: 
             _json(handler, HTTPStatus.OK, console.workflows())
         elif path == "/api/graph":
             _json(handler, HTTPStatus.OK, console.graph(*_run_args(args)))
-        elif path == "/api/io":
+        elif path in ("/api/session", "/api/io"):
+            # Structure and summaries, or verbatim bodies: behind the header either way.
             if handler.headers.get(IO_HEADER) != "1":
                 raise ConsoleError(HTTPStatus.FORBIDDEN, f"{IO_HEADER}: 1 is required")
-            if len(node := args.get("node", "")) > _ID_MAX:
-                raise ConsoleError(HTTPStatus.BAD_REQUEST, "node is a node id")
-            _json(handler, HTTPStatus.OK, console.io(*_run_args(args), node))
-        else:
+            if path == "/api/session":
+                _json(handler, HTTPStatus.OK, console.session(*_run_args(args)))
+            elif "event" in args:
+                _json(handler, HTTPStatus.OK, console.io_event(*_run_args(args), _offset(args)))
+            else:
+                if len(node := args.get("node", "")) > _ID_MAX:
+                    raise ConsoleError(HTTPStatus.BAD_REQUEST, "node is a node id")
+                _json(handler, HTTPStatus.OK, console.io(*_run_args(args), node))
+        else:  # /api/events
             _events(handler, console, *_run_args(args))
     except (BrokenPipeError, ConnectionResetError):
         return
@@ -737,6 +956,6 @@ def _events(
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception as e:  # midway: the stream ends, and EventSource tries again
-            _log(f"/api/graph/events: {_said(e)}")
+            _log(f"/api/events: {_said(e)}")
     finally:
         console.streams.release()

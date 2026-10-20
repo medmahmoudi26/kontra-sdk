@@ -1,6 +1,8 @@
-"""The graph page's routes in the dev codec server (``kontra dev up --ui``; decisions I28):
-the page and its policy, the run's graph painted on the static graph ``kontra serve`` drew
-for its task queue (I35), what the page says without one, the links, the live stream, the list of runs, and how each route refuses. On a
+"""The graph page's routes in the dev codec server (``kontra dev up --ui``; decisions I28,
+I36): the page and its policy, the run's graph painted on the static graph ``kontra serve``
+drew for its task queue (I35), what the page says without one, the links, the live stream of
+change signals and the one fetch each sends the page to, the list of runs, and how each route
+refuses. On a
 real dev server, the codec server on a thread; the seam ⑤ scan of the same routes is
 ``tests/codec/test_codec_console.py``."""
 
@@ -123,6 +125,29 @@ def _events(raw: bytes) -> list[tuple[str, Any]]:
     return out
 
 
+def _watch(srv: CodecServer, w: str) -> tuple[list[tuple[str, Any]], list[dict[str, Any]]]:
+    """What the page does: the event stream, and for each ``session-stat`` the one
+    ``/api/session`` fetch it sends the page to. The frames, and the graphs fetched."""
+    frames: list[tuple[str, Any]] = []
+    graphs: list[dict[str, Any]] = []
+    buf = b""
+    with (
+        httpx.Client(trust_env=False, timeout=120) as http,
+        http.stream("GET", f"http://127.0.0.1:{srv.port}/api/events?w={w}") as r,
+    ):
+        assert r.status_code == 200, r.read()
+        for chunk in r.iter_bytes():
+            buf += chunk
+            *done, buf = buf.split(b"\n\n")
+            for name, data in _events(b"\n\n".join(done) + b"\n\n"):
+                frames.append((name, data))
+                if name == "session-stat":
+                    got = _get(srv, f"/api/session?w={w}", **{"X-Kontra-Console": "1"})
+                    assert got.status_code == 200, got.text
+                    graphs.append(got.json()["graph"])
+    return frames, graphs
+
+
 def _stream(srv: CodecServer, path: str, opened: threading.Event | None = None) -> bytes:
     """The whole event stream (it ends after the closed run's graph); ``opened`` is set
     once it answered."""
@@ -195,8 +220,8 @@ def test_the_page_needs_nothing_its_policy_refuses() -> None:
     assert not re.search(r"https?://", markup)  # no external resource
     for route in (
         "/api/workflows",
-        "/api/graph",
-        "/api/graph/events",
+        "/api/session",
+        "/api/events",
         "/api/io",
         "X-Kontra-Console",
     ):
@@ -364,17 +389,28 @@ async def test_the_stream_shows_a_retry_before_history_does_then_ends(
     serve: Serve, worker: tuple[Client, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``flaky`` fails twice, a second each, then succeeds: DescribeWorkflowExecution says
-    its attempt while it runs, which history says only once it closes."""
+    its attempt while it runs, which history says only once it closes. The stream says that
+    something changed (``session-stat``, a change signal alone, OD2); the page's
+    ``/api/session`` after each is what shows it."""
     monkeypatch.setattr(console_module, "_POLL", 0.2)
     client, queue = worker
     srv = serve()
     wf = f"console-{uuid.uuid4().hex}"
     handle = await client.start_workflow(RetryFlow.run, "hi", id=wf, task_queue=queue)
-    raw = await asyncio.to_thread(_stream, srv, f"/api/graph/events?w={wf}")
+    raw = await asyncio.to_thread(_stream, srv, f"/api/events?w={wf}")
     assert raw.startswith(b"retry: 3000\n\n")
-    events = _events(raw)
-    assert [name for name, _ in events][-2:] == ["graph", "end"]
-    graphs = [g for name, g in events if name == "graph"]
+    frames = _events(raw)
+    assert [name for name, _ in frames][-2:] == ["session-stat", "end"]
+    assert {name for name, _ in frames} == {"session-stat", "end"}  # never a graph, nor a row
+    stats = [data for name, data in frames if name == "session-stat"]
+    assert [s["rev"] for s in stats] == list(range(len(stats)))
+    assert set(stats[0]) == {"history_length", "count", "last_offset", "status", "turn", "rev"}
+    assert (stats[-1]["status"], stats[-1]["count"], stats[-1]["turn"]) == ("completed", 0, None)
+    assert await handle.result() == "hi"
+    # Again, fetching on each signal as the page does.
+    wf = f"console-{uuid.uuid4().hex}"
+    handle = await client.start_workflow(RetryFlow.run, "hi", id=wf, task_queue=queue)
+    frames, graphs = await asyncio.to_thread(_watch, srv, wf)
     states = [
         (_node(g, "flaky").get("status"), _node(g, "flaky").get("attempt"))
         for g in graphs
@@ -386,9 +422,9 @@ async def test_the_stream_shows_a_retry_before_history_does_then_ends(
     assert states[-1] == ("completed", 3)
     assert graphs[-1]["workflow"]["status"] == "completed"
     assert await handle.result() == "hi"
-    # A closed run: its graph at once, then the end.
-    closed = _events(await asyncio.to_thread(_stream, srv, f"/api/graph/events?w={wf}"))
-    assert [name for name, _ in closed] == ["graph", "end"]
+    # A closed run: its signal at once, then the end.
+    closed = _events(await asyncio.to_thread(_stream, srv, f"/api/events?w={wf}"))
+    assert [name for name, _ in closed] == ["session-stat", "end"]
 
 
 async def test_a_step_backing_off_shows_its_failure_before_history_has_it(
@@ -654,13 +690,12 @@ def test_an_unnamed_batch_is_read_again_until_its_child_names_it(
     finally:
         console.close()
     assert asked == [None, None, ("k",), ("k",)]
-    assert [
-        (name, data["nodes"][0]["id"] if name == "graph" else None) for name, data in events
-    ] == [
-        ("graph", "kontra.batch.v1"),
-        ("graph", "kontra.batch.v1[item]"),
-        ("graph", "kontra.batch.v1[item]"),
-        ("end", None),
+    # A signal for each graph the page would be shown differently, none for the same one.
+    assert [(name, data.get("rev"), data.get("status")) for name, data in events] == [
+        ("session-stat", 0, "running"),
+        ("session-stat", 1, "running"),
+        ("session-stat", 2, "completed"),
+        ("end", None, None),
     ]
     assert console_module._unnamed_batch(
         {"nodes": [{"kind": "child", "name": "kontra.batch.v1", "status": "running"}]}
@@ -682,20 +717,18 @@ async def test_streams_are_bounded(
     wf = f"console-{uuid.uuid4().hex}"
     handle = await client.start_workflow(WaitFlow.run, "hi", id=wf, task_queue=queue)
     opened = threading.Event()
-    first = asyncio.create_task(
-        asyncio.to_thread(_stream, srv, f"/api/graph/events?w={wf}", opened)
-    )
+    first = asyncio.create_task(asyncio.to_thread(_stream, srv, f"/api/events?w={wf}", opened))
     assert await asyncio.to_thread(opened.wait, 20)
-    r = await asyncio.to_thread(_get, srv, f"/api/graph/events?w={wf}")
+    r = await asyncio.to_thread(_get, srv, f"/api/events?w={wf}")
     assert r.status_code == 503
     assert r.json() == {"error": "16 live graphs are open already"}
     assert r.headers["Cache-Control"] == "no-store"
     await handle.terminate()
     events = _events(await first)
     assert events[-1][0] == "end"
-    assert events[-2][1]["workflow"]["status"] == "terminated"
-    # The slot is free again (the run is closed: its graph, then the end).
-    again = await asyncio.to_thread(_get, srv, f"/api/graph/events?w={wf}")
+    assert events[-2][1]["status"] == "terminated"
+    # The slot is free again (the run is closed: its signal, then the end).
+    again = await asyncio.to_thread(_get, srv, f"/api/events?w={wf}")
     assert again.status_code == 200
 
 
@@ -736,7 +769,7 @@ def test_bad_requests_are_one_json_line(serve: Serve, dev_server: DevServer) -> 
         ("/api/graph?w=a&r=not%20a%20run", 400),
         ("/api/graph?w=" + "x" * 1001, 400),
         (f"/api/graph?w=nothing-{uuid.uuid4().hex}", 404),
-        (f"/api/graph/events?w=nothing-{uuid.uuid4().hex}", 404),
+        (f"/api/events?w=nothing-{uuid.uuid4().hex}", 404),
     ):
         r = _get(srv, path)
         assert r.status_code == status, (path, r.text)
@@ -744,8 +777,22 @@ def test_bad_requests_are_one_json_line(serve: Serve, dev_server: DevServer) -> 
         assert set(r.json()) == {"error"}
         assert "\n" not in r.json()["error"]
         assert "Traceback" not in r.text
-    io = _get(srv, f"/api/io?w=nothing-{uuid.uuid4().hex}&node=")
-    assert (io.status_code, io.json()) == (403, {"error": "X-Kontra-Console: 1 is required"})
+    for gated in (f"/api/io?w=nothing-{uuid.uuid4().hex}&node=", "/api/session?w=x"):
+        r = _get(srv, gated)
+        assert (r.status_code, r.json()) == (403, {"error": "X-Kontra-Console: 1 is required"})
+    headed = {"X-Kontra-Console": "1"}
+    for path, status in (
+        ("/api/session", 400),
+        (f"/api/session?w=nothing-{uuid.uuid4().hex}", 404),
+        ("/api/io?w=x&event=", 400),
+        ("/api/io?w=x&event=-1", 400),
+        ("/api/io?w=x&event=01", 400),
+        ("/api/io?w=x&event=1e3", 400),
+        (f"/api/io?w=nothing-{uuid.uuid4().hex}&event=0", 404),
+    ):
+        r = _get(srv, path, **headed)
+        assert r.status_code == status, (path, r.text)
+        assert set(r.json()) == {"error"}
     assert _get(srv, "/api/nope").status_code == 404
 
 
