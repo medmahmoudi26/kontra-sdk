@@ -123,6 +123,19 @@ class EnrichOutput(BaseModel):
 express portably (`anyOf`, tuples, untyped `dict` or `Any`) are refused at derivation with a
 fix-it. Field patterns are matched with RE2 on both sides, so no pattern can stall a handler.
 
+The contract says what each side gets. The input is described as pydantic *validates* it:
+what a buyer may send. The output is described as pydantic *serializes* it: what the buyer
+receives, `model_dump(mode="json", by_alias=True)`, which is what temporalio writes for your
+workflow's result. So in the output a `@computed_field` is a member, a `Field(exclude=True)`
+field is not, a `serialization_alias` is the member's name, a serializer's return type is the
+member's type, and every field is required, defaulted or not, since the result always
+carries it. A model used both ways whose two descriptions differ is published twice, as
+`ReportInput` and `ReportOutput`. A constraint written on a named type (an enum, a
+`RootModel`) and again where the type is used holds twice, as pydantic enforces it: the
+contract publishes the tighter bound and the values both allow, and refuses, naming the
+field, the two that cannot be written as one (two different `pattern`s), rather than publish
+a contract looser than your model (decisions I38).
+
 See exactly what you would publish:
 
 ```sh
@@ -603,7 +616,10 @@ serve(ReconAgent.sweep, plugins=[AgentHarnessPlugin()])
   A handler an agent inherits unchanged from another agent class is refused too
   (`ReconV2.sweep` *is* `ReconV1.sweep`, so it cannot say which agent you mean): override it
   in each agent class that sells it. Pydantic aliases work as on a workflow: the message is
-  the input's JSON by alias, and so is the job's result.
+  the input's JSON by alias, and the job's result is the reply's serialization by alias,
+  exactly a workflow's result. The harness publishes the reply keyed by field name; Kontra
+  re-keys it, checks it against the contract and delivers it, so computed fields, excluded
+  fields and serializers come out as the contract describes them.
 - **A hire is one turn.** The job is Kontra's wrapper workflow, `kontra.turn.v1`, started as
   `job-<id>` like any job. It starts your agent as a child (its whole history encrypted to you
   alone), sends the buyer's input as one message to the handler, waits for the handler's
