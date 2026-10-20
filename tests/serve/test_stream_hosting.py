@@ -221,6 +221,17 @@ async def test_the_drain_delivers_the_tail_of_a_short_job(rig: Rig) -> None:
         assert await handle.result() == "ok"
 
 
+async def test_the_drain_counts_only_what_the_envelope_carried(rig: Rig) -> None:
+    """A short job's tail whose sealed items pass the envelope's 512 KiB in one answer (8 x
+    100 KB: one contrib answer, under its 1 MB): the interceptor cuts the answer where the
+    envelope would, so the drain waits for the polls that carry the rest."""
+    job, handle = await rig.start(HostedJob.run, Burst(8, topics=(LISTED,), pad=100_000), False)
+    items = await until_closed(rig.relay(job, min_interval=2.0))
+    assert [i.offset for i in items] == list(range(8))
+    assert all(len(opened(i)["pad"]) == 100_000 for i in items)
+    assert await handle.result() == "ok"
+
+
 async def test_a_continue_as_new_chain_keeps_offsets_and_loses_nothing(rig: Rig) -> None:
     job, handle = await rig.start(ChainJob.run, 3, 2)
     items = await until_closed(rig.relay(job, min_interval=1.0))

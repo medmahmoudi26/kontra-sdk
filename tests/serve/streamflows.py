@@ -26,13 +26,15 @@ AUDIT = "private_audit"
 
 @dataclass
 class Burst:
-    """``n`` items on each of ``topics``, from an activity; ``marker`` goes in every item."""
+    """``n`` items on each of ``topics``, from an activity; ``marker`` goes in every item,
+    and ``pad`` bytes of filler."""
 
     n: int
     marker: str = ""
     topics: tuple[str, ...] = (LISTED, UNLISTED)
     pause: float = 0.02
     heartbeat: bool = False
+    pad: int = 0
 
 
 @activity.defn
@@ -41,9 +43,10 @@ async def burst(spec: Burst) -> None:
     async with client:
         for i in range(spec.n):
             for topic in spec.topics:
-                client.topic(topic).publish(
-                    {"i": i, "secret": f"{spec.marker}-{topic}-activity-{i}"}
-                )
+                item = {"i": i, "secret": f"{spec.marker}-{topic}-activity-{i}"}
+                if spec.pad:
+                    item["pad"] = "p" * spec.pad
+                client.topic(topic).publish(item)
             if spec.heartbeat:
                 activity.heartbeat({"percent": i, "message": f"{spec.marker}-heartbeat-{i}"})
             await asyncio.sleep(spec.pause)

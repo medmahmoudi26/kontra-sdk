@@ -345,6 +345,8 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         self._services = generated
         self._max_claim_check = max_claim_check
         self._context: SerializationContext | None = None
+        #: Claim-checked stream items stored already, shared by every context's copy.
+        self._stream_refs = _stream.BlobRefs()
         #: Claim-checks fetched under this context: the input of one handled Nexus operation
         #: (temporalio makes a context, so a copy of this codec, per Nexus task).
         self._fetched = 0
@@ -508,6 +510,8 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
                 buyer_recipients=_distinct([*self._recipients, buyer]),
                 seller_recipients=list(self._recipients),
                 put_blob=self._put_blob if self._blobs is not None else None,
+                refs=self._stream_refs,
+                scope=job_id,
             )
         except (EnvelopeError, age.AgeError) as e:
             raise CodecError(f"cannot seal job {job_id}'s stream: {e}") from e

@@ -101,3 +101,29 @@ def test_the_hosted_stream_is_the_contribs_own_class() -> None:
     source = inspect.getsource(WorkflowStream.__init__)
     assert 'caller_name != "__init__"' in source
     assert set(vars(interceptors._HostedStream)) <= {"__init__", "__module__", "__doc__", "__qualname__", "__firstlineno__", "__static_attributes__"}  # pyright: ignore[reportPrivateUsage]  # fmt: skip
+
+
+def test_the_recipients_bound_is_a_partys_keys_and_the_buyer() -> None:
+    """A poll's answer is cut for items sealed to at most this many keys -- the gate keeps at
+    most ``RECIPIENTS_MAX`` keys per party, and the job's buyer key is one more -- a constant,
+    so the cut (and the drain that counts on it) replays the same on any worker."""
+    from temporalio.contrib.workflow_streams import PollResult
+    from temporalio.contrib.workflow_streams._types import (  # pyright: ignore[reportPrivateUsage]
+        _WorkflowStreamWireItem,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    from kontra.gate_client.models import RECIPIENTS_MAX
+    from kontra.serve.interceptors import KontraInterceptor
+
+    assert interceptors.RECIPIENTS_BOUND == RECIPIENTS_MAX + 1
+    items = [_WorkflowStreamWireItem("events", "A" * 4_000, i) for i in range(400)]
+    sizes = [("events", i, 3_000) for i in range(400)]
+    inbound = KontraInterceptor(None)._inbound(None)  # type: ignore[arg-type]  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+    cut = inbound._trim(PollResult(items=items, next_offset=400), frozenset({"events"}))  # pyright: ignore[reportPrivateUsage]
+    fit = s.items_that_fit(sizes, buyer_topics={"events"}, recipients=interceptors.RECIPIENTS_BOUND)
+    assert 0 < len(cut.items) == fit < 400
+    assert (cut.more_ready, cut.next_offset) == (True, fit)  # the contrib's truncation
+    # Fewer keys would fit more: the bound is the most, not this worker's count.
+    assert s.items_that_fit(sizes, buyer_topics={"events"}, recipients=2) > fit
+    small = PollResult(items=items[:3], next_offset=3, more_ready=False)
+    assert inbound._trim(small, frozenset()) is small  # pyright: ignore[reportPrivateUsage]

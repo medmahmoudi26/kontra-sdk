@@ -183,6 +183,52 @@ async def test_an_item_above_the_inline_limit_is_claim_checked_or_a_stub() -> No
     assert [i.offset for i in CONVERTER.from_payload(back, PollResult).items] == [0, 2]
 
 
+async def test_a_reread_large_item_reuses_its_blob_within_its_job_only() -> None:
+    """Every poll whose answer holds an item above the inline limit would seal and upload it
+    afresh (a new sha256 each time: age is randomised): the codec reuses the stored blob for
+    the same job, item and recipients, and never across jobs."""
+    huge = {"blob": "y" * (s.ITEM_INLINE_MAX + 1024)}
+    items = [item("events", 0, {"n": 0}), item("events", 1, huge)]
+    blobs = Blobs()
+    c = codec(blobs=blobs)
+    refs: list[str] = []
+    for _ in range(3):  # three polls from 0: a seller's subscriber, a relay that re-reads
+        [envelope] = await c.encode([marked(items)])
+        refs.append(json.loads(envelope.data)["items"][1]["ref"]["sha256"])
+    assert len(set(refs)) == 1
+    assert len(blobs.data) == 1
+    # A copy of the codec for another context of the same job shares what it stored.
+    again = c.with_context(
+        WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id(JOB))
+    )
+    [envelope] = await again.encode([marked(items)])
+    assert json.loads(envelope.data)["items"][1]["ref"]["sha256"] == refs[0]
+    [back] = await again.decode([envelope])
+    assert CONVERTER.from_payload(back, PollResult).items[1].data == items[1].data
+    # Another job's identical item is its own blob: nothing links the two jobs.
+    other = c.with_context(
+        WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id("b" * 32))
+    )
+    [envelope] = await other.encode([marked(items)])
+    assert json.loads(envelope.data)["items"][1]["ref"]["sha256"] != refs[0]
+    assert len(blobs.data) == 2
+
+
+def test_blob_refs_are_bounded() -> None:
+    refs = s.BlobRefs(size=2)
+    keys = [s.BlobRefs.key("job", bytes([i]), ["age1x"]) for i in range(3)]
+    for i, k in enumerate(keys):
+        refs.put(k, (f"{i:064x}", i))
+    assert len(refs) == 2
+    assert refs.get(keys[0]) is None
+    assert refs.get(keys[2]) == (f"{2:064x}", 2)
+    assert s.BlobRefs.key("a", b"x", ["k"]) != s.BlobRefs.key("b", b"x", ["k"])
+    assert s.BlobRefs.key("a", b"x", ["k", "l"]) == s.BlobRefs.key("a", b"x", ["l", "k"])
+    assert s.BlobRefs.key("a", b"x", ["k"]) != s.BlobRefs.key("a", b"x", ["k", "l"])
+    with pytest.raises(ValueError, match="size"):
+        s.BlobRefs(size=0)
+
+
 async def test_the_offset_is_plaintext_and_validated() -> None:
     p = s.offset_payload(15)
     [out] = await codec().encode([p])
@@ -336,3 +382,94 @@ async def test_the_buyers_codec_cannot_open_an_envelope_with_unlisted_items() ->
     )
     with pytest.raises(InvalidPayload, match="never a Nexus payload"):
         await nexus.decode([env])
+
+
+# --------------------------------------------------------------------------- hostile JSON
+
+
+DEEP = b"[" * 100_000  # far under ENVELOPE_MAX, far past the interpreter's stack
+
+
+def test_json_nested_past_the_stack_is_an_envelope_error() -> None:
+    """A hostile worker's answer nested deeper than ``json`` can parse is refused like any
+    other answer that is not an envelope (``RecursionError`` never escapes the reader)."""
+    with pytest.raises(s.EnvelopeError, match="not JSON"):
+        s.parse_envelope(
+            Payload(metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"}, data=DEEP)
+        )
+    inside = b'{"v":1,"items":[' + b"[" * 50_000 + b"]" * 50_000 + b'],"next_offset":1,"more_ready":false}'  # fmt: skip
+    with pytest.raises(s.EnvelopeError):
+        s.parse_envelope(
+            Payload(metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"}, data=inside)
+        )
+
+
+async def test_json_nested_past_the_stack_fails_the_codec_closed() -> None:
+    nested = Payload(metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"}, data=DEEP)
+    with pytest.raises(InvalidPayload, match="not JSON"):
+        await codec().decode([nested])
+    deep_result = marked(sample())
+    deep_result.data = DEEP
+    with pytest.raises(CodecError, match="not JSON"):
+        await codec().encode([deep_result])
+    deep_listed = marked(sample())
+    deep_listed.metadata[s.BUYER_TOPICS_KEY] = b"[" * 2000  # under the list's 2,048 bytes
+    with pytest.raises(CodecError, match="not JSON"):
+        await codec().encode([deep_listed])
+
+
+# --------------------------------------------------------------------------- the interceptor's cut
+
+
+def _mixed() -> list[_WorkflowStreamWireItem]:
+    """Every size class: tiny, 100 KB, just under and just over the inline limit, listed
+    and unlisted, at offsets of growing width."""
+    out: list[_WorkflowStreamWireItem] = []
+    sizes = [10, 100_000, 10, s.ITEM_INLINE_MAX - 2_000, 50, s.ITEM_INLINE_MAX + 10, 100_000]
+    for i, n in enumerate(sizes * 3):
+        topic = ("events", "private", PROGRESS_TOPIC)[i % 3]
+        out.append(item(topic, 9_990 + i * 7, {"pad": "z" * n}))
+    out += [item("events", 20_000 + i, {"n": i}) for i in range(400)]  # many tiny ones
+    return out
+
+
+@pytest.mark.parametrize("seller_keys", [1, 2, 16])
+@pytest.mark.parametrize("blobs", [True, False])
+async def test_what_the_interceptor_keeps_is_sealed_whole(seller_keys: int, blobs: bool) -> None:
+    """The workflow interceptor cuts a poll's answer with :func:`items_that_fit` (and the
+    recipients bound); the codec then seals every item it kept, ``next_offset`` and
+    ``more_ready`` unchanged: the drain counts only what the poller is sent."""
+    keys = [SELLER, *(generate_identity() for _ in range(seller_keys - 1))]
+    c = KontraCodec(
+        SELLER[0],
+        [k[1] for k in keys],
+        role="seller",
+        buyer_keys=Keys(),
+        blobs=Blobs() if blobs else None,
+    ).with_context(WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id(JOB)))
+    rest = _mixed()
+    sent = 0
+    while rest:
+        fit = s.items_that_fit(
+            ((i.topic, i.offset, len(i.data) * 3 // 4) for i in rest),
+            buyer_topics={"events", PROGRESS_TOPIC},
+            recipients=seller_keys + 1,
+        )
+        assert fit >= 1
+        kept, rest = rest[:fit], rest[fit:]
+        end = rest[0].offset if rest else kept[-1].offset + 1
+        [envelope] = await c.encode([marked(kept, next_offset=end, more_ready=bool(rest))])
+        env = s.parse_envelope(envelope)
+        assert len(envelope.data) <= s.ENVELOPE_MAX
+        assert [i.offset for i in env.items] == [i.offset for i in kept]
+        assert (env.next_offset, env.more_ready) == (end, bool(rest))
+        sent += 1
+    assert sent > 3  # the answers were cut: the case is not vacuous
+
+
+def test_the_cut_keeps_at_least_one_item_and_stops_at_the_limit() -> None:
+    big = [("events", i, s.ITEM_INLINE_MAX) for i in range(5)]
+    assert s.items_that_fit(big, buyer_topics={"events"}, recipients=17) == 1
+    assert s.items_that_fit([], buyer_topics={"events"}, recipients=1) == 0
+    tiny = [("events", i, 10) for i in range(10)]
+    assert s.items_that_fit(tiny, buyer_topics={"events"}, recipients=2) == 10

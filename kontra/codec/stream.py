@@ -47,9 +47,11 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -71,11 +73,13 @@ __all__ = [
     "SEALED_TOPIC_KEY",
     "STREAM_ENCODING",
     "STREAM_MARK",
+    "BlobRefs",
     "Envelope",
     "EnvelopeError",
     "EnvelopeItem",
     "ItemUnreadable",
     "buyer_topics",
+    "items_that_fit",
     "offset_payload",
     "open_item",
     "open_poll",
@@ -114,13 +118,56 @@ _INT = re.compile(rb"0|[1-9][0-9]{0,18}", re.ASCII)
 _SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 #: ``{"v":1,"items":[`` ... ``],"next_offset":<19 digits>,"more_ready":false}`` with room.
 _ENVELOPE_FRAME = 128
+#: The most a ``Payload`` metadata entry adds beyond its key and value bytes.
+_MAP_ENTRY = 12
 _ITEM_KEYS = frozenset({"topic", "offset", "ct", "size", "ref"})
 _TOP_KEYS = frozenset({"v", "items", "next_offset", "more_ready"})
+#: What ``json.loads`` raises on input that is not JSON, or JSON nested too deep to parse.
+_JSON_ERRORS = (ValueError, RecursionError)
 
 #: ``put_blob(ciphertext) -> (sha256, size)``: claim-check storage (the codec's blob store).
 PutBlob = Callable[[bytes], Awaitable[tuple[str, int]]]
 #: ``fetch_blob(sha256, size) -> ciphertext``, verified against both.
 FetchBlob = Callable[[str, int], Awaitable[bytes]]
+
+
+class BlobRefs:
+    """The claim-checked items a codec already stored, by job, sealed plaintext and
+    recipients, at most ``size`` of them (the least recently used go first). A poll that
+    re-reads an item above :data:`ITEM_INLINE_MAX` -- the seller's own subscriber, a relay
+    polling from 0 again -- reuses its blob: sealed afresh, age's randomness would make a
+    new ciphertext, a new sha256 and another upload each time. Keyed per job, so two jobs'
+    identical items never share a blob the platform could link."""
+
+    def __init__(self, size: int = 1024) -> None:
+        if size < 1:
+            raise ValueError("size is at least 1")
+        self._size = size
+        self._refs: OrderedDict[bytes, tuple[str, int]] = OrderedDict()
+
+    @staticmethod
+    def key(scope: str, plain: bytes, recipients: Sequence[str]) -> bytes:
+        h = hashlib.sha256()
+        for part in (scope.encode(), *sorted(r.encode() for r in recipients)):
+            h.update(len(part).to_bytes(4, "big"))
+            h.update(part)
+        h.update(plain)
+        return h.digest()
+
+    def get(self, key: bytes) -> tuple[str, int] | None:
+        ref = self._refs.get(key)
+        if ref is not None:
+            self._refs.move_to_end(key)
+        return ref
+
+    def put(self, key: bytes, ref: tuple[str, int]) -> None:
+        self._refs[key] = ref
+        self._refs.move_to_end(key)
+        while len(self._refs) > self._size:
+            self._refs.popitem(last=False)
+
+    def __len__(self) -> int:
+        return len(self._refs)
 
 
 class EnvelopeError(ValueError):
@@ -187,7 +234,7 @@ def _listed(marked: Payload) -> frozenset[str]:
         raise EnvelopeError("a marked poll result names no buyer topics")
     try:
         value: object = json.loads(raw)
-    except ValueError:
+    except _JSON_ERRORS:
         raise EnvelopeError("a marked poll result's buyer topics are not JSON") from None
     if not isinstance(value, list):
         raise EnvelopeError("a marked poll result's buyer topics are not a list")
@@ -215,7 +262,7 @@ def _poll_result(marked: Payload) -> tuple[list[tuple[str, int, Payload]], int, 
         raise EnvelopeError("a marked poll result is not json/plain")
     try:
         value: object = json.loads(marked.data)
-    except ValueError:
+    except _JSON_ERRORS:
         raise EnvelopeError("a marked poll result is not JSON") from None
     if not isinstance(value, dict):
         raise EnvelopeError("a marked poll result is not an object")
@@ -261,17 +308,56 @@ def _entry_len(entry: dict[str, Any]) -> int:
     return len(json.dumps(entry, separators=(",", ":"))) + 1  # and its comma
 
 
+def _item_bound(topic: str, offset: int, size: int, visible: bool, recipients: int) -> int:
+    """At least what :func:`seal_poll` counts for the item: ``size`` bytes of serialized
+    ``Payload`` (at most), sealed to at most ``recipients``, inline, claim-checked or a stub."""
+    # The two sealed metadata entries: a map entry is a tag, a length, and a key and a value
+    # field of a tag, a length and the bytes each (_MAP_ENTRY: room for 3-byte varints).
+    plain = size + 2 * _MAP_ENTRY + len(SEALED_TOPIC_KEY) + len(SEALED_OFFSET_KEY)
+    plain += len(topic.encode("utf-8")) + len(str(offset))
+    ct = age.ciphertext_size(plain, max(recipients, 1))
+    shown = topic if visible else None
+    inline = _entry_len({"topic": shown, "offset": offset, "ct": ""})
+    inline += _b64_len(min(ct, ITEM_INLINE_MAX))
+    if ct <= ITEM_INLINE_MAX:
+        return inline
+    ref = {"sha256": "0" * 64, "size": ct}
+    return max(inline, _entry_len({"topic": shown, "offset": offset, "size": ct, "ref": ref}))
+
+
+def items_that_fit(
+    items: Iterable[tuple[str, int, int]], *, buyer_topics: Collection[str], recipients: int
+) -> int:
+    """How many of ``items`` -- ``(topic, offset, size)`` in log order, ``size`` at least the
+    item's serialized ``Payload`` -- an envelope holds for sure when every item is sealed to
+    at most ``recipients`` keys: never fewer than one. Kontra's workflow interceptor trims a
+    poll's answer to it (inside the sandbox: pure arithmetic), so :func:`seal_poll` never
+    trims an answer the workflow already counted as read to the end (its drain)."""
+    total = _ENVELOPE_FRAME
+    count = 0
+    for topic, offset, size in items:
+        total += _item_bound(topic, offset, size, topic in buyer_topics, recipients)
+        if total > ENVELOPE_MAX and count:
+            break
+        count += 1
+    return count
+
+
 async def seal_poll(
     marked: Payload,
     *,
     buyer_recipients: Sequence[str],
     seller_recipients: Sequence[str],
     put_blob: PutBlob | None,
+    refs: BlobRefs | None = None,
+    scope: str = "",
 ) -> Payload:
     """A marked poll result as the envelope (see the module docstring). A listed topic is
     sealed to ``buyer_recipients`` (the seller's set and the job's buyer key), every other
-    to ``seller_recipients``. Raises :class:`EnvelopeError` for a marked payload that is not
-    one, :class:`age.AgeError` for a recipient that is not one."""
+    to ``seller_recipients``. ``refs``: the claim-checked items stored already, under
+    ``scope`` (the job), reused rather than stored again. Raises :class:`EnvelopeError` for
+    a marked payload that is not one, :class:`age.AgeError` for a recipient that is not
+    one."""
     listed = _listed(marked)
     items, next_offset, more_ready = _poll_result(marked)
     size = _ENVELOPE_FRAME
@@ -299,7 +385,13 @@ async def seal_poll(
             ct = base64.b64encode(age.encrypt(plain, recipients)).decode("ascii")
             out.append({"topic": shown, "offset": offset, "ct": ct})
         elif put_blob is not None:
-            digest, stored = await put_blob(age.encrypt(plain, recipients))
+            key = BlobRefs.key(scope, plain, recipients) if refs is not None else None
+            ref = refs.get(key) if refs is not None and key is not None else None
+            if ref is None:
+                ref = await put_blob(age.encrypt(plain, recipients))
+                if refs is not None and key is not None:
+                    refs.put(key, ref)
+            digest, stored = ref
             out.append(
                 {
                     "topic": shown,
@@ -456,7 +548,9 @@ def _parse(payload: Payload) -> _Parsed:
         raise EnvelopeError(f"a stream envelope is larger than {ENVELOPE_MAX} bytes")
     try:
         value: object = json.loads(payload.data)
-    except ValueError:
+    except _JSON_ERRORS:
+        # RecursionError: JSON nested deeper than the interpreter's stack (``[`` * 100,000
+        # is far under ENVELOPE_MAX) -- a hostile worker's answer, refused like any other.
         raise EnvelopeError("a stream envelope is not JSON") from None
     if not isinstance(value, dict) or frozenset(cast(dict[str, Any], value)) != _TOP_KEYS:
         raise EnvelopeError("a stream envelope is not {v, items, next_offset, more_ready}")

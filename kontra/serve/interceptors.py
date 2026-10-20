@@ -37,11 +37,17 @@ nothing else, so the root hosts the stream (``temporalio.contrib.workflow_stream
   which runs outside the sandbox -- with the topics the buyer may read: the offering's
   ``streams`` (by task queue) and ``kontra.progress``. :mod:`kontra.codec.stream` seals it
   item by item. Any other answer (a seller who replaced the handler) is left alone and
-  encrypted whole: the relay then stops, and nothing leaks.
+  encrypted whole: the relay then stops, and nothing leaks. Before marking, the answer is
+  cut where its sealed envelope could pass the envelope's limit (the contrib's own
+  truncation: ``next_offset`` at the first item left out, ``more_ready``), so the codec
+  never trims it and what this run counts as read is what the poller is sent.
 * **History guard.** A poll is refused at validation, ``KontraStreamFull``, once the run's
   history is past half of Kontra's pinned limits (:data:`STREAM_HISTORY_EVENTS`,
-  :data:`STREAM_HISTORY_BYTES`). A rejected update is not written to history, so no poll --
-  a genuine relay's, or a leaked relay token's -- grows a job toward termination.
+  :data:`STREAM_HISTORY_BYTES`). A rejected update is not written to history, so past it no
+  poll adds to the history: the relay's share stays near half of the limits (the job's own
+  work has the other half). It bounds history growth only: a burst of oversized poll
+  requests ends a run whatever this answers (the SDK echoes refused updates too), which only
+  the Authorizer can refuse (``docs/security.md``, residual risks).
 * **Drain.** A relay sleeps between polls, so a job that publishes and returns would close
   before the next poll. When the run returns or fails and any poll was seen in the chain,
   the root waits (at most :data:`DRAIN_TIMEOUT`) for a poll to have answered up to the
@@ -98,9 +104,16 @@ from temporalio.worker import (
 )
 
 from kontra import _runtime
-from kontra.codec.stream import BUYER_TOPICS_KEY, POLL_MARK, STREAM_MARK, buyer_topics
+from kontra.codec.stream import (
+    BUYER_TOPICS_KEY,
+    POLL_MARK,
+    STREAM_MARK,
+    buyer_topics,
+    items_that_fit,
+)
 from kontra.codec.stream import offset_payload as _offset_payload
 from kontra.contract.names import (
+    PROGRESS_TOPIC,
     STREAM_OFFSET_QUERY,
     STREAM_POLL_UPDATE,
     STREAM_PUBLISH_SIGNAL,
@@ -112,6 +125,7 @@ from kontra.serve.turn import TURN_ACTIVITY
 __all__ = [
     "DRAIN_TIMEOUT",
     "JOB_HEADER",
+    "RECIPIENTS_BOUND",
     "STREAM_BASE_HEADER",
     "STREAM_FULL",
     "STREAM_HISTORY_BYTES",
@@ -141,6 +155,10 @@ STREAM_HISTORY_EVENTS = 10_240
 STREAM_HISTORY_BYTES = 10 * 1024 * 1024
 #: The failure type of a poll refused past the history budget (``kontra._relay``).
 STREAM_FULL = "KontraStreamFull"
+#: The most keys a job's stream item is sealed to: a party's registered keys (the gate
+#: keeps at most 16, ``gate_client.models.RECIPIENTS_MAX``) and the job's buyer key. A poll's
+#: answer is cut to what surely fits one envelope sealed to that many.
+RECIPIENTS_BOUND = 16 + 1
 _JSON_PLAIN = b"json/plain"
 _INT = re.compile(rb"0|[1-9][0-9]{0,18}", re.ASCII)
 
@@ -367,13 +385,31 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
             self._in_flight -= 1
         if not isinstance(result, PollResult):
             return result  # not the stream's answer: encrypted whole, the relay stops
+        listed = self._listed.get(workflow.info().task_queue, frozenset[str]())
+        result = self._trim(result, listed)
         if not result.more_ready:
             self._answered_to = max(self._answered_to, result.next_offset)
         [p] = workflow.payload_converter().to_payloads([result])
         p.metadata[STREAM_MARK] = POLL_MARK
-        listed = self._listed.get(workflow.info().task_queue, frozenset[str]())
         p.metadata[BUYER_TOPICS_KEY] = buyer_topics(sorted(listed))
         return RawValue(p)
+
+    def _trim(self, result: PollResult, listed: frozenset[str]) -> PollResult:
+        """The answer as the codec will send it: cut, with the contrib's own truncation
+        protocol, where the sealed envelope could pass ``ENVELOPE_MAX``, so the codec never
+        trims it and the drain counts only what the poller is sent. Deterministic, and the
+        same on every worker (the drain's wait replays on it): the bound is the most keys
+        any party's item is sealed to, a constant, never this worker's own key count."""
+        items = result.items
+        fit = items_that_fit(
+            # A wire item's data is base64 of the serialized Payload: 3/4 of it, at most.
+            ((i.topic, i.offset, len(i.data) * 3 // 4) for i in items),
+            buyer_topics=listed | {PROGRESS_TOPIC},
+            recipients=RECIPIENTS_BOUND,
+        )
+        if fit >= len(items):
+            return result
+        return PollResult(items=items[:fit], next_offset=items[fit].offset, more_ready=True)
 
     async def handle_query(self, input: HandleQueryInput) -> Any:
         result = await super().handle_query(input)
