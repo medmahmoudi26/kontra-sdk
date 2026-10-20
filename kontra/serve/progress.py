@@ -21,7 +21,9 @@ after every :data:`BACKOFF_EVERY` items forwarded, up to :data:`INTERVAL_MAX`; a
 ``budget`` (:data:`PROGRESS_BUDGET`, 1,000) items per job, after which nothing more is
 forwarded (one log line; history events still show liveness). With an interval of 0 every
 heartbeat is published, in order, batched into as few signals as the sends allow, still
-within the budget.
+within the budget. The count is this forwarder's -- one per worker process -- and outlives
+a quiet spell: each worker process that runs a job's activities forwards at most ``budget``
+of its items.
 
 When an activity returns, :meth:`ProgressForwarder.settle` publishes the job's queued
 heartbeat -- the latest -- at once, whatever the interval, and waits *briefly* for it, so the
@@ -45,7 +47,7 @@ import math
 import os
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -86,9 +88,14 @@ _ACTIVITY_MAX = 255
 #: heartbeats keeps this many and drops the oldest.
 _QUEUE_MAX = 1000
 _SEND_TIMEOUT = 10.0
-#: A job that has been quiet this long is forgotten (its state is a few bytes, but a
-#: worker runs for months).
+#: A job that has been quiet this long is forgotten (its queue and its publisher: a worker
+#: runs for months) -- all but its count of forwarded items, which its budget and its
+#: back-off read: that is kept past the longest job (``max_duration`` is 30 days at most),
+#: for this many jobs at most, the longest-forgotten dropped first. A job that heartbeats in
+#: phases (a timer, a quiet activity between them) spends one budget, not one per phase.
 _FORGET_AFTER = 300.0
+_REMEMBER_FOR = 31 * 86_400.0
+_REMEMBER_MAX = 16_384
 #: How long a returning activity may wait for its due heartbeats to be published, and how
 #: long nothing waits after that bound was hit (Temporal is slow or down).
 SETTLE_TIMEOUT = 5.0
@@ -150,7 +157,8 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
 class ProgressForwarder:
     """``bind(client)`` with the worker's Temporal client, ``start()`` on the worker's loop,
     ``offer()`` from any thread, ``settle(job)`` when an activity returns, ``aclose()`` to
-    publish what is left and stop. ``budget``: items per job, at most. ``clock`` is
+    publish what is left and stop. ``budget``: items per job, at most (this forwarder's:
+    one per worker process), counted across the job's quiet spells. ``clock`` is
     monotonic seconds, ``wall`` the record's timestamp; tests may replace either."""
 
     def __init__(
@@ -178,6 +186,8 @@ class ProgressForwarder:
         self._settling: set[asyncio.Task[None]] = set()
         self._lock = threading.Lock()
         self._jobs: dict[str, _Job] = {}
+        #: Forgotten jobs' forwarded counts and when they were forgotten (``clock``).
+        self._counts: OrderedDict[str, tuple[int, float]] = OrderedDict()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake: asyncio.Event | None = None
         self._task: asyncio.Task[None] | None = None
@@ -219,7 +229,9 @@ class ProgressForwarder:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
-                job = self._jobs[job_id] = _Job()
+                forwarded = self._recall(job_id)
+                job = self._jobs[job_id] = _Job(forwarded=forwarded)
+                job.spent = forwarded >= self.budget and forwarded > 0  # said already
             if job.forwarded >= self.budget:
                 self.dropped += 1
                 self._spent(job_id, job)
@@ -235,6 +247,24 @@ class ProgressForwarder:
             self._poke()
         else:
             loop.call_soon_threadsafe(self._poke)
+
+    def _remember(self, job_id: str, forwarded: int, now: float) -> None:
+        """Keep a forgotten job's count (under :attr:`_lock`), within the bounds."""
+        if forwarded > 0:
+            self._counts[job_id] = (forwarded, now)
+            self._counts.move_to_end(job_id)
+        while self._counts:
+            _, (_, at) = next(iter(self._counts.items()))
+            if len(self._counts) <= _REMEMBER_MAX and now - at <= _REMEMBER_FOR:
+                break
+            self._counts.popitem(last=False)
+
+    def _recall(self, job_id: str) -> int:
+        """A forgotten job's count, back (under :attr:`_lock`); 0 for a job never seen."""
+        kept = self._counts.pop(job_id, None)
+        if kept is None or self._clock() - kept[1] > _REMEMBER_FOR:
+            return 0
+        return kept[0]
 
     def _spent(self, job_id: str, job: _Job) -> None:
         if not job.spent:
@@ -290,6 +320,7 @@ class ProgressForwarder:
                 if not job.queue:
                     if not job.lock.locked() and now - job.last_offer > _FORGET_AFTER:
                         del self._jobs[job_id]
+                        self._remember(job_id, job.forwarded, now)
                     continue
                 wait = job.last_sent + self._interval(job) - now
                 if wait <= 0:

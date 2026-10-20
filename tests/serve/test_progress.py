@@ -436,3 +436,47 @@ def test_the_record_is_json_the_buyer_reads() -> None:
         json.dumps({"v": 1, "at": "2026-10-20T00:00:00Z", "activity": "a", "details": [1, None]})
     )
     assert record.details == [1, None]
+
+
+async def test_the_budget_and_the_back_off_outlive_a_quiet_spell() -> None:
+    """A job is forgotten after a quiet spell (its queue and its publisher), not its count:
+    heartbeats in phases separated by timers spend one budget, and keep their back-off."""
+    now = [0.0]
+    temporal = Temporal()
+    fw = forwarder(temporal, interval=0, budget=5, clock=lambda: now[0])
+    fw.start()
+    job = new_job_id()
+    for phase in range(3):
+        for i in range(10):
+            fw.offer(job, "work", ({"phase": phase, "i": i},))
+            await fw.flush(job)
+        now[0] += fwd._FORGET_AFTER + 1  # pyright: ignore[reportPrivateUsage]
+        fw._poke()  # pyright: ignore[reportPrivateUsage]
+        await _until(lambda: job not in fw._jobs)  # pyright: ignore[reportPrivateUsage]
+    assert len(temporal.records(job)) == 5
+    await fw.aclose()
+    # The back-off reads the same count: a job back after a quiet spell keeps its interval.
+    paced = ProgressForwarder(interval=5)
+    with paced._lock:  # pyright: ignore[reportPrivateUsage]
+        paced._remember(job, fwd.BACKOFF_EVERY, 0.0)  # pyright: ignore[reportPrivateUsage]
+        back = fwd._Job(forwarded=paced._recall(job))  # pyright: ignore[reportPrivateUsage]
+    assert paced._interval(back) == 10  # pyright: ignore[reportPrivateUsage]
+
+
+def test_forgotten_counts_are_bounded() -> None:
+    now = [0.0]
+    fw = ProgressForwarder(interval=0, clock=lambda: now[0])
+    with fw._lock:  # pyright: ignore[reportPrivateUsage]
+        for i in range(fwd._REMEMBER_MAX + 10):  # pyright: ignore[reportPrivateUsage]
+            fw._remember(f"job-{i:032x}", 1, now[0])  # pyright: ignore[reportPrivateUsage]
+        assert len(fw._counts) == fwd._REMEMBER_MAX  # pyright: ignore[reportPrivateUsage]
+        assert fw._recall(f"job-{0:032x}") == 0  # the oldest went first  # pyright: ignore[reportPrivateUsage]
+        assert fw._recall(f"job-{20:032x}") == 1  # pyright: ignore[reportPrivateUsage]
+        now[0] = fwd._REMEMBER_FOR + 1  # pyright: ignore[reportPrivateUsage]
+        assert fw._recall(f"job-{21:032x}") == 0  # past the longest job  # pyright: ignore[reportPrivateUsage]
+        fw._remember(f"job-{1:032x}", 0, now[0])  # pyright: ignore[reportPrivateUsage]
+        assert not fw._counts  # expired ones are dropped as new ones come  # pyright: ignore[reportPrivateUsage]
+    from kontra.contract.offering import MAX_DURATION_RANGE
+
+    # Kept past the longest job.
+    assert MAX_DURATION_RANGE[1].total_seconds() < fwd._REMEMBER_FOR  # pyright: ignore[reportPrivateUsage]
