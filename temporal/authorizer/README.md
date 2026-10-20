@@ -10,7 +10,8 @@ Every cell can be enforced.
   code, every allow justified in a comment, no string parsing; decisions are exact string
   equality and set membership only. One rule reads the request: the stream relay's, which
   takes two typed fields of the message Temporal already decoded and compares each, whole,
-  with a value it constructs.
+  with a value it constructs, then compares the whole message's encoded size with
+  `RelayRequestMax` (4 KiB), one integer comparison.
 - `callbackguard/` — the one check the Authorizer cannot make: a Nexus completion callback
   token may only complete the operation it was issued for (see below). Separate on
   purpose: it validates what a request carries, the policy decides who may make a call.
@@ -61,7 +62,7 @@ permission the mapper drops.
 | **No token** | `Health/Check`, `GetSystemInfo`, `GetClusterInfo` | everything else |
 | **Malformed token** (expired, unknown `kid`, `alg:none`, HS256-with-public-key, wrong or missing audience, a gate API token) | — | everything (rejected at claim-mapping, before the authorizer) |
 | **`worker` in A** (a party token: seller, buyer, API-key session, dev party) | the WorkflowService allowlist below, in namespace **A** only, including updates, queries, signals, cancel and terminate of A's own workflows | any namespace B, `temporal-system` and the platform namespace `kontra-system`; every OperatorService / AdminService call; the Nexus HTTP API (`DispatchNexusTask`, completions); namespace admin, batch, schedules, resets, deletes, pause, workflow options, worker deployments and versioning, compute config |
-| **stream relay** for job J of A (`sub = relay/A/job-J`, no permissions) | `UpdateWorkflowExecution` with update name `__temporal_workflow_stream_poll`, and `QueryWorkflow` with query type `__temporal_workflow_stream_offset`, on workflow `job-J` in namespace **A** only | every other API (`PollWorkflowExecutionUpdate`, describe, history, signal — the stream's publish signal included — start, `ExecuteMultiOperation`); any other update or query (`__stack_trace` included); any other workflow of A; job J's id in any other namespace |
+| **stream relay** for job J of A (`sub = relay/A/job-J`, no permissions) | `UpdateWorkflowExecution` with update name `__temporal_workflow_stream_poll`, and `QueryWorkflow` with query type `__temporal_workflow_stream_offset`, on workflow `job-J` in namespace **A** only, each request at most `RelayRequestMax` (4 KiB) encoded | every other API (`PollWorkflowExecutionUpdate`, describe, history, signal — the stream's publish signal included — start, `ExecuteMultiOperation`); any other update or query (`__stack_trace` included); any other workflow of A; job J's id in any other namespace; a poll or offset query over 4 KiB, whatever field (topics, identity, header, arguments) makes it so |
 | **worker controller** (`sub = platform/worker-controller`, no permissions) | the 10 worker-deployment, task-queue and count calls in `ControllerAPIs`, in the platform namespace `kontra-system` only | every call in any other namespace; in `kontra-system`: polls, start, describe, signal, update, query, terminate, reset, delete, batch, schedules, `ListWorkerDeployments`, `CreateWorkerDeployment`, the three compute-config calls, versioning rules |
 | **any other role** (`admin`, `write`, `read`, an unknown role in a namespace, `temporal-system:read`/`write`/`admin`/`worker`), even alongside `worker`, whatever the token's subject (a relay's or the controller's included) | nothing beyond what `worker` in A grants | everything those roles would grant on a stock Temporal — including all Operator/Admin APIs |
 | **a permission the mapper drops** (`temporal-system:` with an unknown role, no `:`, not a string, a claim that is not a list) | no permission: the token is judged by its subject, so the controller's or a relay's subject gets exactly that principal's calls | as for that subject |
@@ -105,14 +106,23 @@ decoded, requires the handler name to equal its constant, and compares the token
 whole, with `RelaySubject(request namespace, request workflow id)`. Nothing is split or
 unescaped: a namespace is a handle and a job's workflow id is `job-<32 hex>`, neither holds
 a `/`, so only the job the subject was built from rebuilds it. Run ids, update ids, payloads
-and callbacks are not read; callbacks are the callback guard's, which applies to the relay and
-the controller as to every other token. A relay needs nothing else: re-sending its Update
-with the same update id returns the outcome, and with an empty run id it follows a
+and callbacks are not read, only counted: last, a request whose encoded size (`proto.Size` of
+the whole message) is over `RelayRequestMax`, 4 KiB, is denied. The largest the gate's relay
+builds is 898 bytes (`TestRelayRequestMax`); the cap keeps what a relay token's requests can
+add to one workflow task of its job far below Temporal's 4 MiB gRPC message limit, and does
+not apply to a party's own requests. Callbacks are the callback guard's, which applies to the
+relay and the controller as to every other token. A relay needs nothing else: re-sending its
+Update with the same update id returns the outcome, and with an empty run id it follows a
 continue-as-new. `PollWorkflowExecutionUpdate` is denied because it names no update and
-would read any update's outcome by id. Every completed poll's outcome (up to the stream's
-~1 MB response cap) is written to the job's history, so a leaked relay token, re-polling from
-offset 0, can push the job past `limit.historySize.error` and have Temporal terminate it;
-the authorizer reads no payload and cannot bound that (`docs/security.md`, decisions I30).
+would read any update's outcome by id. Every completed poll's outcome (up to the stream
+envelope's 512 KiB) is written to the job's history; a leaked relay token re-polling from
+offset 0 no longer pushes the job past `limit.historySize.error`, because the job refuses
+polls once its history is past half of the pinned limits (#52, decisions I31). The size cap
+holds requests, not answers, and the authorizer reads no payload, so the answers are bounded
+in the job instead: the polls one workflow task completes answer in the worker's one reply,
+and a job root answers at most 1.5 MiB in one task and holds further polls back for a later
+one, so concurrent polls cannot push that reply past the 4 MiB limit (#52's answer budget;
+`docs/security.md`, decisions I30, I31).
 
 The controller is `temporal-worker-controller` rolling out Kontra's own workers. It may make
 the 10 calls in `ControllerAPIs` (describe, promote, ramp, manage, annotate and retire worker
@@ -284,8 +294,9 @@ a Docker client's proxy settings into every container.
 - `GOFLAGS=-p=1 go test ./...` — the deny matrix (every cell against Kontra's authorizer,
   Temporal's no-op authorizer and Temporal's default authorizer, each with the typed request
   Temporal would hand it), a full sweep of every frontend API (both reflection versions and
-  the Nexus HTTP routes included) against every kind of caller, namespace and a favourable and
-  hostile requests, a check that every listed API is a real unary gRPC method and that no
+  the Nexus HTTP routes included) against every kind of caller, namespace and a favourable,
+  an oversized and hostile requests, the relay's size cap at its edge, a check that every
+  listed API is a real unary gRPC method and that no
   allowlist holds a call escrow depends on, the relay subject's golden vectors shared with
   the Python twin (`testdata/principals.json`) and its injectivity, Temporal's own
   interceptor handing the authorizer the decoded request, the callback guard (every carrier, every header spelling, every URL), the config /

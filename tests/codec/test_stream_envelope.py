@@ -438,7 +438,9 @@ def _mixed() -> list[_WorkflowStreamWireItem]:
 async def test_what_the_interceptor_keeps_is_sealed_whole(seller_keys: int, blobs: bool) -> None:
     """The workflow interceptor cuts a poll's answer with :func:`items_that_fit` (and the
     recipients bound); the codec then seals every item it kept, ``next_offset`` and
-    ``more_ready`` unchanged: the drain counts only what the poller is sent."""
+    ``more_ready`` unchanged: the drain counts only what the poller is sent. And what the
+    interceptor counts against a workflow task's answer budget, :func:`envelope_bound`, is
+    at least what the codec writes."""
     keys = [SELLER, *(generate_identity() for _ in range(seller_keys - 1))]
     c = KontraCodec(
         SELLER[0],
@@ -461,10 +463,26 @@ async def test_what_the_interceptor_keeps_is_sealed_whole(seller_keys: int, blob
         [envelope] = await c.encode([marked(kept, next_offset=end, more_ready=bool(rest))])
         env = s.parse_envelope(envelope)
         assert len(envelope.data) <= s.ENVELOPE_MAX
+        bound = s.envelope_bound(
+            ((i.topic, i.offset, len(i.data) * 3 // 4) for i in kept),
+            buyer_topics={"events", PROGRESS_TOPIC},
+            recipients=seller_keys + 1,
+        )
+        assert len(envelope.data) <= bound
         assert [i.offset for i in env.items] == [i.offset for i in kept]
         assert (env.next_offset, env.more_ready) == (end, bool(rest))
         sent += 1
     assert sent > 3  # the answers were cut: the case is not vacuous
+
+
+async def test_an_answer_held_back_is_an_envelope_within_its_bound() -> None:
+    """A poll held back past a workflow task's answer budget: no items, ``more_ready``, at
+    the offset it asked; sealed as any answer, within the frame the interceptor counts."""
+    end = 10**18
+    [envelope] = await codec().encode([marked([], next_offset=end, more_ready=True)])
+    env = s.parse_envelope(envelope)
+    assert (env.items, env.next_offset, env.more_ready) == ((), end, True)
+    assert len(envelope.data) <= s.envelope_bound((), buyer_topics=(), recipients=17)
 
 
 def test_the_cut_keeps_at_least_one_item_and_stops_at_the_limit() -> None:

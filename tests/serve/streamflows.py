@@ -114,6 +114,30 @@ class OwnStreamJob:
 
 
 @workflow.defn
+class FilledJob:
+    """Hosts its own stream and publishes ``n`` items of ``pad`` bytes as its run starts,
+    then waits for ``finish`` (or returns at once with ``wait=False``): polls sent before
+    its first workflow task are all answered in that one task."""
+
+    @workflow.init
+    def __init__(self, n: int, pad: int, wait: bool = True) -> None:
+        self.stream = WorkflowStream()
+        self.done = False
+
+    @workflow.run
+    async def run(self, n: int, pad: int, wait: bool = True) -> str:
+        for i in range(n):
+            self.stream.topic(LISTED).publish({"i": i, "pad": "p" * pad})
+        if wait:
+            await workflow.wait_condition(lambda: self.done)
+        return "ok"
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.done = True
+
+
+@workflow.defn
 class ChainJob:
     """Hosts no stream and continues-as-new: Kontra carries the offsets across the chain."""
 

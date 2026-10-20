@@ -28,7 +28,8 @@
 //     ControllerSubject: the worker-deployment calls in ControllerAPIs, in
 //     PlatformNamespace only.
 //   - The gate's stream relay carries no permission and the subject RelaySubject(namespace,
-//     job workflow id): the stream's poll Update and offset Query on that one workflow.
+//     job workflow id): the stream's poll Update and offset Query on that one workflow, each
+//     request at most RelayRequestMax bytes.
 //
 // A permission string the mapper drops is no permission: "temporal-system:" with a role it
 // does not know (it maps to no role and creates no namespace key), an entry with no ":", an
@@ -46,18 +47,22 @@
 // Decisions compare whole strings for equality or set membership; nothing here splits an
 // API name, a namespace, an endpoint name or a subject. One rule reads the request: a
 // stream relay's, which takes two typed fields of the message Temporal already
-// deserialized (CallTarget.Request), the workflow id and the update name or query type. It
-// compares each, whole, with a value it constructs. A request of any other type is denied.
+// deserialized (CallTarget.Request), the workflow id and the update name or query type,
+// and compares each, whole, with a value it constructs; then it compares the whole
+// message's encoded size (proto.Size) with RelayRequestMax, one integer comparison: the
+// payloads and headers are counted, never decoded. A request of any other type is denied.
 package authorizer
 
 import (
 	"context"
+	"strconv"
 
 	commonpb "go.temporal.io/api/common/v1"
 	ws "go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/common/authorization"
 	"go.temporal.io/server/common/primitives"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -79,6 +84,22 @@ const (
 	// still written to the job's history, which this policy cannot bound (decisions I30).
 	StreamPollUpdate  = "__temporal_workflow_stream_poll"
 	StreamOffsetQuery = "__temporal_workflow_stream_offset"
+
+	// RelayRequestMax is the largest request the relay rule allows, in encoded bytes: the
+	// proto.Size of the whole typed request, so its identity, header, arguments (a poll's
+	// topics and offset) and every other field count. The largest request the gate's relay
+	// (kontra._relay, #52) builds is 898 bytes: nine topics (an offering's eight streams,
+	// each named with 64 characters, and kontra.progress), the largest offset, a
+	// 32-character namespace, the pinned first run id and a pid@hostname identity with a
+	// 64-character host name (TestRelayRequestMax builds it); an OpenTelemetry
+	// trace header, which the relay does not send, would add about 200 more. 4 KiB is
+	// over four times that. A party token's requests are not capped here: a party sizes
+	// requests to its own workflows as it likes. The cap bounds what a leaked relay
+	// token's requests can make its job's workflow task carry: Temporal holds at most
+	// history.maxInFlightUpdates updates of a workflow in flight at once (10, Temporal's
+	// default, pinned in dynamicconfig/kontra.yaml), so those stay under 40 KiB, far below
+	// the 4 MiB gRPC message limit a workflow task must fit in (decisions I30).
+	RelayRequestMax = 4 << 10
 )
 
 // RelaySubject is the subject of the gate's stream relay for the workflow workflowID in
@@ -350,12 +371,14 @@ func controller(claims *authorization.Claims, t *authorization.CallTarget) autho
 // request (another type, none for a stream, a Nexus HTTP dispatch, an update inside
 // ExecuteMultiOperation) is denied. The subject is then compared, whole, with the one
 // RelaySubject builds from the request: a token whose subject is anything else, empty
-// included, is denied here too.
+// included, is denied here too. Last, a request whose encoded size is over RelayRequestMax
+// is denied, whatever field makes it so.
 func relay(claims *authorization.Claims, t *authorization.CallTarget) authorization.Result {
 	if !partyNamespace(t.Namespace) {
 		return deny("a stream relay acts in a party's namespace only")
 	}
 	var workflowID, handler, want string
+	var msg proto.Message
 	switch req := t.Request.(type) {
 	case *ws.UpdateWorkflowExecutionRequest:
 		if t.APIName != ws.WorkflowService_UpdateWorkflowExecution_FullMethodName {
@@ -363,12 +386,14 @@ func relay(claims *authorization.Claims, t *authorization.CallTarget) authorizat
 		}
 		workflowID = req.GetWorkflowExecution().GetWorkflowId()
 		handler, want = req.GetRequest().GetInput().GetName(), StreamPollUpdate
+		msg = req
 	case *ws.QueryWorkflowRequest:
 		if t.APIName != ws.WorkflowService_QueryWorkflow_FullMethodName {
 			return deny("this API is not available to a stream relay: " + t.APIName)
 		}
 		workflowID = req.GetExecution().GetWorkflowId()
 		handler, want = req.GetQuery().GetQueryType(), StreamOffsetQuery
+		msg = req
 	default:
 		return deny("this API is not available to a stream relay: " + t.APIName)
 	}
@@ -377,6 +402,9 @@ func relay(claims *authorization.Claims, t *authorization.CallTarget) authorizat
 	}
 	if claims.Subject != RelaySubject(t.Namespace, workflowID) {
 		return deny("the token is not this workflow's stream relay")
+	}
+	if proto.Size(msg) > RelayRequestMax {
+		return deny("a stream relay's request may be at most " + strconv.Itoa(RelayRequestMax) + " bytes")
 	}
 	return allow(claims)
 }

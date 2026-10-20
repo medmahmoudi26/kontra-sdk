@@ -37,7 +37,9 @@ gives up). ``closed()`` is the gate's own
 observer (decisions I6), asked after every failure and every empty wait. Between answers that
 were not ``more_ready`` the loop waits :data:`MIN_INTERVAL` or what ``pace()`` says, whichever
 is longer; ``pace()`` returning None stops it with ``history_budget`` (:func:`pace_for` is the
-shared policy).
+shared policy). A ``more_ready`` answer is polled again at once, from its ``next_offset``:
+one with no items is a poll the job held back, past the answers one of its workflow tasks
+may carry (``kontra.serve.interceptors.STREAM_ANSWER_BUDGET``), and is no failure.
 
 Imports ``temporalio.api`` protos, ``temporalio.service``, :mod:`kontra.contract` and
 :mod:`kontra.codec.stream` -- never ``temporalio.contrib``: the gate depends on the wire shape,
@@ -109,7 +111,10 @@ _COOLDOWN = 0.2
 _BACKOFF_START = 0.5
 _BACKOFF_MAX = 30.0
 _EXHAUSTED_MAX = 60.0
-_TOPICS_MAX = 64
+#: The most topics a poll names: an offering's streams (``offering.STREAMS_MAX``, 8) and
+#: ``kontra.progress``. The gate's largest poll then stays far under the Authorizer's 4 KiB
+#: cap on a relay request (``RelayRequestMax``, decisions I30).
+_TOPICS_MAX = 9
 _RESEND = frozenset({RPCStatusCode.DEADLINE_EXCEEDED, RPCStatusCode.CANCELLED})
 _GONE = frozenset({RPCStatusCode.NOT_FOUND, RPCStatusCode.FAILED_PRECONDITION})
 _DENIED = frozenset({RPCStatusCode.PERMISSION_DENIED, RPCStatusCode.UNAUTHENTICATED})
