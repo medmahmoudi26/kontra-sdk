@@ -5,10 +5,12 @@ as a seller writes them; an importable module, as Temporal's workflow sandbox re
 ``Delivery`` has every case of ``tests/contract/zoo.py`` a value can carry: a computed field,
 an excluded one, a serialization alias, a serializer that changes the JSON type, scalar,
 factory, ``= None`` and nested defaults, a tagged union with a defaulted branch, and an enum
-re-constrained where it is used (a ``$ref`` and its sibling)."""
+re-constrained where it is used (a ``$ref`` and its sibling). ``unset_json`` is a client plugin
+whose payload converter leaves unset fields out (``exclude_unset``, as OpenAI Agents' does)."""
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 from datetime import datetime
 from decimal import Decimal
@@ -16,6 +18,9 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, computed_field, field_serializer
 from temporalio import workflow
+from temporalio.contrib.pydantic import PydanticPayloadConverter, ToJsonOptions
+from temporalio.converter import DataConverter
+from temporalio.plugin import SimplePlugin
 
 with workflow.unsafe.imports_passed_through():
     from temporal_agent_harness.harness import AgentWorkflowRunner, agent
@@ -120,3 +125,17 @@ class DeliverAgent:
 
 async def quote(order: Order) -> Quote:
     return Quote(price=Decimal("0.01"))
+
+
+class LeavesUnsetOut(PydanticPayloadConverter):
+    """pydantic's converter with ``exclude_unset``: a seller's own, kept by Kontra's plugin."""
+
+    def __init__(self) -> None:
+        super().__init__(ToJsonOptions(exclude_unset=True))
+
+
+def _leave_unset_out(dc: DataConverter | None) -> DataConverter:
+    return dataclasses.replace(dc or DataConverter.default, payload_converter_class=LeavesUnsetOut)
+
+
+unset_json = SimplePlugin("acme.unset-json", data_converter=_leave_unset_out)

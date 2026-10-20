@@ -10,7 +10,9 @@ catalog's contract (what ``kontra.hire`` checks every delivery against), reads b
 ``kontra.hire``'s decoding, and parses as the type a buyer generates from that contract.
 Before I38 the contract was the validation schema: the computed ``area`` was a member it
 refused, ``secret`` one it required, and the handler failed every job (its reply lacked the
-excluded field)."""
+excluded field). A workflow entry on a client whose payload converter leaves unset fields
+out (OpenAI Agents' does) delivers them all the same: the job's result is the model's
+serialization, not the converter's options'."""
 
 from __future__ import annotations
 
@@ -38,6 +40,12 @@ from kontra import serve
 from tests.serve.serialized_sellers import DeliverFlow, quote
 
 serve(DeliverFlow, quote=quote)
+"""
+_UNSET = """
+from kontra import serve
+from tests.serve.serialized_sellers import DeliverFlow, quote, unset_json
+
+serve(DeliverFlow, quote=quote, plugins=[unset_json])
 """
 _HANDLER = """
 from temporal_agent_harness.plugin import AgentHarnessPlugin
@@ -106,7 +114,9 @@ def test_both_entry_kinds_publish_one_contract(tmp_path: Path) -> None:
 
 
 @pytest.mark.temporal
-@pytest.mark.parametrize("worker", [_WORKFLOW, _HANDLER], ids=["workflow", "handler"])
+@pytest.mark.parametrize(
+    "worker", [_WORKFLOW, _UNSET, _HANDLER], ids=["workflow", "exclude_unset", "handler"]
+)
 async def test_a_delivered_result_is_what_the_published_contract_describes(
     dev_server: DevServer, tmp_path: Path, worker: str
 ) -> None:

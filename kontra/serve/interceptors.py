@@ -9,7 +9,12 @@ payload keys are known.
 
 * Workflow side (:class:`_WorkflowInbound`): the job is the workflow's own (root) or the
   incoming header's (anything below it); the outbound interceptor stamps it on every
-  activity, local activity, child workflow and continue-as-new it schedules.
+  activity, local activity, child workflow and continue-as-new it schedules. The root's
+  result, when it is a pydantic model, is handed on as ``model_dump(mode="json",
+  by_alias=True)``: the job's result is the output model's serialization, which is what
+  the contract describes (decisions I38), whatever payload converter the worker's client
+  has -- one that leaves unset fields out (``exclude_unset``, as OpenAI Agents' does) would
+  otherwise deliver less than every result carries.
 * Activity side (:class:`_ActivityInbound`): reads the header, sets
   :func:`kontra._runtime.job_context` for the activity's duration (so
   ``Artifact.from_path`` uploads for the right job) and wraps the outbound interceptor so
@@ -22,9 +27,9 @@ payload keys are known.
   the job closes; a slow or unreachable gate does not hold activities up.
 
 This module runs inside workflow code: it imports only temporalio, the standard library,
-:mod:`kontra.contract.names`, :mod:`kontra._runtime` (a context variable; no I/O,
-deterministic) and the turn activity's name, and the workflow interceptor class is handed to
-the sandbox as an object.
+pydantic (passed through by temporalio's sandbox), :mod:`kontra.contract.names`,
+:mod:`kontra._runtime` (a context variable; no I/O, deterministic) and the turn activity's
+name, and the workflow interceptor class is handed to the sandbox as an object.
 
 Known gap: a *descendant* workflow learns its job when its run method starts; an activity
 scheduled by a signal handler that runs before that (a signal in the very first activation)
@@ -38,6 +43,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any, NoReturn, Protocol
 
+from pydantic import BaseModel
 from temporalio import activity, workflow
 from temporalio.api.common.v1 import Payload
 from temporalio.worker import (
@@ -118,7 +124,11 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
 
     async def execute_workflow(self, input: ExecuteWorkflowInput) -> Any:
         self._header_job = job_from_headers(input.headers)
-        return await super().execute_workflow(input)
+        result = await super().execute_workflow(input)
+        if isinstance(result, BaseModel) and job_id_from_workflow_id(workflow.info().workflow_id):
+            # The job's result: the model's serialization, not the converter's options'.
+            return result.model_dump(mode="json", by_alias=True)
+        return result
 
 
 class _WorkflowOutbound(WorkflowOutboundInterceptor):
