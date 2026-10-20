@@ -117,9 +117,8 @@ relay and the controller as to every other token. A relay needs nothing else: re
 Update with the same update id returns the outcome, and with an empty run id it follows a
 continue-as-new. `PollWorkflowExecutionUpdate` is denied because it names no update and
 would read any update's outcome by id. Every completed poll's outcome (up to the stream
-envelope's 13,504 bytes of references since I39, 512 KiB before) is written to the job's history; a leaked relay token re-polling from
-offset 0 no longer pushes the job past `limit.historySize.error`, because the job refuses
-polls once its history is past half of the pinned limits (#52, decisions I31). The size cap
+envelope's 13,504 bytes of references since I39, 512 KiB before) is written to the job's history; what a leaked relay token's polls add is bounded by the job
+(its per-run poll budget and its guard, decisions I31, I39). The size cap
 holds requests, not answers, and the authorizer never sees an answer, so the answers are bounded
 in the job instead: the polls one workflow task completes answer in the worker's one reply,
 and a job root answers at most 1.5 MiB in one task and holds further polls back for a later
