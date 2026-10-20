@@ -3,9 +3,10 @@
 These start the real ``kontra-temporal`` binary on free ports with SQLite in memory, serve
 a local JWKS that the server's default claim mapper fetches and a revocation list it polls
 (the gate's ``GET /v1/auth/revocations``), and mint ES256 JWTs the way the gate will: each
-names a session (``sid``). The seller namespaces, buyer namespace and the Nexus endpoint are created
-through the INTERNAL frontend (the control plane); every assertion that follows is made on
-the PUBLIC frontend, over the wire with real ``temporalio`` clients.
+names a session (``sid``). The seller namespaces, buyer namespace, Kontra's own platform
+namespace and the Nexus endpoints are created through the INTERNAL frontend (the control
+plane); every assertion that follows is made on the PUBLIC frontend, over the wire with real
+``temporalio`` clients.
 
 Run with ``.venv/bin/pytest -m temporal tests/temporal`` (the marker is deselected by the
 default addopts). ``KONTRA_TEMPORAL_BIN`` overrides the binary under test.
@@ -45,6 +46,7 @@ from typing import Any
 import jwt
 import pytest
 import temporal_isolation_app as app
+import wire_ledger
 from cryptography.hazmat.primitives.asymmetric import ec
 from google.protobuf.duration_pb2 import Duration
 from jwt.algorithms import ECAlgorithm
@@ -52,6 +54,8 @@ from temporalio.api.nexus.v1 import EndpointSpec, EndpointTarget
 from temporalio.api.operatorservice.v1 import CreateNexusEndpointRequest
 from temporalio.api.workflowservice.v1 import RegisterNamespaceRequest
 from temporalio.client import Client
+
+from kontra.contract import names
 
 AUDIENCE = "kontra:temporal"
 
@@ -276,7 +280,7 @@ class Signer:
 
     def jwt(
         self,
-        permissions: list[str],
+        permissions: list[str] | None,
         *,
         subject: str = "party",
         audience: str | None = AUDIENCE,
@@ -288,10 +292,13 @@ class Signer:
     ) -> str:
         claims: dict[str, Any] = {
             "sub": subject,
-            "permissions": permissions,
             "exp": exp or datetime.now(UTC) + timedelta(hours=1),
             "iat": datetime.now(UTC),
         }
+        # ``permissions=None`` leaves the claim out, as the gate mints a relay's or the
+        # worker controller's token; ``[]`` sends it empty. Both map to no role.
+        if permissions is not None:
+            claims["permissions"] = permissions
         # Every token the gate mints names its session; ``sid=None`` leaves it out.
         session = uuid.uuid4().hex if sid is ... else sid
         if session is not None:
@@ -308,6 +315,23 @@ class Signer:
 
     def api_key(self, namespace: str, **kw: Any) -> str:
         return self.jwt([f"{namespace}:worker"], subject=f"{namespace}-worker", **kw)
+
+    def relay(
+        self, namespace: str, job_id: str, *, permissions: list[str] | None = None, **kw: Any
+    ) -> str:
+        """The gate's stream relay for one job: no permission, and the subject the real
+        constructor builds (``names.relay_subject``), so this suite guards it too."""
+        return self.jwt(permissions, subject=names.relay_subject(namespace, job_id), **kw)
+
+    def controller(self, *, permissions: list[str] | None = None, **kw: Any) -> str:
+        """The temporal-worker-controller's token (KON-15): no permission, its constant
+        subject."""
+        return self.jwt(permissions, subject=names.WORKER_CONTROLLER_SUBJECT, **kw)
+
+    def platform_worker(self, **kw: Any) -> str:
+        """One of Kontra's own workers: an ordinary worker token for the platform namespace,
+        which only the platform mints (decisions I30)."""
+        return self.api_key(names.PLATFORM_NAMESPACE, **kw)
 
 
 class _JWKS:
@@ -372,6 +396,7 @@ class Cluster:
     endpoint_name: str
     endpoint_id: str
     other_endpoint_name: str  # another seller's offering (namespace other)
+    platform_namespace: str = names.PLATFORM_NAMESPACE
 
 
 @pytest.fixture(scope="session")
@@ -423,7 +448,12 @@ def _provision(internal_address: str) -> list[tuple[str, str]]:
 
     async def go() -> list[tuple[str, str]]:
         control = await Client.connect(internal_address, namespace="temporal-system")
-        for ns in (app.SELLER_NAMESPACE, app.BUYER_NAMESPACE, app.OTHER_NAMESPACE):
+        for ns in (
+            app.SELLER_NAMESPACE,
+            app.BUYER_NAMESPACE,
+            app.OTHER_NAMESPACE,
+            names.PLATFORM_NAMESPACE,
+        ):
             await control.workflow_service.register_namespace(
                 RegisterNamespaceRequest(
                     namespace=ns,
@@ -480,3 +510,15 @@ async def connect_public(
     return await Client.connect(
         cluster.public_address, namespace=namespace, api_key=api_key, tls=False, **client_kwargs
     )
+
+
+def pytest_terminal_summary(terminalreporter: Any) -> None:
+    """Print every wire cell's outcome (``wire_ledger.OUTCOMES``) once the session ends."""
+    outcomes = wire_ledger.OUTCOMES
+    if not outcomes:
+        return
+    width = max(len(c) for c, _, _ in outcomes)
+    terminalreporter.section("deny-matrix / positive-path wire outcomes")
+    for cell, expectation, outcome in outcomes:
+        terminalreporter.write_line(f"  [{expectation:5}] {cell:<{width}}  {outcome}")
+    terminalreporter.write_line(f"{len(outcomes)} cells")
