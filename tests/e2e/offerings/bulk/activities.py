@@ -1,5 +1,5 @@
-"""Temporal through the façade: kontra.workflow and kontra.activity only (D1). The file is written on a thread (the worker's
-event loop keeps serving), hashed as it is written, and uploaded with `Artifact.from_path`,
+"""Vanilla Temporal: temporalio only, no kontra import (decisions I29). The file is written on a thread (the
+worker's event loop keeps serving), hashed as it is written, and uploaded with `Artifact.from_path`,
 which streams it: memory stays flat whatever the size."""
 
 import asyncio
@@ -9,8 +9,7 @@ import tempfile
 from pathlib import Path
 
 from models import Artifact, BulkInput, BulkOutput
-
-from kontra import activity
+from temporalio import activity
 
 BLOCK = 1 << 20
 

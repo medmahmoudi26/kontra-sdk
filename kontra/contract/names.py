@@ -36,6 +36,7 @@ __all__ = [
     "OfferingId",
     "OfferingRef",
     "Version",
+    "agent_workflow_id",
     "batch_workflow_id",
     "is_endpoint_name",
     "is_handle",
@@ -62,6 +63,8 @@ _REF_RE = re.compile(
 _HEX32_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
 _ENDPOINT_RE = re.compile(r"k[0-9a-f]{32}", re.ASCII)
 _JOB_WF_PREFIX = "job-"
+#: What follows ``job-<id>`` in the id of a bound-handler job's agent child.
+_AGENT_SUFFIX = "/agent"
 
 #: Handles a party may never take: Temporal's own namespaces, and the platform's names.
 RESERVED_HANDLES = frozenset(
@@ -290,11 +293,20 @@ def job_workflow_id(job_id: str) -> str:
 
 def batch_workflow_id(parent_workflow_id: str, activity: str, token: str) -> str:
     """The id of the ``kontra.batch.v1`` child a workflow starts for
-    ``execute_activities_in_parallel(activity, ...)``: the parent's id, the activity's
-    Temporal name, and ``token`` (one ``workflow.uuid4()`` of the parent's, so batching the
-    same activity twice in one run gets two ids). Never the shape of a job's workflow id,
-    so :func:`job_id_from_workflow_id` reads none from it."""
+    ``execute_activities_in_parallel(activity, ...)`` (:mod:`kontra.contrib.parallel`): the
+    parent's id, the activity's Temporal name, and ``token`` (one ``workflow.uuid4()`` of the
+    parent's, so batching the same activity twice in one run gets two ids). Never the shape
+    of a job's workflow id, so :func:`job_id_from_workflow_id` reads none from it."""
     return f"{parent_workflow_id}/batch/{activity}/{token}"
+
+
+def agent_workflow_id(job_id: str) -> str:
+    """The id of the agent workflow a bound-handler job runs its one turn in
+    (:mod:`kontra.serve.turn`): a child of the job's ``job-<id>`` wrapper. Never the shape of a
+    job's workflow id, so :func:`job_id_from_workflow_id` reads none from it and the codec
+    encrypts the agent's payloads to the seller alone -- the buyer receives the job's result
+    from the wrapper, never the agent's history."""
+    return job_workflow_id(job_id) + _AGENT_SUFFIX
 
 
 def job_id_from_workflow_id(workflow_id: object) -> str | None:

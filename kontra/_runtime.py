@@ -1,9 +1,10 @@
 """The process's Kontra runtime: who we are, our key, our gate client, and (in a seller
 activity) which job we are working for.
 
-``kontra.serve.Worker`` installs one when it starts; ``kontra.hire.Kontra`` installs one
-when it is created. ``Artifact`` methods and the progress forwarder read it. Seller
-workflow and activity code never touch it directly (D1).
+``kontra.plugin.KontraPlugin`` installs one when its worker starts (``kontra.serve.Worker``
+and ``serve()`` build that plugin); ``kontra.hire.Kontra`` installs one when it is created.
+``Artifact`` methods and the progress forwarder read it. Seller workflow and activity code
+never touch it directly (decisions I29: they import no ``kontra``).
 """
 
 from __future__ import annotations

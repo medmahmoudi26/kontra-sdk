@@ -29,6 +29,12 @@ x-kontra: {name: acme/enrich, version: "1.2.0", ..., contract_hash: "sha256:..."
 Operations carry an explicit `fqn` because nexgen would otherwise put `Quote` and
 `Execute` (the PascalCase of the key) on the wire, which the handler does not serve.
 
+`execute.input` describes what a buyer sends and `execute.output` what the buyer receives,
+the result's JSON as delivered, every member present. A type both use that reads one way and
+writes another is two definitions (`ReportInput`, `ReportOutput`); `kontra.contract` derives
+the first from a pydantic model's validation and the second from its serialization
+(decisions I38).
+
 nexgen 0.2.5 refuses `x-kontra` as an unknown root keyword, so it is given the *nexgen
 view*: the same document without `x-kontra` (`kontra.contract.nexgen_view`), taken only
 after the hash has been verified.

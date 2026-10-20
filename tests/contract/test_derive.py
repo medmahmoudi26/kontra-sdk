@@ -191,9 +191,11 @@ class Rich(BaseModel):
 
 
 def test_lowering(enrich_spec: OfferingSpec) -> None:
+    """The input side (validation mode); ``Rich`` has defaults, so its output, where every
+    field is required and none has a default (decisions I38), is ``RichOutput``."""
     doc = derive(enrich_spec, Rich, Rich)
     defs = doc["$defs"]
-    rich = defs["Rich"]
+    rich = defs["RichInput"]
     props = rich["properties"]
     assert rich["additionalProperties"] is False  # extra="allow" does not open the contract
     assert "title" not in rich
@@ -209,8 +211,8 @@ def test_lowering(enrich_spec: OfferingSpec) -> None:
     }  # inlined
     assert "Color" not in defs
     assert props["pet"] == {
-        "oneOf": [{"$ref": "#/$defs/Cat"}, {"$ref": "#/$defs/Dog"}]
-    }  # no discriminator
+        "oneOf": [{"$ref": "#/$defs/Cat"}, {"$ref": "#/$defs/DogInput"}]
+    }  # no discriminator; Dog's default makes its two modes differ, Cat's agree
     assert props["counts"] == {
         "type": "object",
         "additionalProperties": {"oneOf": [{"type": "integer"}, {"type": "null"}]},
@@ -225,6 +227,21 @@ def test_lowering(enrich_spec: OfferingSpec) -> None:
     assert props["doc"] == {"oneOf": [{"$ref": "#/$defs/KontraArtifact"}, {"type": "null"}]}
     assert defs["Cat"]["properties"]["kind"] == {"type": "string", "const": "cat"}
     assert rich["required"] == ["pet", "when"]
+    out = defs["RichOutput"]
+    assert out["required"] == sorted(Rich.model_fields)
+    assert out["properties"]["color"] == {"type": "string", "enum": ["red", "blue"]}
+    assert out["properties"]["pet"] == {
+        "oneOf": [{"$ref": "#/$defs/Cat"}, {"$ref": "#/$defs/DogOutput"}]
+    }
+    assert sorted(defs) == [
+        "Cat",
+        "DogInput",
+        "DogOutput",
+        "KontraArtifact",
+        "KontraQuote",
+        "RichInput",
+        "RichOutput",
+    ]
 
 
 def test_artifact_def_only_when_used(enrich_spec: OfferingSpec) -> None:

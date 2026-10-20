@@ -86,6 +86,16 @@ class UpperFlow:
         )
 
 
+@workflow.defn(name="UpperFlow")
+class ImpostorFlow(UpperFlow):
+    """``UpperFlow``'s Temporal name on another class: what a plugin that swaps the entry
+    class registers (``tests/serve/test_plugin.py``)."""
+
+    @workflow.run
+    async def run(self, order: Order) -> Shout:
+        return Shout(text=order.text, length=0)
+
+
 @workflow.defn
 class SentinelFlow:
     """Only registered, never run (the kwargs passthrough test)."""

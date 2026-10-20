@@ -19,7 +19,8 @@ You need [uv](https://docs.astral.sh/uv/), Go (the version in `temporal/authoriz
 `GOTOOLCHAIN=auto` fetches it), and Docker for `kontra dev` and the images.
 
 ```sh
-make sync      # .venv from uv.lock: Python 3.12, every extra, the dev group
+make sync      # .venv from uv.lock: Python 3.12, every extra, the dev group (which carries
+               # temporalio-openai-agents and temporal-agent-harness for the agent tests)
 make check     # what CI runs
 ```
 
@@ -90,14 +91,23 @@ it, end to end and below, with the last full run.
 - **Validate what people type** with anchored `re.fullmatch` and length limits. Never
   `re.match` with `$` (it accepts a trailing newline), and never strip or normalise before
   validating.
-- **D1.** Seller `workflows.py` and `activities.py` import nothing from `kontra`;
-  `grep -r "import kontra" examples/*/workflows.py examples/*/activities.py` prints nothing.
+- **Sellers write native Temporal** (D1 as the PRD wrote it; decisions I29). Seller
+  `workflows.py` and `activities.py` import `temporalio` directly and nothing from `kontra`;
+  `worker.py` is the one file that imports `kontra` (`quote.py` takes `kontra.serve.Quote`,
+  `models.py` may use `kontra.types`). `grep -rE '^\s*(from|import)\s+kontra\b'
+  examples/*/workflows.py examples/*/activities.py` prints nothing. Never add a Temporal
+  re-export to `kontra`. Kontra never imports `temporal_agent_harness` at runtime.
 - **Dependencies.** The distribution is `kontra-sdk`; never add a bare `kontra` dependency
   anywhere (PyPI `kontra` is an unrelated project). Add a dependency in `pyproject.toml`, run
   `uv lock`, and commit both files.
 - **Temporal upgrades** (`temporalio`, `go.temporal.io/server`) are deliberate: re-run the
   callback guard's carrier sweep and the wire suite, and read the upstream changes to Nexus
   completions ([docs/security.md](docs/security.md#the-callback-guard-and-the-upstream-nexus-completion-issue)).
+  `temporalio` is a declared range (`>=1.34,<1.38`, in `pyproject.toml` and `kontra/_compat.py`,
+  which a test keeps equal). The lock stays on the minor the suite last passed on (1.34, today
+  the only release in the range, so 1.35 to 1.37 are admitted untested): when a new minor
+  ships, a PR moves the lock to it with a green suite, and the range widens past 1.38 only
+  that way.
 - **Tests for behaviour.** Every behaviour a change adds has a test; no stubs, `TODO`s or
   `NotImplementedError` left behind. pyright strict stays clean on `kontra/`.
 - **Docstrings say why**, briefly. The code already says what.

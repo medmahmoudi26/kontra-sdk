@@ -340,6 +340,12 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         return self._services
 
     @property
+    def claim_check_threshold(self) -> int | None:
+        """The most bytes of ciphertext an encoded payload carries inline: above it, the
+        ciphertext goes to the blob store. None: no blob store, so every payload is inline."""
+        return self._threshold if self._blobs is not None else None
+
+    @property
     def context(self) -> SerializationContext | None:
         return self._context
 
