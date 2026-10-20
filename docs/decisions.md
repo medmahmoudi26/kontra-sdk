@@ -2013,7 +2013,7 @@ and `kontra contract` warn where they differ, and seam ③ asserts the verdict.
   | optionals | `oneOf: [T, null]` against `anyOf: [T, null]`; `default: null` | representational when `T` cannot be null; null is no default (I2) |
   | list and dict defaults | dropped by Kontra, kept by the harness | representational: annotation-only, and nexgen materialises only scalar defaults (I2) |
   | tagged unions | OpenAPI `discriminator` kept by the harness | representational: not a 2020-12 assertion; the `const` tags select the branch |
-  | every model with pydantic's default `extra="ignore"` | contract `additionalProperties: false`, harness none | **policy, not reported** (the owner's decision, below): the contract closes every model (§11.3); pydantic drops other keys on input and never emits one, so no value exchanged differs |
+  | every model with pydantic's default `extra="ignore"` | contract `additionalProperties: false`, harness none | **policy, not reported** (decided in the owner's place, below): the contract closes every model (§11.3); pydantic drops other keys on input and never emits one, so no value exchanged differs |
   | `extra="allow"` | contract `additionalProperties: false`, harness `true` | **semantic, `open`**: the model accepts keys the contract forbids, and serializes them into its reply |
   | a constraint on a named type and again where it is used (`Annotated[Code, Field(max_length=10)]` over `class Code(RootModel[Annotated[str, StringConstraints(max_length=5)]])`; `Field(json_schema_extra={"enum": ["a", "z"]})` over an enum of `a`, `b`) | harness `{$ref: Code, maxLength: 10}`, both asserted (at most 5, as pydantic validates); contract `{maxLength: 10, type: string}`, the use site's value only | **semantic, `drift` on both sides**: the contract accepts `"abcdefg"`, and `"z"`, which the model refuses (for the owner, below) |
   | output fields with a default (scalar, factory, `= None`, nested) | harness `required` lists them, the contract does not | **semantic, `defaults`**: the reply always carries them; the contract lets them be absent |
@@ -2055,12 +2055,13 @@ and `kontra contract` warn where they differ, and seam ③ asserts the verdict.
   `extra="allow"` silences `open`), and the zoo's `allow` and `outer` handlers show `open` at
   a model's root and nested. The test agents in `tests/serve/harness_agents.py` keep
   pydantic's default `extra="ignore"` and show no difference at all.
-- **The contract closes models by policy: no difference (the owner's decision).** As first
+- **The contract closes models by policy: no difference (decided in the owner's place; on #53
+  for the owner to confirm or overturn).** As first
   built, `open` was also the contract's `additionalProperties: false` against the harness's
   absence of it, so it fired on nearly every handler: Kontra closes every model (I2, §11.3)
-  whatever its `extra`, and pydantic's default, `extra="ignore"`, writes nothing. The owner
-  decided that the warning must not fire on every handler, or sellers learn to ignore it, and
-  with it the rows it exists for. For an `extra="ignore"` model the difference changes no
+  whatever its `extra`, and pydantic's default, `extra="ignore"`, writes nothing. A warning
+  that fires on every handler teaches sellers to ignore it, and with it the rows it exists for,
+  so it must not. For an `extra="ignore"` model the difference changes no
   value actually exchanged -- pydantic drops other keys on input and never emits one on
   output -- so it is Kontra's closing policy, not drift, and the canonical form sets it aside
   (`kontra.contract.harness._closed_alike`, tested pair by pair). `extra="allow"` is still
