@@ -237,9 +237,9 @@ STREAM_ITEM_MAX = 256 * 1024
 #: The most blobs one ``POST /v1/jobs/{id}/stream/blobs`` creates: the items of one poll's
 #: answer (``kontra.codec.stream.STREAM_ITEMS_MAX``, decisions I39).
 STREAM_BLOBS_MAX = 64
-#: The longest a stream blob's PUT URL is valid: the codec spends at most 2 s uploading
-#: (``kontra.codec.stream.STREAM_UPLOAD_BUDGET``), so a URL that outlives a minute serves
-#: only whoever copied it.
+#: The longest a stream blob's PUT URL is valid: the codec spends at most its upload budget
+#: uploading (2 s by default, 8 s at most: ``kontra.codec.stream.STREAM_UPLOAD_BUDGET`` and
+#: ``STREAM_UPLOAD_BUDGET_MAX``), so a URL that outlives a minute serves only whoever copied it.
 STREAM_URL_TTL_MAX = 60
 _STREAM_B64_MAX = 4 * -(-STREAM_ITEM_MAX // 3)
 #: Relayed ciphertext a gate stores per topic of a job, and per job; past either, one
