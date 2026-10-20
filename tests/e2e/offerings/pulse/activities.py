@@ -1,11 +1,10 @@
-"""Temporal through the façade: kontra.workflow and kontra.activity only (D1). `pulse` heartbeats as any Temporal activity
-would; `quiet` never does."""
+"""Vanilla Temporal: temporalio only, no kontra import (decisions I29). `pulse` heartbeats as any Temporal
+activity would; `quiet` never does."""
 
 import asyncio
 
 from models import PulseInput
-
-from kontra import activity
+from temporalio import activity
 
 #: Slower than the forwarder's default interval (1 s, latest wins: PRD §8.4), with room
 #: for a slow post, so that under the settings a seller ships with every heartbeat is its

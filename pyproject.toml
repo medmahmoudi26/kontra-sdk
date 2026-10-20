@@ -25,10 +25,13 @@ classifiers = [
   "Topic :: System :: Distributed Computing",
   "Typing :: Typed",
 ]
-# temporalio is pinned to a minor: standalone Nexus operations and serialization
-# context are experimental there, and a minor bump may change them.
+# temporalio: the range kontra-sdk is tested on (decisions I29). Sellers import temporalio
+# directly, so compatibility is a dependency problem, not an import path: the codec relies on
+# experimental APIs (serialization context, Nexus operation info), so the range only widens
+# after a green suite on the new minor. kontra/_compat.py holds the same range (a test keeps
+# them equal); KontraPlugin refuses to start outside it, `kontra serve`/`publish` warn.
 dependencies = [
-  "temporalio>=1.34,<1.35",
+  "temporalio>=1.34,<1.38",
   "pydantic>=2.9,<3",
   "httpx>=0.27,<1",
   "pyyaml>=6",
@@ -44,14 +47,10 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp>=2.3,<3"]  # kontra.mcp is written on MCPServer (mcp 2.x)
-# Temporal's OpenAI Agents integration (temporalio.openai_agents): kontra.workflow re-exports
-# activity_as_tool and mcp_server, and serve() installs its plugin for a workflow that imports
-# `agents`. [mcp]: serve(mcp_servers=).
-agents = ["temporalio-openai-agents[mcp]>=1.1,<2"]
 # `kontra serve --otlp`: Temporal's TracingInterceptor (temporalio's own extra of the same
 # name) and the OTLP/gRPC span exporter.
 opentelemetry = [
-  "temporalio[opentelemetry]>=1.34,<1.35",
+  "temporalio[opentelemetry]>=1.34,<1.38",
   "opentelemetry-exporter-otlp-proto-grpc>=1.39,<2",
 ]
 # webauthn (duo-labs, BSD): the fake gate verifies real passkey answers with the same code as the
@@ -81,6 +80,13 @@ dev = [
   "psutil>=6",
   "boto3>=1.35",
   "webauthn>=3.0.1,<4",
+  # A seller's agent dependencies are the seller's (decisions I29): these are for kontra-sdk's
+  # own checks. Temporal's OpenAI Agents integration: `kontra graph`'s scripted model
+  # (kontra/cli/_scripted.py, under pyright strict) and examples/chef-agents' tests.
+  "temporalio-openai-agents[mcp]>=1.1,<2",
+  # Temporal's agent harness (the PRD's pin): the bound-handler tests run a real agent, and
+  # check Kontra's copy of its wire shape (kontra/serve/turn.py). Never a runtime import.
+  "temporal-agent-harness==0.6.0",
 ]
 
 [build-system]

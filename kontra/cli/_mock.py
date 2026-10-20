@@ -5,13 +5,17 @@ back into one static graph (:mod:`kontra.graph`).
 Nothing in the seller's code changes. The worker ``worker.py`` builds is read, not run: its
 bound workflows, its extra workflows (the children they start), its registered activities
 and its plugins. A plain ``temporalio.worker.Worker`` per bound offering, on that offering's
-own task queue, serves the workflows, ``kontra.batch.v1`` and ONE dynamic activity, which
-answers every activity type nothing else registered -- the seller's, a ``pages=`` activity,
-a tool -- with a value of the type the seller's activity of that name declares
-(:mod:`kontra._sample`), or null for a name the worker does not register. An agent workflow
-keeps the agents plugin, with a scripted model (:mod:`kontra.cli._scripted`). The data
-converter is the one ``kontra serve`` gives such a worker, without the codec: nothing is
-encrypted. The test server cannot be bound to the loopback (it takes a port, nothing else),
+own task queue, serves the workflows, ``kontra.batch.v1`` (the optional
+:mod:`kontra.contrib.parallel` helper's child, whether or not the seller's plugins add it)
+and ONE dynamic activity, which answers every activity type nothing else registered -- the
+seller's, a ``pages=`` activity, a tool -- with a value of the type the seller's activity of
+that name declares (:mod:`kontra._sample`), or null for a name the worker does not register.
+A workflow whose worker has Temporal's ``OpenAIAgentsPlugin`` among its ``plugins=`` (an
+agent workflow; the seller's own dependency, ``temporalio-openai-agents``) gets that
+integration with a scripted model instead (:mod:`kontra.cli._scripted`); no other seller
+plugin is run. The data converter is the payload converter ``kontra serve`` ends up with for
+such a worker, without the codec: nothing is encrypted. An offering bound to an agent's
+handler (one hire, one turn: :mod:`kontra.serve.turn`) is not drawn yet (kontra-sdk#56). The test server cannot be bound to the loopback (it takes a port, nothing else),
 so it listens on every interface, unauthenticated, while the command runs: anyone who can
 reach the machine can read the runs' inputs and results -- an ``--input`` given too -- and
 start workflows the mock worker runs. It is downloaded once into a directory only this user
@@ -37,6 +41,7 @@ import contextlib
 import logging
 import os
 import stat
+import sys
 import warnings
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -48,15 +53,16 @@ from temporalio import activity
 from temporalio.api.enums.v1 import EventType, WorkflowTaskFailedCause
 from temporalio.client import Client, WorkflowHistory
 from temporalio.common import RawValue
-from temporalio.converter import DataConverter
+from temporalio.contrib.pydantic import PydanticPayloadConverter
+from temporalio.converter import DataConverter, PayloadConverter
 from temporalio.runtime import LoggingConfig, Runtime, TelemetryConfig, TelemetryFilter
 from temporalio.service import RPCError
 from temporalio.testing import WorkflowEnvironment
 
-from kontra import _agents, graph
-from kontra._parallel import _Batch
+from kontra import graph
 from kontra._sample import Unsampleable, draw
 from kontra.cli._common import fail
+from kontra.contrib.parallel import _Batch
 from kontra.serve.worker import _dedupe, workflow_runner
 
 __all__ = ["Explored", "explore", "server_dir"]
@@ -121,8 +127,31 @@ class _Answers:
             return None
 
 
+#: Where Temporal's OpenAI Agents integration lives (the seller's dependency).
+_AGENTS_MODULE = "temporalio.openai_agents"
+
+
+def uses_agents(plugins: object) -> bool:
+    """Whether a worker's ``plugins=`` hold Temporal's ``OpenAIAgentsPlugin``. Read without
+    importing anything: a plugin instance exists only once its module was imported."""
+    module = sys.modules.get(_AGENTS_MODULE)
+    plugin_type = getattr(module, "OpenAIAgentsPlugin", None)
+    if not isinstance(plugin_type, type) or not isinstance(plugins, list | tuple):
+        return False
+    return any(isinstance(p, plugin_type) for p in plugins)  # pyright: ignore[reportUnknownVariableType]
+
+
+def _payload_converter(plugins: object) -> type[PayloadConverter]:
+    """The payload converter ``kontra serve``'s client ends up with: the agents plugin's
+    (it decodes the model activity's input leniently), else pydantic."""
+    if not uses_agents(plugins):
+        return PydanticPayloadConverter
+    from temporalio.openai_agents import OpenAIPayloadConverter
+
+    return OpenAIPayloadConverter
+
+
 def _stub(answers: _Answers) -> Callable[..., Any]:
-    # Temporal's defn, not kontra's: kontra's would note it for serve() to register.
     @activity.defn(dynamic=True)
     async def stub(args: Sequence[RawValue]) -> Any:
         # Drawn off the event loop: a large value must not hold up the runs' deadline.
@@ -316,14 +345,20 @@ async def explore(
     """The mock runs of each of ``bindings`` (the worker's bound offerings), run ``i`` of
     binding ``k`` started with ``inputs[k][i]`` and given ``deadline`` seconds; one test
     server for all of them."""
+    for bound in bindings:
+        if bound.kind == "handler":
+            fail(
+                f"kontra graph does not draw an agent's handler yet: {bound.key} is "
+                f"{bound.agent.__name__}.{bound.handler} (kontra-sdk#56)"
+            )
     options = worker.options
     plugins = options.get("plugins")
     registered = _registered(options.get("activities") or ())
     answers = _Answers(registered, seed)
-    converter = DataConverter(payload_converter_class=_agents.payload_converter_class(plugins))
+    converter = DataConverter(payload_converter_class=_payload_converter(plugins))
     extra = list(options.get("workflows") or ())
     worker_plugins: list[temporalio.worker.Plugin] = []
-    if _agents.uses_agents(plugins):
+    if uses_agents(plugins):
         from kontra.cli._scripted import scripted_plugin
 
         worker_plugins.append(scripted_plugin(lambda: answers.run, seed))

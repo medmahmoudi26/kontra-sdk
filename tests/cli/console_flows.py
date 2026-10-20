@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
-from kontra import ApplicationError, RetryPolicy, activity, workflow
+from temporalio import activity, workflow
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
 
 #: How long each attempt of :func:`flaky` runs: long enough for a stream polling every
 #: 0.2 s to see it running.

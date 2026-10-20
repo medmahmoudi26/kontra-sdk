@@ -1,6 +1,6 @@
 """Types a seller may use in ``models.py``. ``Artifact`` is the only Kontra touch allowed
-in seller models (D1, §10.8): a reference to bytes in the claim-check bucket, never the
-bytes themselves.
+in seller models (decisions I29, §10.8): a reference to bytes in the claim-check bucket,
+never the bytes themselves. Importing this module loads no Temporal.
 
 The methods reach the process's Kontra runtime (``kontra._runtime``), installed by
 ``kontra.serve.Worker`` on the seller side and by ``kontra.hire.Kontra`` on the buyer side.

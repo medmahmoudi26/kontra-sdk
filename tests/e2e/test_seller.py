@@ -120,13 +120,12 @@ async def test_ac01_init_dev_serve_yields_a_hireable_offering(stack: Stack, tmp_
     project = work / "wc"
     key = f"{seller_handle}/wc@0.1.0"
 
-    # The job's code reaches Temporal only through the façade (`from kontra import ...`,
-    # never `import kontra` or temporalio), and no Python symbol in offering.yaml (D1, D11).
+    # The job's code is vanilla Temporal -- temporalio imported directly, nothing from kontra
+    # (decisions I29) -- and no Python symbol is in offering.yaml (D11).
     for name in ("workflows.py", "activities.py"):
         source = (project / name).read_text()
-        assert "import kontra" not in source, name
-        assert re.search(r"^\s*(from|import)\s+(temporalio|nexusrpc)\b", source, re.M) is None
-        assert re.search(r"^from kontra import ", source, re.M), name
+        assert re.search(r"^\s*(from|import)\s+kontra\b", source, re.M) is None, name
+        assert re.search(r"^from temporalio import ", source, re.M), name
     yaml_text = (project / "offering.yaml").read_text()
     for symbol in ("WcFlow", "count_words", "quote:", "workflows.", "activities."):
         assert symbol not in yaml_text, symbol
@@ -247,12 +246,12 @@ async def test_ac18_a_hold_for_one_contract_is_refused_by_a_handler_serving_anot
         pass  # published: hash X
     drift(project)
     (project / "drifted.py").write_text(
-        "from kontra.serve import worker as w\n"
+        "from kontra.plugin import KontraPlugin\n"
         "\n"
         "async def no_hash_lock(self, gate, profile):\n"
         "    return {b.key: b.contract_hash() for b in self.offerings}\n"
         "\n"
-        "w.Worker._hash_lock = no_hash_lock\n"
+        "KontraPlugin._hash_lock = no_hash_lock\n"
         "\n"
         "from worker import worker  # noqa: E402\n"
         "\n"

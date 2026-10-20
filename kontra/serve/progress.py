@@ -2,8 +2,8 @@
 
 Seller code calls ``activity.heartbeat(details)`` as it would for Temporal anyway; Kontra's
 activity outbound interceptor sees every call (before the SDK throttles them) and offers
-``(job, activity, details)`` here. Nothing in seller code knows: delete ``kontra`` and the
-heartbeats simply stop being forwarded (D1).
+``(job, activity, details)`` here. Nothing in seller code knows: delete ``worker.py`` and the
+heartbeats simply stop being forwarded (decisions I29).
 
 Per job the forwarder keeps only the latest details and sends at most one event per
 ``interval`` seconds (``$KONTRA_PROGRESS_INTERVAL``, default 1) -- however slow the gate is

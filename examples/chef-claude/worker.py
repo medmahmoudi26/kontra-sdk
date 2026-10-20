@@ -1,7 +1,8 @@
-"""Binds the code to the offering; all worker tuning lives here (D11). `serve()` binds
-offering.yaml and quote.py beside this file to `ChefFlow` and registers every activity the
-workflow imports. Every keyword is a `temporalio.worker.Worker` argument, passed through
-verbatim.
+"""Binds the code to the offering; all worker tuning lives here (D11), and this is the one file
+that imports `kontra` (decisions I29). `serve()` binds offering.yaml and quote.py beside this
+file to `ChefFlow`, and registers every `@activity.defn` function of this project (the
+modules imported from this directory, its tests left out). Every keyword is a
+`temporalio.worker.Worker` argument, passed through verbatim.
 
 The `claude` binary and its credentials are this machine's too -- `claude` on PATH, logged
 in or given `ANTHROPIC_API_KEY` -- worker config, like the number of activity slots."""

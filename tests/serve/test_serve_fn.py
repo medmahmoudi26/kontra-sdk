@@ -1,7 +1,8 @@
-"""``serve(Flow)``: what it binds (offering.yaml and quote.py beside worker.py, the first
-workflow), what it registers (every imported ``kontra.activity.defn``, the agents plugin when
-the workflows imported ``agents``), when it runs (``__main__`` only), how the CLI finds it,
-and the callable ``kontra.serve`` package."""
+"""``serve(entry)``: what it binds (offering.yaml and quote.py beside worker.py, the entry),
+what it registers (every ``@activity.defn`` function of the project's modules, found by
+scanning them; ``workflows=`` and ``plugins=`` passed through as temporalio's keywords), when
+it runs (``__main__`` only), how the CLI finds it, and the callable ``kontra.serve``
+package. Seller code here is vanilla temporalio (decisions I29)."""
 
 from __future__ import annotations
 
@@ -10,7 +11,6 @@ import inspect
 import runpy
 import sys
 import textwrap
-import types
 import uuid
 from pathlib import Path
 from typing import Any
@@ -19,10 +19,10 @@ import pytest
 from click.testing import CliRunner, Result
 
 import kontra
-from kontra import _agents
 from kontra.cli import cli as kontra_cli
 from kontra.cli._project import load_worker
 from kontra.serve import BindingError, Worker
+from kontra.serve._serve import project_activities
 from kontra.serve.worker import TEMPORAL_KWARGS, workflow_runner
 from kontra.testing.devserver import DevServer
 
@@ -39,7 +39,7 @@ _FILES = {
             text: str
         """,
     "activities.py": """
-        from kontra import activity
+        from temporalio import activity
 
         @activity.defn
         async def shout(text: str) -> str:
@@ -53,7 +53,7 @@ _FILES = {
     "workflows.py": """
         from datetime import timedelta
 
-        from kontra import workflow
+        from temporalio import workflow
 
         with workflow.unsafe.imports_passed_through():
             from activities import shout
@@ -158,9 +158,10 @@ def test_serve_binds_offering_yaml_and_quote_py_beside_worker_py(
     assert no_run == []  # imported, not run
 
 
-def test_the_first_workflow_is_bound_and_the_rest_registered(
+def test_the_entry_is_bound_and_further_workflows_registered(
     tmp_path: Path, no_run: list[Worker]
 ) -> None:
+    """Every keyword is temporalio's, verbatim: further workflows go in ``workflows=``."""
     root = _project(
         tmp_path / "p",
         """
@@ -169,7 +170,7 @@ def test_the_first_workflow_is_bound_and_the_rest_registered(
         from kontra import serve
         from workflows import Child, Flow
 
-        serve(Flow, Child, max_concurrent_activities=7,
+        serve(Flow, workflows=[Child], max_concurrent_activities=7,
               graceful_shutdown_timeout=timedelta(seconds=3))
         """,
     )
@@ -216,9 +217,20 @@ def test_quote_py_without_a_quote_function(tmp_path: Path) -> None:
         pass
 
 
-def test_serve_refuses_no_workflow_and_offerings(tmp_path: Path) -> None:
-    with pytest.raises(TypeError, match=r"serve\(MyFlow\)"):
-        kontra.serve()
+def test_serve_refuses_no_entry_two_entries_and_offerings(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="entry"):
+        kontra.serve()  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="positional"):
+        kontra.serve(object, object)  # type: ignore[call-arg]  # serve(Flow, workflows=[Child])
+    root = _project(
+        tmp_path / "x",
+        "from kontra import serve\nfrom workflows import Flow\nserve(Flow.run)\n",
+    )
+    with (
+        pytest.raises(BindingError, match=r"@workflow\.defn class.*@agent\.accepts"),
+        load_worker(root),
+    ):
+        pass
     root = _project(
         tmp_path / "p",
         "from kontra import serve\nfrom workflows import Flow\nserve(Flow, offerings=[])\n",
@@ -237,14 +249,14 @@ def test_serve_refuses_no_workflow_and_offerings(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- activities
 
 
-def test_every_imported_activity_is_registered_but_methods(tmp_path: Path) -> None:
+def test_every_activity_of_the_project_is_registered_but_methods(tmp_path: Path) -> None:
     root = _project(tmp_path / "p", ONE_LINE)
     with load_worker(root) as worker:
         assert _names(worker.options["activities"]) == ["shout"]
         assert worker.options["activities"][0] is sys.modules["activities"].shout
 
 
-def test_activities_passed_are_added_after_the_imported_ones(tmp_path: Path) -> None:
+def test_activities_passed_are_added_after_the_found_ones(tmp_path: Path) -> None:
     root = _project(
         tmp_path / "p",
         """
@@ -263,9 +275,9 @@ def test_activities_passed_are_added_after_the_imported_ones(tmp_path: Path) -> 
 
 
 def test_another_projects_activities_are_not_registered(tmp_path: Path) -> None:
-    """kontra.activity.defn remembers every activity of the process; serve() takes those
-    whose module is the one imported now, so a project loaded earlier (here: still loaded,
-    its same-named `activities` set aside) lends it nothing."""
+    """The scan reads the modules loaded from under worker.py's own directory: a project
+    loaded earlier (here: still loaded, its same-named `activities` set aside) lends it
+    nothing, and neither does any module of the test process outside the project."""
     other = dict(_FILES)
     other["activities.py"] = _FILES["activities.py"].replace("shout", "bellow")
     other["workflows.py"] = _FILES["workflows.py"].replace("shout", "bellow")
@@ -275,6 +287,132 @@ def test_another_projects_activities_are_not_registered(tmp_path: Path) -> None:
         assert _names(one.options["activities"]) == ["bellow"]
         with load_worker(second) as two:
             assert _names(two.options["activities"]) == ["shout"]
+
+
+def _load(path: Path, name: str) -> None:
+    """Import ``path`` as module ``name`` (as a test run of the project would load it)."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+
+
+_ACTIVITY = """
+from temporalio import activity
+
+@activity.defn(name="{name}")
+async def {name}(text: str) -> str:
+    return text
+"""
+
+
+def test_the_scan_skips_tests_environments_and_reexports(tmp_path: Path) -> None:
+    """Activities in the project's modules, once each (a function a module imports from
+    another is found in its own), in import then definition order; none from the project's
+    tests, a virtual environment, build output or a dot directory -- all loaded here, as a
+    test run of the project would load them -- and none from outside the project."""
+    root = tmp_path / "p"
+    files = {
+        "acts_one.py": _ACTIVITY.format(name="one"),
+        "acts_two.py": "from acts_one import one  # a re-export\n"
+        + _ACTIVITY.format(name="two")
+        + _ACTIVITY.format(name="three"),
+        "tests/test_it.py": _ACTIVITY.format(name="in_tests"),
+        ".venv/lib/dep.py": _ACTIVITY.format(name="in_venv"),
+        "build/lib/copy.py": _ACTIVITY.format(name="in_build"),
+        ".hidden/x.py": _ACTIVITY.format(name="in_dot_dir"),
+    }
+    names: list[str] = []
+    sys.path.insert(0, str(root))
+    try:
+        for rel, text in files.items():
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+            names.append(path.stem)
+            _load(path, path.stem)
+        importlib.import_module("tests.serve.flows")  # activities outside the project
+        assert _names(project_activities(root.resolve())) == ["one", "two", "three"]
+    finally:
+        sys.path.remove(str(root))
+        for name in names:
+            sys.modules.pop(name, None)
+
+
+def test_two_activities_of_one_name_are_refused_naming_both(tmp_path: Path) -> None:
+    """Temporal registers one activity per name: two in the project are refused when
+    worker.py is imported, naming both modules -- never the last one silently winning."""
+    root = _project(
+        tmp_path / "p",
+        "import twin\nfrom kontra import serve\nfrom workflows import Flow\nserve(Flow)\n",
+        **{
+            "twin.py": """
+                from temporalio import activity
+
+                @activity.defn(name="shout")
+                async def shout_again(text: str) -> str:
+                    return text
+                """,
+        },
+    )
+    with (
+        pytest.raises(
+            BindingError,
+            match=r"'shout' is defined twice in the project: twin\.shout_again and activities\.shout",
+        ),
+        load_worker(root),
+    ):
+        pass
+
+
+_FACTORY = """
+    from temporalio import activity
+
+    def make(name: str):
+        @activity.defn(name=name)
+        async def fetch(url: str) -> str:
+            return name + url
+
+        return fetch
+    """
+
+
+def _activity_names(fns: list[Any]) -> list[str]:
+    return [getattr(f, "__temporal_activity_definition").name for f in fns]
+
+
+def test_activities_a_factory_of_the_project_makes_are_registered(tmp_path: Path) -> None:
+    """An activity a function makes (``fetch_a = make("fetch_a")``) has the factory's module
+    as its own, and that module never binds it: the scan used to pass it over, the worker
+    started, and the first job failed on an activity not registered. It is found where a
+    project module binds it, after those defined at module level, once however often it is
+    bound; two made with one name are refused, naming both."""
+    worker_py = "import made\nfrom kontra import serve\nfrom workflows import Flow\nserve(Flow)\n"
+    made = """
+        from factory import make
+
+        fetch_a = make("fetch_a")
+        fetch_b = make("fetch_b")
+        again = fetch_a
+        """
+    root = _project(tmp_path / "p", worker_py, **{"factory.py": _FACTORY, "made.py": made})
+    with load_worker(root) as worker:
+        found = worker.options["activities"]
+        assert _activity_names(found) == ["shout", "fetch_a", "fetch_b"]
+        assert found[1] is sys.modules["made"].fetch_a
+    twice = made + 'fetch_c = make("fetch_a")\n'
+    root = _project(tmp_path / "q", worker_py, **{"factory.py": _FACTORY, "made.py": twice})
+    with (
+        pytest.raises(
+            BindingError,
+            match=r"'fetch_a' is defined twice in the project: made\.fetch_a \(made by "
+            r"factory\.make\.<locals>\.fetch\) and made\.fetch_c",
+        ),
+        load_worker(root),
+    ):
+        pass
 
 
 # --------------------------------------------------------------------------- running
@@ -425,217 +563,19 @@ def test_from_kontra_import_serve_before_and_after_the_package_is_imported() -> 
     assert out.split() == ["_CallablePackage", "_CallablePackage"]
 
 
-# --------------------------------------------------------------------------- agents
+# --------------------------------------------------------------------------- plugins
 #
-# No keyword says "this workflow runs an agent" (decisions I25): a workflow that does imports
-# OpenAI's ``agents``, and serve() reads that from the process after worker.py imported it.
-
-#: ``workflows.py`` of a workflow that runs an agent: it imports OpenAI's Agents SDK.
-_PASSED = " " * 12  # inside `with workflow.unsafe.imports_passed_through():`, dedented
-AGENT_WORKFLOWS = _FILES["workflows.py"].replace(
-    f"{_PASSED}from models import Inp, Out\n",
-    f"{_PASSED}from models import Inp, Out\n{_PASSED}from agents import Agent, Runner\n",
-)
-assert "from agents import Agent, Runner" in AGENT_WORKFLOWS
+# A seller's own Temporal plugins pass through as temporalio's ``plugins=`` keyword (decisions
+# I29): Kontra sniffs no import. Temporal's OpenAI Agents integration is the seller's
+# dependency and their plugin; on the client, before Kontra's, its converter is the one the
+# worker gets (``test_plugin.py`` checks the order against a running worker).
 
 
-@pytest.fixture
-def agents_installed() -> None:
-    if not AGENTS:
-        pytest.skip("the [agents] extra is not installed")
+def test_plugins_is_a_temporal_worker_keyword_passed_verbatim(tmp_path: Path) -> None:
+    from temporalio.plugin import SimplePlugin
 
-
-@pytest.fixture
-def no_openai_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Nothing in the environment points at OpenAI: what a worker gets is what serve() made."""
-    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_DEFAULT_MODEL"):
-        monkeypatch.delenv(name, raising=False)
-
-
-def test_agents_is_not_a_keyword(tmp_path: Path) -> None:
-    """``serve(Flow, agents=True)`` is a ``TypeError`` like any keyword that is not
-    ``temporalio.worker.Worker``'s; nothing that builds a worker or its converter takes it."""
-    from kontra.serve._serve import serve_from
-    from kontra.serve.worker import seller_data_converter
-
-    for fn in (
-        kontra.serve.serve,
-        type(kontra.serve).__call__,
-        serve_from,
-        seller_data_converter,
-        _agents.plugins,
-        _agents.payload_converter_class,
-    ):
-        assert "agents" not in inspect.signature(fn).parameters, fn
-    assert "agents" not in TEMPORAL_KWARGS
-    root = _project(
-        tmp_path / "p",
-        "from kontra import serve\nfrom workflows import Flow\nserve(Flow, agents=True)\n",
-    )
-    with (
-        pytest.raises(TypeError, match=r"unexpected keyword argument 'agents'"),
-        load_worker(root),
-    ):
-        pass
-
-
-def test_a_workflow_that_imports_no_agents_gets_no_plugin(
-    tmp_path: Path,
-    no_openai_env: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Installed is not imported: with the extra or without it, the worker of a workflow
-    that does not import ``agents`` gets no plugin and temporalio's pydantic converter, and
-    needs no OPENAI_API_KEY. ``mcp_servers`` is worker config the workflow never asks for:
-    unused, and implying nothing."""
-    from temporalio.contrib.pydantic import PydanticPayloadConverter
-
-    root = _project(
-        tmp_path / "p",
-        "from kontra import serve\nfrom workflows import Flow\n"
-        "serve(Flow, mcp_servers={'shodan': object})\n",
-    )
-    for installed in (True, False):
-        monkeypatch.setattr(_agents, "AVAILABLE", installed)
-        with load_worker(root) as worker:
-            assert "plugins" not in worker.options
-            converter = _agents.payload_converter_class(worker.options.get("plugins"))
-            assert converter is PydanticPayloadConverter
-    assert "agents" not in sys.modules  # importing kontra.workflow did not import it either
-
-
-def _openai_agents_installed_in(site: Path) -> Path:
-    """An installation of OpenAI's Agents SDK in ``site``, as pip makes one: the
-    ``openai-agents`` distribution and its ``agents`` package, whose ``__init__.py`` this
-    returns."""
-    package = site / "agents"
-    package.mkdir(parents=True)
-    (package / "__init__.py").write_text("")
-    info = site / "openai_agents-0.0.1.dist-info"
-    info.mkdir()
-    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: openai-agents\nVersion: 0.0.1\n")
-    return package / "__init__.py"
-
-
-def test_an_agents_import_without_the_extra_names_the_extra(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """OpenAI's Agents SDK imported -- the ``openai-agents`` distribution's ``agents`` -- and
-    not Temporal's integration: the worker could not run the workflow's agent, and says what
-    installs it."""
-    monkeypatch.setattr(_agents, "AVAILABLE", False)
-    site = tmp_path / "site"
-    theirs = types.ModuleType("agents")
-    theirs.__file__ = str(_openai_agents_installed_in(site))
-    monkeypatch.syspath_prepend(str(site))
-    monkeypatch.setitem(sys.modules, "agents", theirs)  # what the workflow imported
-    root = _project(tmp_path / "p", ONE_LINE)
-    with (
-        pytest.raises(TypeError, match=r"imports OpenAI's Agents SDK.*kontra-sdk\[agents\]"),
-        load_worker(root),
-    ):
-        pass
-    with pytest.raises(AttributeError, match=r"kontra-sdk\[agents\]"):
-        _agents.facade("activity_as_tool")
-
-
-def test_a_sellers_own_module_named_agents_runs_no_agent(
-    tmp_path: Path, no_openai_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The signal is OpenAI's ``agents``, not the name: a seller's own ``agents.py`` that the
-    workflow module imports is no Agents SDK, so, with the extra or without it, its worker
-    gets no plugin and the pydantic converter (and no ``TypeError``)."""
-    from temporalio.contrib.pydantic import PydanticPayloadConverter
-
-    workflows = _FILES["workflows.py"].replace(
-        f"{_PASSED}from models import Inp, Out\n",
-        f"{_PASSED}from models import Inp, Out\n{_PASSED}from agents import GREETING\n",
-    )
-    root = _project(
-        tmp_path / "p",
-        ONE_LINE,
-        **{"workflows.py": workflows, "agents.py": "GREETING = 'hi'\n"},
-    )
-    for installed in (True, False):
-        monkeypatch.setattr(_agents, "AVAILABLE", installed)
-        with load_worker(root) as worker:
-            assert sys.modules["agents"].GREETING == "hi"  # the seller's own, imported
-            assert "plugins" not in worker.options
-            converter = _agents.payload_converter_class(worker.options.get("plugins"))
-            assert converter is PydanticPayloadConverter
-
-
-#: ``worker.py`` with the ``Worker`` written out rather than ``serve()``.
-EXPLICIT = """
-    from activities import shout
-    from quote import quote
-    from workflows import Flow
-
-    from kontra.serve import Worker, offering
-
-    worker = Worker(offerings=[offering("offering.yaml", workflow=Flow, quote=quote)],
-                    activities=[shout])
-    """
-
-
-def test_an_explicit_worker_of_an_agent_workflow_gets_the_plugin_too(
-    tmp_path: Path, agents_installed: None, no_openai_env: None
-) -> None:
-    """``worker = Worker(...)`` written out follows the same rule as serve(): its workflows
-    imported ``agents``, so it gets the plugin, and its converter follows. The seller could
-    not pass the plugin in a published offering: ``kontra publish`` refuses ``temporalio``
-    imports. Without the import, no plugin."""
-    from temporalio.openai_agents import OpenAIAgentsPlugin, OpenAIPayloadConverter
-
-    root = _project(tmp_path / "p", EXPLICIT, **{"workflows.py": AGENT_WORKFLOWS})
-    with load_worker(root) as worker:
-        plugins = worker.options["plugins"]
-    assert [type(p) for p in plugins] == [OpenAIAgentsPlugin]
-    assert _agents.payload_converter_class(plugins) is OpenAIPayloadConverter
-    sys.modules.pop("agents")  # a new worker process
-    plain = _project(tmp_path / "q", EXPLICIT)
-    with load_worker(plain) as worker:
-        assert "plugins" not in worker.options
-
-
-def test_the_facade_imports_agents_only_when_a_workflow_names_it() -> None:
-    """``kontra.workflow`` is imported by every workflow; ``activity_as_tool`` and
-    ``mcp_server`` load ``agents`` when first named, so the import stays the signal. A star
-    import names neither, and ``dir()`` lists them without loading them."""
-    import subprocess
-
-    probe = textwrap.dedent(
-        """
-        import sys
-        import kontra, kontra.serve, kontra.hire, kontra.testing
-        from kontra import workflow
-        from kontra.workflow import *
-        print("agents" in sys.modules)
-        if workflow._agents.AVAILABLE:
-            assert {"activity_as_tool", "mcp_server"} <= set(dir(workflow))
-            print("agents" in sys.modules)
-            from temporalio.openai_agents import workflow as theirs
-            assert workflow.activity_as_tool is theirs.activity_as_tool
-            assert workflow.mcp_server is theirs.temporal_mcp_server
-            print("agents" in sys.modules)
-        """
-    )
-    out = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
-    ).stdout
-    assert out.split() == (["False", "False", "True"] if AGENTS else ["False"])
-
-
-def test_an_agents_import_installs_the_plugin_with_the_mcp_servers(
-    tmp_path: Path, agents_installed: None, no_openai_env: None
-) -> None:
-    """The worker of a workflow that imports ``agents`` gets the plugin -- the model activity,
-    the MCP servers' activities, the seller's own plugins after it -- and the converter its
-    activities decode with. It needs no OPENAI_API_KEY to be built: the model endpoint is
-    read at the first model call."""
-    from temporalio import activity as temporal_activity
-    from temporalio.openai_agents import OpenAIAgentsPlugin, OpenAIPayloadConverter
-
+    assert "plugins" in TEMPORAL_KWARGS
+    assert "mcp_servers" not in inspect.signature(kontra.serve.serve).parameters
     root = _project(
         tmp_path / "p",
         """
@@ -643,121 +583,52 @@ def test_an_agents_import_installs_the_plugin_with_the_mcp_servers(
         from theirs import plugin
         from workflows import Flow
 
-        def shodan():
-            raise AssertionError("made on the worker, when a workflow lists its tools")
-
-        serve(Flow, mcp_servers={"shodan": shodan}, plugins=[plugin])
+        serve(Flow, plugins=[plugin])
         """,
         **{
-            "workflows.py": AGENT_WORKFLOWS,
-            "theirs.py": """
-                from temporalio.plugin import SimplePlugin
-
-                plugin = SimplePlugin("theirs")
-                """,
+            "theirs.py": "from temporalio.plugin import SimplePlugin\n\nplugin = SimplePlugin('theirs')\n"
         },
-    )
-    with load_worker(root) as worker:
-        assert "agents" in sys.modules
-        plugins = worker.options["plugins"]
-        assert plugins[1:] == [sys.modules["theirs"].plugin]  # the seller's, after ours
-    assert isinstance(plugins[0], OpenAIAgentsPlugin)
-    activities = plugins[0].activities(None)  # type: ignore[misc]  # what it adds on a worker
-    names = {temporal_activity._Definition.must_from_callable(a).name for a in activities}
-    assert {"invoke_model_activity", "temporalio.mcp.shodan.call-tool"} <= names
-    assert _agents.uses_agents(plugins)
-    assert _agents.payload_converter_class(plugins) is OpenAIPayloadConverter
-
-
-def test_the_sellers_own_agents_plugin_is_the_one(
-    tmp_path: Path, agents_installed: None, no_openai_env: None
-) -> None:
-    """An ``OpenAIAgentsPlugin`` the seller passes in ``plugins=`` (Temporal's own config, its
-    model timeouts say) is the worker's: serve() adds none of its own, which would register
-    the same activities twice. ``mcp_servers=`` then belongs in that plugin."""
-    from temporalio.openai_agents import OpenAIAgentsPlugin
-
-    theirs = """
-        from datetime import timedelta
-
-        from temporalio.openai_agents import ModelActivityParameters, OpenAIAgentsPlugin
-
-        plugin = OpenAIAgentsPlugin(
-            model_params=ModelActivityParameters(start_to_close_timeout=timedelta(minutes=5))
-        )
-        """
-    root = _project(
-        tmp_path / "p",
-        "from kontra import serve\nfrom theirs import plugin\nfrom workflows import Flow\n"
-        "serve(Flow, plugins=[plugin])\n",
-        **{"workflows.py": AGENT_WORKFLOWS, "theirs.py": theirs},
     )
     with load_worker(root) as worker:
         [plugin] = worker.options["plugins"]
         assert plugin is sys.modules["theirs"].plugin
-    assert isinstance(plugin, OpenAIAgentsPlugin)
-    both = _project(
-        tmp_path / "q",
-        "from kontra import serve\nfrom theirs import plugin\nfrom workflows import Flow\n"
-        "serve(Flow, plugins=[plugin], mcp_servers={'shodan': object})\n",
-        **{"workflows.py": AGENT_WORKFLOWS, "theirs.py": theirs},
+        assert isinstance(plugin, SimplePlugin)
+
+
+def test_importing_agents_installs_nothing(tmp_path: Path) -> None:
+    """A workflow that imports OpenAI's ``agents`` gets no plugin it did not ask for: the
+    integration is the seller's, in ``plugins=``."""
+    workflows = _FILES["workflows.py"].replace(
+        "            from models import Inp, Out\n",
+        "            from models import Inp, Out\n            import agents  # noqa: F401\n",
     )
-    with pytest.raises(TypeError, match="give that plugin the MCP servers"), load_worker(both):
-        pass
+    root = _project(tmp_path / "p", ONE_LINE, **{"workflows.py": workflows})
+    with load_worker(root) as worker:
+        assert "plugins" not in worker.options
 
 
-def test_the_model_endpoint_is_the_agents_sdks_default_client(
-    agents_installed: None, no_openai_env: None
-) -> None:
-    """``set_default_openai_client`` and ``set_default_openai_api``, the Agents SDK's own, in
-    worker.py decide what the model activity dials. The API is read when the plugin is built
-    (so worker.py sets it before serve()); the client at the model call, so one set after
-    serve() built the plugin counts too. (The plugin's default provider
-    would build ``AsyncOpenAI()`` from the environment when the worker is built, and never
-    see either; with no key in the environment it would refuse to build at all.)"""
-    import agents
-    from agents import OpenAIChatCompletionsModel
-    from agents.models import _openai_shared
-    from openai import AsyncOpenAI
-
-    saved = (
-        _openai_shared.get_default_openai_client(),
-        _openai_shared.get_use_responses_by_default(),
-    )
-    try:
-        agents.set_default_openai_api("chat_completions")
-        [plugin] = _agents.plugins()  # `agents` is imported: the workflow runs an agent
-        endpoint = AsyncOpenAI(base_url="http://127.0.0.1:9/v1", api_key="local")
-        agents.set_default_openai_client(endpoint, use_for_tracing=False)
-        invoke = plugin.activities(None)[0]  # type: ignore[misc]  # invoke_model_activity
-        model = invoke.__self__._model_provider.get_model(None)
-        assert isinstance(model, OpenAIChatCompletionsModel)
-        assert model._client is endpoint
-    finally:
-        _openai_shared._default_openai_client = saved[0]
-        _openai_shared.set_use_responses_by_default(saved[1])
-
-
-def test_plugins_is_a_temporal_worker_keyword() -> None:
-    """serve() puts the agents plugin on the worker through temporalio's own ``plugins=``,
-    which ``Worker`` passes verbatim: the client Kontra connects stays Kontra's."""
-    assert "plugins" in TEMPORAL_KWARGS
+AGENTS = importlib.util.find_spec("temporalio.openai_agents") is not None
 
 
 @pytest.mark.temporal
+@pytest.mark.skipif(not AGENTS, reason="temporalio-openai-agents (the dev group's) is missing")
 async def test_an_agent_workflow_with_an_activity_tool_runs_on_the_plugin(
-    dev_server: DevServer, agents_installed: None
+    dev_server: DevServer,
 ) -> None:
-    """The plugin on the worker (as serve() puts it), Kontra's sandbox and the payload
-    converter :func:`kontra._agents.payload_converter_class` names for it: the agent loop
-    runs in the workflow, the model call and ``workflow.activity_as_tool`` as activities.
-    With temporalio's strict ``PydanticPayloadConverter`` instead, the model activity fails
-    to decode its input (``ActivityModelInput``, 71 validation errors) and retries forever.
-    The model is Temporal's test model, so nothing leaves the machine."""
+    """``OpenAIAgentsPlugin`` on the client (where ``serve()`` routes a client plugin), Kontra's
+    sandbox, and no converter picked by hand: the plugin's own ``OpenAIPayloadConverter`` is
+    the client's, the agent loop runs in the workflow, the model call and
+    ``activity_as_tool`` as activities. With temporalio's strict ``PydanticPayloadConverter``
+    instead, the model activity fails to decode its input (``ActivityModelInput``, 71
+    validation errors) and retries forever. The model is Temporal's test model, so nothing
+    leaves the machine."""
     import temporalio.worker
     from temporalio.client import Client
-    from temporalio.converter import DataConverter
-    from temporalio.openai_agents import ModelActivityParameters, OpenAIAgentsPlugin
+    from temporalio.openai_agents import (
+        ModelActivityParameters,
+        OpenAIAgentsPlugin,
+        OpenAIPayloadConverter,
+    )
     from temporalio.openai_agents.testing import (
         ResponseBuilders,
         TestModel,
@@ -776,17 +647,15 @@ async def test_an_agent_workflow_with_an_activity_tool_runs_on_the_plugin(
         model_params=ModelActivityParameters(), model_provider=TestModelProvider(model)
     )
     base = dev_server.client.config()
-    base["data_converter"] = DataConverter(
-        payload_converter_class=_agents.payload_converter_class([plugin])
-    )
+    base["plugins"] = [plugin]
     client = Client(**base)
+    assert client.data_converter.payload_converter_class is OpenAIPayloadConverter
     queue = f"agents-{uuid.uuid4().hex[:8]}"
     async with temporalio.worker.Worker(
         client,
         task_queue=queue,
         workflows=[Triage],
         activities=[lookup],
-        plugins=[plugin],
         workflow_runner=workflow_runner(),  # Kontra's sandbox: kontra passed through
     ):
         out = await client.execute_workflow(

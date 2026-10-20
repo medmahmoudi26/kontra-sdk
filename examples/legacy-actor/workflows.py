@@ -1,11 +1,12 @@
 """The old Batch loop, as a workflow. Retries, heartbeats and resumption are Temporal's; the
-old Session/checkpoint machinery has no counterpart because it is not needed. Only the
-kontra façade is imported (D1), which is Temporal's own objects: with
-`from temporalio import ...` instead, this runs on any Temporal."""
+old Session/checkpoint machinery has no counterpart because it is not needed. Vanilla
+Temporal: only `temporalio` is imported, never `kontra`, so this runs on any Temporal worker
+as it is (decisions I29)."""
 
 from datetime import timedelta
 
-from kontra import RetryPolicy, workflow
+from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from activities import head_batch

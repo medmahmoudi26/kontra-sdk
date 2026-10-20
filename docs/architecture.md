@@ -77,8 +77,10 @@ is what lets a ledger adapter be swapped and keeps a future split into services 
 | `kontra.gate_client` | the hand-written HTTP client: one method per route of `routes.py`, models in `models.py` |
 | `kontra.profile`, `kontra.auth` | the local profile, this machine's key and a buyer's per-job keys; the session that refreshes gate and Temporal tokens |
 | `kontra._jobkeys`, `kontra._devices` | share to my account (decisions I25): a job key wrapped to each of the account's devices with a proof of possession (shared with the gate), and this machine as one of them |
-| `kontra`, `kontra.workflow`, `kontra.activity` | the seller's façade: Temporal's own objects re-exported, never wrapped (`activity.defn` returns Temporal's own, after noting it for `serve()`), plus `serve`, `Worker`, `Page` and `workflow.execute_activities_in_parallel` (`kontra._parallel`, the `kontra.batch.v1` child) |
-| `kontra.serve` | the seller's `serve()` and `Worker`: generated Nexus handler, hold-token check, codec, progress forwarding; Temporal's own metrics and spans, and the worker's logs, when asked (`kontra serve --metrics`, `--otlp`) |
+| `kontra` | only what Kontra defines (decisions I29): `serve`, `Worker` and `KontraPlugin`, loaded on first use, and `__version__`; no Temporal re-exports (seller code imports `temporalio` itself) |
+| `kontra.plugin` | `KontraPlugin`, a `temporalio` client and worker plugin: everything Kontra adds to a seller's Temporal -- the connection from the profile, the namespace, the codec, the task queue from the contract, the generated Nexus service, the interceptor, the sandbox passthrough, and at start the JWKS, the hash lock and the progress forwarder |
+| `kontra.serve` | the seller's `serve()` and `Worker` (the process runner, built on `KontraPlugin`): binding a workflow class or an agent's handler, activity discovery by a scan of the project, the generated Nexus handler, the hold-token check, progress forwarding, the bound handler's turn wrapper (`kontra.serve.turn`); Temporal's own metrics and spans, and the worker's logs, when asked (`kontra serve --metrics`, `--otlp`) |
+| `kontra.contrib.parallel` | an optional helper, not core: `execute_activities_in_parallel` and its `kontra.batch.v1` child, registered by `ParallelPlugin` only when a seller passes it |
 | `kontra.hire` | the buyer's `Kontra` client, `service()` for workflows, the hire worker |
 | `kontra.mcp` | `kontra mcp`, the eight agent tools and a seller's `workers`, built on `kontra.hire` |
 | `kontra.cli` | the `kontra` command; no business rule lives here |
@@ -114,13 +116,22 @@ Rules that keep the seams real:
   both run it. `kontra/workers.py` is the only code that turns a task queue's numbers into a
   verdict; the real and the fake gate both run it too. `kontra._control` is the only code that
   talks to the internal frontend.
-- **D1.** Seller `workflows.py` and `activities.py` import Temporal only through the `kontra`
-  façade (`from kontra import workflow, activity, ...`: Temporal's own objects, so swapping in
-  `from temporalio import ...` still runs on any Temporal; decisions I20); `models.py`
-  may use `kontra.types.Artifact`. The tests check the examples and the `kontra init`
-  scaffold, and `kontra publish` refuses a project whose modules import `temporalio` or
-  `nexusrpc` or call `continue_as_new` (the one continue-as-new is `kontra.batch.v1`'s),
-  naming file and line; a `kontra dev` profile skips that check.
+- **Sellers write native Temporal** (decisions I29, superseding D1/I20). Seller
+  `workflows.py` and `activities.py` import `temporalio` directly and nothing from `kontra`, so
+  without `worker.py` they run on any Temporal worker (all but `Artifact` I/O, which needs the
+  Kontra runtime `worker.py`'s plugin installs); `worker.py` is the one file that imports
+  `kontra` (`quote.py` takes `kontra.serve.Quote`, `models.py` may use `kontra.types.Artifact`).
+  The tests check the examples and the `kontra init` scaffold, and run `examples/hello` without
+  `worker.py` on a plain Temporal worker. What constrains a seller is not what they import: the
+  Authorizer, the codec, the contract hash, `names.py` and escrow. `kontra publish` scans
+  nothing; continue-as-new is the seller's.
+- **Kontra last.** A seller's client plugins go on the client before `KontraPlugin`, which has
+  the last word on the connection, the namespace and the codec; the codec is a payload codec,
+  so it stacks under whatever payload converter an earlier plugin set. Kontra never imports
+  `temporal_agent_harness`: `kontra/serve/turn.py` holds its wire shape as constants.
+- **A tested temporalio range.** `temporalio>=1.34,<1.38`, one constant pair in
+  `kontra._compat`: a Kontra worker refuses to start outside it, `kontra serve` and
+  `kontra publish` warn.
 - **Distribution name.** The PyPI distribution is `kontra-sdk`; a bare `kontra` dependency
   installs an unrelated project.
 
@@ -138,7 +149,8 @@ a trailing newline. So every Temporal identifier is built in one place,
 | nexgen service key | `AcmeEnrich`, with `fqn: acme.enrich` | constructed |
 | Task queue | `acme/enrich@1.2.0` | constructed |
 | Seller namespace | `acme` | a party's namespace is its handle |
-| Handler workflow id | `job-<32 hex>` | constructed from the job id |
+| Handler workflow id | `job-<32 hex>` | constructed from the job id (for a bound agent handler, the job is Kontra's `kontra.turn.v1` wrapper) |
+| Agent child workflow id | `job-<32 hex>/agent` | constructed from the job id, for the agent a bound handler's wrapper starts; not job-shaped, so the codec encrypts its payloads to the seller alone |
 | Batch child workflow id | `<parent workflow id>/batch/<activity>/<uuid4>` (`job-<32 hex>/batch/...` under a handler) | constructed from the parent's id, the activity's Temporal name and a `workflow.uuid4()` of the parent's, for the `kontra.batch.v1` child; reads back as no job id |
 
 - No code splits a task queue, service name or endpoint to recover an offering, and no
