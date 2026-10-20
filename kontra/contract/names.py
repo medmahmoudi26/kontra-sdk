@@ -31,7 +31,11 @@ from functools import total_ordering
 
 __all__ = [
     "HANDLE_MAX",
+    "PLATFORM_NAMESPACE",
     "RESERVED_HANDLES",
+    "STREAM_OFFSET_QUERY",
+    "STREAM_POLL_UPDATE",
+    "WORKER_CONTROLLER_SUBJECT",
     "NameError_",
     "OfferingId",
     "OfferingRef",
@@ -44,6 +48,7 @@ __all__ = [
     "job_workflow_id",
     "new_endpoint_name",
     "new_job_id",
+    "relay_subject",
     "validate_handle",
 ]
 
@@ -286,6 +291,32 @@ def job_workflow_id(job_id: str) -> str:
     if not is_job_id(job_id):
         raise NameError_(f"{job_id!r} is not a job id")
     return _JOB_WF_PREFIX + job_id
+
+
+#: Temporal identities that are not parties. Each contains "/", which no handle can
+#: (``_HANDLE``), so no party token's ``sub`` is ever one of them (temporal/authorizer,
+#: decisions I30).
+WORKER_CONTROLLER_SUBJECT = "platform/worker-controller"
+#: Kontra's own Temporal namespace (KON-15); a reserved handle, so no party can take it.
+PLATFORM_NAMESPACE = "kontra-system"
+#: The two workflow-stream handlers a relay may use (``temporalio.contrib.workflow_streams``
+#: wire names, Public Preview; pinned by tests/contract/test_names.py). The gate depends on
+#: these names, never on the contrib package.
+STREAM_POLL_UPDATE = "__temporal_workflow_stream_poll"
+STREAM_OFFSET_QUERY = "__temporal_workflow_stream_offset"
+
+
+def relay_subject(namespace: str, job_id: str) -> str:
+    """The Temporal subject of the gate's stream relay for one job:
+    ``relay/<namespace>/job-<job id>``.
+
+    Constructed, never parsed (I1): the authorizer rebuilds it from a request's namespace and
+    workflow id and compares the whole string (temporal/authorizer ``RelaySubject``). The
+    namespace must be a party's (a handle, not a reserved one) and the job id a job id, so
+    neither part holds a ``/`` and only one job's requests rebuild it.
+    """
+    validate_handle(namespace, what="namespace")
+    return "relay/" + namespace + "/" + job_workflow_id(job_id)
 
 
 def batch_workflow_id(parent_workflow_id: str, activity: str, token: str) -> str:
