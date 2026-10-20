@@ -44,6 +44,8 @@ RULE = {
     "ReachFromAnyRun": "E19",
     "BlamesWhenUnsure": "E19",
     "ForgetsTheStart": "E19",
+    "ReachIgnoresHolds": "E19",
+    "ForgesStartTimes": "E19",
 }
 
 

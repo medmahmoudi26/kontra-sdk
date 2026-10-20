@@ -7,7 +7,9 @@ what it withholds (an unsealed delivery), how failures map, and the stream relay
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -132,6 +134,8 @@ class Recorder:
     call: CallRecord | None = None
     #: What describe_call raises (it alone: the observation it follows stands).
     fail_call: Exception | None = None
+    #: describe_call never answers: a buyer's namespace that stalls reads.
+    stall_call: bool = False
 
     def _call(self, *call: Any) -> None:
         self.calls.append(call)
@@ -226,6 +230,8 @@ class Recorder:
         self._call("describe_call", namespace, operation_id)
         if self.fail_call is not None:
             raise self.fail_call
+        if self.stall_call:
+            await asyncio.Event().wait()
         return self.call
 
 
@@ -682,6 +688,36 @@ async def test_a_verified_or_pinned_lineage_started_and_nothing_is_read() -> Non
     assert [c[0] for c in control.calls] == ["observe", "observe"]
     for lineage in (seen, gone):
         assert (lineage.reach, lineage.buyer_start) == (Reach.STARTED, None)
+
+
+async def test_a_fenced_jobs_placeholder_is_not_read() -> None:
+    """A fenced job's placeholder (OCCUPIED) is observed until the job's deadline (a cancel's
+    watch) and never judged: its reach is None, with no read of the buyer's namespace."""
+    e, control, _ = engine()
+    control.call = _call(failure=TIMEOUT)
+    placeholder = Observation(ObservedStatus.TERMINATED, provenance=Provenance.OCCUPIED, pin="p")
+    control.observation = (placeholder, None)
+    seen = await e.observe(GOLDEN, pin=None, holds=CALL.holds)
+    assert [c[0] for c in control.calls] == ["observe"]
+    assert (seen.observation, seen.reach, seen.buyer_start) == (placeholder, None, None)
+
+
+async def test_a_reach_read_that_stalls_is_cut_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A buyer's namespace that never answers delays the observation escrow needs by the
+    read's own bound at most (``CALL_READ_TIMEOUT``, 2 s; shortened here), whatever the
+    control plane does, and the reach is None."""
+    import kontra.engine.temporal as adapter
+
+    assert adapter._REACH_WAIT == 2.0  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(adapter, "_REACH_WAIT", 0.05)
+    e, control, _ = engine()
+    obs = Observation(ObservedStatus.NOT_FOUND)
+    control.stall_call = True
+    began = time.monotonic()
+    async with asyncio.timeout(5):
+        seen = await e.observe(GOLDEN, pin=None, holds=CALL.holds)
+    assert time.monotonic() - began < 1
+    assert (seen.observation, seen.reach, seen.buyer_start) == (obs, None, None)
 
 
 @pytest.mark.parametrize(

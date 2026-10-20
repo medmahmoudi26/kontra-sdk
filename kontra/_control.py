@@ -116,6 +116,7 @@ from kontra.escrow import Observation, ObservedStatus, Provenance
 from kontra.gate_client import models as m
 
 __all__ = [
+    "CALL_READ_TIMEOUT",
     "CHAIN_READS",
     "DEFAULT_RETENTION",
     "EXECUTE_OPERATION",
@@ -188,6 +189,10 @@ _OCCUPY_TIMEOUT = timedelta(minutes=1)
 _OCCUPY_DELAY = timedelta(hours=1)
 
 _RPC_TIMEOUT = timedelta(seconds=15)
+#: How long :meth:`Control.describe_call` waits: a describe answers in milliseconds, and the
+#: read is made on every observation of a job with no verified run, in a namespace whose load
+#: its buyer controls (decisions I40) -- one that hangs costs at most this, not the RPC's 15 s.
+CALL_READ_TIMEOUT = timedelta(seconds=2)
 _NAMESPACE_WAIT = 30.0
 _JSON_PLAIN = b"json/plain"
 _MESSAGE_MAX = 1000
@@ -2153,10 +2158,11 @@ class Control:
         buyer never called". Ids the frontend refuses as malformed name nothing (None), as in
         the other lookups: an error there would be asked again forever.
 
-        Not retried (one RPC): the Temporal adapter reads it on every observation of a job
-        with no verified run, and a buyer can keep its own namespace refusing reads -- a retry
-        loop there would hold up every other job's observation. What it cannot read is
-        "cannot say", asked again at the next observation."""
+        One RPC, not retried, and given :data:`CALL_READ_TIMEOUT` (2 s), not the 15 s of the
+        other calls: the Temporal adapter reads it on every observation of a job with no
+        verified run, and a buyer can keep its own namespace refusing or stalling reads -- a
+        retry loop, or a long wait, there would hold up every other job's observation. What
+        it cannot read in time is "cannot say", asked again at the next observation."""
         try:
             resp: DescribeNexusOperationExecutionResponse = (
                 await self._wf.describe_nexus_operation_execution(
@@ -2164,7 +2170,7 @@ class Control:
                         namespace=namespace, operation_id=operation_id
                     ),
                     retry=False,
-                    timeout=_RPC_TIMEOUT,
+                    timeout=CALL_READ_TIMEOUT,
                 )
             )
         except RPCError as e:

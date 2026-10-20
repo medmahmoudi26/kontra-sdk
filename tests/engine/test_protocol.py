@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import subprocess
 import sys
 import typing
@@ -81,7 +82,21 @@ AUTHORING_WORDS = frozenset(
 
 
 def _words(name: str) -> set[str]:
-    return set(name.lower().split("_"))
+    """The words of an identifier or a value, however it is spelled: ``snake_case``,
+    ``CamelCase``, ``SCREAMING_CASE``, or any mix (``NexusReach``, ``nexus_never``)."""
+    return {w.lower() for w in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+", name)}
+
+
+def test_the_walk_reads_words_in_every_spelling() -> None:
+    """A Temporal word hides in no spelling: a class name (``NexusReach``), an enum value
+    (``"nexus_never_dispatched"``), a member or field name, an acronym."""
+    assert _words("NexusReach") == {"nexus", "reach"}
+    assert _words("nexus_never_dispatched") == {"nexus", "never", "dispatched"}
+    assert _words("NEVER_DISPATCHED") == {"never", "dispatched"}
+    assert _words("task_queue") == {"task", "queue"}
+    assert _words("HTTPWorkflowRun") == {"http", "workflow", "run"}
+    assert _words("result_sha256") == {"result", "sha", "256"}
+    assert _words("ObservedStatus") & TEMPORAL_WORDS == set()
 
 
 def test_the_member_set_is_pinned() -> None:
@@ -176,9 +191,10 @@ def test_no_temporal_concept_is_in_the_protocols_types() -> None:
     assert {OfferingId, Version, JobPlan, Observation, SealedPayload, BuyerStart} <= seen
     assert {Reach, ObservedStatus, Provenance, Stop} <= enums
     for enum in enums:
-        assert not _words(enum.__name__.lower()) & TEMPORAL_WORDS, enum.__name__
+        assert not _words(enum.__name__) & TEMPORAL_WORDS, enum.__name__
         for value in enum:
             assert not _words(value.name) & TEMPORAL_WORDS, (enum.__name__, value.name)
+            assert not _words(str(value.value)) & TEMPORAL_WORDS, (enum.__name__, value.value)
     hits = {
         (cls.__name__, name)
         for cls in seen
@@ -187,7 +203,7 @@ def test_no_temporal_concept_is_in_the_protocols_types() -> None:
     }
     assert hits == EXEMPT
     for cls in seen:
-        assert not _words(cls.__name__.lower()) & TEMPORAL_WORDS, cls.__name__
+        assert not _words(cls.__name__) & TEMPORAL_WORDS, cls.__name__
 
 
 class _Signer:

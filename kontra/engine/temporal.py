@@ -20,11 +20,12 @@ adds what the Protocol asks of an adapter and nothing of its own about money.
   and never handed out -- minted again, and the frontend dialled with it, once half its life
   is spent, so a job's relay outlives any one token.
 * How far a job's start got (:attr:`~kontra.engine.Observed.reach`, decisions I40) is
-  STARTED for a verified or pinned lineage, and otherwise read from the buyer's standalone
-  operation ``job-<id>`` (:meth:`~kontra._control.Control.describe_call`) and mapped by
-  :func:`reach_of`, the case analysis kontra-cloud's ``judge_call`` made (FIXUPS #22); a read
-  that fails is None, never an error, so reputation never holds up an observation escrow
-  needs.
+  STARTED for a verified or pinned lineage and None for a fenced job's placeholder, with no
+  read, and otherwise read from the buyer's standalone operation ``job-<id>``
+  (:meth:`~kontra._control.Control.describe_call`) and mapped by :func:`reach_of`, the case
+  analysis kontra-cloud's ``judge_call`` made (FIXUPS #22). A read that fails is None, never
+  an error, so reputation never fails an observation escrow needs; one that stalls is cut
+  off at :data:`~kontra._control.CALL_READ_TIMEOUT` (2 s), all it can delay one by.
 * The internal frontend is reached only through :class:`kontra._control.Control` (the relay's
   pace too: :meth:`~kontra._control.Control.history_size`); the relay reads where
   ``relay_service`` dials (the public frontend, or a dev server's own:
@@ -41,6 +42,7 @@ behind :meth:`TemporalEngine.observe` now (``reach``, decisions I40).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, replace
@@ -58,6 +60,7 @@ from temporalio.api.workflowservice.v1 import (
 )
 
 from kontra._control import (
+    CALL_READ_TIMEOUT,
     EXECUTE_OPERATION,
     HANDLER_BAD_REQUEST,
     HANDLER_INTERNAL,
@@ -142,6 +145,9 @@ HISTORY_LIMITS: Final = (20_480, 20 * 1024 * 1024)
 
 _KEYS = ("buyer", "job", "offering", "route", "seller")
 _JSON_PLAIN = b"json/plain"
+#: The most a reach read (:meth:`TemporalEngine._reach`) may delay an observation, in
+#: seconds, whatever the control plane does: ``Control.describe_call``'s own RPC timeout.
+_REACH_WAIT = CALL_READ_TIMEOUT.total_seconds()
 _QUOTE_KINDS: Final[Mapping[NexusSyncKind, QuoteKind]] = {
     NexusSyncKind.OK: QuoteKind.OK,
     NexusSyncKind.HANDLER_ERROR: QuoteKind.REFUSED,
@@ -534,13 +540,20 @@ class TemporalEngine:
     ) -> tuple[Reach | None, BuyerStart | None]:
         """How far the job's start got (decisions I40). A verified lineage, or the pinned one
         (verified when escrow pinned it), was begun by the buyer's start: STARTED, with no
-        read. Otherwise the buyer's standalone operation ``job-<id>`` is described and mapped
-        (:func:`reach_of`); a read that fails is None ("cannot say"), never raised: reach is
-        reputation, and the observation is escrow's."""
+        read. A fenced job's placeholder (OCCUPIED) is None, with no read either: no gate
+        judges a job it fenced (a cancel's), and a canceled job is watched until its deadline,
+        which would otherwise read the buyer's namespace on every look for nothing.
+        Otherwise the buyer's standalone operation ``job-<id>`` is described and mapped
+        (:func:`reach_of`); a read that fails, or does not answer within
+        :data:`~kontra._control.CALL_READ_TIMEOUT` whatever the control plane, is None
+        ("cannot say"), never raised: reach is reputation, and the observation is escrow's."""
         if pin or obs.provenance is Provenance.VERIFIED:
             return Reach.STARTED, None
+        if obs.provenance is Provenance.OCCUPIED:
+            return None, None
         try:
-            record = await self._control.describe_call(h.buyer, h.workflow_id)
+            async with asyncio.timeout(_REACH_WAIT):
+                record = await self._control.describe_call(h.buyer, h.workflow_id)
         except Exception:
             return None, None
         return reach_of(record, call)

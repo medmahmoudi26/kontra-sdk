@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Awaitable, Callable, Collection
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Literal, cast
 
@@ -34,6 +34,7 @@ from kontra.engine import (
     Stop,
     StreamBatch,
     StreamItem,
+    hold_digest,
 )
 from kontra.escrow import Observation, ObservedStatus
 from kontra.testing.engine import FakeEngine, _Job, _parse, _Run  # pyright: ignore[reportPrivateUsage]
@@ -399,11 +400,20 @@ class ReachFromAnyRun(FakeEngine):
     buyer never started (a buyer colluding with a third party could produce such a run)."""
 
     def _reach(
-        self, job_id: str, job: _Job | None, *, verified: bool, pinned: bool
+        self,
+        job_id: str,
+        job: _Job | None,
+        holds: Collection[str],
+        *,
+        verified: bool,
+        pinned: bool,
+        placeholder: bool = False,
     ) -> tuple[Reach | None, BuyerStart | None]:
-        if job is not None and job.runs:
+        if job is not None and job.runs and not placeholder:
             return Reach.STARTED, None
-        return super()._reach(job_id, job, verified=verified, pinned=pinned)
+        return super()._reach(
+            job_id, job, holds, verified=verified, pinned=pinned, placeholder=placeholder
+        )
 
 
 class BlamesWhenUnsure(FakeEngine):
@@ -411,12 +421,65 @@ class BlamesWhenUnsure(FakeEngine):
     start went unanswered."""
 
     def _reach(
-        self, job_id: str, job: _Job | None, *, verified: bool, pinned: bool
+        self,
+        job_id: str,
+        job: _Job | None,
+        holds: Collection[str],
+        *,
+        verified: bool,
+        pinned: bool,
+        placeholder: bool = False,
     ) -> tuple[Reach | None, BuyerStart | None]:
-        reach, start = super()._reach(job_id, job, verified=verified, pinned=pinned)
+        reach, start = super()._reach(
+            job_id, job, holds, verified=verified, pinned=pinned, placeholder=placeholder
+        )
         if reach is Reach.NEVER_DISPATCHED:
             return Reach.UNANSWERED, BuyerStart()
         return reach, start
+
+
+class ReachIgnoresHolds(FakeEngine):
+    """Reports the gate's start STARTED whatever ``holds`` the observation was made with: a
+    start that is not the one the gate's holds name -- not the job's call, as the Temporal
+    adapter matches it -- blames the seller."""
+
+    def _reach(
+        self,
+        job_id: str,
+        job: _Job | None,
+        holds: Collection[str],
+        *,
+        verified: bool,
+        pinned: bool,
+        placeholder: bool = False,
+    ) -> tuple[Reach | None, BuyerStart | None]:
+        if job is not None and job.start_hold is not None:
+            holds = {*holds, hold_digest(job.start_hold)}
+        return super()._reach(
+            job_id, job, holds, verified=verified, pinned=pinned, placeholder=placeholder
+        )
+
+
+class ForgesStartTimes(FakeEngine):
+    """Every reach right, but the start's record forged so that an unanswered start would pass
+    any gate's window: made long ago, never giving up."""
+
+    def _reach(
+        self,
+        job_id: str,
+        job: _Job | None,
+        holds: Collection[str],
+        *,
+        verified: bool,
+        pinned: bool,
+        placeholder: bool = False,
+    ) -> tuple[Reach | None, BuyerStart | None]:
+        reach, start = super()._reach(
+            job_id, job, holds, verified=verified, pinned=pinned, placeholder=placeholder
+        )
+        if start is None:
+            return reach, start
+        return reach, BuyerStart(datetime(2000, 1, 1, tzinfo=UTC), None, start.withdrawal_asked)
 
 
 class ForgetsTheStart(FakeEngine):
@@ -464,4 +527,6 @@ BROKEN: tuple[type[FakeEngine], ...] = (
     ReachFromAnyRun,
     BlamesWhenUnsure,
     ForgetsTheStart,
+    ReachIgnoresHolds,
+    ForgesStartTimes,
 )

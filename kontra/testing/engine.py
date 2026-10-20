@@ -29,9 +29,11 @@ began, with one of ``holds``, is verified); a start idempotent by job, refused b
 a run the seller started first; ASK as a request the code may ignore, END as final; deliveries
 only as :class:`~kontra.engine.SealedPayload`; per-run stream logs of age files; credentials
 confined to their party's side of a job (the seller's run is reached and stopped by the
-seller's credential alone; the buyer's side is its start); and the start's reach (I40):
-STARTED once the gate's start began a run, REFUSED when it was refused (a fence, or a run of
-the seller's own first), NEVER_DISPATCHED before it, whatever runs of the seller's own exist.
+seller's credential alone; the buyer's side is its start); and the start's reach (I40), as
+the Temporal adapter reads it: STARTED once the gate's start began a run, REFUSED when a run
+of the seller's own took the job first, NEVER_DISPATCHED before any start, whatever runs of
+the seller's own exist, and for an observation whose ``holds`` are not the start's; None for
+a fenced job's placeholder, which is not read.
 """
 
 from __future__ import annotations
@@ -161,6 +163,9 @@ class _Job:
     fence_pin: str | None = None
     #: The gate's start as the engine recorded it (I40): when, until when, a withdrawal.
     start: BuyerStart | None = None
+    #: The hold the gate's start carried (I40: a start is this job's only with one of
+    #: ``holds``, as the Temporal adapter matches the buyer's call).
+    start_hold: str | None = None
     #: The gate's start was refused: the job was fenced, or a run took it first.
     refused: bool = False
 
@@ -311,7 +316,8 @@ class FakeEngine:
         lineage of it is verified (decisions I40): a seller whose worker never answered
         (UNANSWERED, with the start's times), a start the seller's code refused or failed, a
         buyer that withdrew, or None, an engine that cannot read the buyer's records. A
-        verified lineage stays STARTED whatever is scripted, as on every engine."""
+        verified lineage stays STARTED whatever is scripted, as on every engine, and a fenced
+        job's placeholder None, as on Temporal."""
         self._reaches[_parse(handle)["job"]] = (reach, start)
 
     def runs(self, handle: JobHandle) -> int:
@@ -342,15 +348,31 @@ class FakeEngine:
         return run.by_gate and run.hold is not None and hold_digest(run.hold) in set(holds)
 
     def _reach(
-        self, job_id: str, job: _Job | None, *, verified: bool, pinned: bool
+        self,
+        job_id: str,
+        job: _Job | None,
+        holds: Collection[str],
+        *,
+        verified: bool,
+        pinned: bool,
+        placeholder: bool = False,
     ) -> tuple[Reach | None, BuyerStart | None]:
         """How far the job's start got (I40), from the buyer's start alone: never from a run
-        of the seller's own."""
+        of the seller's own, and only from a start carrying one of ``holds`` (else none of
+        the job's is seen, as ``reach_of`` matches the buyer's call). A fenced job's
+        placeholder is not read (None), as on Temporal."""
         if verified or pinned:
             return Reach.STARTED, None
+        if placeholder:
+            return None, None
         if job_id in self._reaches:
             return self._reaches[job_id]
-        if job is None or not job.gate_started:
+        if (
+            job is None
+            or not job.gate_started
+            or job.start_hold is None
+            or hold_digest(job.start_hold) not in set(holds)
+        ):
             return Reach.NEVER_DISPATCHED, None
         if any(r.by_gate for r in job.runs):
             return Reach.STARTED, job.start
@@ -445,7 +467,7 @@ class FakeEngine:
         self._up()
         job = self._job(plan)
         if job.start is None:
-            job.start = BuyerStart(self._clock(), deadline)
+            job.start, job.start_hold = BuyerStart(self._clock(), deadline), hold
         if job.gate_started or job.fence_pin is not None or job.runs:
             # Idempotent by job; a fenced job, or one whose id a run took first, starts none.
             job.refused = job.refused or not job.gate_started
@@ -469,8 +491,11 @@ class FakeEngine:
         job = self._jobs.get(plan["job"])
         run = self._lineage(job, pin) if job is not None else None
         if run is None:
-            reach, start = self._reach(plan["job"], job, verified=False, pinned=pin is not None)
-            if job is not None and job.fence_pin is not None and pin is None:
+            fenced = job is not None and job.fence_pin is not None and pin is None
+            reach, start = self._reach(
+                plan["job"], job, holds, verified=False, pinned=pin is not None, placeholder=fenced
+            )
+            if job is not None and fenced:
                 placeholder = Observation(
                     ObservedStatus.TERMINATED, provenance=Provenance.OCCUPIED, pin=job.fence_pin
                 )
@@ -479,7 +504,9 @@ class FakeEngine:
                 Observation(ObservedStatus.NOT_FOUND, pin=pin), reach=reach, buyer_start=start
             )
         verified = self._verified(run, holds)
-        reach, start = self._reach(plan["job"], job, verified=verified, pinned=pin is not None)
+        reach, start = self._reach(
+            plan["job"], job, holds, verified=verified, pinned=pin is not None
+        )
         obs = Observation(
             status=run.status,
             started_at=run.started_at,

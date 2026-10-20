@@ -63,9 +63,13 @@ The checks (each raises :class:`EngineContractViolation` naming the rule):
 * E19 reach (decisions I40), how far the buyer's start got, which a gate's reputation reads:
   STARTED in every observation of a verified or pinned lineage the suite made, and for the
   buyer's start that began one, before and after its end; NEVER_DISPATCHED before any start,
-  and while only a run of the seller's own exists (it is no start of the buyer's); and for the
-  gate's start of a job such a run took first, or of a fenced job, a reach that blames no one
-  (refused, or never handed over).
+  and while only a run of the seller's own exists (it is no start of the buyer's); a reach
+  that blames no one (refused, or never handed over) for the gate's start of a job such a run
+  took first, for a fenced job (or None: a placeholder need not be read), and for the buyer's
+  start observed with holds that are not its own. Every start's record the suite was handed
+  is that start's, as a gate's window reads it: made when the suite made it (never earlier),
+  giving up by the deadline the suite gave (never later, nor never), and not withdrawn where
+  the buyer never asked. The engine's clock and the suite's may differ by ``_SKEW`` (10 s).
 
 :func:`run_engine_contract` returns one line per check, ``ok`` or ``SKIPPED`` with why.
 """
@@ -170,9 +174,12 @@ _WAIT = 30.0
 _POLL = 0.05
 _QUOTE_TIMEOUT = 3.0
 _RACES = 6
-#: What the gate's start of a job a run of the seller's own took first, or of a fenced job, may
-#: reach (E19): refused, or never handed over -- nothing that could cost the seller.
+#: What the gate's start of a job a run of the seller's own took first, or of a fenced job, or
+#: the buyer's start observed with holds that are not its own, may reach (E19): refused, or
+#: never handed over -- nothing that could cost the seller.
 _UNBLAMED = frozenset({Reach.NEVER_DISPATCHED, Reach.REFUSED})
+#: How far the engine's clock and the suite's may disagree (E19: a start's record).
+_SKEW = timedelta(seconds=10)
 
 
 class EngineContractViolation(AssertionError):
@@ -1004,12 +1011,52 @@ def _reach_of(rule: str, what: str, seen: Observed, want: Collection[Reach | Non
         raise _violation(rule, f"{what}: a start's record that is not a BuyerStart: {record!r}")
 
 
+def _start_record(
+    rule: str,
+    what: str,
+    seen: Observed,
+    made: tuple[datetime, datetime],
+    deadline: datetime,
+    *,
+    withdrawn: bool | None = None,
+) -> None:
+    """The start's record ``seen`` carries, if any, is that start's own, as a gate's window
+    and wording read it (an unanswered start blames the seller only if it was made early and
+    waited long enough): made within ``made`` (no earlier), giving up by the ``deadline``
+    ``start`` was given (no later, nor never), and, with ``withdrawn``, asked to withdraw
+    exactly when the buyer did. ``made_at`` None (not recorded) is allowed: such a start never
+    waited."""
+    record = seen.buyer_start
+    if record is None:
+        return
+    first, last = made
+    made_at, gives_up_at = record.made_at, record.gives_up_at
+    for t in (made_at, gives_up_at):
+        if t is not None and t.utcoffset() is None:
+            raise _violation(rule, f"{what}: a start's record with a naive time: {record}")
+    if made_at is not None and not first - _SKEW <= made_at <= last + _SKEW:
+        raise _violation(
+            rule, f"{what}: the start is recorded made at {made_at}, not {first}..{last}: {seen}"
+        )
+    if gives_up_at is None or gives_up_at > deadline + _SKEW:
+        raise _violation(
+            rule,
+            f"{what}: the start is recorded giving up at {gives_up_at}, not by {deadline}: {seen}",
+        )
+    if withdrawn is not None and record.withdrawal_asked is not withdrawn:
+        raise _violation(
+            rule, f"{what}: the start's withdrawal is {record.withdrawal_asked}, not {withdrawn}"
+        )
+
+
 async def _e19(r: _Run) -> str:
     e = r.e
+    began = r.deadline - _DEADLINE
     for seen, pin in r.observed:  # again: a type can be forged
         o = seen.observation
         if o.provenance is Provenance.VERIFIED or pin is not None:
             _reach_of("E19", "a verified or pinned lineage", seen, {Reach.STARTED, None})
+        _start_record("E19", "a start", seen, (began, datetime.now(UTC)), r.deadline)
     job_id, handle, holds = r.new()
     _reach_of("E19", "before any start", await r.observe(handle, holds), {Reach.NEVER_DISPATCHED})
     await r.h.seller_start(handle, job_id, r.marker)
@@ -1021,29 +1068,41 @@ async def _e19(r: _Run) -> str:
         lambda o: o.observation.status is not ObservedStatus.NOT_FOUND,
     )
     _reach_of("E19", "a run the seller started itself", own, {Reach.NEVER_DISPATCHED})
+    what = "the gate's start of a job the seller's run took first"
+    before = datetime.now(UTC)
     with contextlib.suppress(EngineError):  # refusing a start a run beat is correct
         await r.start(job_id, handle, "ok")
+    after = datetime.now(UTC)
     await asyncio.sleep(r.settle * 1.5)
     taken = await r.observe(handle, holds)
-    _reach_of("E19", "the gate's start of a job the seller's run took first", taken, _UNBLAMED)
+    _reach_of("E19", what, taken, _UNBLAMED)
+    _start_record("E19", what, taken, (before, after), r.deadline, withdrawn=False)
     job_id, handle, holds = r.new()
     await e.fence(handle, reason="a cancel before any run")
+    what = "the gate's start of a fenced job"
+    before = datetime.now(UTC)
     with contextlib.suppress(EngineError):  # refusing a fenced job's start is correct
         await r.start(job_id, handle, "ok")
+    after = datetime.now(UTC)
     await asyncio.sleep(r.settle * 1.5)
-    _reach_of("E19", "the gate's start of a fenced job", await r.observe(handle, holds), _UNBLAMED)
+    fenced = await r.observe(handle, holds)
+    _reach_of("E19", what, fenced, _UNBLAMED | {None})
+    _start_record("E19", what, fenced, (before, after), r.deadline, withdrawn=False)
     job_id, handle, holds = r.new()
     await r.start(job_id, handle, "hang")
-    began = await r.until("E19", "a verified run", handle, holds, _running_verified)
-    _reach_of("E19", "the buyer's start that began a lineage", began, {Reach.STARTED})
-    pin = _pin_of("E19", began)
+    lineage = await r.until("E19", "a verified run", handle, holds, _running_verified)
+    _reach_of("E19", "the buyer's start that began a lineage", lineage, {Reach.STARTED})
+    foreign = await r.observe(handle, frozenset({"0" * 64}))
+    _reach_of("E19", "the buyer's start, observed with other holds", foreign, _UNBLAMED)
+    pin = _pin_of("E19", lineage)
     await e.cancel(handle, stop=Stop.END, pin=pin, reason="done")
     ended = await r.until("E19", "the end", handle, holds, _closed, pin=pin)
     _reach_of("E19", "an ended lineage, pinned", ended, {Reach.STARTED})
     _reach_of("E19", "an ended lineage", await r.observe(handle, holds), {Reach.STARTED})
     return (
         "reach: STARTED for every verified lineage; NEVER_DISPATCHED before a start and for a "
-        "run of the seller's own; a start a run beat, or a fence, blames no one"
+        "run of the seller's own; a start a run beat, a fence, or other holds blame no one; "
+        "a start's record is its own"
     )
 
 

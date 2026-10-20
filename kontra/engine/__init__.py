@@ -340,10 +340,12 @@ class Observed:
 
     ``reach`` (decisions I40): how far the buyer's start got, for reputation only -- escrow
     is handed ``observation`` and never sees it. None: the engine cannot say (the buyer's
-    records could not be read), which blames no one; never an exception, so a failed read for
-    reputation never holds up money. A verified lineage was begun by the buyer's start, so its
-    reach is STARTED (or None); an observation of a pinned lineage likewise. ``buyer_start``:
-    the start's own record, when the engine found one (never without a reach)."""
+    records could not be read, or not in time; or were not read, for a fenced job's
+    placeholder, which no gate judges), which blames no one; never an exception, so a failed
+    read for reputation never fails an observation money needs, and an engine bounds how long
+    a slow one can delay it. A verified lineage was begun by the buyer's start, so its reach is
+    STARTED (or None); an observation of a pinned lineage likewise. ``buyer_start``: the
+    start's own record, when the engine found one (never without a reach)."""
 
     observation: Observation
     result: SealedPayload | None = None
@@ -557,7 +559,8 @@ class Engine(Protocol):
           sha256 and size;
         * for reputation only, how far the buyer's start got (:class:`Reach`, decisions I40):
           STARTED for a verified or pinned lineage, else read from the engine's records of
-          the buyer's start of the job (:class:`BuyerStart`), never from the job's runs.
+          the buyer's start of the job (:class:`BuyerStart`), never from the job's runs; an
+          engine need not read it for a fenced job's placeholder (OCCUPIED: None).
 
         Before any start the status is NOT_FOUND, never an exception and never RUNNING. With
         ``pin``, the observation is of that lineage only, never of another run of the job. A
@@ -566,12 +569,12 @@ class Engine(Protocol):
         completion without its result). "Cannot say" is an exception, never a status:
         :class:`EngineError`, :class:`PartyLookupError`, :class:`ObservationIncomplete` --
         except for ``reach``, whose "cannot say" is None: a read for reputation never fails an
-        observation escrow needs.
+        observation escrow needs, and delays it by at most a bounded wait.
 
         Temporal: ``Control.observe`` (describe; the request id, callbacks and links resolved
         in the buyer's namespace; the first run id; the chain walk); ``reach`` from
         ``Control.describe_call`` (the standalone Nexus operation ``job-<id>`` in the buyer's
-        namespace, described)."""
+        namespace, described: one RPC, not retried, cut off at 2 s)."""
         ...
 
     async def liveness(self, handle: JobHandle, *, pin: Pin) -> Liveness | None:

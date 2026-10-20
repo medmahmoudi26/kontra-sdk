@@ -89,10 +89,10 @@ async def test_the_seller_side_refuses_plaintext_items_and_one_open_run() -> Non
 
 async def test_the_fake_models_and_scripts_reach() -> None:
     """Decisions I40: how far the buyer's start got, from the start alone -- NEVER_DISPATCHED
-    before it (a run of the seller's own changes nothing), REFUSED when the fake refused it,
-    STARTED once it began a lineage -- and whatever a test scripts while no lineage is
-    verified (an unanswered start, an engine that cannot say). A verified lineage stays
-    STARTED."""
+    before it (a run of the seller's own changes nothing) and when observed with holds that
+    are not its own, REFUSED when the fake refused it, STARTED once it began a lineage -- and
+    whatever a test scripts while no lineage is verified (an unanswered start, an engine that
+    cannot say). A verified lineage stays STARTED; a fenced job's placeholder is None."""
     h = await FakeHarness().setup()
     fake = h.fake
     job_id = new_job_id()
@@ -107,6 +107,11 @@ async def test_the_fake_models_and_scripts_reach() -> None:
     assert refused.reach is Reach.REFUSED
     assert refused.buyer_start is not None
     assert refused.buyer_start.gives_up_at == deadline
+    # A start is the job's only with one of the gate's holds, as the Temporal adapter
+    # matches the buyer's call (``reach_of``): with others, none of the job's is seen.
+    foreign = frozenset({"0" * 64})
+    other = await fake.observe(handle, pin=None, holds=foreign)
+    assert (other.reach, other.buyer_start) == (Reach.NEVER_DISPATCHED, None)
     unanswered = BuyerStart(made_at=_far(), gives_up_at=None)
     fake.script_reach(handle, Reach.UNANSWERED, unanswered)
     seen = await fake.observe(handle, pin=None, holds=holds)
@@ -123,6 +128,27 @@ async def test_the_fake_models_and_scripts_reach() -> None:
     assert verified.observation.provenance is Provenance.VERIFIED
     assert verified.reach is Reach.STARTED  # whatever was scripted
     await fake.cancel(handle, stop=Stop.END, pin=None, reason="done")
+
+    # The gate's start began a lineage; observed with other holds, it is not the job's start.
+    job_id = new_job_id()
+    handle = fake.bind(JobPlan(job_id, h.offering, h.route, h.buyer, h.seller))
+    holds = frozenset({hold_digest(h.hold(job_id))})
+    await fake.start(handle, h.input("hang", "m"), hold=h.hold(job_id), deadline=_far())
+    other = await fake.observe(handle, pin=None, holds=foreign)
+    assert other.observation.provenance is Provenance.NOT_FROM_BUYER
+    assert (other.reach, other.buyer_start) == (Reach.NEVER_DISPATCHED, None)
+    assert (await fake.observe(handle, pin=None, holds=holds)).reach is Reach.STARTED
+    await fake.cancel(handle, stop=Stop.END, pin=None, reason="done")
+
+    # A fenced job's placeholder is not read, as on Temporal (no gate judges a fenced job).
+    job_id = new_job_id()
+    handle = fake.bind(JobPlan(job_id, h.offering, h.route, h.buyer, h.seller))
+    holds = frozenset({hold_digest(h.hold(job_id))})
+    await fake.fence(handle, reason="a cancel before any run")
+    await fake.start(handle, b"{}", hold=h.hold(job_id), deadline=_far())
+    fenced = await fake.observe(handle, pin=None, holds=holds)
+    assert fenced.observation.provenance is Provenance.OCCUPIED
+    assert (fenced.reach, fenced.buyer_start) == (None, None)
 
 
 def _far():  # type: ignore[no-untyped-def]
