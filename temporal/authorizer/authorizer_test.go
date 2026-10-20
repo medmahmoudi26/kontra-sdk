@@ -438,6 +438,9 @@ var matrix = []cell{
 	// The relay's size cap is the relay's alone: a party sizes its own requests.
 	{"seller-self", "acme:worker poll past the relay cap: topics", acmeWorker, updateWF, "acme", paddedPoll("acme", jobJ, "topics"), allow, allow, deny},
 	{"seller-self", "acme:worker poll past the relay cap: header", acmeWorker, updateWF, "acme", paddedPoll("acme", jobJ, "header"), allow, allow, deny},
+	// Nor the relay's shape (decisions I30): a party's arguments are its own codec's.
+	{"seller-self", "acme:worker poll argument: binary/kontra-age", acmeWorker, updateWF, "acme", misshapedPoll("acme", jobJ, "age"), allow, allow, deny},
+	{"seller-self", "acme:worker offset query with an argument", acmeWorker, query, "acme", misshapedOffset("acme", jobJ, "argument"), allow, allow, deny},
 	{"seller-self", "acme:worker offset past the relay cap: args", acmeWorker, query, "acme", paddedOffset("acme", jobJ, "args"), allow, allow, deny},
 
 	// --- party token: the denials escrow depends on, in a seller's and a buyer's namespace
@@ -532,6 +535,26 @@ var matrix = []cell{
 	{"relay-J", "relay(acme,J) offset past the cap: header", relayJ, query, "acme", paddedOffset("acme", jobJ, "header"), deny, allow, deny},
 	{"relay-J", "relay(acme,J) permissions:[] poll past the cap", relayEmpty, updateWF, "acme", paddedPoll("acme", jobJ, "topics"), deny, allow, deny},
 	{"relay-J", "relay subject + temporal-system:relay (dropped) poll past the cap", relaySysUnknown, updateWF, "acme", paddedPoll("acme", jobJ, "identity"), deny, allow, deny},
+	// Shaped as kontra._relay builds it (decisions I30): a poll's one argument json/plain, no
+	// header; the offset query with neither. Anything else would reach the seller's codec
+	// before the job's validator could refuse it.
+	{"relay-J", "relay(acme,J) poll argument: binary/kontra-age", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "age"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll argument: binary/kontra-age alone", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "age alone"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll argument: a claim-check reference", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "claim-check"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll argument: a stream envelope", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "stream"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll argument: an external-storage reference", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "external storage"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll argument: external payload details", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "external payload"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll argument: a json/protobuf reference", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "protobuf reference"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll argument: an extra metadata key", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "extra metadata"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll argument: JSON/plain", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "encoding case"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll argument: no metadata", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "no metadata"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll with no argument", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "no argument"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll with two arguments", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "two arguments"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll with a header", relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "header"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) offset query with an argument", relayJ, query, "acme", misshapedOffset("acme", jobJ, "argument"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) offset query with a header", relayJ, query, "acme", misshapedOffset("acme", jobJ, "header"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) permissions:[] poll argument: binary/kontra-age", relayEmpty, updateWF, "acme", misshapedPoll("acme", jobJ, "age"), deny, allow, deny},
+
 	// Any other handler: the harness's approvals, the publish signal's name, none, the
 	// built-in queries that expose a workflow's internals, the two names swapped.
 	{"relay-J", "relay(acme,J) update approve", relayJ, updateWF, "acme", upd("acme", jobJ, "approve"), deny, allow, deny},
@@ -686,19 +709,21 @@ var matrix = []cell{
 }
 
 func TestDenyMatrix(t *testing.T) {
+	// A new authorizer for every cell: each cell is decided on its own, so the relay's rate
+	// (TestRelayRate's) never decides a cell however many relay cells the matrix holds.
 	authorizers := []struct {
 		name   string
-		a      authorization.Authorizer
+		build  func() authorization.Authorizer
 		expect func(cell) authorization.Decision
 	}{
-		{"kontra", kontra.New(), func(c cell) authorization.Decision { return c.kontra }},
-		{"noop", authorization.NewNoopAuthorizer(), func(c cell) authorization.Decision { return c.noop }},
-		{"default", authorization.NewDefaultAuthorizer(), func(c cell) authorization.Decision { return c.dflt }},
+		{"kontra", func() authorization.Authorizer { return kontra.New() }, func(c cell) authorization.Decision { return c.kontra }},
+		{"noop", authorization.NewNoopAuthorizer, func(c cell) authorization.Decision { return c.noop }},
+		{"default", authorization.NewDefaultAuthorizer, func(c cell) authorization.Decision { return c.dflt }},
 	}
 	for _, c := range matrix {
 		for _, az := range authorizers {
 			t.Run(az.name+"/"+c.name(), func(t *testing.T) {
-				got := decide(t, az.a, c.claims, c.api, c.ns, c.request())
+				got := decide(t, az.build(), c.claims, c.api, c.ns, c.request())
 				if want := az.expect(c); got != want {
 					t.Fatalf("%s authorizer: got %s, want %s", az.name, show(got), show(want))
 				}
@@ -1006,6 +1031,7 @@ func TestDenyCarriesAReason(t *testing.T) {
 		{relayJ, updateWF, "acme", upd("acme", jobK, kontra.StreamPollUpdate)},
 		{relayJ, updateWF, "acme", paddedPoll("acme", jobJ, "header")},
 		{relayJ, describe, "acme", requestFor(describe, "acme", jobJ)},
+		{relayJ, updateWF, "acme", misshapedPoll("acme", jobJ, "age")},
 		{controller, setCurrent, "acme", nil},
 		{controller, start, platform, nil},
 	} {
@@ -1214,6 +1240,118 @@ func TestRelayDoesNotMutateRequest(t *testing.T) {
 	}
 }
 
+// fakeClock is a settable clock for the relay's rate.
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time { return c.t }
+
+// TestRelayRate pins the relay's rate (decisions I30): a token bucket per relay subject,
+// RelayBurst deep and RelayRate a second; past it a request is denied with
+// RelayRateReason, the reason kontra._relay waits on; a request the rest of the rule denies
+// spends nothing; another subject has its own bucket; a party's calls have none.
+func TestRelayRate(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_000_000, 0)}
+	a := kontra.NewWithClock(clock.now)
+	poll := func(claims *authorization.Claims, ns, wf string, req any) authorization.Result {
+		t.Helper()
+		if req == nil {
+			req = relayPoll(ns, wf)
+		}
+		res, err := a.Authorize(context.Background(), claims, &authorization.CallTarget{APIName: updateWF, Namespace: ns, Request: req})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	// Denied for another reason first: those spend no token.
+	for range 3 * kontra.RelayBurst {
+		if res := poll(relayJ, "acme", jobJ, misshapedPoll("acme", jobJ, "age")); res.Decision != deny || res.Reason == kontra.RelayRateReason {
+			t.Fatalf("a misshaped poll: %+v", res)
+		}
+		if res := poll(relayJ, "acme", jobJ, paddedPoll("acme", jobJ, "identity")); res.Decision != deny || res.Reason == kontra.RelayRateReason {
+			t.Fatalf("a poll past the cap: %+v", res)
+		}
+	}
+	for i := range kontra.RelayBurst {
+		if res := poll(relayJ, "acme", jobJ, nil); res.Decision != allow {
+			t.Fatalf("request %d of the burst: %+v", i+1, res)
+		}
+	}
+	res := poll(relayJ, "acme", jobJ, nil)
+	if res.Decision != deny || res.Reason != kontra.RelayRateReason {
+		t.Fatalf("past the burst: %+v", res)
+	}
+	// The offset query shares the subject's bucket.
+	q, _ := a.Authorize(context.Background(), relayJ, &authorization.CallTarget{APIName: query, Namespace: "acme", Request: qry("acme", jobJ, kontra.StreamOffsetQuery)})
+	if q.Decision != deny || q.Reason != kontra.RelayRateReason {
+		t.Fatalf("the offset query past the burst: %+v", q)
+	}
+	// Another job's relay, and the party, are not held back by J's.
+	relayK := mustJWT(kontra.RelaySubject("acme", jobK))
+	if res := poll(relayK, "acme", jobK, nil); res.Decision != allow {
+		t.Fatalf("job K's relay: %+v", res)
+	}
+	for range 3 * kontra.RelayBurst {
+		if res := poll(acmeWorker, "acme", jobJ, nil); res.Decision != allow {
+			t.Fatalf("the seller's own poll: %+v", res)
+		}
+	}
+	// It refills at RelayRate a second, never past RelayBurst; a clock that goes back adds
+	// nothing.
+	clock.t = clock.t.Add(-time.Hour)
+	if res := poll(relayJ, "acme", jobJ, nil); res.Decision != deny {
+		t.Fatalf("a clock gone back refilled the bucket: %+v", res)
+	}
+	clock.t = clock.t.Add(time.Hour + time.Second/kontra.RelayRate)
+	if res := poll(relayJ, "acme", jobJ, nil); res.Decision != allow {
+		t.Fatalf("one token after 1/RelayRate s: %+v", res)
+	}
+	if res := poll(relayJ, "acme", jobJ, nil); res.Decision != deny {
+		t.Fatalf("only one token after 1/RelayRate s: %+v", res)
+	}
+	clock.t = clock.t.Add(time.Hour)
+	allowed := 0
+	for range 2 * kontra.RelayBurst {
+		if poll(relayJ, "acme", jobJ, nil).Decision == allow {
+			allowed++
+		}
+	}
+	if allowed != kontra.RelayBurst {
+		t.Fatalf("after an hour idle, %d allowed, want RelayBurst (%d)", allowed, kontra.RelayBurst)
+	}
+	// The zero Authorizer applies no rate (New builds one, and main.go uses New).
+	var zero kontra.Authorizer
+	for range 2 * kontra.RelayBurst {
+		res, _ := zero.Authorize(context.Background(), relayJ, &authorization.CallTarget{APIName: updateWF, Namespace: "acme", Request: relayPoll("acme", jobJ)})
+		if res.Decision != allow {
+			t.Fatalf("the zero Authorizer: %+v", res)
+		}
+	}
+}
+
+// TestRelayRateIsConcurrentSafe: Temporal calls the authorizer from many goroutines; exactly
+// RelayBurst of many concurrent requests on one stopped clock pass.
+func TestRelayRateIsConcurrentSafe(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(2_000_000, 0)}
+	a := kontra.NewWithClock(clock.now)
+	results := make(chan authorization.Decision, 200)
+	for range 200 {
+		go func() {
+			res, _ := a.Authorize(context.Background(), relayJ, &authorization.CallTarget{APIName: updateWF, Namespace: "acme", Request: relayPoll("acme", jobJ)})
+			results <- res.Decision
+		}()
+	}
+	allowed := 0
+	for range 200 {
+		if <-results == allow {
+			allowed++
+		}
+	}
+	if allowed != kontra.RelayBurst {
+		t.Fatalf("%d of 200 concurrent requests allowed, want %d", allowed, kontra.RelayBurst)
+	}
+}
+
 // TestRelayRequestMax pins the relay's size cap: the whole encoded request counts, the
 // largest poll the gate's relay builds stays under a quarter of it (in the longest
 // namespace a handle can be), and a request of exactly RelayRequestMax bytes passes while
@@ -1333,11 +1471,16 @@ func show(d authorization.Decision) string {
 // (temporalio.contrib.workflow_streams _PUBLISH_SIGNAL), which a relay may never send.
 const streamPublish = "__temporal_workflow_stream_publish"
 
+// upd is an Update named name whose argument is shaped as kontra._relay's poll (one
+// json/plain payload): only the name makes it a relay's or not.
 func upd(ns, wf, name string) *ws.UpdateWorkflowExecutionRequest {
 	return &ws.UpdateWorkflowExecutionRequest{
 		Namespace:         ns,
 		WorkflowExecution: &commonpb.WorkflowExecution{WorkflowId: wf},
-		Request:           &updatepb.Request{Meta: &updatepb.Meta{UpdateId: "u"}, Input: &updatepb.Input{Name: name}},
+		Request: &updatepb.Request{
+			Meta:  &updatepb.Meta{UpdateId: "u"},
+			Input: &updatepb.Input{Name: name, Args: pollArgs([]string{"kontra.progress"}, 0)},
+		},
 	}
 }
 
@@ -1450,6 +1593,60 @@ func paddedOffset(ns, wf, field string) *ws.QueryWorkflowRequest {
 	return r
 }
 
+// misshapedPoll is the largest genuine poll with its argument or header changed in one way
+// kontra._relay never sends: each would reach the seller's codec (or temporalio's external
+// storage) before the job's validator, and fail the job's workflow task, or fetch.
+func misshapedPoll(ns, wf, how string) *ws.UpdateWorkflowExecutionRequest {
+	r := relayPoll(ns, wf)
+	args := r.Request.Input.Args.Payloads
+	switch how {
+	case "age":
+		args[0].Metadata = map[string][]byte{"encoding": []byte("binary/kontra-age"), "kontra-v": []byte("1")}
+	case "age alone":
+		args[0].Metadata = map[string][]byte{"encoding": []byte("binary/kontra-age")}
+	case "claim-check":
+		args[0].Metadata = map[string][]byte{"encoding": []byte("binary/kontra-claim-check"), "kontra-v": []byte("1")}
+		args[0].Data = []byte(`{"sha256":"` + strings.Repeat("0", 64) + `","size":67108864}`)
+	case "stream":
+		args[0].Metadata = map[string][]byte{"encoding": []byte("binary/kontra-stream"), "kontra-v": []byte("1")}
+	case "external storage":
+		args[0].Metadata = map[string][]byte{"encoding": []byte("json/external-storage-reference")}
+	case "external payload":
+		args[0].ExternalPayloads = []*commonpb.Payload_ExternalPayloadDetails{{SizeBytes: 1 << 20}}
+	case "protobuf reference":
+		args[0].Metadata = map[string][]byte{"encoding": []byte("json/protobuf"), "messageType": []byte("temporal.api.sdk.v1.ExternalStorageReference")}
+	case "extra metadata":
+		args[0].Metadata["kontra-v"] = []byte("1")
+	case "encoding case":
+		args[0].Metadata = map[string][]byte{"encoding": []byte("JSON/plain")}
+	case "no metadata":
+		args[0].Metadata = nil
+	case "no argument":
+		r.Request.Input.Args = nil
+	case "two arguments":
+		r.Request.Input.Args.Payloads = append(args, pollArgs(nil, 0).Payloads[0])
+	case "header":
+		r.Request.Input.Header = &commonpb.Header{Fields: map[string]*commonpb.Payload{"h": {}}}
+	default:
+		panic("no such shape: " + how)
+	}
+	return r
+}
+
+// misshapedOffset is the offset query with an argument or a header: the query takes none.
+func misshapedOffset(ns, wf, how string) *ws.QueryWorkflowRequest {
+	r := qry(ns, wf, kontra.StreamOffsetQuery)
+	switch how {
+	case "argument":
+		r.Query.QueryArgs = pollArgs(nil, 0)
+	case "header":
+		r.Query.Header = &commonpb.Header{Fields: map[string]*commonpb.Payload{"h": {}}}
+	default:
+		panic("no such shape: " + how)
+	}
+	return r
+}
+
 // inputs maps every unary method of the services the frontend registers to its request type.
 var inputs = func() map[string]protoreflect.MessageDescriptor {
 	m := map[string]protoreflect.MessageDescriptor{}
@@ -1512,7 +1709,7 @@ func requestWith(apiName, ns, wf, update, queryType string) any {
 	}
 	switch req := msg.Interface().(type) {
 	case *ws.UpdateWorkflowExecutionRequest:
-		req.Request = &updatepb.Request{Meta: &updatepb.Meta{UpdateId: "u"}, Input: &updatepb.Input{Name: update}}
+		req.Request = upd(ns, wf, update).Request
 	case *ws.QueryWorkflowRequest:
 		req.Query = &querypb.WorkflowQuery{QueryType: queryType}
 	case *ws.PollWorkflowExecutionUpdateRequest:
