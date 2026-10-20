@@ -39,12 +39,16 @@ crosses a seam updates that seam's test **in the same PR**.
   assigned by the catalog; nothing derives an offering from one or authorizes by its shape
   (`docs/decisions.md` I1, I3). Validate typed input with anchored `fullmatch`, never `re.match`.
 - `kontra/escrow.py` holds the job rules as pure functions; both gates (real and fake) use it.
-- Seller `workflows.py` and `activities.py` reach Temporal only through the façade (D1, `docs/decisions.md`
-  I20): `from kontra import workflow, activity, RetryPolicy, ApplicationError, Page`, never `temporalio`
-  or `nexusrpc`, never `import kontra`, never the serving stack. The façade is Temporal's own objects, so
-  `from temporalio import workflow` in its place still runs on any Temporal. `models.py` may use
-  `kontra.types.Artifact`. `grep -r "import kontra" examples/*/workflows.py examples/*/activities.py`
-  must print nothing; `tests/examples/test_imports.py` checks the rest.
+- Seller `workflows.py` and `activities.py` are vanilla Temporal (`docs/decisions.md` I29): they import
+  `temporalio` directly and nothing from `kontra`, so deleting `worker.py` leaves code that runs on any
+  Temporal worker, unmodified. `worker.py` is the one file of an offering that imports `kontra`
+  (`serve`, or `KontraPlugin` on the seller's own client); besides it, `quote.py` takes only
+  `kontra.serve.Quote` and `models.py` only `kontra.types` (`Artifact`). No `kontra.temporal` re-export
+  namespace (rejected in I29). `grep -rE '^\s*(from|import)\s+kontra\b' examples/*/workflows.py
+  examples/*/activities.py` must print nothing; `tests/examples/test_imports.py` checks the rest (and
+  runs `examples/hello` without `worker.py` on a plain Temporal worker).
+- Kontra never imports `temporal_agent_harness` at runtime: `kontra/serve/turn.py` holds the harness's
+  wire shape as constants, checked against the harness in `tests/serve/test_turn.py`.
 - Every seam has a fake in `kontra.testing`, so a seller tests a full lifecycle without containers.
 - The PyPI distribution is `kontra-sdk`; `kontra` on PyPI is someone else's package. Never add a bare
   `kontra` dependency anywhere.

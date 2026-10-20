@@ -564,6 +564,10 @@ below), and each has its rule here.
 
 ## I20. Seller code imports Temporal only through `kontra` (D1, amended)
 
+**Superseded by I29** (kontra-sdk#51): seller code imports `temporalio` directly and nothing
+from `kontra`; `worker.py` is the one file that imports `kontra`. Kept as the record of why
+the façade was tried.
+
 The PRD's D1 said seller `workflows.py` and `activities.py` import nothing from `kontra`, so that
 deleting Kontra leaves code that runs on any Temporal. It now says the reverse of the letter and
 keeps the intent: they import Temporal **only** through the façade -- `from kontra import
@@ -588,6 +592,13 @@ workflow, activity, RetryPolicy, ApplicationError, Page` -- and never `temporali
   in strings; what loading the code loads) over the examples and the `kontra init` scaffold.
 
 ## I25. The workflow does what it wants (D1; kontra-sdk#27)
+
+**Superseded by I29** (kontra-sdk#51) in its derivation: no plugin or converter is derived
+from what a workflow imports, and the `[agents]` extra is gone; a seller passes
+`OpenAIAgentsPlugin` in `serve(plugins=[...])`. Its principle (no Kontra keyword changes what
+workflow code may do) and its endpoint rule (`model_provider=OpenAIProvider()`) stand. Not the
+I25 that `docs/security.md` and most "decisions I25" references mean: that one is "Share to
+my account", below.
 
 Kept next to I20 because it is the same rule from the worker's side: the façade aliases
 Temporal and never wraps it, so a workflow that is a legal Temporal workflow without Kontra
@@ -1211,6 +1222,10 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
 
 ## I27. `kontra graph` (kontra-sdk#42)
 
+**Amended by I29**: an agent workflow's mock runs follow the `OpenAIAgentsPlugin` its worker
+passes, not its `agents` import, and there is no `[agents]` extra; `examples/sweep` fans out
+in plain Temporal, so its graph has one `check_headers` node instead of a batch.
+
 `kontra graph` prints the static graph of the workflows `worker.py` binds, before anyone has
 run them: for each bound offering it runs the workflow `--runs` times (default 8) in
 Temporal's time-skipping test server, every activity answered by ONE dynamic stub with a
@@ -1497,3 +1512,206 @@ ways:
   ciphertext. Routes are compared without the query now (the server fetches no claim-check
   reference whatever the query says), and `tests/cli/test_codec_server.py` posts what the UI
   posts.
+
+## I29. Sellers write native Temporal; `worker.py` is the only kontra import (kontra-sdk#50, #51)
+
+Decisions 1, 2, 3, 4 and 12 of kontra-sdk#50. **Supersedes** D1 as I20 amended it, and the
+first I25's derivation of the agents plugin from the workflow's imports; **amends** I27's
+lines on agent workflows and batches in mock runs. A seller's `workflows.py` and
+`activities.py` are vanilla `temporalio`: they import Temporal themselves and nothing from
+`kontra`. `worker.py` is the one file of an offering that imports `kontra`; besides it,
+`quote.py` takes `Quote` from `kontra.serve` and `models.py` may use `kontra.types`
+(`Artifact`). Delete `worker.py` and the rest runs on any Temporal worker, unmodified.
+
+- **Why.** The façade was never a security boundary. What constrains a seller does not care
+  what their code imports: the Authorizer (seam ①: deny by default, a token scoped to the
+  seller's namespace), the codec (everything a buyer sees, encrypted to the job's keys), the
+  contract hash (a worker serves only code whose contract the catalog holds), `names.py`
+  (service, task-queue and workflow-id strings constructed, never parsed back) and escrow
+  (I6, I16). All five are untouched. What the façade cost: an import path that is not
+  Temporal's, so no Temporal doc, sample or plugin could be pasted in as written; a mirror
+  that is never complete (contrib modules, plugins, exceptions); and Kontra's additions mixed
+  into Temporal's namespace. I20's own reasons go too: the dependency closure is a tested
+  range now, and the publish scan it enabled is dropped (both below).
+- **`kontra` exports only what Kontra defines**: `serve`, `Worker` and `KontraPlugin`, each
+  loaded on first use (so `import kontra` and `kontra.types` load no Temporal), and
+  `__version__`. `kontra.workflow`, `kontra.activity` and the `RetryPolicy`,
+  `ApplicationError` and `Page` re-exports are deleted. `kontra.workflow` (and the other four)
+  raises an `AttributeError` naming the replacement (`from temporalio import workflow`, ...);
+  `from kontra import workflow` gets Python's own `ImportError` ("cannot import name"), which
+  drops a module `__getattr__`'s message.
+- **Activities are found by a scan of the project.** `temporalio.activity.defn` notes nothing
+  anywhere, so `serve()` registers every module-level function it stamped
+  (`__temporal_activity_definition`) in a module loaded from under `worker.py`'s directory and
+  defined in that module (a function one module imports from another counts once, in its
+  own), skipping dot-directories, `tests`, `test`, `venv`, `node_modules`, `__pycache__`,
+  `build`, `dist`, `site-packages` and `kontra` itself, in import then definition order; then
+  the `activities=` passed, by identity, none twice. A method still needs
+  `activities=[obj.method]`. Two activities of one Temporal name are a `BindingError` naming
+  both modules, never the last one silently winning. `KontraPlugin` and a `Worker(...)`
+  written out discover nothing: they register what they are given.
+- **`serve(entry, /, *, quote=None, **worker_kwargs)`.** `entry` is a `@workflow.defn` class or
+  one `@agent.accepts` handler of an agent written with Temporal's agent harness
+  (`serve(ReconAgent.sweep)`, below); passing the agent class itself is a `BindingError` with
+  that fix-it. Every other keyword is `temporalio.worker.Worker`'s, verbatim: `workflows=` for
+  the children the entry starts (`serve(Flow, Child)` is Python's own `TypeError` now),
+  `activities=` after the scan, and `plugins=`. `offering(path, entry=..., quote=...)` binds the
+  same two kinds (`workflow=` stays, as that keyword for a class). The contract is derived by
+  `kontra.contract`, unchanged, from the entry's type hints: for a handler, its one pydantic
+  message (parameters the harness injects, `Annotated[...]`, are skipped) and its pydantic
+  return, cross-checked with the models the agent declares for it. An agent whose init data
+  is required is refused: Kontra has nothing to pass, and init data is no part of the
+  contract. A handler of a class defined in a function or in `__main__` is refused, as a
+  workflow class is.
+- **`KontraPlugin` (`kontra.plugin`) is everything Kontra adds to a seller's Temporal**, as one
+  `temporalio.plugin.SimplePlugin` (client and worker plugin) named `kontra.KontraPlugin`:
+  - *connection*: the profile resolved (or `KONTRA_API_KEY`), its key checked against the
+    party's recipients, the profile's Temporal address, TLS and `worker` JWT (refreshed in the
+    background), the process's Kontra runtime, and the temporalio range. The `target_host`
+    passed is replaced: `kontra.plugin.TARGET` (`"kontra"`) is the placeholder, anything else
+    is logged.
+  - *client*: the profile's namespace, and the codec. Kontra's codec is a payload *codec*, so it
+    stacks under any payload *converter*: one an earlier plugin set is kept
+    (`OpenAIPayloadConverter`, the harness's), temporalio's default is replaced by pydantic's.
+    Refused, with a `ServeError` naming it: another payload codec; a failure converter other
+    than temporalio's default (Kontra installs its own, which encrypts failure messages);
+    external storage whose threshold is at or below the codec's claim-check threshold plus
+    4,096 bytes, which would offload a job's payload where its buyer cannot read it (the
+    harness's 1.5 MB default is fine). Headers stay out of the codec: any other
+    `header_codec_behavior` is replaced, with a warning, since the job header must be read
+    before any payload key is known.
+  - *worker*: a worker whose `workflows` hold an offering's entry class (the workflow, or the
+    agent of a bound handler) serves that offering: the task queue from its `name@version`
+    (the one passed is replaced), the entry first, the generated Nexus service and Kontra's
+    interceptor prepended, Temporal's sandbox with `kontra` passed through (a seller's own
+    `SandboxedWorkflowRunner` gets the same; any other runner is theirs, untouched), and for a
+    handler the turn wrapper and its activity. Any other worker of the client is left alone.
+    Several offerings bound to one class (versions of the same code: `tests/hire` serves
+    three of `TextFlow` from one worker) are told apart by the task queue the worker names,
+    compared with each offering's constructed one; a worker naming none of them is refused.
+    Refusing a second offering of a class outright, the first plan, would have broken that.
+  - *start*, once per plugin, in `run_worker`: the gate's JWKS for the hold check, the hash
+    lock (each contract hash against the catalog's; a `kontra dev` profile publishes an
+    unpublished version) and the progress forwarder, all moved there from `Worker`, so a
+    hash-lock refusal comes out of the worker's run, not out of `prepare()`. Then the worker's
+    final config is checked: a plugin given to the worker alone runs after Kontra's
+    `configure_worker`, and a changed task queue, a dropped Nexus service, another interceptor
+    first, or a client without Kontra's codec is a `ServeError`. A revoked session is
+    diagnosed as before.
+
+  The constructor does no I/O. `await plugin.prepare()` (idempotent; the connection hook runs
+  it) checks the range, opens the session and builds the codec, and `aclose()` releases them.
+  A client built as `Client(service_client, plugins=[kontra])` skips the connection hook: its
+  `configure_client` without `prepare()` is a `ServeError` saying so.
+- **Plugin order: Kontra last.** `kontra.serve.Worker` stays the process runner (the CLI's
+  capture, `kontra.testing`'s Marketplace, signals, `wait_ready`), built on the plugin:
+  `Client.connect("kontra", plugins=[*client_plugins, kontra])`, then one
+  `temporalio.worker.Worker` per offering on that client. A seller plugin that is a
+  `temporalio.client.Plugin` (any `SimplePlugin`: `OpenAIAgentsPlugin`, the harness's
+  `AgentHarnessPlugin`, `ParallelPlugin`) goes on the client, in the seller's order, before
+  Kontra's: the converter it chose stays, and the last word on the connection, the namespace
+  and the codec is Kontra's. A worker-only plugin goes to the inner workers, and the start
+  check above holds it to what Kontra set.
+- **The escape hatch: `KontraPlugin.from_profile(entry)`.** A seller with a worker main of
+  their own writes `Client.connect("kontra", plugins=[*theirs, KontraPlugin.from_profile(SweepFlow)])`
+  and a plain `temporalio.worker.Worker(client, task_queue="kontra", workflows=[SweepFlow],
+  activities=[...])`, and never touches the CLI. **Where the issue and the code part ways:**
+  the issue sketches `from_profile()` with no argument; the entry is required, because the
+  contract, the task queue and the generated Nexus service all come from it, and finding it
+  in the yaml (D11), by convention or by a decorator in workflow code is exactly what the
+  issue rejects. `from_profile` binds `offering.yaml` (and `quote.py`, unless `quote=`) beside
+  the calling file, as `serve()` does; it discovers no activities.
+- **A bound handler: one hire is one turn** (`kontra.serve.turn`). An agent workflow cannot be
+  the job: its `run` returns nothing, and only after `close`; a handler's reply is an event on
+  the agent's workflow stream, not an update result. So the generated `execute` starts
+  Kontra's wrapper workflow, `kontra.turn.v1`, as the job (`job-<id>`, exactly as for a
+  workflow entry, so escrow, the codec's buyer rule and the job header are unchanged). The
+  wrapper starts the agent as a child (`args=[{}]`; id `names.agent_workflow_id(job_id)`,
+  `job-<id>/agent`, which is not job-shaped, so the agent's whole history is encrypted to the
+  seller alone; same task queue; `ParentClosePolicy.TERMINATE`; the remaining job time as its
+  timeout), runs one activity, `kontra.turn.v1.deliver`, which sends the contract-validated
+  input as the handler's message (`send_agent_message`, with an update id stable across
+  attempts) and reads the `turn_events` stream from the receipt's offset to the reply to that
+  message, then signals `close`, waits for the agent, and returns the reply as the job's
+  result. A handler that raises fails the job, non-retryably, with its message; a tool
+  approval or a callback for that message fails it at once (a job is one turn, without buyer
+  approvals; session jobs are kontra-sdk#60); the agent ending first fails it. Kontra never
+  imports the harness: its wire shape (the update, signal and topic names, the envelope and
+  reply fields, the event types) is written out once in `turn.py`, and a golden test holds it
+  to the harness. The activity heartbeats for liveness only: the interceptor never forwards
+  its heartbeats as buyer progress. `kontra graph` refuses a handler offering for now
+  (kontra-sdk#56).
+- **`execute_activities_in_parallel` is an optional helper**, `kontra.contrib.parallel`, not a
+  primitive: neither `serve()` nor `Worker` registers `kontra.batch.v1` any more. A seller who
+  wants it imports it in their workflow and passes `plugins=[ParallelPlugin()]` (a
+  `SimplePlugin` adding the child workflow and passing the module through the sandbox) to
+  `serve()` or to any Temporal worker. The child takes any page with a list `items` and a
+  `next` (`Page` stays, as a convenience). `BATCH_WORKFLOW = "kontra.batch.v1"` and the field
+  names of `_Spec`, `_Cursor` and `_Options` do not change: runs in flight, `kontra.graph` and
+  the console read them. The helper puts a `kontra` import in the workflow file, so no
+  example uses it: `examples/sweep` fans out in plain Temporal (one `execute_activity` per URL
+  under an `asyncio.Semaphore(50)`, folded by `tally`), well within one history's limits for
+  its 200 URLs (its README has the arithmetic).
+- **The `[agents]` extra is gone**, with everything that read `sys.modules["agents"]`:
+  `kontra._agents`, the derived plugin and converter, `serve(mcp_servers=)`, and the tests'
+  guard that kept `agents` unimported. A seller running OpenAI's Agents SDK depends on
+  `temporalio-openai-agents` and passes `OpenAIAgentsPlugin(model_params=ModelActivityParameters(),
+  model_provider=OpenAIProvider(), mcp_servers=...)` in `serve(plugins=[...])` themselves, as
+  `examples/chef-agents/worker.py` does. The first I25's premise, that a published offering
+  could not import `temporalio` to pass the plugin, is what decision 2 removes. Its endpoint
+  rule stands: `model_provider=OpenAIProvider()` makes the model activity read the Agents
+  SDK's default client, set in `worker.py`; without it the plugin builds its own
+  `AsyncOpenAI()` from the environment when the worker is built. Its principle stands too: no
+  Kontra keyword changes what workflow code may do; a seller's Temporal plugins are Temporal
+  config. kontra-sdk's dev group carries `temporalio-openai-agents[mcp]` (and
+  `temporal-agent-harness==0.6.0` for the handler tests), so CI still runs chef-agents and
+  type-checks `kontra graph`'s scripted model.
+- **The temporalio range.** Compatibility is a dependency problem, not an import path:
+  `temporalio>=1.34,<1.38` (and the `opentelemetry` extra's) is the range kontra-sdk is tested
+  on. It is one constant pair in `kontra._compat`, never read back from installed metadata (an
+  editable install's can be stale), and a test holds it equal to `pyproject.toml`'s.
+  `KontraPlugin.prepare()` refuses to start outside it, before anything else (the codec relies
+  on temporalio's serialization context and Nexus operation info, experimental APIs a minor
+  may change); `kontra serve` (a log warning) and `kontra publish` (a line on stderr) warn
+  before they import `worker.py`, which may be what then fails. The lock stays on the minor
+  the suite last ran green on (Dependabot ignores temporalio minors), and widening the range
+  is a deliberate PR after a green suite on the new minor. Today the range admits only 1.34:
+  1.35 to 1.37 are not released.
+- **The publish scan is dropped** (decision 2). `kontra publish` no longer refuses `temporalio`
+  imports or `continue_as_new` in seller code (`kontra/cli/_seller_code.py` is deleted; the
+  gate's copy is kontra-cloud#46): continuing as new is the seller's business, and an import
+  scan constrained nothing the five controls above leave open.
+- **The sandbox still passes `kontra` through** by default (`workflow_runner()`): Kontra's turn
+  wrapper runs in it, a seller's models may use `kontra.types`, a workflow that hires imports
+  `kontra.hire`, and the parallel helper keeps one class identity for its spec.
+- **Rejected.** `from kontra.temporal import workflow`: the façade under a longer name -- the
+  mirror is never complete, sellers end up with mixed imports, copying from Temporal's docs
+  stops working, and to pyright it is one line thick anyway. `entry:` in `offering.yaml`
+  (D11: the yaml names no code), a `@kontra.offering` decorator (`kontra` back inside workflow
+  files), and finding the entry by convention.
+- **Amends I27.** An agent workflow's mock runs follow the plugin the seller passed, not an
+  import: `kontra graph` gives the scripted model to a worker whose `plugins=` hold
+  `temporalio.openai_agents.OpenAIAgentsPlugin` (an `isinstance`, against that module only
+  when it is loaded: an instance existing means it is; `temporalio.contrib.openai_agents` is
+  not recognised), and its converter is that plugin's. A project whose `agents`, or Temporal's
+  integration, is not installed fails naming `temporalio-openai-agents`, the project's own
+  dependency. The mock worker still registers `kontra.batch.v1` itself, whatever the seller's
+  plugins, and its stub is temporalio's `defn` (there is no Kontra registry left to stay out
+  of). `examples/sweep`'s graph changed with its fan-out: `check_headers` is one activity
+  node, with an edge to itself from the run whose `plan` drew 201 URLs (50 start at once, then
+  each completion starts the next in a workflow task of its own), where it was the
+  `kontra.batch.v1[check_headers]` child.
+- **Checked by** `tests/examples/test_imports.py` (workflows and activities import `temporalio`
+  and no `kontra`, by statement, dynamic import or module name in a string; models only
+  `kontra.types`, quote only `kontra.serve.Quote`; loading them loads at most `kontra` and
+  `kontra.types`, and nothing for a seller without `Artifact`; the scaffold the same; and
+  `examples/hello` without `worker.py` and `quote.py` runs on a plain Temporal worker in a
+  process where importing `kontra` fails), `tests/serve/test_serve_fn.py` (the scan and its
+  refusals, the entry kinds, the agents plugin on the client with its converter kept),
+  `tests/serve/test_plugin.py` (the converter, codec, failure-converter and storage rules, the
+  order, the escape hatch running a whole Marketplace job on a plain temporalio worker, a
+  worker-only plugin that undoes Kontra refused), `tests/serve/test_turn.py` and
+  `tests/codec/test_codec_turn.py` (a real harness agent hired: one turn, a handler's failure,
+  the binding refusals, the wire constants against the harness, the marker scan of both
+  histories), `tests/serve/test_compat.py`, `tests/parallel` (the helper and its plugin) and
+  `tests/examples/test_chef_agents.py`.
