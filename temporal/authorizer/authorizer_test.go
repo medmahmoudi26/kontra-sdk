@@ -13,7 +13,8 @@ package authorizer_test
 // does on the wire. Every request is the typed message Temporal would hand the authorizer
 // (CallTarget.Request): a cell with no request of its own gets the one requestFor builds,
 // naming the cell's namespace, job J and the stream handlers, the most favourable request a
-// stream relay could send.
+// stream relay could send. The relay's size cap (RelayRequestMax) has cells of its own:
+// the largest request the gate's relay builds, and the same past the cap.
 
 import (
 	"context"
@@ -24,14 +25,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
 	commonpb "go.temporal.io/api/common/v1"
+	enumspb "go.temporal.io/api/enums/v1"
 	ops "go.temporal.io/api/operatorservice/v1"
 	querypb "go.temporal.io/api/query/v1"
 	"go.temporal.io/api/serviceerror"
@@ -431,6 +435,10 @@ var matrix = []cell{
 	{"seller-self", "acme:worker", acmeWorker, cancel, "acme", nil, allow, allow, deny},
 	{"seller-self", "acme:worker", acmeWorker, history, "acme", nil, allow, allow, deny},
 	{"seller-self", "acme:worker", acmeWorker, list, "acme", nil, allow, allow, deny},
+	// The relay's size cap is the relay's alone: a party sizes its own requests.
+	{"seller-self", "acme:worker poll past the relay cap: topics", acmeWorker, updateWF, "acme", paddedPoll("acme", jobJ, "topics"), allow, allow, deny},
+	{"seller-self", "acme:worker poll past the relay cap: header", acmeWorker, updateWF, "acme", paddedPoll("acme", jobJ, "header"), allow, allow, deny},
+	{"seller-self", "acme:worker offset past the relay cap: args", acmeWorker, query, "acme", paddedOffset("acme", jobJ, "args"), allow, allow, deny},
 
 	// --- party token: the denials escrow depends on, in a seller's and a buyer's namespace
 	// A reset brings a terminated pinned run back to life in the same chain, completion
@@ -511,6 +519,19 @@ var matrix = []cell{
 	{"relay-J", "relay(acme,J) job K", relayJ, query, "acme", qry("acme", jobK, kontra.StreamOffsetQuery), deny, allow, deny},
 	{"relay-J", "relay(acme,J) job J@other", relayJ, updateWF, "other", nil, deny, allow, deny},
 	{"relay-J", "relay(acme,J) job J@other", relayJ, query, "other", nil, deny, allow, deny},
+	// Each request at most RelayRequestMax bytes, counted over the whole message: the
+	// largest poll the gate's relay builds and its offset query pass; the same past the cap
+	// in its topics, its identity or a header does not, nor under a token judged a relay
+	// because its permissions are none or dropped.
+	{"relay-J", "relay(acme,J) largest genuine poll", relayJ, updateWF, "acme", relayPoll("acme", jobJ), allow, allow, deny},
+	{"relay-J", "relay(acme,J) offset query", relayJ, query, "acme", qry("acme", jobJ, kontra.StreamOffsetQuery), allow, allow, deny},
+	{"relay-J", "relay(acme,J) poll past the cap: topics", relayJ, updateWF, "acme", paddedPoll("acme", jobJ, "topics"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll past the cap: identity", relayJ, updateWF, "acme", paddedPoll("acme", jobJ, "identity"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) poll past the cap: header", relayJ, updateWF, "acme", paddedPoll("acme", jobJ, "header"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) offset past the cap: args", relayJ, query, "acme", paddedOffset("acme", jobJ, "args"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) offset past the cap: header", relayJ, query, "acme", paddedOffset("acme", jobJ, "header"), deny, allow, deny},
+	{"relay-J", "relay(acme,J) permissions:[] poll past the cap", relayEmpty, updateWF, "acme", paddedPoll("acme", jobJ, "topics"), deny, allow, deny},
+	{"relay-J", "relay subject + temporal-system:relay (dropped) poll past the cap", relaySysUnknown, updateWF, "acme", paddedPoll("acme", jobJ, "identity"), deny, allow, deny},
 	// Any other handler: the harness's approvals, the publish signal's name, none, the
 	// built-in queries that expose a workflow's internals, the two names swapped.
 	{"relay-J", "relay(acme,J) update approve", relayJ, updateWF, "acme", upd("acme", jobJ, "approve"), deny, allow, deny},
@@ -719,10 +740,11 @@ type sweepCaller struct {
 }
 
 // sweepRequest is one of the requests TestSweep sends to every API: the workflow it names
-// and the handler names an Update or a Query carries, or none at all.
+// and the handler names an Update or a Query carries, or none at all; padded takes an
+// Update or a Query past RelayRequestMax with a header.
 type sweepRequest struct {
 	label, wf, update, query string
-	none                     bool
+	none, padded             bool
 }
 
 // TestSweep checks every method of every service the frontend serves, for every kind of
@@ -761,10 +783,11 @@ func TestSweep(t *testing.T) {
 	}
 	namespaces := []string{"acme", "buyer", "", "temporal-system", "kontra-system"}
 	requests := []sweepRequest{
-		{"favourable", jobJ, "__temporal_workflow_stream_poll", "__temporal_workflow_stream_offset", false},
-		{"job K", jobK, "__temporal_workflow_stream_poll", "__temporal_workflow_stream_offset", false},
-		{"other handlers", jobJ, "approve", "__stack_trace", false},
-		{"no request", "", "", "", true},
+		{"favourable", jobJ, "__temporal_workflow_stream_poll", "__temporal_workflow_stream_offset", false, false},
+		{"favourable past the relay cap", jobJ, "__temporal_workflow_stream_poll", "__temporal_workflow_stream_offset", false, true},
+		{"job K", jobK, "__temporal_workflow_stream_poll", "__temporal_workflow_stream_offset", false, false},
+		{"other handlers", jobJ, "approve", "__stack_trace", false, false},
+		{"no request", "", "", "", true, false},
 	}
 	built := map[string]any{}
 	requestOf := func(name, ns string, r sweepRequest) any {
@@ -773,7 +796,16 @@ func TestSweep(t *testing.T) {
 		}
 		key := name + "\x00" + ns + "\x00" + r.label
 		if req, ok := built[key]; !ok {
-			built[key] = requestWith(name, ns, r.wf, r.update, r.query)
+			req := requestWith(name, ns, r.wf, r.update, r.query)
+			if r.padded {
+				switch req := req.(type) {
+				case *ws.UpdateWorkflowExecutionRequest:
+					req.Request.Input.Header = paddingHeader()
+				case *ws.QueryWorkflowRequest:
+					req.Query.Header = paddingHeader()
+				}
+			}
+			built[key] = req
 		} else {
 			return req
 		}
@@ -804,7 +836,8 @@ func TestSweep(t *testing.T) {
 							r.update == "__temporal_workflow_stream_poll") ||
 							(name == "/temporal.api.workflowservice.v1.WorkflowService/QueryWorkflow" &&
 								r.query == "__temporal_workflow_stream_offset")
-						if handler && !r.none && ns == c.relayNS && r.wf == c.relayWF {
+						// The size cap is the relay rule's alone: it changes no other row.
+						if handler && !r.none && !r.padded && ns == c.relayNS && r.wf == c.relayWF {
 							want = allow
 						}
 					}
@@ -971,6 +1004,7 @@ func TestDenyCarriesAReason(t *testing.T) {
 	}{
 		{buyerWorker, describe, "acme", nil},
 		{relayJ, updateWF, "acme", upd("acme", jobK, kontra.StreamPollUpdate)},
+		{relayJ, updateWF, "acme", paddedPoll("acme", jobJ, "header")},
 		{relayJ, describe, "acme", requestFor(describe, "acme", jobJ)},
 		{controller, setCurrent, "acme", nil},
 		{controller, start, platform, nil},
@@ -1162,6 +1196,9 @@ func TestRelayDoesNotMutateRequest(t *testing.T) {
 		qry("acme", jobJ, kontra.StreamOffsetQuery),
 		qry("other", jobJ, "__stack_trace"),
 		updateWithStart("acme", jobJ, kontra.StreamPollUpdate),
+		relayPoll("acme", jobJ),
+		paddedPoll("acme", jobJ, "topics"),
+		paddedOffset("acme", jobJ, "header"),
 		&ws.UpdateWorkflowExecutionRequest{Namespace: "acme"}, // nothing set below the top
 		&ws.QueryWorkflowRequest{Namespace: "acme"},
 	} {
@@ -1173,6 +1210,52 @@ func TestRelayDoesNotMutateRequest(t *testing.T) {
 		}
 		if !proto.Equal(before, req) {
 			t.Fatalf("the authorizer changed %v", req)
+		}
+	}
+}
+
+// TestRelayRequestMax pins the relay's size cap: the whole encoded request counts, the
+// largest poll the gate's relay builds stays under a quarter of it (in the longest
+// namespace a handle can be), and a request of exactly RelayRequestMax bytes passes while
+// one byte more does not.
+func TestRelayRequestMax(t *testing.T) {
+	longest := strings.Repeat("a", 32) // HANDLE_MAX
+	genuine := relayPoll(longest, jobJ)
+	size := proto.Size(genuine)
+	if size*4 > kontra.RelayRequestMax {
+		t.Fatalf("the largest genuine poll is %d bytes: RelayRequestMax (%d) leaves too little margin", size, kontra.RelayRequestMax)
+	}
+	relay := mustJWT(kontra.RelaySubject(longest, jobJ))
+	if got := decide(t, kontra.New(), relay, updateWF, longest, genuine); got != allow {
+		t.Fatalf("the largest genuine poll (%d bytes) was %s", size, show(got))
+	}
+	t.Logf("the largest genuine poll is %d bytes; RelayRequestMax is %d", size, kontra.RelayRequestMax)
+
+	// Grow the identity to the cap exactly, then one byte past it.
+	edge := relayPoll("acme", jobJ)
+	for proto.Size(edge) < kontra.RelayRequestMax {
+		edge.Request.Meta.Identity += "i"
+	}
+	if got := proto.Size(edge); got != kontra.RelayRequestMax {
+		t.Fatalf("could not build a request of exactly %d bytes (got %d)", kontra.RelayRequestMax, got)
+	}
+	if got := decide(t, kontra.New(), relayJ, updateWF, "acme", edge); got != allow {
+		t.Fatalf("a poll of exactly RelayRequestMax bytes was %s", show(got))
+	}
+	edge.Request.Meta.Identity += "i"
+	if got := decide(t, kontra.New(), relayJ, updateWF, "acme", edge); got != deny {
+		t.Fatalf("a poll one byte past RelayRequestMax was %s", show(got))
+	}
+
+	// Every padded request is past the cap by its own field alone.
+	for _, field := range []string{"topics", "identity", "header"} {
+		if size := proto.Size(paddedPoll("acme", jobJ, field)); size <= kontra.RelayRequestMax {
+			t.Errorf("the poll padded by %s is only %d bytes", field, size)
+		}
+	}
+	for _, field := range []string{"args", "header"} {
+		if size := proto.Size(paddedOffset("acme", jobJ, field)); size <= kontra.RelayRequestMax {
+			t.Errorf("the offset query padded by %s is only %d bytes", field, size)
 		}
 	}
 }
@@ -1279,6 +1362,92 @@ func updateWithStart(ns, wf, name string) *ws.ExecuteMultiOperationRequest {
 		}}},
 		{Operation: &ws.ExecuteMultiOperationRequest_Operation_UpdateWorkflow{UpdateWorkflow: upd(ns, wf, name)}},
 	}}
+}
+
+// pollArgs is a poll's argument as kontra._relay encodes the contrib's PollInput: json/plain,
+// compact, keys sorted.
+func pollArgs(topics []string, offset int64) *commonpb.Payloads {
+	data, err := json.Marshal(struct {
+		FromOffset int64    `json:"from_offset"`
+		Topics     []string `json:"topics"`
+	}{offset, topics})
+	if err != nil {
+		panic(err)
+	}
+	return &commonpb.Payloads{Payloads: []*commonpb.Payload{
+		{Metadata: map[string][]byte{"encoding": []byte("json/plain")}, Data: data},
+	}}
+}
+
+// topicNames is n distinct 64-character topic names, the longest check_topic allows.
+func topicNames(n int) []string {
+	names := make([]string, n)
+	for i := range names {
+		prefix := fmt.Sprintf("t%03d", i)
+		names[i] = prefix + strings.Repeat("x", 64-len(prefix))
+	}
+	return names
+}
+
+// relayPoll is the largest poll the gate's relay builds (kontra._relay, #52): an offering's
+// eight streams (offering.STREAMS_MAX) with 64-character names and kontra.progress, the
+// largest offset, the pinned first run id, a uuid4 hex update id and a pid@hostname
+// identity with a 64-character host name.
+func relayPoll(ns, wf string) *ws.UpdateWorkflowExecutionRequest {
+	topics := append(topicNames(8), "kontra.progress")
+	slices.Sort(topics)
+	return &ws.UpdateWorkflowExecutionRequest{
+		Namespace:           ns,
+		WorkflowExecution:   &commonpb.WorkflowExecution{WorkflowId: wf},
+		FirstExecutionRunId: "0198f2a4-6f4c-7c3e-9b1a-0123456789ab",
+		WaitPolicy: &updatepb.WaitPolicy{
+			LifecycleStage: enumspb.UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED,
+		},
+		Request: &updatepb.Request{
+			Meta: &updatepb.Meta{UpdateId: strings.Repeat("f", 32), Identity: "4194304@" + strings.Repeat("h", 64)},
+			Input: &updatepb.Input{
+				Name: kontra.StreamPollUpdate, Args: pollArgs(topics, math.MaxInt64),
+			},
+		},
+	}
+}
+
+// padding is RelayRequestMax bytes: in any one field, it takes a request past the cap.
+var padding = strings.Repeat("p", kontra.RelayRequestMax)
+
+func paddingHeader() *commonpb.Header {
+	return &commonpb.Header{Fields: map[string]*commonpb.Payload{"pad": {Data: []byte(padding)}}}
+}
+
+// paddedPoll is relayPoll past RelayRequestMax in one field: "topics" (more 64-character
+// topics than any offering has), "identity" or "header".
+func paddedPoll(ns, wf, field string) *ws.UpdateWorkflowExecutionRequest {
+	r := relayPoll(ns, wf)
+	switch field {
+	case "topics":
+		r.Request.Input.Args = pollArgs(topicNames(kontra.RelayRequestMax/64), 0)
+	case "identity":
+		r.Request.Meta.Identity = padding
+	case "header":
+		r.Request.Input.Header = paddingHeader()
+	default:
+		panic("no such field: " + field)
+	}
+	return r
+}
+
+// paddedOffset is the offset query past RelayRequestMax in one field: "args" or "header".
+func paddedOffset(ns, wf, field string) *ws.QueryWorkflowRequest {
+	r := qry(ns, wf, kontra.StreamOffsetQuery)
+	switch field {
+	case "args":
+		r.Query.QueryArgs = &commonpb.Payloads{Payloads: []*commonpb.Payload{{Data: []byte(padding)}}}
+	case "header":
+		r.Query.Header = paddingHeader()
+	default:
+		panic("no such field: " + field)
+	}
+	return r
 }
 
 // inputs maps every unary method of the services the frontend registers to its request type.

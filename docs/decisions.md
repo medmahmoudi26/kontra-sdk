@@ -1559,8 +1559,16 @@ changed, all deny to allow: two for the stream relay, ten for the worker control
   Every other request type, a type under another API's name (Temporal itself hands the
   cross-namespace command check a workflow task's response under `SignalWorkflowExecution`),
   an update inside `ExecuteMultiOperation`, a stream handshake (no request) and the Nexus HTTP
-  dispatch are denied. The rule reads those two typed fields and nothing else -- no run id,
-  update id, payload, header, callback or link. **Strict wire shape (owner, Q1):** the relay
+  dispatch are denied. The rule reads those two typed fields and the request's encoded size,
+  and nothing else -- no run id, update id, payload, header, callback or link is read, though
+  each counts toward the size. **A relay request is at most `RelayRequestMax`, 4 KiB** (the
+  #52 review): `proto.Size` of the whole typed request, so identity, header, arguments and
+  topics all count, compared with the constant, one integer comparison, after the handler
+  name and the subject. The largest request the gate's relay builds is 898 bytes (nine
+  topics: an offering's eight streams named with 64 characters and `kontra.progress`; the
+  largest offset; a 32-character namespace; the pinned run id; a pid@hostname identity), so
+  4 KiB is over four times a genuine poll, and the offset query is about 110 bytes. A
+  party's own requests are not capped. **Strict wire shape (owner, Q1):** the relay
   makes only those two calls; it re-sends its Update with the same update id and wait policy
   COMPLETED until the answer carries the outcome (the server finds an update by its id), with an
   empty run id so it follows a continue-as-new; `StreamDraining` is retried after a cooldown with
@@ -1674,16 +1682,28 @@ the sentence above) and `docs/security.md`.
 - Residual risk: a relay that presented another update's id would get that update's outcome
   (the server matches an update by id alone); update ids are random ids the relay never sees,
   and outcomes are ciphertext to the job's parties.
+- **The relay's size cap closes what the #52 review found.** A leaked relay token's requests
+  could still end its job by their size alone: every workflow task must fit in Temporal's
+  4 MiB gRPC message, Temporal terminates a run whose workflow task it cannot deliver, and
+  #52's poll guard cannot refuse an oversized poll, because a refused update's request
+  travels in the workflow task all the same. With `RelayRequestMax`, what a relay token's
+  requests add to one workflow task of its job is at most `history.maxInFlightUpdates` (10,
+  Temporal's default, not changed by Kontra) times 4 KiB, two orders of magnitude below the
+  limit. #52's poll guard (polls refused at validation, so not written to history, once the
+  run's history is past half of Kontra's pinned limits) bounds what polls add to the job's
+  history, and could not bound this; the cap bounds what they add to a workflow task. With
+  both, the burst the #52 review found no longer ends a job.
 - **Residual risk: a leaked relay token can end its job.** With only its two allowed calls, it
   polls from offset 0 again and again, each time with a new update id, and so appends up to
   `history.maxTotalUpdates` completed updates of up to about 1 MB each to job J's history. Past
   `limit.historySize.error` (20 MiB, pinned) Temporal terminates the run
   (`enforceHistorySizeCheck`, reason "Workflow history size exceeds limit."), and escrow refunds
   the job as "seller workflow terminated", against the seller. Any stream above about 10.5 KB
-  (20 MiB / 2,000) is enough, and one of about 1 MB takes about twenty polls
-  (`test_relay_polls_alone_can_end_their_job`, over the wire). The session is revoked only when
+  (20 MiB / 2,000) is enough, and one of about 1 MB takes about twenty polls (measured over
+  the wire). The session is revoked only when
   the job closes or the last listener leaves, so a leaked token stays live while a buyer
-  listens. The Authorizer cannot bound this, because it does not read the payload. Mitigations,
+  listens. The Authorizer cannot bound this: its size cap holds a relay's requests, the cost is
+  in the answers, and it does not read the payload. Mitigations,
   recorded and **not adopted here** (the owner decides): handler workflows that host a stream
   continue-as-new on `workflow.info().is_continue_as_new_suggested()` (escrow follows the pinned
   chain, and the relay's empty run id follows the current run), which turns the termination
@@ -1695,11 +1715,16 @@ the sentence above) and `docs/security.md`.
 - #51 documents that a seller who turns on Worker Versioning gets no tasks.
 
 Tested: the Go deny matrix, every cell with its typed request, against Kontra's and Temporal's
-two authorizers (319 cells, 253 of them denials that Temporal's no-op authorizer allows; 957
-checks); a sweep of all 191 surfaces against 26 kinds of caller, five namespaces and a
-favourable, a hostile and no request (99,320 decisions, the expected rule restated in the
-test); Temporal's own authorization interceptor handing the relay rule the decoded request;
-and `tests/temporal` over the wire against the real binary (58 tests), the relay, controller,
-self-access and escrow cells included. What a relay's polls cost a job's history is stated
+two authorizers (331 cells, 260 of them denials that Temporal's no-op authorizer allows; 993
+checks), the relay's size cap among them (the largest genuine poll and the offset query
+allowed; a poll past the cap by its topics, its identity or a header, and an offset query by
+its arguments or a header, denied; a party's oversized update and query allowed); a sweep of
+all 191 surfaces against 26 kinds of caller, five namespaces and five requests -- a favourable
+one, the same past the relay's cap, two hostile ones and none (124,150 decisions, the expected
+rule restated in the test); the cap at its edge (`TestRelayRequestMax`: exactly 4 KiB passes,
+one byte more does not); Temporal's own authorization interceptor handing the relay rule the
+decoded request; and `tests/temporal` over the wire against the real binary (59 tests), the
+relay, controller, self-access and escrow cells included, and a relay poll past the cap
+refused while the relay's own poll on the same job still answers. What a relay's polls cost a job's history is stated
 above and in `docs/security.md`, not pinned by a wire test: that test would be a ready-made
 recipe in a public repository.

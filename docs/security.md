@@ -34,7 +34,7 @@ What that means concretely, and what enforces it:
 | One seller forges another seller's Nexus result | the callback guard (below) |
 | A buyer reads, signals or cancels a seller's handler workflow | the Authorizer: a buyer's token has no call in the seller's namespace, including the job it paid for |
 | A seller resets or deletes a workflow, or a buyer deletes its call records or shortens their retention, to change what escrow sees | the Authorizer: resets, deletes, namespace updates, batch operations and schedules are denied to every token |
-| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as ciphertext and cannot publish to it. It **can end that job**: every poll's result is written to the job's history, and enough polls push the job past Temporal's history size limit, which terminates it, a refund against the seller ([the stream relay](#the-stream-relay)) |
+| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, each request at most 4 KiB, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as ciphertext and cannot publish to it, and its requests together cannot make the job's workflow task too large for Temporal to deliver. It **can end that job**: every poll's result is written to the job's history, and enough polls push the job past Temporal's history size limit, which terminates it, a refund against the seller ([the stream relay](#the-stream-relay)) |
 | The worker controller's credential leaks | rollouts of Kontra's own workers in the platform namespace: no seller namespace, no workflow start, no compute config |
 | A buyer forges or alters a hold token (amount, seller, expiry, contract) | ES256 signature checked offline by the seller's handler, with audience, expiry, seller namespace, offering and contract hash |
 | A buyer replays a hold token | the handler workflow id is built from the job id and started with reject-duplicate: one execution per hold; a cancel before the job started occupies that id, so the refunded hold cannot start it either |
@@ -156,8 +156,9 @@ policy your worker runs under). The public frontend enforces this policy (PRD §
 `docs/decisions.md` I3, I30). Every decision is exact string equality or set membership, and
 no name or subject is ever split or parsed. One rule reads the request: the stream relay's,
 which takes two typed fields of the message Temporal has already decoded (the workflow id, and
-the update name or query type) and compares each, whole, with a value it constructs. A request
-of any other type is denied.
+the update name or query type) and compares each, whole, with a value it constructs, then
+compares the whole message's encoded size with a constant (4 KiB). A request of any other type
+is denied.
 
 Three kinds of token mean anything on the public frontend, and the Authorizer tells them apart
 from the claims Temporal's default claim mapper produces, in this order: a token that carries
@@ -182,7 +183,7 @@ drops into a relay's or the controller's token.
 | no token | health, `GetSystemInfo`, `GetClusterInfo` | everything else |
 | malformed token (expired, unknown key, `alg: none`, HS256 with the public key, wrong or missing audience, a gate API token, no session, a revoked session) | -- | everything, at claim mapping |
 | **party token**: `worker` in namespace A. A seller's worker token, a seller's API-key session, a buyer and the dev party hold the same token; they are identical on the wire | an explicit allowlist of WorkflowService calls in A: task polling and responding, heartbeats, start / signal / signal-with-start / update-with-start / update / query / describe / history / cancel / terminate / list / count of A's own workflows, standalone Nexus operations in A, and `DescribeTaskQueue` on A's own queues (backlog stats for `temporal task-queue describe` and KEDA -- metadata, no payloads) | any other namespace, `temporal-system` and the platform namespace `kontra-system`; every OperatorService and AdminService call; the Nexus HTTP API; namespace admin, batch operations, schedules, resets, deletes, pause, workflow options, worker deployments and versioning rules, compute config |
-| **stream relay** of job J in A: `sub = relay/A/job-J`, no permissions, minted by the gate only | `UpdateWorkflowExecution` with update name `__temporal_workflow_stream_poll`, and `QueryWorkflow` with query type `__temporal_workflow_stream_offset`, on workflow `job-J` in A only | every other call, on J or anywhere: the stream's publish signal, any other update or query (`__stack_trace` included), `PollWorkflowExecutionUpdate`, describe, history, start, cancel, terminate, update-with-start; both handlers on any other workflow of A, and on J's id in any other namespace |
+| **stream relay** of job J in A: `sub = relay/A/job-J`, no permissions, minted by the gate only | `UpdateWorkflowExecution` with update name `__temporal_workflow_stream_poll`, and `QueryWorkflow` with query type `__temporal_workflow_stream_offset`, on workflow `job-J` in A only, each request at most 4 KiB encoded | every other call, on J or anywhere: the stream's publish signal, any other update or query (`__stack_trace` included), `PollWorkflowExecutionUpdate`, describe, history, start, cancel, terminate, update-with-start; both handlers on any other workflow of A, and on J's id in any other namespace; a poll or offset query over 4 KiB, whatever field makes it so |
 | **worker controller**: `sub = platform/worker-controller`, no permissions, minted by the gate only | ten calls, in the platform namespace `kontra-system` only: describe, promote, ramp, manage, annotate and delete worker deployments and their versions, `DescribeTaskQueue`, `CountWorkflowExecutions` | every call in any other namespace; in `kontra-system`, every other call: no task, no workflow start, describe, signal, update or query, no other deployment or versioning call, no compute config |
 | any other role (`admin`, `write`, `read`, an unknown role in a namespace, `temporal-system:` with `read`, `write`, `admin` or `worker`), even next to `worker`, and whatever the token's subject (a relay's or the controller's included) | nothing beyond what `worker` in A grants | everything those roles grant on stock Temporal |
 | a permission string the mapper drops (`temporal-system:` with an unknown role, no `:`, not a string, a claim that is not a list) | no permission: judged by the token's subject, so the controller's or a relay's subject gets exactly that principal's calls | as for that subject |
@@ -267,6 +268,17 @@ not its API's, an update inside `ExecuteMultiOperation`, and a stream handshake 
 are denied. Run ids, update ids, payloads, headers and callbacks are not read; callbacks are
 the callback guard's, which applies to the relay as to every other token.
 
+Every field is counted, though: a relay request whose encoded size (the whole message, so its
+identity, headers and arguments, a poll's topics and offset among them) is over 4 KiB
+(`RelayRequestMax`) is denied, one integer comparison. The largest request the gate's relay
+builds is under 900 bytes: nine topics (an offering's eight streams and `kontra.progress`) of
+at most 64 characters, an offset, the pinned run id and its identity. The cap keeps what a
+relay token's requests can add to one workflow task of its job far below the 4 MiB gRPC
+message every workflow task must fit in (Temporal terminates a run whose workflow task it
+cannot deliver): Temporal holds at most `history.maxInFlightUpdates` (10 by default) of a
+workflow's updates in flight at once, so that is at most 40 KiB. A party's own requests are
+not capped: the cap is the relay rule's.
+
 The relay needs nothing else. Re-sending its Update with the same update id returns that
 update's outcome, and with an empty run id it targets the current run, so it follows a
 continue-as-new; once escrow has pinned the job's chain, the gate sets that run as the
@@ -291,12 +303,12 @@ purpose. Polling from offset 0 again and again, each time with a new update id, 
 to 2,000 completed updates of up to about 1 MB each, and once the history passes
 `limit.historySize.error` (20 MiB, pinned in `dynamicconfig/kontra.yaml`) Temporal terminates
 the run. Escrow then refunds the job as "seller workflow terminated", against the seller. Any
-stream above about 10.5 KB is enough; one of about 1 MB takes about twenty polls
-(`tests/temporal`: `test_relay_polls_alone_can_end_their_job`). The token stays live while a
-buyer listens, because its session is revoked only when the job closes or the last listener
-leaves.
+stream above about 10.5 KB is enough; one of about 1 MB takes about twenty polls (measured
+against the built server). The token stays live while a buyer listens, because its session is
+revoked only when the job closes or the last listener leaves.
 
-The Authorizer cannot bound this, because it does not read payloads. Three mitigations are
+The Authorizer cannot bound this: its cap holds each request to 4 KiB, but the cost is in the
+answers, and it does not read payloads. Three mitigations are
 recorded and none is adopted yet (decisions I30). A handler workflow that hosts a stream can
 continue-as-new when `workflow.info().is_continue_as_new_suggested()`: that turns the
 termination into churn, because escrow follows the pinned chain and the relay's empty run id
@@ -410,9 +422,11 @@ deadline rule.
   install (`KONTRA_CONTROL_NET`.2).
 - **A leaked stream-relay token can end its job.** Its two calls are enough: every poll's
   result is written to the job's history, and enough of them push the job past Temporal's
-  history size limit, which terminates it, a refund against the seller. The Authorizer
-  cannot bound it (it does not read payloads); see [the stream relay](#the-stream-relay) for
-  the numbers and the mitigations recorded in decisions I30.
+  history size limit, which terminates it, a refund against the seller. The Authorizer caps
+  each relay request at 4 KiB, which keeps its requests from ending the job by their size,
+  but cannot bound what the answers add to history (it does not read payloads); see
+  [the stream relay](#the-stream-relay) for the numbers and the mitigations recorded in
+  decisions I30.
 - **Token lifetime.** A worker token's session revoked at the gate is refused by Kontra's
   Temporal server within its revocation poll (5 s), as long as the server can reach the
   gate's list (`GET /v1/auth/revocations`); while it cannot, the token stays valid until its
