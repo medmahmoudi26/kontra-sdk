@@ -294,6 +294,12 @@ async def _download_all(value: Any, directory: Path) -> list[Path]:
 @click.option("--cancel", is_flag=True, help="Cancel before delivery (the hold refunds).")
 @click.option("--progress", is_flag=True, help="Follow the job's progress until it closes.")
 @click.option(
+    "--stream",
+    "topic",
+    metavar="TOPIC",
+    help="Follow one topic of the job's stream (its offering's `streams`): one JSON line per item.",
+)
+@click.option(
     "--result",
     "result_dir",
     type=click.Path(file_okay=False, path_type=Path),
@@ -306,6 +312,7 @@ def job(
     reject: str | None,
     cancel: bool,
     progress: bool,
+    topic: str | None,
     result_dir: Path | None,
     as_json: bool,
 ) -> None:
@@ -316,9 +323,9 @@ def job(
     from kontra.contract.names import is_job_id
     from kontra.hire import Kontra
 
-    actions = [accept_, reject is not None, cancel, progress, result_dir is not None]
+    actions = [accept_, reject is not None, cancel, progress, topic is not None, result_dir is not None]  # fmt: skip
     if sum(actions) > 1:
-        fail("pick one of --accept, --reject, --cancel, --progress, --result")
+        fail("pick one of --accept, --reject, --cancel, --progress, --stream, --result")
     if not is_job_id(job_id):
         fail(f"{job_id!r} is not a job id (32 hex characters)")
 
@@ -337,6 +344,12 @@ def job(
                 else:
                     click.echo(f"{p.at.isoformat(timespec='seconds')}  {p}")
             return events
+        if topic is not None:
+            # Decrypted items, one JSON line each, as they arrive (the seller's JSON: printed
+            # as JSON, never as text that could drive the terminal).
+            async for item in j.stream(topic):
+                click.echo(json.dumps(item, separators=(",", ":"), ensure_ascii=True))
+            return None
         if result_dir is not None:
             value = await j.result()
             # What lands here is the decrypted delivery: directories made for it are the
@@ -362,6 +375,8 @@ def job(
         _flush()
 
     def _show_job_outcome(out: Any) -> None:
+        if topic is not None:
+            return
         if as_json:
             if progress:
                 emit_json([_progress_dict(p) for p in out])

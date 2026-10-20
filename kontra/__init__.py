@@ -1,31 +1,36 @@
 """Kontra: a marketplace of durable, quoted jobs.
 
-A seller imports only from here -- ``from kontra import workflow, activity, serve`` -- and
-Temporal stays behind the façade: :mod:`kontra.workflow` and :mod:`kontra.activity` are
-Temporal's own objects re-exported, so the code still runs on any Temporal (decisions D1).
-``worker.py`` binds the workflow to its offering with :func:`serve` (or the explicit
-:class:`Worker`). Buyers hire with :mod:`kontra.hire` from a script, from inside their own
-workflow, or from an agent through ``kontra mcp``.
+Sellers write vanilla Temporal -- ``from temporalio import workflow, activity`` -- and the one
+file of theirs that imports ``kontra`` is ``worker.py``, which binds the workflow (or an
+agent's handler) to its offering with :func:`serve`, or puts :class:`KontraPlugin` on a
+Temporal client of their own (decisions I29). Buyers hire with :mod:`kontra.hire` from a
+script, from inside their own workflow, or from an agent through ``kontra mcp``.
 
-``Worker`` and ``serve`` load the serving stack (gate client, codec, auth) on first use, not
-on ``import kontra``: workflow code imports this package, and the sandbox should not have to
-pass any of that through.
+This package exports only what Kontra defines. ``serve``, ``Worker`` and ``KontraPlugin``
+load the serving stack (gate client, codec, auth, temporalio) on first use, not on
+``import kontra``: the CLI starts without it, and a seller's ``models.py`` importing
+:mod:`kontra.types` loads no Temporal.
 """
 
 from typing import TYPE_CHECKING, Any
 
-from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
-
-from kontra import activity, workflow
-from kontra._parallel import Page
-
 if TYPE_CHECKING:
+    from kontra.plugin import KontraPlugin
     from kontra.serve import Worker, serve
 
 __version__ = "0.2.4"
 
-__all__ = ["ApplicationError", "Page", "RetryPolicy", "Worker", "activity", "serve", "workflow"]
+__all__ = ["KontraPlugin", "Worker", "__version__", "serve"]
+
+#: Names this package exported before kontra-sdk#51, and what replaces each.
+_GONE = {
+    "workflow": "`from temporalio import workflow`",
+    "activity": "`from temporalio import activity`",
+    "RetryPolicy": "`from temporalio.common import RetryPolicy`",
+    "ApplicationError": "`from temporalio.exceptions import ApplicationError`",
+    "Page": "`from kontra.contrib.parallel import Page` (or a model of your own with "
+    "`items` and `next`)",
+}
 
 
 def __getattr__(name: str) -> Any:
@@ -33,4 +38,13 @@ def __getattr__(name: str) -> Any:
         import kontra.serve
 
         return getattr(kontra.serve, name)
+    if name == "KontraPlugin":
+        from kontra.plugin import KontraPlugin
+
+        return KontraPlugin
+    if name in _GONE:
+        raise AttributeError(
+            f"`kontra.{name}` is gone: {_GONE[name]} -- seller code imports Temporal directly "
+            "(kontra-sdk#51, decisions I29)"
+        )
     raise AttributeError(f"module 'kontra' has no attribute {name!r}")

@@ -41,7 +41,7 @@ from kontra.testing.fake_gate import FakeGate
 from kontra.testing.ledger_contract import assert_invariants
 
 from .conftest import World
-from .support import ScriptedControl, json_payload, ok_quote, quote_payload, wire
+from .support import ScriptedControl, json_payload, ok_quote, quote_payload, sealed, wire
 
 #: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
 #: (`Profile.new_pending_job_identity`); a test that drives the route itself only needs a
@@ -430,9 +430,7 @@ async def test_result_is_the_stored_ciphertext_for_the_buyer_only(shop: Shop) ->
     with pytest.raises(GateError) as e:
         await shop.buyer.gate.result(job.job_id)
     assert (e.value.status, e.value.code) == (404, "not_delivered")
-    stored = Payload(
-        metadata={"encoding": b"binary/kontra-age"}, data=b"sealed result"
-    ).SerializeToString()
+    stored = sealed(b"sealed result")  # a delivery: what the seller's codec stored
     shop.observe(job.job_id, ObservedStatus.COMPLETED, stored)
     await shop.gate.sweep()
     res = await shop.buyer.gate.result(job.job_id)
@@ -610,9 +608,9 @@ async def test_the_gate_observes_with_the_buyers_call_then_the_pinned_run(shop: 
     await shop.buyer.gate.start(job.job_id, wire(json_payload({"text": "hi"})))
     started_with = shop.control.starts[-1].headers["kontra-hold"]
     assert started_with != job.hold_token  # re-signed
-    shop.observe(job.job_id, ObservedStatus.RUNNING, run_id="run-7")
+    shop.observe(job.job_id, ObservedStatus.RUNNING, pin="run-7")
     await shop.gate.sweep()
-    assert shop.gate.jobs[job.job_id].record.run_id == "run-7"
+    assert shop.gate.jobs[job.job_id].record.pin == "run-7"
     await shop.gate.sweep()
     _, _, call, pinned = shop.control.observed[-1]
     assert pinned == "run-7"
@@ -657,7 +655,7 @@ async def test_a_pinned_job_ignores_a_later_run_of_its_id(shop: Shop) -> None:
     assert (await shop.buyer.gate.job(job.job_id)).state is m.JobState.WORKING
     # The seller terminated the buyer's run and completed another (verified or not, it is
     # not the pinned one): no delivery.
-    shop.observe(job.job_id, ObservedStatus.COMPLETED, b"r", run_id="run-2")
+    shop.observe(job.job_id, ObservedStatus.COMPLETED, b"r", pin="run-2")
     await shop.gate.sweep()
     view = await shop.buyer.gate.job(job.job_id)
     assert (view.state, view.delivery) == (m.JobState.WORKING, None)
@@ -826,7 +824,7 @@ async def test_a_cancel_after_an_unseen_delivery_is_refused(shop: Shop) -> None:
     assert (view.state, view.escrow) == (m.JobState.COMPLETED, m.Escrow.HELD)
     assert view.delivery is not None
     assert base64.b64decode((await shop.buyer.gate.result(job.job_id)).payload.b64) == (
-        b"the delivery"
+        sealed(b"the delivery")
     )
     assert shop.control.cancels == []
     await shop.buyer.gate.accept(job.job_id)
@@ -996,9 +994,7 @@ async def test_an_open_job_holding_only_the_placeholder_refunds_saying_so(shop: 
     """A cancel occupied the id but was never saved (a crash): the job waits for its
     deadline like any job no call started, then refunds naming the placeholder."""
     job = await shop.hire(1000)
-    shop.observe(
-        job.job_id, ObservedStatus.TERMINATED, provenance=Provenance.OCCUPIED, run_id="run-p"
-    )
+    shop.observe(job.job_id, ObservedStatus.TERMINATED, provenance=Provenance.OCCUPIED, pin="run-p")
     await shop.gate.sweep()
     assert (await shop.buyer.gate.job(job.job_id)).state is m.JobState.SUBMITTED
     shop.gate.advance(timedelta(hours=1, seconds=2))
@@ -1061,7 +1057,7 @@ async def test_history_progress_is_only_ever_the_pinned_runs(shop: Shop) -> None
         state=ObservedStatus.TERMINATED, last_event="WorkflowExecutionTerminated"
     )
     shop.observe(
-        occupied.job_id, ObservedStatus.TERMINATED, provenance=Provenance.OCCUPIED, run_id="p"
+        occupied.job_id, ObservedStatus.TERMINATED, provenance=Provenance.OCCUPIED, pin="p"
     )
     await shop.gate.sweep()
     assert shop.gate.jobs[occupied.job_id].events == []
@@ -1133,7 +1129,7 @@ async def test_a_run_that_completes_before_the_terminate_is_delivered(shop: Shop
     view = await shop.buyer.gate.job(job.job_id)
     assert (view.state, view.escrow) == (m.JobState.COMPLETED, m.Escrow.HELD)
     assert base64.b64decode((await shop.buyer.gate.result(job.job_id)).payload.b64) == (
-        b"the delivery"
+        sealed(b"the delivery")
     )
     await shop.buyer.gate.accept(job.job_id)
     assert await shop.balances() == (b0 - 1000, s0 + 950, k0 + 50)

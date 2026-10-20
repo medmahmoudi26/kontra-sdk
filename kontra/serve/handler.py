@@ -12,7 +12,8 @@ Service ``acme.enrich`` (:attr:`OfferingId.service_name`), two operations:
   fetching any of it (decisions I16), validate the input, re-run the seller's ``quote`` and
   refuse if the price went up or the currency changed (decisions I10) -- or if this input
   needs longer than the hold's max_duration, or than is left before the hold expires --,
-  record the buyer's key, then start the bound workflow as ``job-<id>`` with a timeout that
+  record the buyer's key, then start the bound workflow (for a bound handler: the turn
+  wrapper, :mod:`kontra.serve.turn`) as ``job-<id>`` with a timeout that
   ends by the gate's refund deadline (the hold's ``deadline``; without one, its expiry plus
   the escrow grace). Every refusal happens before any workflow
   exists, as a non-retryable ``BAD_REQUEST`` whose message names what failed -- never an
@@ -420,9 +421,11 @@ class OfferingService:
         timeout = self.run_timeout(claims, priced)
         self.jobs.record(claims.job_id, claims.buyer_key, claims.contract_hash)
         try:
+            # The bound workflow with the input, or (a bound handler) Kontra's turn wrapper
+            # with the handler's message: the only step that depends on the entry's kind.
             return await ctx.start_workflow(
                 self.bound.run_fn,
-                inp,
+                self.bound.job_input(inp),
                 id=job_workflow_id(claims.job_id),
                 execution_timeout=timeout,
                 # One start per job, closed or running: a call attached to a running

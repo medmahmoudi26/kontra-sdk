@@ -229,23 +229,20 @@ ROUTES: tuple[Route, ...] = (
     Route("job_key", "GET", f"{P}/jobs/{{job_id}}/key", "party", None, m.JobKey),
     Route("job_keys", "GET", f"{P}/me/job-keys", "party", None, m.JobKeyList),
     Route("share_job_keys", "POST", f"{P}/me/job-keys", "party", m.ShareJobKeys, m.SharedJobKeys),
+    # The job's workflow stream relayed (decisions I31): SSE of StreamEvent to the job's
+    # buyer or seller. Query: ``topic`` (repeatable; each in the offering version's streams
+    # or kontra.progress, else 422 unknown_topic; default all of them), ``history``
+    # (liveness events too), ``after`` (a cursor; else the ``Last-Event-ID`` header). At most
+    # STREAM_LISTENERS_MAX listeners per job (429 too_many_listeners). It ends once the job
+    # is closed and its relay finished. The seller posts nothing: the relay reads the stream.
     Route(
-        "progress",
+        "stream",
         "GET",
-        f"{P}/jobs/{{job_id}}/progress",
+        f"{P}/jobs/{{job_id}}/stream",
         "party",
         None,
-        m.ProgressEvent,
+        m.StreamEvent,
         stream=True,
-    ),
-    Route(
-        "post_progress",
-        "POST",
-        f"{P}/jobs/{{job_id}}/progress",
-        "party|worker",
-        m.ProgressPost,
-        None,
-        status=204,
     ),
     # artifacts & claim-check blobs
     Route(
@@ -270,6 +267,14 @@ ROUTES: tuple[Route, ...] = (
     ),
     Route("create_blob", "POST", f"{P}/blobs", "party|worker", m.BlobCreate, m.BlobUrl),
     Route("get_blob", "GET", f"{P}/blobs/{{sha256}}", "party|worker", None, m.BlobUrl),
+    Route(
+        "create_stream_blobs",
+        "POST",
+        f"{P}/jobs/{{job_id}}/stream/blobs",
+        "party|worker",
+        m.StreamBlobsCreate,
+        m.StreamBlobUrls,
+    ),
     # money
     Route("balance", "GET", f"{P}/balance", "party", None, m.Balance),
     Route("topup", "POST", f"{P}/topup", "party", m.Topup, m.TopupResult),

@@ -8,9 +8,11 @@ api.openai.com -- with no OPENAI_API_KEY anywhere.
 The stand-in answers as a model that calls the tool once and then cooks with what it got:
 what a real model cooks is not tested here (point ``LLM_BASE_URL`` at one for that).
 
-And the other half of kontra-sdk#27: a worker gets the agents plugin, and its lenient payload
-converter, exactly when its workflows import ``agents`` -- ``examples/hello`` does not, so it
-gets neither and needs no OpenAI key."""
+And how the plugin gets there (decisions I29): ``worker.py`` passes Temporal's
+``OpenAIAgentsPlugin`` in ``serve(plugins=[...])`` itself, as on any Temporal worker. Kontra
+detects nothing: a worker whose ``worker.py`` passes no plugin runs none, whatever its
+workflows import. The plugin goes on the client ahead of Kontra's, so the client's payload
+converter is the plugin's, and Kontra's codec encrypts under it."""
 
 from __future__ import annotations
 
@@ -136,7 +138,7 @@ async def test_the_model_activity_dials_the_workers_endpoint(
     market: Market, tmp_path: Path
 ) -> None:
     if not AGENTS:
-        pytest.skip("the [agents] extra is not installed")
+        pytest.skip("temporalio-openai-agents (the dev group's) is not installed")
     stand_in, tripwire = StandIn(), Tripwire()
     env = seller_env(market.seller.home, market.sites)
     assert not any(name.startswith("OPENAI_") for name in env)  # no key, no base URL
@@ -172,16 +174,30 @@ async def test_the_model_activity_dials_the_workers_endpoint(
     assert tripwire.seen == []  # no other host: not api.openai.com, not its traces
 
 
+#: Each example's worker, built as ``kontra serve`` builds it: the plugins it routes to the
+#: client and to the inner workers, and the payload converter its client ends up with --
+#: the seller's client plugins applied in order, then Kontra's rule (a throwaway codec).
 _PROBE = """
-import json, sys
-from kontra import _agents
+import json
+from temporalio.converter import DataConverter
 from kontra.cli._project import load_worker
+from kontra.codec import KontraCodec
+from kontra.codec.age import generate_identity
+from kontra.plugin import KontraPlugin
+
 with load_worker(".") as worker:
-    plugins = worker.options.get("plugins") or []
+    client_plugins, worker_plugins = worker._routed()
+config = {"data_converter": DataConverter.default}
+for plugin in client_plugins:
+    config = plugin.configure_client(config)
+identity, recipient = generate_identity()
+codec = KontraCodec(identity, [recipient], role="seller", blobs=None)
+converter = KontraPlugin._data_converter(config["data_converter"], codec)
 print(json.dumps({
-    "agents": "agents" in sys.modules,
-    "plugins": [type(p).__name__ for p in plugins],
-    "converter": _agents.payload_converter_class(plugins).__name__,
+    "client": [type(p).__name__ for p in client_plugins],
+    "worker": [type(p).__name__ for p in worker_plugins],
+    "converter": converter.payload_converter_class.__name__,
+    "codec": converter.payload_codec is codec,
 }))
 """
 
@@ -197,16 +213,17 @@ print(json.dumps({
         ("chef-agents", True),
     ],
 )
-def test_a_worker_runs_the_agents_plugin_iff_its_workflows_import_agents(
+def test_a_worker_runs_the_agents_plugin_its_worker_py_passes(
     name: str, runs_an_agent: bool
 ) -> None:
     """Each example's worker, built as ``kontra serve`` builds it, in a fresh process with no
-    ``OPENAI_*`` in its environment. ``examples/hello`` (and every seller but chef-agents):
-    no ``agents`` import, no plugin, temporalio's pydantic converter, no key needed.
-    ``examples/chef-agents``, which imports ``agents``: the plugin and its converter, and no
-    key needed either -- the endpoint is read at the first model call."""
+    ``OPENAI_*`` in its environment. ``examples/chef-agents``, whose ``worker.py`` passes
+    ``OpenAIAgentsPlugin``: the plugin on the client, its ``OpenAIPayloadConverter`` kept
+    under Kontra's codec (pydantic would refuse the model activity's input), and no key
+    needed -- the endpoint is read at the first model call. Every other seller passes no
+    plugin: none, and the pydantic converter Kontra puts in temporalio's default's place."""
     if runs_an_agent and not AGENTS:
-        pytest.skip("the [agents] extra is not installed")
+        pytest.skip("temporalio-openai-agents (the dev group's) is not installed")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("OPENAI_", "KONTRA_"))}
     result = subprocess.run(
         [sys.executable, "-c", _PROBE],
@@ -221,9 +238,15 @@ def test_a_worker_runs_the_agents_plugin_iff_its_workflows_import_agents(
     built = json.loads(result.stdout.strip().splitlines()[-1])
     if runs_an_agent:
         assert built == {
-            "agents": True,
-            "plugins": ["OpenAIAgentsPlugin"],
+            "client": ["OpenAIAgentsPlugin"],
+            "worker": [],
             "converter": "OpenAIPayloadConverter",
+            "codec": True,
         }
     else:
-        assert built == {"agents": False, "plugins": [], "converter": "PydanticPayloadConverter"}
+        assert built == {
+            "client": [],
+            "worker": [],
+            "converter": "PydanticPayloadConverter",
+            "codec": True,
+        }

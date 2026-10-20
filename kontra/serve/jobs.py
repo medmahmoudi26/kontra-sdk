@@ -3,7 +3,8 @@
 :class:`JobDirectory` maps a job to its buyer's public key (and the contract hash it was
 hired under). The Nexus handler records it from the verified hold token -- the key travels
 signed by the gate, so a seller cannot be tricked into encrypting a delivery to someone
-else -- and the codec and the progress forwarder read it. After a restart, or in another
+else -- and the codec reads it (a job stream's items too: the progress forwarder publishes
+through the codec, decisions I31). After a restart, or in another
 worker process, the entry is missing; the directory then asks the gate
 (``GET /v1/jobs/{id}/seller``), which only answers the job's seller.
 

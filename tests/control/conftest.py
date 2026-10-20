@@ -1,8 +1,9 @@
 """Fixtures for the control-plane tests: one Temporal dev server per test process
 (shared with ``tests/testing``), a :class:`~kontra._control.Control` per test.
 
-Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once into the
-temp directory; with neither the binary nor the network, the tests are skipped."""
+Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once and
+checksum-verified (``kontra.devgate.temporal_cli``); with neither the binary nor the network,
+the tests are skipped."""
 
 from __future__ import annotations
 

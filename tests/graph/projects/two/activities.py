@@ -1,6 +1,6 @@
 """The two project's activities: one per offering, and one no workflow schedules."""
 
-from kontra import activity
+from temporalio import activity
 
 
 @activity.defn
