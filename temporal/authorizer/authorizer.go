@@ -29,7 +29,8 @@
 //     PlatformNamespace only.
 //   - The gate's stream relay carries no permission and the subject RelaySubject(namespace,
 //     job workflow id): the stream's poll Update and offset Query on that one workflow, each
-//     request at most RelayRequestMax bytes.
+//     request at most RelayRequestMax bytes and shaped as kontra._relay builds it, at most
+//     RelayRate a second.
 //
 // A permission string the mapper drops is no permission: "temporal-system:" with a role it
 // does not know (it maps to no role and creates no namespace key), an entry with no ":", an
@@ -49,13 +50,18 @@
 // stream relay's, which takes two typed fields of the message Temporal already
 // deserialized (CallTarget.Request), the workflow id and the update name or query type,
 // and compares each, whole, with a value it constructs; then it compares the whole
-// message's encoded size (proto.Size) with RelayRequestMax, one integer comparison: the
-// payloads and headers are counted, never decoded. A request of any other type is denied.
+// message's encoded size (proto.Size) with RelayRequestMax, one integer comparison; then
+// the shape of its payloads: how many there are, and their metadata compared whole with
+// the one entry kontra._relay writes (relayShaped) -- counted and compared, never decoded,
+// and a payload's data is never read. A request of any other type is denied. One rule keeps
+// state: the relay's rate, a token bucket per relay subject (relayLimiter).
 package authorizer
 
 import (
 	"context"
 	"strconv"
+	"sync"
+	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
 	ws "go.temporal.io/api/workflowservice/v1"
@@ -100,6 +106,28 @@ const (
 	// default, pinned in dynamicconfig/kontra.yaml), so those stay under 40 KiB, far below
 	// the 4 MiB gRPC message limit a workflow task must fit in (decisions I30).
 	RelayRequestMax = 4 << 10
+
+	// RelayRate and RelayBurst bound how often one relay subject's requests are allowed, in
+	// this frontend process (Kontra runs one frontend per deployment, kontra.yaml): a token
+	// bucket per subject, RelayBurst deep, refilled at RelayRate a second. The gate's relay
+	// (kontra._relay, #52) polls about once every two seconds and, catching up, once per
+	// answer; a leaked relay token is held to the same, so it spends at most RelayRate of
+	// its namespace's frontend.namespaceRPS (200: 5%), and its requests reach the job's
+	// worker, each a workflow task or a query task of the seller's, at most RelayRate a
+	// second (decisions I30). It slows what the polls add to the job's history, and does not
+	// bound it. Only a request every other check allowed spends a token.
+	RelayRate  = 10
+	RelayBurst = 20
+
+	// RelayRateReason is the deny reason of a relay request past its rate. A relay reads it
+	// from the error's typed details (PermissionDeniedFailure.reason), compares it whole, and
+	// waits instead of stopping; tests/temporal pins it over the wire.
+	RelayRateReason = "kontra: a stream relay's requests are past their rate"
+
+	// relayEncoding is the one metadata entry of a relay poll's argument: json/plain, which
+	// the seller's codec passes through and temporalio's converter decodes in the workflow,
+	// where a value that is not a poll is a rejection (decisions I30).
+	relayEncoding = "json/plain"
 )
 
 // RelaySubject is the subject of the gate's stream relay for the workflow workflowID in
@@ -282,13 +310,21 @@ var RelayAPIs = setOf(
 	ws.WorkflowService_QueryWorkflow_FullMethodName,
 )
 
-// Authorizer implements Temporal's authorization.Authorizer with the policy above.
-type Authorizer struct{}
+// Authorizer implements Temporal's authorization.Authorizer with the policy above. Build it
+// with New: the zero value applies no relay rate.
+type Authorizer struct {
+	relays *relayLimiter
+}
 
 var _ authorization.Authorizer = Authorizer{}
 
 // New returns Kontra's authorizer.
-func New() Authorizer { return Authorizer{} }
+func New() Authorizer { return NewWithClock(time.Now) }
+
+// NewWithClock is New on a given clock, for tests of the relay's rate.
+func NewWithClock(now func() time.Time) Authorizer {
+	return Authorizer{relays: &relayLimiter{now: now, buckets: map[string]*relayBucket{}, sweepAt: relaySweepMin}}
+}
 
 // Authorize decides one call. Temporal calls it before every frontend request: gRPC
 // (unary and streaming, which carry no namespace and no request), the HTTP API, and the
@@ -303,7 +339,7 @@ func New() Authorizer { return Authorizer{} }
 // One thing this cannot see: a Nexus completion travels from the handler's namespace to
 // the caller's as Temporal's internal principal, named only by an unsigned token. The
 // callbackguard package checks those tokens where a handler hands them to Temporal.
-func (Authorizer) Authorize(
+func (a Authorizer) Authorize(
 	_ context.Context, claims *authorization.Claims, target *authorization.CallTarget,
 ) (authorization.Result, error) {
 	switch {
@@ -318,7 +354,7 @@ func (Authorizer) Authorize(
 	case claims.Subject == ControllerSubject:
 		return controller(claims, target), nil
 	}
-	return relay(claims, target), nil
+	return relay(claims, target, a.relays), nil
 }
 
 // hasPermissions reports whether the token carried any permission. Temporal's default
@@ -371,28 +407,34 @@ func controller(claims *authorization.Claims, t *authorization.CallTarget) autho
 // request (another type, none for a stream, a Nexus HTTP dispatch, an update inside
 // ExecuteMultiOperation) is denied. The subject is then compared, whole, with the one
 // RelaySubject builds from the request: a token whose subject is anything else, empty
-// included, is denied here too. Last, a request whose encoded size is over RelayRequestMax
-// is denied, whatever field makes it so.
-func relay(claims *authorization.Claims, t *authorization.CallTarget) authorization.Result {
+// included, is denied here too. Then a request whose encoded size is over RelayRequestMax
+// is denied, whatever field makes it so, and one not shaped as kontra._relay builds it
+// (relayShaped). Last, the subject's rate (limits).
+func relay(claims *authorization.Claims, t *authorization.CallTarget, limits *relayLimiter) authorization.Result {
 	if !partyNamespace(t.Namespace) {
 		return deny("a stream relay acts in a party's namespace only")
 	}
 	var workflowID, handler, want string
 	var msg proto.Message
+	var shaped bool
 	switch req := t.Request.(type) {
 	case *ws.UpdateWorkflowExecutionRequest:
 		if t.APIName != ws.WorkflowService_UpdateWorkflowExecution_FullMethodName {
 			return deny("this API is not available to a stream relay: " + t.APIName)
 		}
 		workflowID = req.GetWorkflowExecution().GetWorkflowId()
-		handler, want = req.GetRequest().GetInput().GetName(), StreamPollUpdate
+		input := req.GetRequest().GetInput()
+		handler, want = input.GetName(), StreamPollUpdate
+		shaped = len(input.GetHeader().GetFields()) == 0 && relayShaped(input.GetArgs().GetPayloads())
 		msg = req
 	case *ws.QueryWorkflowRequest:
 		if t.APIName != ws.WorkflowService_QueryWorkflow_FullMethodName {
 			return deny("this API is not available to a stream relay: " + t.APIName)
 		}
 		workflowID = req.GetExecution().GetWorkflowId()
-		handler, want = req.GetQuery().GetQueryType(), StreamOffsetQuery
+		query := req.GetQuery()
+		handler, want = query.GetQueryType(), StreamOffsetQuery
+		shaped = len(query.GetHeader().GetFields()) == 0 && len(query.GetQueryArgs().GetPayloads()) == 0
 		msg = req
 	default:
 		return deny("this API is not available to a stream relay: " + t.APIName)
@@ -406,7 +448,95 @@ func relay(claims *authorization.Claims, t *authorization.CallTarget) authorizat
 	if proto.Size(msg) > RelayRequestMax {
 		return deny("a stream relay's request may be at most " + strconv.Itoa(RelayRequestMax) + " bytes")
 	}
+	if !shaped {
+		return deny("a stream relay's request carries only what kontra._relay sends: a poll one json/plain argument, no header")
+	}
+	if !limits.allow(claims.Subject) {
+		return authorization.Result{Decision: authorization.DecisionDeny, Reason: RelayRateReason}
+	}
 	return allow(claims)
+}
+
+// relayShaped reports whether a poll's arguments are what kontra._relay sends: exactly one
+// payload whose metadata is exactly {"encoding": "json/plain"}, nothing stored externally.
+// Every payload of a request is decoded by the seller's worker -- its codec and temporalio's
+// external storage -- before any validator of the job's can refuse the poll, and an argument
+// they cannot decode (a ciphertext, a claim-check reference they would fetch, #52's
+// stream envelope) fails the job's workflow task, again on every attempt. A json/plain payload
+// passes the codec untouched and reaches the converter, where an argument that is not a
+// poll is a rejection, which costs the job nothing (decisions I30). Counted and compared;
+// the payload's data is not read.
+func relayShaped(args []*commonpb.Payload) bool {
+	if len(args) != 1 {
+		return false
+	}
+	md := args[0].GetMetadata()
+	return len(md) == 1 && string(md["encoding"]) == relayEncoding && len(args[0].GetExternalPayloads()) == 0
+}
+
+// relaySweepMin is the size from which the relay's buckets are swept of full ones.
+const relaySweepMin = 1024
+
+// relayLimiter is the relay's rate: a token bucket per relay subject. Only a request the
+// rest of the relay rule allowed reaches it, so a subject is one the gate signed a token
+// for. A full bucket is the same as none, so full ones are dropped when the map grows past
+// sweepAt: what it holds follows the relay traffic of the last RelayBurst/RelayRate seconds.
+type relayLimiter struct {
+	mu      sync.Mutex
+	now     func() time.Time
+	buckets map[string]*relayBucket
+	sweepAt int
+}
+
+type relayBucket struct {
+	tokens float64
+	at     time.Time
+}
+
+func (l *relayLimiter) allow(subject string) bool {
+	if l == nil {
+		return true // the zero Authorizer: no rate (New builds one)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	b, ok := l.buckets[subject]
+	if !ok {
+		if len(l.buckets) >= l.sweepAt {
+			l.sweep(now)
+			l.sweepAt = max(relaySweepMin, 2*len(l.buckets))
+		}
+		b = &relayBucket{tokens: RelayBurst, at: now}
+		l.buckets[subject] = b
+	} else {
+		b.tokens = refill(b, now)
+		if now.After(b.at) {
+			b.at = now // a clock that went back moves nothing back
+		}
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+func (l *relayLimiter) sweep(now time.Time) {
+	for subject, b := range l.buckets {
+		if refill(b, now) >= RelayBurst {
+			delete(l.buckets, subject)
+		}
+	}
+}
+
+// refill is b's tokens at now: RelayRate a second since it was last spent, at most
+// RelayBurst. A clock that went back adds nothing.
+func refill(b *relayBucket, now time.Time) float64 {
+	elapsed := now.Sub(b.at).Seconds()
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	return min(float64(RelayBurst), b.tokens+elapsed*RelayRate)
 }
 
 // IsInternal reports whether the claims are Temporal's internal principal, which only the

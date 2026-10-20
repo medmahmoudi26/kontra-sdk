@@ -8,8 +8,9 @@ typed requests; this file proves the same cells against the real server binary w
 * the gate's **stream relay** for job J (``names.relay_subject``, no permissions) polls its
   job's stream and reads its offset with only ``UpdateWorkflowExecution`` and
   ``QueryWorkflow`` -- the strict wire shape (I30, Q1) -- and is refused everything else,
-  the stock ``WorkflowStreamClient.subscribe()`` included, and any request past the
-  Authorizer's size cap (``RelayRequestMax``);
+  the stock ``WorkflowStreamClient.subscribe()`` included, any request past the
+  Authorizer's size cap (``RelayRequestMax``), any request not shaped as the gate's relay
+  builds it (Q10), and any request past its subject's rate (``RelayRate``, Q11);
 * the **worker controller** (KON-15) rolls out a versioned worker of Kontra's own in the
   platform namespace, and is refused everywhere else;
 * a **party token** steers its own jobs (updates, queries, signals, cancel, terminate), and
@@ -36,6 +37,7 @@ from temporalio.api.batch.v1 import BatchOperationReset
 from temporalio.api.common.v1 import Header, Payload, Payloads, WorkflowExecution, WorkflowType
 from temporalio.api.deployment.v1 import WorkerDeploymentVersion as DeploymentVersion
 from temporalio.api.enums.v1 import (
+    EventType,
     ResetReapplyType,
     TaskQueueType,
     UpdateWorkflowExecutionLifecycleStage,
@@ -102,6 +104,7 @@ from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker, WorkerDeploymentConfig
 from wire_ledger import assert_allowed, assert_authorized, assert_denied, assert_refused, record
 
+from kontra import codec
 from kontra.contract import names
 
 pytestmark = pytest.mark.temporal
@@ -119,6 +122,14 @@ RELAY_RPC_TIMEOUT = timedelta(seconds=10)
 #: The Authorizer's ``RelayRequestMax`` (temporal/authorizer): the largest relay request, in
 #: encoded bytes, it allows.
 RELAY_REQUEST_MAX = 4 * 1024
+#: The Authorizer's ``RelayRate`` and ``RelayBurst``: a relay subject's requests a second, and
+#: at once.
+RELAY_RATE = 10
+RELAY_BURST = 20
+#: The Authorizer's ``RelayRateReason``, compared whole: a relay refused with it waits.
+RELAY_RATE_REASON = "kontra: a stream relay's requests are past their rate"
+#: A part of the reason the Authorizer gives a relay request not shaped as the relay builds it.
+RELAY_SHAPE_REASON = "carries only what kontra._relay sends"
 COMPLETED = (
     UpdateWorkflowExecutionLifecycleStage.UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED
 )
@@ -392,12 +403,16 @@ RelayCall = Callable[[Cluster, Client, str], Awaitable[Any]]
 
 
 def _update(namespace: str, workflow_id: str, name: str) -> UpdateWorkflowExecutionRequest:
+    """An Update named ``name`` whose argument is shaped as a relay's poll (one json/plain
+    payload, decisions I30, Q10): only the name makes it the relay's or not."""
+    arg = Payload(metadata={"encoding": b"json/plain"}, data=b'{"from_offset":0,"topics":["log"]}')
     return UpdateWorkflowExecutionRequest(
         namespace=namespace,
         workflow_execution=wf(workflow_id),
         wait_policy=WaitPolicy(lifecycle_stage=COMPLETED),
         request=UpdateRequest(
-            meta=UpdateMeta(update_id=str(uuid.uuid4())), input=UpdateInput(name=name)
+            meta=UpdateMeta(update_id=str(uuid.uuid4())),
+            input=UpdateInput(name=name, args=Payloads(payloads=[arg])),
         ),
     )
 
@@ -622,6 +637,204 @@ async def test_relay_requests_past_the_size_cap_are_refused(cluster: Cluster) ->
         assert stream_items(relay, answered)
         description = await handle.describe()
         assert description.status == WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_RUNNING
+
+
+RelayRequest = UpdateWorkflowExecutionRequest | QueryWorkflowRequest
+
+
+def _misshapen(workflow_id: str) -> dict[str, RelayRequest]:
+    """Polls and offset queries of J's relay token, each changed in one way the gate's relay
+    never sends: an argument the seller's worker would decode before the job's validator
+    could refuse it (a Kontra ciphertext, a claim-check reference its codec would fetch, a
+    temporalio external-storage reference), a metadata key or argument more or fewer, a
+    header."""
+
+    def poll(
+        metadata: dict[str, bytes] | None = None,
+        *,
+        data: bytes = b"{}",
+        args: int = 1,
+        header: bool = False,
+    ) -> UpdateWorkflowExecutionRequest:
+        req = _update(SELLER, workflow_id, names.STREAM_POLL_UPDATE)
+        payloads = req.request.input.args.payloads
+        if metadata is not None:
+            payloads[0].CopyFrom(Payload(metadata=metadata, data=data))
+        if args == 0:
+            req.request.input.ClearField("args")
+        elif args == 2:
+            payloads.append(Payload(metadata={"encoding": b"json/plain"}, data=b"{}"))
+        if header:
+            req.request.input.header.CopyFrom(Header(fields={"h": Payload(data=b"x")}))
+        return req
+
+    def offset(*, args: bool = False, header: bool = False) -> QueryWorkflowRequest:
+        req = _query(SELLER, workflow_id, names.STREAM_OFFSET_QUERY)
+        if args:
+            req.query.query_args.payloads.append(
+                Payload(metadata={"encoding": b"json/plain"}, data=b"0")
+            )
+        if header:
+            req.query.header.CopyFrom(Header(fields={"h": Payload(data=b"x")}))
+        return req
+
+    reference = f'{{"sha256":"{"0" * 64}","size":{codec.MAX_CLAIM_CHECK}}}'.encode()
+    return {
+        "Update(poll)@J argument binary/kontra-age": poll(
+            {"encoding": codec.ENCODING, "kontra-v": b"1"},
+            data=b"age-encryption.org/v1\n-> X25519 x\n",
+        ),
+        "Update(poll)@J argument a claim-check reference": poll(
+            {"encoding": codec.CLAIM_CHECK_ENCODING, "kontra-v": b"1"}, data=reference
+        ),
+        "Update(poll)@J argument an external-storage reference": poll(
+            {"encoding": b"json/external-storage-reference"}
+        ),
+        "Update(poll)@J argument with a second metadata key": poll(
+            {"encoding": b"json/plain", "kontra-v": b"1"}
+        ),
+        "Update(poll)@J argument JSON/plain": poll({"encoding": b"JSON/plain"}),
+        "Update(poll)@J argument with no metadata": poll({}),
+        "Update(poll)@J with no argument": poll(args=0),
+        "Update(poll)@J with two arguments": poll(args=2),
+        "Update(poll)@J with a header": poll(header=True),
+        "Query(offset)@J with an argument": offset(args=True),
+        "Query(offset)@J with a header": offset(header=True),
+    }
+
+
+async def test_relay_requests_not_shaped_as_the_relay_builds_them_are_refused(
+    cluster: Cluster,
+) -> None:
+    """A relay request carries only what the gate's relay sends -- a poll with one json/plain
+    argument and no header, an offset query with neither (decisions I30, Q10). Each other
+    shape is refused by the Authorizer with the shape's reason, before any workflow of the
+    seller's sees it: the job's history does not grow and no workflow task fails. The relay's
+    own poll on the same job then answers, and the job runs on."""
+    async with stream_job(cluster, steps=2) as (_seller, job_id, handle):
+        workflow_id = handle.id
+        relay = await connect_public(cluster, SELLER, api_key=cluster.signer.relay(SELLER, job_id))
+
+        async def all_published() -> bool:
+            return await relay_offset(relay, SELLER, workflow_id) == 4
+
+        await eventually(all_published)
+        before = len((await handle.fetch_history()).events)
+        for cell, request in _misshapen(workflow_id).items():
+            call = (
+                relay.workflow_service.update_workflow_execution(request, timeout=RELAY_RPC_TIMEOUT)
+                if isinstance(request, UpdateWorkflowExecutionRequest)
+                else relay.workflow_service.query_workflow(request, timeout=RELAY_RPC_TIMEOUT)
+            )
+            with pytest.raises(RPCError) as denied:
+                await call
+            assert denied.value.status == RPCStatusCode.PERMISSION_DENIED, cell
+            reason = denial_reason(denied.value)
+            assert RELAY_SHAPE_REASON in reason, (cell, reason)
+            record(f"relay-J/{cell}", "deny", "PERMISSION_DENIED")
+        history = await handle.fetch_history()
+        assert len(history.events) == before
+        assert not any(
+            e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED for e in history.events
+        )
+
+        answered = await assert_allowed(
+            "relay-J/Update(poll)@J as the relay builds it, after the refusals",
+            relay_poll(relay, SELLER, workflow_id, topics=["log", "progress"], from_offset=0),
+        )
+        assert len(stream_items(relay, answered)) == 4
+        description = await handle.describe()
+        assert description.status == WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_RUNNING
+
+
+async def test_a_relay_past_its_rate_is_refused(cluster: Cluster) -> None:
+    """A relay subject is held to ``RelayRate`` requests a second, ``RelayBurst`` at once
+    (decisions I30, Q11): sent all at once, its offset queries and polls past the burst are
+    refused alike with ``RelayRateReason``; another job's relay, and the seller on the same
+    job, are not held back; and once the bucket refills, the relay's poll answers again."""
+    async with stream_job(cluster, steps=1) as (seller, job_id, handle):
+        other_id = names.new_job_id()
+        other = await seller.start_workflow(
+            app.StreamJob.run,
+            app.StreamJobInput(1),
+            id=names.job_workflow_id(other_id),
+            task_queue=app.SELLER_TASK_QUEUE,
+        )
+        try:
+            for h in (handle, other):  # the seller's own query: no relay request is spent
+
+                async def published(h: WorkflowHandle[Any, str] = h) -> bool:
+                    return await h.query(names.STREAM_OFFSET_QUERY, result_type=int) == 2
+
+                await eventually(published)
+            relay = await connect_public(
+                cluster, SELLER, api_key=cluster.signer.relay(SELLER, job_id)
+            )
+            service = relay.workflow_service
+
+            def query() -> Awaitable[Any]:
+                return service.query_workflow(
+                    _query(SELLER, handle.id, names.STREAM_OFFSET_QUERY), timeout=RELAY_RPC_TIMEOUT
+                )
+
+            def poll() -> Awaitable[Any]:
+                return service.update_workflow_execution(
+                    _update(SELLER, handle.id, names.STREAM_POLL_UPDATE), timeout=RELAY_RPC_TIMEOUT
+                )
+
+            kinds = ["query", "query", "poll"] * RELAY_BURST
+            began = asyncio.get_running_loop().time()
+            outcomes = await asyncio.gather(
+                *(query() if kind == "query" else poll() for kind in kinds),
+                return_exceptions=True,
+            )
+            elapsed = asyncio.get_running_loop().time() - began
+            refused: list[str] = []
+            for kind, outcome in zip(kinds, outcomes, strict=True):
+                if isinstance(outcome, RPCError) and outcome.status == (
+                    RPCStatusCode.PERMISSION_DENIED
+                ):
+                    assert denial_reason(outcome) == RELAY_RATE_REASON, denial_reason(outcome)
+                    refused.append(kind)
+                elif isinstance(outcome, BaseException) and not isinstance(outcome, RPCError):
+                    raise outcome
+            # Anything but PERMISSION_DENIED passed the Authorizer (Temporal may still refuse a
+            # poll past its in-flight update limit).
+            authorized = len(kinds) - len(refused)
+            assert RELAY_BURST <= authorized <= RELAY_BURST + RELAY_RATE * elapsed + 1, (
+                authorized,
+                elapsed,
+            )
+            assert {"query", "poll"} <= set(refused), refused
+            record(
+                "relay-J/Query(offset) and Update(poll)@J past its burst",
+                "deny",
+                "PERMISSION_DENIED",
+            )
+
+            # Another job's relay has a bucket of its own; the seller has none.
+            relay_k = await connect_public(
+                cluster, SELLER, api_key=cluster.signer.relay(SELLER, other_id)
+            )
+            await assert_allowed(
+                "relay-K/Query(offset)@K while J's relay is past its rate",
+                relay_offset(relay_k, SELLER, other.id),
+            )
+            await assert_allowed(
+                "seller-self/acme:worker/Query(offset)@J while J's relay is past its rate",
+                handle.query(names.STREAM_OFFSET_QUERY, result_type=int),
+            )
+
+            # Refilled at RelayRate a second: the relay reads on.
+            await asyncio.sleep(RELAY_BURST / RELAY_RATE)
+            answered = await assert_allowed(
+                "relay-J/Update(poll)@J once its rate refilled",
+                relay_poll(relay, SELLER, handle.id, topics=["log", "progress"], from_offset=0),
+            )
+            assert len(stream_items(relay, answered)) == 2
+        finally:
+            with contextlib.suppress(RPCError):
+                await other.terminate("the test is over")
 
 
 @pytest.mark.parametrize(
