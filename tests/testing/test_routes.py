@@ -27,7 +27,7 @@ from kontra.testing import SoftAuthenticator, fake_gate
 from kontra.testing.fake_gate import FakeGate
 
 from .conftest import World
-from .support import json_payload, ok_quote, wire
+from .support import json_payload, ok_quote, sealed, wire
 
 #: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
 #: (`Profile.new_pending_job_identity`); a test that drives the route itself only needs a
@@ -200,7 +200,7 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
         "WorkflowExecutionCompleted",
         2,
     )
-    assert (await buyer.gate.result(one.job_id)).size == len(b"cipher")
+    assert (await buyer.gate.result(one.job_id)).size == len(sealed(b"cipher"))
     await buyer.gate.reject(one.job_id, "wrong case")
     assert [j.job_id for j in (await judge.gate.disputes()).items] == [one.job_id]
     resolved = await judge.gate.resolve(

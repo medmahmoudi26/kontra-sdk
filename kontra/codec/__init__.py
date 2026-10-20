@@ -114,6 +114,7 @@ from kontra.codec.stream import (
     EnvelopeError,
 )
 from kontra.contract.names import job_id_from_workflow_id
+from kontra.engine import AGE_MAGIC, NotSealed
 from kontra.gate_client import models as m
 
 __all__ = [
@@ -134,6 +135,7 @@ __all__ = [
     "KontraCodec",
     "KontraFailureConverter",
     "SellerKeys",
+    "check_sealed",
     "data_converter",
 ]
 
@@ -747,6 +749,38 @@ def _parse_reference(raw: bytes) -> tuple[str, int]:
     ):
         raise InvalidPayload("malformed claim-check reference")
     return digest, size
+
+
+def check_sealed(data: bytes) -> None:
+    """Raise :class:`~kontra.engine.NotSealed` unless ``data`` is exactly one serialized
+    Kontra payload envelope as this codec writes it: canonical (deterministic) protobuf, the
+    metadata ``{encoding, kontra-v: 1}`` and nothing else, and either ``binary/kontra-age``
+    with an age v1 file as data or ``binary/kontra-claim-check`` with a well-formed reference.
+
+    What seam ⑥ hands a gate as a delivery (:class:`kontra.engine.SealedPayload`): a result
+    that fails this is plaintext, or bytes the codec did not write, and is never a delivery
+    (decisions I32). Nothing is decrypted or fetched: only the envelope is read."""
+    p = Payload()
+    try:
+        p.ParseFromString(data)
+    except DecodeError:
+        raise NotSealed("not a serialized payload") from None
+    if p.SerializeToString(deterministic=True) != data:
+        raise NotSealed("not a canonical payload")
+    if set(p.metadata) != {"encoding", _VERSION_KEY} or p.metadata[_VERSION_KEY] != _VERSION:
+        raise NotSealed("not a kontra v1 payload envelope")
+    encoding = p.metadata["encoding"]
+    if encoding == ENCODING:
+        if not p.data.startswith(AGE_MAGIC):
+            raise NotSealed("a binary/kontra-age payload without an age file")
+        return
+    if encoding == CLAIM_CHECK_ENCODING:
+        try:
+            _parse_reference(p.data)
+        except InvalidPayload:
+            raise NotSealed("a malformed claim-check reference") from None
+        return
+    raise NotSealed("its encoding is not Kontra ciphertext")
 
 
 class KontraFailureConverter(

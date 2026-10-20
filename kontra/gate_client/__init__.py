@@ -633,14 +633,19 @@ class GateClient:
 
     # catalog
     async def publish(
-        self, document: dict[str, Any], *, streams: Sequence[str] = ()
+        self,
+        document: dict[str, Any],
+        *,
+        streams: Sequence[str] = (),
+        engine: m.EngineName = m.DEFAULT_ENGINE,
     ) -> m.CatalogEntry:
-        """Publish ``document`` with ``offering.yaml``'s ``streams`` (catalog data beside
-        it, never hashed, fixed per version: decisions I31)."""
+        """Publish ``document`` with ``offering.yaml``'s ``streams`` and the ``engine`` the
+        version runs on (catalog data beside it, never hashed, fixed per version: decisions
+        I31, I32). The default engine is not sent: a gate reads its absence as it."""
         return await self._model(
             "publish",
             m.CatalogEntry,
-            body=m.PublishRequest(document=document, streams=list(streams)),
+            body=m.PublishRequest(document=document, streams=list(streams), engine=engine),
         )
 
     async def search(

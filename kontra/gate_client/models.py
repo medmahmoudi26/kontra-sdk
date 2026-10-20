@@ -21,7 +21,7 @@ import re
 from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Final, Literal, cast
 
 from pydantic import (
     AfterValidator,
@@ -52,12 +52,14 @@ __all__ = [
     "CHALLENGE_MAX",
     "CONFIRMATION_REQUIRED",
     "CONFIRM_ID_PATTERN",
+    "DEFAULT_ENGINE",
     "DEVICES_MAX",
     "DEVICE_ADDS_PER_HOUR",
     "DEVICE_GRANT",
     "DEVICE_IDLE_SECONDS",
     "DEVICE_LABEL_PATTERN",
     "EMAIL_MAX",
+    "ENGINE_NAMES",
     "HANDOFF_PATTERN",
     "HANDOFF_TTL_SECONDS",
     "HIDDEN_DEVICE_LABEL",
@@ -106,6 +108,7 @@ __all__ = [
     "DeviceStart",
     "DeviceView",
     "DownloadUrl",
+    "EngineName",
     "ErrorBody",
     "Escrow",
     "GateInfo",
@@ -1042,6 +1045,19 @@ def _streams(value: list[str]) -> list[str]:
 
 _Streams = Annotated[list[_Topic], Field(max_length=STREAMS_MAX), AfterValidator(_streams)]
 
+#: The engines an offering version can run on (seam ⑥, ``kontra.engine``, decisions I32).
+#: Additive: a gate learns a new name before any client sends it, and no model a gate answers
+#: with carries it, so adding a value never breaks an old client.
+EngineName = Literal["temporal"]
+ENGINE_NAMES: Final[tuple[EngineName, ...]] = ("temporal",)
+#: What a version runs on when its publish names no engine (every client before #55, and
+#: every client since that publishes for this one: it omits the default).
+DEFAULT_ENGINE: Final[EngineName] = "temporal"
+
+
+def _is_default_engine(value: object) -> bool:
+    return value == DEFAULT_ENGINE
+
 
 class PublishRequest(_M):
     """``POST /v1/catalog``: the full contract document (with ``x-kontra``), as JSON. A
@@ -1053,10 +1069,18 @@ class PublishRequest(_M):
     ``streams``: ``offering.yaml``'s ``streams:``, the topics of a job's workflow stream a
     buyer may read (decisions I31) -- beside the document, never in it: catalog data, not in
     the contract hash. Canonical (sorted, distinct; ``kontra.contract.offering.check_streams``)
-    and fixed per version: a republish of the same version with other streams is 409."""
+    and fixed per version: a republish of the same version with other streams is 409.
+
+    ``engine``: the engine the version runs on (seam ⑥, decisions I32), beside the document
+    like ``streams``: never hashed, fixed at the version's first publish (a republish with
+    another is 409 ``engine_fixed``), and never in anything a buyer reads. Absent means
+    :data:`DEFAULT_ENGINE`, and a client sends it only when it is not the default, so a
+    client of this version publishes to a gate that predates the field (owner decision
+    OD11 of #55). A name the gate runs no adapter for is 422 ``unsupported_engine``."""
 
     document: dict[str, Any] = Field(max_length=_MEMBERS_MAX)
     streams: _Streams = Field(default_factory=list[str])
+    engine: EngineName = Field(default=DEFAULT_ENGINE, exclude_if=_is_default_engine)
 
 
 class CatalogEntry(_M):

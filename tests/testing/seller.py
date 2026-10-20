@@ -1,11 +1,18 @@
 """A minimal seller for the end-to-end tests, written against plain temporalio and the
 gate's public contract (what ``kontra.serve`` will automate): a Nexus service with a sync
 ``quote`` and a workflow-run ``execute`` that verifies the hold token offline against the
-gate's JWKS (D10, decisions I10) and starts ``job-<id>`` (decisions I6)."""
+gate's JWKS (D10, decisions I10) and starts ``job-<id>`` (decisions I6).
+
+Its client (:func:`sealing`) puts a job's payloads in the codec's delivery envelope
+(:class:`EnvelopeCodec`), as a seller's ``KontraCodec`` would: an engine adapter hands the gate
+nothing else as a delivery (seam ⑥, decisions I32). The envelope is the format only -- an age
+file's first line, then the payload in the clear -- so a test reads the result back with
+:func:`unseal_payload`; the real encryption is ``test_payloads_stay_ciphertext_end_to_end``'s."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, MutableMapping
+import dataclasses
+from collections.abc import AsyncGenerator, MutableMapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any
@@ -15,18 +22,71 @@ import nexusrpc
 import nexusrpc.handler
 from nexusrpc.handler import StartOperationContext
 from temporalio import nexus
+from temporalio.api.common.v1 import Payload
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
+from temporalio.converter import (
+    DataConverter,
+    PayloadCodec,
+    SerializationContext,
+    WithSerializationContext,
+    WorkflowSerializationContext,
+)
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.nexus import WorkflowRunOperationContext
 from temporalio.worker import Worker
 
-from kontra.contract.names import job_workflow_id
+from kontra.contract.names import job_id_from_workflow_id, job_workflow_id
+from kontra.engine import AGE_MAGIC
 from kontra.gate_client import models as m
 
 from .seller_flows import EnrichJob, Order, shout
 
 PRICE_PER_CHAR = 100
+_SEALED = b"binary/kontra-age"
+
+
+def seal_payload(p: Payload) -> Payload:
+    """``p`` in the delivery envelope's format (not encrypted: see the module docstring)."""
+    return Payload(
+        metadata={"encoding": _SEALED, "kontra-v": b"1"}, data=AGE_MAGIC + p.SerializeToString()
+    )
+
+
+def unseal_payload(p: Payload) -> Payload:
+    if p.metadata.get("encoding") != _SEALED:
+        return p
+    assert p.data.startswith(AGE_MAGIC)
+    return Payload.FromString(p.data[len(AGE_MAGIC) :])
+
+
+class EnvelopeCodec(PayloadCodec, WithSerializationContext):
+    """Seals the payloads of a job's root workflow ``job-<id>`` (its input and its result) and
+    nothing else -- the quote's price stays plaintext, as the seller codec's rules have it."""
+
+    def __init__(self, sealing: bool = False) -> None:
+        self._sealing = sealing
+
+    def with_context(self, context: SerializationContext) -> EnvelopeCodec:
+        root = isinstance(context, WorkflowSerializationContext) and (
+            job_id_from_workflow_id(context.workflow_id) is not None
+        )
+        return EnvelopeCodec(root)
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return [seal_payload(p) if self._sealing else p for p in payloads]
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return [unseal_payload(p) for p in payloads]
+
+
+def sealing(client: Client) -> Client:
+    """``client`` with :class:`EnvelopeCodec` (sharing its connection)."""
+    config = client.config()
+    config["data_converter"] = dataclasses.replace(
+        DataConverter.default, payload_codec=EnvelopeCodec()
+    )
+    return Client(**config)
 
 
 def seller_handler(

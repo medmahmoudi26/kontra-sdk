@@ -405,3 +405,102 @@ def test_the_stream_replaces_the_progress_routes() -> None:
     assert not [r for r in ROUTES if r.path.endswith("/progress")]
     assert not hasattr(m, "ProgressEvent")
     assert not hasattr(m, "ProgressPost")
+
+
+# --------------------------------------------------------------------------- the engine (seam ⑥)
+
+
+def test_publish_request_engine_defaults_to_temporal_and_names_only_engines() -> None:
+    """``PublishRequest.engine`` (decisions I32): what the version runs on, beside the
+    document. Absent -- every client before #55 -- it is ``temporal``; a name that is no
+    engine is refused by the model, before any gate code runs."""
+    doc = {"nexusrpc": "1.0.0"}
+    assert m.PublishRequest(document=doc).engine == "temporal"
+    assert m.PublishRequest.model_validate({"document": doc}).engine == "temporal"
+    assert m.PublishRequest.model_validate({"document": doc, "engine": "temporal"}).engine == (
+        "temporal"
+    )
+    for bad in ("golem", "Temporal", "", None, 1):
+        with pytest.raises(ValueError, match="engine"):
+            m.PublishRequest.model_validate({"document": doc, "engine": bad})
+    assert m.ENGINE_NAMES == ("temporal",)
+    assert m.DEFAULT_ENGINE == "temporal"
+    schema = m.PublishRequest.model_json_schema()["properties"]["engine"]
+    assert (schema.get("const") or schema["enum"][0], schema["default"]) == (
+        "temporal",
+        "temporal",
+    )
+
+
+async def test_the_client_omits_the_default_engine() -> None:
+    """Owner decision OD11 of #55: a client of this version sends ``engine`` only when it is
+    not the default, so it still publishes to a gate that predates the field (which refuses
+    an unknown member)."""
+    rec = Recorder(lambda _: json_response(200, minimal(m.CatalogEntry)))
+    async with GateClient("http://gate.test", token=static("t"), transport=rec.transport) as c:
+        await c.publish({"nexusrpc": "1.0.0"})
+        await c.publish({"nexusrpc": "1.0.0"}, engine="temporal")
+    from ._support import body
+
+    assert [body(r) for r in rec.requests] == [
+        {"document": {"nexusrpc": "1.0.0"}, "streams": []},
+        {"document": {"nexusrpc": "1.0.0"}, "streams": []},
+    ]
+    assert "engine" not in m.PublishRequest(document={}).model_dump(mode="json")
+
+
+def _properties(schema: Any) -> set[str]:
+    """Every property name anywhere in a JSON schema (``$defs`` included)."""
+    found: set[str] = set()
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == "properties" and isinstance(value, dict):
+                found |= set(value)
+            found |= _properties(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            found |= _properties(item)
+    return found
+
+
+#: Every route a buyer reads (and the publish answer, a CatalogEntry): never the engine.
+BUYER_VIEWS = (
+    m.CatalogEntry,
+    m.CatalogSummary,
+    m.CatalogList,
+    m.QuoteView,
+    m.HireView,
+    m.JobView,
+    m.JobList,
+    m.PartyView,
+    m.ResultView,
+    m.SellerJobView,
+    m.WorkersView,
+    m.StreamEvent,
+)
+
+
+@pytest.mark.parametrize("model", BUYER_VIEWS, ids=lambda c: c.__name__)
+def test_no_buyer_facing_model_carries_the_engine(model: type[Any]) -> None:
+    """The engine is a property of the offering that buyers never see (decisions I32)."""
+    assert "engine" not in model.model_fields
+    assert "engine" not in _properties(model.model_json_schema(mode="serialization"))
+
+
+def test_no_route_answers_with_the_engine() -> None:
+    """Walk every route's response schema: ``engine`` is in none (only PublishRequest, a
+    request, carries it). The gate's OpenAPI snapshot in kontra-cloud asserts the same."""
+    carried = [
+        r.name
+        for r in ROUTES
+        if r.response is not None
+        and "engine" in _properties(r.response.model_json_schema(mode="serialization"))
+    ]
+    assert carried == []
+    requests = [
+        r.name
+        for r in ROUTES
+        if r.request is not None
+        and "engine" in _properties(r.request.model_json_schema(mode="validation"))
+    ]
+    assert requests == ["publish"]

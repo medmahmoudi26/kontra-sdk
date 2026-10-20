@@ -30,7 +30,9 @@ from kontra._control import (
     TemporalError,
 )
 from kontra.auth import Session, login
+from kontra.codec import check_sealed
 from kontra.contract import derive_document, parse_offering
+from kontra.engine import AGE_MAGIC, NotSealed
 from kontra.escrow import Observation, ObservedStatus, Provenance
 from kontra.gate_client import models as m
 from kontra.workers import offline
@@ -90,6 +92,15 @@ def unwire(w: m.WirePayload) -> Payload:
 def quote_payload(**fields: Any) -> Payload:
     """A seller's plaintext ``KontraQuote`` answer."""
     return json_payload(fields)
+
+
+def sealed(raw: bytes) -> bytes:
+    """``raw`` inside a delivery envelope as the seller's codec stores a job's result
+    (``binary/kontra-age``, ``kontra-v`` 1, an age file's first line): what a TemporalEngine
+    hands the gate as a ``SealedPayload``. Deterministic, so a test can compare bytes."""
+    return Payload(
+        metadata={"encoding": b"binary/kontra-age", "kontra-v": b"1"}, data=AGE_MAGIC + raw
+    ).SerializeToString(deterministic=True)
 
 
 def ok_quote(amount_minor: int = 1234, seconds: int = 3600) -> Payload:
@@ -154,6 +165,8 @@ class ScriptedControl:
         default_factory=list[tuple[str, str, BuyerCall, str | None]]
     )
     cancels: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
+    #: the ``first_run_id`` of every cancel_workflow call ("" for none)
+    cancel_chains: list[str] = field(default_factory=list[str])
     terminates: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
     terminate_chains: list[str] = field(default_factory=list[str])
     #: every occupy_job call: (namespace, workflow id, reason)
@@ -188,14 +201,23 @@ class ScriptedControl:
         workflow_id: str,
         status: ObservedStatus,
         result: bytes | None = None,
+        *,
+        seal: bool = True,
         **kw: Any,
     ) -> None:
         """Script what the next observations of ``workflow_id`` see. Unless ``provenance`` /
-        ``run_id`` say otherwise, it is the run the buyer's call started (``run-1``), as
-        :class:`~kontra._control.Control` would have verified it."""
+        ``pin`` say otherwise, it is the run the buyer's call started (``run-1``), as
+        :class:`~kontra._control.Control` would have verified it. ``result`` is the stored
+        result: sealed with :func:`sealed` unless it is a delivery envelope already, or
+        ``seal=False`` (a seller that bypassed the codec: the engine reports UNSEALED)."""
         if status is not ObservedStatus.NOT_FOUND:
             kw.setdefault("provenance", Provenance.VERIFIED)
-            kw.setdefault("run_id", "run-1")
+            kw.setdefault("pin", "run-1")
+        if result is not None and seal:
+            try:
+                check_sealed(result)
+            except NotSealed:
+                result = sealed(result)
         self.observations[(namespace, workflow_id)] = (Observation(status=status, **kw), result)
 
     async def ensure_namespace(
@@ -258,7 +280,10 @@ class ScriptedControl:
         self.summarised.append((namespace, workflow_id, pinned))
         return self.summaries.get((namespace, workflow_id))
 
-    async def cancel_workflow(self, namespace: str, workflow_id: str, reason: str) -> None:
+    async def cancel_workflow(
+        self, namespace: str, workflow_id: str, reason: str, first_run_id: str = ""
+    ) -> None:
+        self.cancel_chains.append(first_run_id)
         if self.fail_stops:
             self.fail_stops -= 1
             raise TemporalError("frontend down")

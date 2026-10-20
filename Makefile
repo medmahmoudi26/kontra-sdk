@@ -25,7 +25,7 @@ BIN := .venv/bin
 # -ra: name every skip, so a test that did not run is visible in CI's log.
 PYTEST_FLAGS ?= -q -ra
 
-# The seam tests, ② to ⑤ (CLAUDE.md, PRD §19.1). They run as their own CI job so that a
+# The seam tests, ② to ⑥ (CLAUDE.md, PRD §19.1). They run as their own CI job so that a
 # seam break is named as one; `test` runs everything else, so nothing runs twice.
 #   ② gate HTTP API   tests/gate_client/test_routes.py
 #   ③ contract        tests/contract (derivation, canonical form, hash, validation)
@@ -33,14 +33,17 @@ PYTEST_FLAGS ?= -q -ra
 #   ④ ledger          tests/ledger (the §9.3 suite, and its teeth)
 #   ⑤ codec           tests/codec, tests/artifacts (round trips, marker scans of history, bucket,
 #                     a worker's metrics and spans, and the dev graph page's routes)
-# Seam ① is `deny-matrix` below.
+#   ⑥ engine          tests/engine (the engine contract and its teeth against FakeEngine, and
+#                     against TemporalEngine on a dev server; the Protocol's pins)
+# Seam ① is `deny-matrix` below (it also runs seam ⑥'s isolation over the wire).
 SEAM_TESTS := \
 	tests/gate_client/test_routes.py \
 	tests/contract \
 	tests/examples/test_golden.py \
 	tests/ledger \
 	tests/codec \
-	tests/artifacts
+	tests/artifacts \
+	tests/engine
 WIRE_TESTS := tests/temporal
 E2E_TESTS := tests/e2e
 
@@ -129,7 +132,7 @@ test: venv-present $(KONTRA_TEMPORAL_CLI) ## The unit tests: everything but the 
 	$(BIN)/pytest -m "$(UNIT_MARKERS)" $(UNIT_IGNORES) $(PYTEST_FLAGS) tests
 
 .PHONY: seams
-seams: venv-present $(KONTRA_TEMPORAL_CLI) ## The seam tests ② to ⑤ (gate API, contract, ledger, codec)
+seams: venv-present $(KONTRA_TEMPORAL_CLI) ## The seam tests ② to ⑥ (gate API, contract, ledger, codec, engine)
 	$(BIN)/pytest -m "$(UNIT_MARKERS)" $(PYTEST_FLAGS) $(SEAM_TESTS)
 
 .PHONY: deny-matrix
