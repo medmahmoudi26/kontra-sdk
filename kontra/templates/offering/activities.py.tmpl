@@ -1,14 +1,13 @@
-"""Temporal activities through the kontra façade (D1): `activity` is Temporal's, and its
-`defn` also notes the activity for `serve()` to register. Heartbeat as you would for
+"""Plain Temporal activities: `activity` is `temporalio`'s, and `serve()` in worker.py finds
+every `@activity.defn` function of this project by itself. Heartbeat as you would for
 Temporal anyway; Kontra's worker forwards the details to the buyer, encrypted, as the job's
 progress."""
 
 import re
 from collections import Counter
 
-from kontra import activity
-
 from models import {{Class}}Output
+from temporalio import activity
 
 _WORD = re.compile(r"[\w']+")
 

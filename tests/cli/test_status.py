@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from kontra.engine.temporal import TemporalEngine
 from kontra.gate_client import models as m
 from kontra.testing import Marketplace
 from kontra.workers import STALE_NOTE
@@ -101,11 +102,17 @@ async def test_status_shows_the_backlog_and_each_worker_once(store: Store) -> No
         ),
         m.TaskQueueType.NEXUS: m.TaskQueueTypeInfo(pollers=[seen("a@1", 0)]),
     }
-    store.mp.gate.control = _Temporal(described)  # type: ignore[assignment]
+    gate = store.mp.gate
+    # The Workers view is the Temporal adapter's (seam ⑥): give the gate one for the call.
+    gate.engines["temporal"] = TemporalEngine(
+        _Temporal(described),  # type: ignore[arg-type]
+        signer=gate.signer,
+        address=gate.temporal_address,
+    )
     try:
         out = (await store.seller.ok("status", store.offering)).stdout
     finally:
-        store.mp.gate.control = None
+        del gate.engines["temporal"]
     assert out.splitlines() == [
         f"{store.offering}  activity backlog growing for 5 min, 1 poller -- scale up",
         f"  task queue  {store.offering}",

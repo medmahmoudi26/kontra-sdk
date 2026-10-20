@@ -35,11 +35,11 @@ from temporalio.client import Client, WorkflowFailureError
 from temporalio.converter import DataConverter, PayloadCodec
 from temporalio.worker import Worker
 
-from kontra._parallel import _Batch
 from kontra.cli._codec_server import CodecServer
 from kontra.cli._console import Connected, Console
 from kontra.codec import CLAIM_CHECK_ENCODING, ENCODING, KontraCodec
 from kontra.codec.age import generate_identity
+from kontra.contrib.parallel import ParallelPlugin
 from kontra.serve.worker import seller_data_converter, workflow_runner
 from kontra.testing.devserver import (
     CLI_ENV,
@@ -190,9 +190,10 @@ async def test_the_graph_page_shows_payloads_through_its_io_route_alone(
     async with Worker(
         client,
         task_queue=queue,
-        workflows=[LeakFlow, RefuseFlow, _Batch],
+        workflows=[LeakFlow, RefuseFlow],
         activities=[heartbeat_then_fail, item],
         workflow_runner=workflow_runner(),
+        plugins=[ParallelPlugin()],
     ):
         handle = await client.start_workflow(
             LeakFlow.run, f"input {MARKER}", id=wf, task_queue=queue

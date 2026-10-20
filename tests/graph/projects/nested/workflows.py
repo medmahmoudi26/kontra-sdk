@@ -4,7 +4,9 @@ minItems, so run 0's first page is empty and only `list_pages` is scheduled)."""
 
 from datetime import timedelta
 
-from kontra import workflow
+from temporalio import workflow
+
+from kontra.contrib.parallel import execute_activities_in_parallel
 
 with workflow.unsafe.imports_passed_through():
     from activities import list_pages, note, probe, visit
@@ -21,9 +23,7 @@ def add(acc: int, n: int) -> int:
 class Inner:
     @workflow.run
     async def run(self, names: list[str]) -> list[bool]:
-        return await workflow.execute_activities_in_parallel(
-            probe, items=names, start_to_close_timeout=T
-        )
+        return await execute_activities_in_parallel(probe, items=names, start_to_close_timeout=T)
 
 
 @workflow.defn
@@ -34,7 +34,7 @@ class NestedFlow:
         await workflow.execute_child_workflow(
             Inner.run, inp.names, id=f"{workflow.info().workflow_id}-inner"
         )
-        seen = await workflow.execute_activities_in_parallel(
+        seen = await execute_activities_in_parallel(
             visit, pages=list_pages, reduce=add, init=0, start_to_close_timeout=T
         )
         return NestedOutput(seen=n + seen)

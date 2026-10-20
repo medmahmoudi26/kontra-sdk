@@ -3,7 +3,7 @@ waits, a wait nothing ends, or a crash on the input."""
 
 from datetime import timedelta
 
-from kontra import workflow
+from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from activities import after, odd, step

@@ -1,4 +1,5 @@
-"""The progress stream: the SSE decoder and GateClient.progress() reconnection."""
+"""A job's stream (decisions I31): the SSE decoder, and GateClient.stream() -- its query,
+the events it reads, reconnection from the last cursor, cursor dedupe, and its bounds."""
 
 from __future__ import annotations
 
@@ -106,27 +107,60 @@ def _client(rec: Recorder) -> GateClient:
 
 
 async def test_events_keepalives_and_multi_line_data(sleeps: list[float]) -> None:
-    body = m.ProgressEvent.model_validate(
-        {"seq": 2, "at": NOW, "source": "heartbeat", "activity": "fetch", "ciphertext_b64": "QQ"}
+    body = m.StreamEvent.model_validate(
+        {
+            "cursor": 2,
+            "kind": "item",
+            "at": NOW,
+            "topic": "turn_events",
+            "offset": 7,
+            "ciphertext_b64": "QQ",
+        }
     ).model_dump_json(indent=1)
-    multi = "".join(f"data: {line}\n" for line in body.splitlines()) + "\n"
+    multi = "event: item\n" + "".join(f"data: {line}\n" for line in body.splitlines()) + "\n"
+    gap = m.StreamEvent.model_validate(
+        {"cursor": 3, "kind": "gap", "at": NOW, "topic": "t", "offset": 8, "size": 9, "reason": "too_large"}
+    ).model_dump_json()  # fmt: skip
     rec = Recorder(
         lambda _: sse(
-            [": hello\n\n", event(1), ": keepalive\n\n", multi, "event: end\ndata: {}\n\n"]
+            [
+                ": hello\n\n",
+                event(1),
+                ": keepalive\n\n",
+                multi,
+                f"id: 3\nevent: gap\ndata: {gap}\n\n",
+                "event: end\ndata: {}\n\n",
+            ]
         )
     )
     async with _client(rec) as c:
-        got = [e async for e in c.progress(JOB)]
-    assert [(e.seq, e.source, e.activity) for e in got] == [
-        (1, m.ProgressSource.HISTORY, None),
-        (2, m.ProgressSource.HEARTBEAT, "fetch"),
+        got = [e async for e in c.stream(JOB)]
+    assert [(e.cursor, e.kind, e.topic, e.offset) for e in got] == [
+        (1, m.StreamEventKind.HISTORY, None, None),
+        (2, m.StreamEventKind.ITEM, "turn_events", 7),
+        (3, m.StreamEventKind.GAP, "t", 8),
     ]
     assert len(rec.requests) == 1
+    assert rec.requests[0].url.path == f"/v1/jobs/{JOB}/stream"
+    assert rec.requests[0].headers["accept"] == "text/event-stream"
     assert query(rec.requests[0]) == {"after": "0"}
     assert sleeps == []
 
 
-async def test_reconnects_from_the_last_seq_after_a_dropped_connection(sleeps: list[float]) -> None:
+async def test_topics_and_history_are_asked_for(sleeps: list[float]) -> None:
+    rec = Recorder(lambda _: sse([event(1)]))
+    async with _client(rec) as c:
+        [e async for e in c.stream(JOB, topics=["turn_events", "kontra.progress"], history=True)]
+    [r] = rec.requests
+    assert r.url.params.get_list("topic") == ["turn_events", "kontra.progress"]
+    assert r.url.params["history"] == "true"
+    with pytest.raises(TypeError):
+        c.stream(JOB, topics="turn_events")
+
+
+async def test_reconnects_from_the_last_cursor_after_a_dropped_connection(
+    sleeps: list[float],
+) -> None:
     def respond(r: httpx.Request) -> httpx.Response:
         after = int(r.url.params["after"])
         if after == 0:
@@ -136,16 +170,16 @@ async def test_reconnects_from_the_last_seq_after_a_dropped_connection(sleeps: l
 
     rec = Recorder(respond)
     async with _client(rec) as c:
-        got = [e.seq async for e in c.progress(JOB)]
+        got = [e.cursor async for e in c.stream(JOB)]
     assert got == [1, 2, 3]
     assert [query(r)["after"] for r in rec.requests] == ["0", "2"]
     assert sleeps == [0.1]
 
 
-async def test_starts_after_the_given_seq(sleeps: list[float]) -> None:
+async def test_starts_after_the_given_cursor(sleeps: list[float]) -> None:
     rec = Recorder(lambda _: sse([event(5), event(6)]))
     async with _client(rec) as c:
-        got = [e.seq async for e in c.progress(JOB, after=5)]
+        got = [e.cursor async for e in c.stream(JOB, after=5)]
     assert got == [6]
     assert query(rec.requests[0]) == {"after": "5"}
 
@@ -157,7 +191,7 @@ async def test_backoff_is_bounded(sleeps: list[float]) -> None:
     rec = Recorder(respond)
     async with _client(rec) as c:
         with pytest.raises(httpx.ConnectError):
-            [e async for e in c.progress(JOB)]
+            [e async for e in c.stream(JOB)]
     assert sleeps == [0.1, 0.2, 0.3]
     assert len(rec.requests) == 4
 
@@ -182,7 +216,7 @@ async def test_a_successful_connect_resets_the_backoff(sleeps: list[float]) -> N
 
     rec = Recorder(respond)
     async with _client(rec) as c:
-        got = [e.seq async for e in c.progress(JOB)]
+        got = [e.cursor async for e in c.stream(JOB)]
     assert got == [1, 2]
     assert sleeps == [0.1, 0.1, 0.2, 0.3]
 
@@ -193,13 +227,13 @@ async def test_gateway_errors_are_retried_other_errors_are_not(sleeps: list[floa
     )
     rec = Recorder(lambda _: next(script))
     async with _client(rec) as c:
-        assert [e.seq async for e in c.progress(JOB)] == [1]
+        assert [e.cursor async for e in c.stream(JOB)] == [1]
     assert sleeps == [0.1, 0.2]
 
     rec = Recorder(lambda _: error(404, "not_found", "no such job"))
     async with _client(rec) as c:
         with pytest.raises(GateError) as ei:
-            [e async for e in c.progress(JOB)]
+            [e async for e in c.stream(JOB)]
     assert (ei.value.status, ei.value.code) == (404, "not_found")
     assert len(rec.requests) == 1
 
@@ -208,7 +242,7 @@ async def test_persistent_gateway_errors_raise_the_last_one(sleeps: list[float])
     rec = Recorder(lambda _: error(503, "unavailable", "restarting"))
     async with _client(rec) as c:
         with pytest.raises(GateError) as ei:
-            [e async for e in c.progress(JOB)]
+            [e async for e in c.stream(JOB)]
     assert ei.value.code == "unavailable"
     assert len(rec.requests) == 4
 
@@ -227,16 +261,16 @@ async def test_401_on_the_stream_refreshes_the_token(sleeps: list[float]) -> Non
     rec = Recorder(respond)
     c = GateClient("http://gate.test", token=provider, transport=rec.transport)
     async with c:
-        assert [e.seq async for e in c.progress(JOB)] == [1]
+        assert [e.cursor async for e in c.stream(JOB)] == [1]
     assert len(rec.requests) == 2
     assert sleeps == []
 
 
 async def test_a_malformed_event_is_invalid_response(sleeps: list[float]) -> None:
-    rec = Recorder(lambda _: sse(['data: {"seq": "x"}\n\n']))
+    rec = Recorder(lambda _: sse(['data: {"cursor": "x"}\n\n']))
     async with _client(rec) as c:
         with pytest.raises(GateError, match="invalid_response"):
-            [e async for e in c.progress(JOB)]
+            [e async for e in c.stream(JOB)]
 
 
 async def test_breaking_out_early_closes_the_response(sleeps: list[float]) -> None:
@@ -252,12 +286,35 @@ async def test_breaking_out_early_closes_the_response(sleeps: list[float]) -> No
 
     rec = Recorder(lambda _: httpx.Response(200, stream=Tracked()))
     async with _client(rec) as c:
-        it = c.progress(JOB)
+        it = c.stream(JOB)
         async for e in it:
-            assert e.seq == 1
+            assert e.cursor == 1
             break
         await it.aclose()  # type: ignore[attr-defined]
     assert closed == [True]
+
+
+async def test_an_event_breaking_its_kinds_rules_is_invalid_response(sleeps: list[float]) -> None:
+    bad = '{"cursor": 1, "kind": "item", "at": "2026-01-01T00:00:00Z", "topic": "t"}'
+    rec = Recorder(lambda _: sse([f"event: item\ndata: {bad}\n\n"]))
+    async with _client(rec) as c:
+        with pytest.raises(GateError, match="not a StreamEvent"):
+            [e async for e in c.stream(JOB)]
+
+
+async def test_a_resumed_stream_carries_the_cursor_and_retries_the_topics(
+    sleeps: list[float],
+) -> None:
+    def respond(r: httpx.Request) -> httpx.Response:
+        if r.url.params["after"] == "0":
+            return sse([event(1)], fail=httpx.ReadError("reset"))
+        return sse([event(2)])
+
+    rec = Recorder(respond)
+    async with _client(rec) as c:
+        assert [e.cursor async for e in c.stream(JOB, topics=["a"])] == [1, 2]
+    assert [r.url.params.get_list("topic") for r in rec.requests] == [["a"], ["a"]]
+    assert [r.url.params["after"] for r in rec.requests] == ["0", "1"]
 
 
 # --------------------------------------------------------------------------- bounds
@@ -292,8 +349,8 @@ async def test_an_oversized_event_is_invalid_response_not_unbounded_memory(
     got: list[int] = []
 
     async def follow(c: GateClient) -> None:
-        async for e in c.progress(JOB):
-            got.append(e.seq)
+        async for e in c.stream(JOB):
+            got.append(e.cursor)
 
     async with _client(rec) as c:
         with pytest.raises(GateError) as ei:

@@ -6,8 +6,9 @@ temporalio's own context plumbing."""
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -39,7 +40,7 @@ from kontra.codec import (
     data_converter,
 )
 from kontra.codec.age import AgeError, decrypt, encrypt, generate_identity
-from kontra.contract.names import job_workflow_id
+from kontra.contract.names import agent_workflow_id, batch_workflow_id, job_workflow_id
 from kontra.gate_client import models as m
 
 JOB = "0123456789abcdef0123456789abcdef"
@@ -78,13 +79,40 @@ class Keys:
 
 
 class Blobs:
-    def __init__(self) -> None:
+    """An in-memory claim-check bucket, and a job's stream blobs (``StreamStore``): which job
+    each was stored for, how many uploads there were, and an optional failure or delay."""
+
+    def __init__(self, *, delay: float = 0.0, fail: bool = False) -> None:
         self.data: dict[str, bytes] = {}
         self.gets = 0
         self.limits: list[int | None] = []
+        self.scopes: dict[str, str] = {}
+        #: Stream blobs uploaded (absent before), and every ``put_stream`` call's size.
+        self.uploads = 0
+        self.calls: list[int] = []
+        self.delay = delay
+        self.fail = fail
 
     async def put(self, sha256: str, data: bytes) -> None:
         self.data[sha256] = data
+
+    async def put_stream(
+        self, job_id: str, blobs: Sequence[tuple[str, bytes]], done: Callable[[str], None]
+    ) -> None:
+        self.calls.append(len(blobs))
+        if self.fail:
+            raise CodecError("the bucket is down")
+        for digest, data in blobs:
+            if digest in self.data:
+                done(digest)  # stored already: nothing uploaded
+                continue
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            assert sha256(data).hexdigest() == digest
+            self.data[digest] = data
+            self.scopes[digest] = job_id
+            self.uploads += 1
+            done(digest)
 
     async def get(self, sha256: str, *, limit: int | None = None) -> bytes:
         self.gets += 1
@@ -182,6 +210,15 @@ def handling(monkeypatch: pytest.MonkeyPatch) -> None:
         ("seller", WorkflowSerializationContext("acme", "job-" + JOB + "\n"), {"seller"}),
         ("seller", WorkflowSerializationContext("acme", JOB), {"seller"}),
         ("seller", WorkflowSerializationContext("acme", "enrich-1"), {"seller"}),
+        # seller: a bound handler's agent child, and a batch child, are never job-shaped:
+        # their histories are the seller's alone (the job's result reaches the buyer from
+        # the job-<id> wrapper)
+        ("seller", WorkflowSerializationContext("acme", agent_workflow_id(JOB)), {"seller"}),
+        (
+            "seller",
+            WorkflowSerializationContext("acme", batch_workflow_id(job_workflow_id(JOB), "a", "t")),
+            {"seller"},
+        ),
         ("seller", None, {"seller"}),
         # seller: a Nexus *call* its workflow makes (it hires another offering) is a
         # buyer's input: the endpoint's seller and ourselves, never plaintext
@@ -1007,3 +1044,38 @@ async def test_traces_stay_where_they_are_encrypted_to_the_seller() -> None:
         await seller.encode_failure(e, failure)
     [attributes] = await _attributes(failure)
     assert 'File "' in attributes["stack_trace"]
+
+
+# --------------------------------------------------------------------------- seam ⑥: sealed
+
+
+async def test_what_the_codec_writes_for_a_job_is_a_sealed_delivery() -> None:
+    """``check_sealed`` (decisions I32) accepts exactly what this codec stores as a job's
+    result, inline and claim-checked, serialized as Temporal stores it, and refuses the
+    plaintext a seller that bypassed the codec would store."""
+    from kontra.codec import check_sealed
+    from kontra.engine import NotSealed, SealedPayload
+
+    blobs = Blobs()
+    big = payload(b'"' + MARKER * 2000 + b'"')
+    seller = seller_codec(blobs=blobs, claim_check_threshold=4096).with_context(WF_JOB)
+    inline, checked = await seller.encode([payload(), big])
+    assert (inline.metadata["encoding"], checked.metadata["encoding"]) == (
+        ENCODING,
+        CLAIM_CHECK_ENCODING,
+    )
+    for p in (inline, checked):
+        stored = p.SerializeToString(deterministic=True)
+        check_sealed(stored)
+        assert MARKER not in SealedPayload(stored).data
+    with pytest.raises(NotSealed):
+        check_sealed(payload().SerializeToString(deterministic=True))
+    # The envelope's shape with plaintext behind an age file's first line: no age file.
+    stored = inline.SerializeToString(deterministic=True)
+    first_line = inline.data[: inline.data.index(b"\n") + 1]
+    forged = Payload()
+    forged.CopyFrom(inline)
+    forged.data = first_line + b'{"text": "' + MARKER + b'"}'
+    with pytest.raises(NotSealed):
+        check_sealed(forged.SerializeToString(deterministic=True))
+    check_sealed(stored)

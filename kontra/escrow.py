@@ -8,22 +8,31 @@ are idempotent, so a crash between the two is repaired by :func:`reconcile` on t
 sweep.
 
 Every input is a fact the platform can observe without reading a payload (§8.3): the
-state of the seller's handler workflow ``job-<id>`` in the seller's namespace, the clock,
-and the buyer's accept / reject / cancel calls.
+state of the job's run as the engine records it (an :class:`Observation`, which the gate
+reads through seam ⑥, ``kontra.engine``: on Temporal, the seller's handler workflow
+``job-<id>``), the clock, and the buyer's accept / reject / cancel calls. Nothing here knows
+which engine ran the job: a run is named by its opaque :attr:`Observation.pin`, and a stop
+is an :class:`EffectKind` the gate maps onto its engine (``kontra.engine.STOPS``).
 
 Effects are carried out in the order given, and no ``REFUND`` is ever returned before the
 fact that justifies it. A buyer's cancel of a job whose run was observed is the one rule
 that needs a fact the call itself cannot have -- whether the run completed first, and its
-delivery already reached the buyer's own Nexus call -- so it takes two steps:
+delivery already reached the buyer's own start (on Temporal, its Nexus call) -- so it takes
+two steps:
 :func:`cancel` records the request and asks for the pinned run's termination
 (:attr:`EffectKind.TERMINATE_RUN`), and the platform completes it by observing the pinned
 chain afterwards and applying what it shows with :func:`observe`.
 
-Only a run the buyer's own Nexus call started can deliver (decisions I15). A seller can
-start ``job-<id>`` itself, with any input, or stop the run the buyer's call started and
-complete a later one; the observer establishes by lookup in the buyer's namespace which
-run (if any) the buyer's call started (:class:`Provenance`), escrow pins that run's chain
-(:attr:`JobRecord.run_id`) and ignores every other run of the id.
+Only a run the buyer's own start began can deliver (decisions I15). A seller can start
+the job's run itself, with any input, or stop the run the buyer's start began and complete a
+later one; the observer establishes from records no party can write after the fact (on
+Temporal, by lookup in the buyer's namespace) which run, if any, the buyer's start began
+(:class:`Provenance`), escrow pins that run's lineage (:attr:`JobRecord.pin`) and ignores
+every other run of the job.
+
+A completion whose result is not Kontra ciphertext is never a delivery
+(:attr:`ObservedStatus.UNSEALED`, decisions I32): end-to-end encryption is a guarantee of
+seam ⑥, and an engine adapter withholds what is not sealed.
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ __all__ = [
     "DEFAULT_GRACE",
     "NOT_FROM_BUYER_REASON",
     "OCCUPIED_REASON",
+    "UNSEALED_REASON",
     "Effect",
     "EffectKind",
     "EscrowError",
@@ -65,13 +75,17 @@ _OPEN = frozenset({JobState.SUBMITTED, JobState.WORKING})
 
 #: Why a job whose only completed run was not started by the buyer's call refunds.
 NOT_FROM_BUYER_REASON = "delivery not started by the buyer's call"
-#: Why a job the buyer canceled refunds: through the gate (:func:`cancel`), or by cancelling
-#: its own Nexus call (:attr:`Observation.buyer_canceled`). A gate counts neither against
-#: the seller.
+#: Why a job the buyer canceled refunds: through the gate (:func:`cancel`), or by withdrawing
+#: its own start (on Temporal, cancelling its Nexus call: :attr:`Observation.buyer_canceled`).
+#: A gate counts neither against the seller.
 BUYER_CANCEL_REASON = "canceled by buyer"
 #: Why an open job whose ``job-<id>`` holds only the control plane's placeholder
 #: (:attr:`Provenance.OCCUPIED`) refunds at its deadline: no call could start it.
 OCCUPIED_REASON = "no run: the job's workflow id was occupied before any call started it"
+#: Why a job whose verified run completed with a result that is not Kontra ciphertext
+#: refunds (:attr:`ObservedStatus.UNSEALED`): counted against the seller, whose worker
+#: bypassed the codec; the platform never stores those bytes.
+UNSEALED_REASON = "delivery not sealed"
 
 
 class EscrowError(Exception):
@@ -90,11 +104,15 @@ class ObservedStatus(StrEnum):
     CANCELED = "canceled"
     TERMINATED = "terminated"
     TIMED_OUT = "timed_out"
+    #: A completion whose result is not Kontra ciphertext (decisions I32): the adapter
+    #: withheld its bytes, and it is never a delivery (:data:`UNSEALED_REASON`).
+    UNSEALED = "unsealed"
 
 
 class Provenance(StrEnum):
-    """Whether the observed run of ``job-<id>`` is the one the buyer's ``execute`` call
-    started, as an authoritative lookup in the buyer's namespace established it. Only
+    """Whether the observed run of the job is the one the buyer's start began, as an
+    authoritative lookup established it (on Temporal: the buyer's ``execute`` call, looked up
+    in the buyer's namespace). Only
     ``VERIFIED`` runs count for anything; the others differ only in what the observer could
     tell (logs, support, the reason a refund gives), never in whether escrow pays."""
 
@@ -121,9 +139,10 @@ class Provenance(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class Observation:
-    """What the platform saw of ``job-<id>`` in the seller's namespace: the latest run of
-    the continue-as-new chain the buyer's call started once escrow has pinned it, else the
-    latest run of the id.
+    """What the platform saw of the job's run as the engine records it: the latest run of
+    the lineage the buyer's start began once escrow has pinned it, else the latest run of
+    the job (on Temporal: ``job-<id>`` in the seller's namespace, a lineage being a
+    continue-as-new chain).
 
     The default ``provenance`` is ``UNVERIFIED`` on purpose: an observer that does not
     establish provenance gets no delivery, never an unchecked one."""
@@ -135,8 +154,10 @@ class Observation:
     result_sha256: str | None = None
     result_size: int | None = None
     provenance: Provenance = Provenance.UNVERIFIED
-    #: The run id of the observed chain's first run: what escrow pins once it is verified.
-    run_id: str | None = None
+    #: The observed lineage, as the engine adapter names it (opaque; on Temporal, the run id
+    #: of the chain's first run): what escrow pins once it is verified, and compares for
+    #: equality, nothing more.
+    pin: str | None = None
     #: A verified run that ended ``CANCELED``: the buyer's own call recorded that the buyer
     #: asked to cancel it (its standalone operation's cancellation, or a
     #: ``NexusOperationCancelRequested`` event for it in the buyer's workflow), read from the
@@ -152,7 +173,7 @@ class EffectKind(StrEnum):
     CANCEL_WORKFLOW = "cancel_workflow"
     TERMINATE_WORKFLOW = "terminate_workflow"
     #: Step one of a buyer's cancel of a job with an observed run (:func:`cancel`):
-    #: terminate the open run of the pinned chain (:attr:`JobRecord.run_id`), then observe
+    #: terminate the open run of the pinned chain (:attr:`JobRecord.pin`), then observe
     #: that chain and apply the observation (:func:`observe`) -- the refund waits for it.
     #: A cancel *request* would not do: a run that ignores it, or completes first, delivers
     #: to the buyer's own call, and the buyer would have both the result and the money.
@@ -178,7 +199,6 @@ class JobRecord:
     offering: str
     buyer: str
     seller: str
-    seller_ns: str
     amount: Money
     review_window: timedelta
     created_at: datetime
@@ -191,10 +211,10 @@ class JobRecord:
     delivery_sha256: str | None = None
     delivery_size: int | None = None
     reason: str | None = None
-    #: The first run of the chain the buyer's call started, pinned by the first verified
-    #: observation. From then on only that chain counts: a later run of ``job-<id>`` (the
-    #: seller's own start after terminating it) is ignored.
-    run_id: str | None = None
+    #: The lineage the buyer's start began (:attr:`Observation.pin`, opaque), pinned by the
+    #: first verified observation. From then on only that lineage counts: a later run of
+    #: the job (the seller's own start after terminating it) is ignored.
+    pin: str | None = None
     #: When the buyer asked to cancel a job whose run was observed (:func:`cancel`). The
     #: job stays open until an observation of the pinned chain decides it: terminated (the
     #: platform's doing, for this cancel) or canceled refunds as the buyer's cancel;
@@ -213,7 +233,6 @@ def new_job(
     offering: str,
     buyer: str,
     seller: str,
-    seller_ns: str,
     amount: Money,
     max_duration: timedelta,
     review_window: timedelta,
@@ -226,7 +245,6 @@ def new_job(
         offering=offering,
         buyer=buyer,
         seller=seller,
-        seller_ns=seller_ns,
         amount=amount,
         review_window=review_window,
         created_at=now,
@@ -285,7 +303,7 @@ def _deliver(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord
 
 
 def observe(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord, list[Effect]]:
-    """Apply one observation of the seller's handler workflow.
+    """Apply one observation of the job's run.
 
     A run that is not the buyer's call (:class:`Provenance` other than ``VERIFIED``, or
     another run than the pinned one) moves nothing: the job waits for the buyer's call as
@@ -296,17 +314,21 @@ def observe(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord,
     :func:`cancel`: the pinned chain terminated or canceled refunds as the buyer's cancel,
     completed is a delivery (it beat the termination), failed or timed out refunds as it
     would have anyway (it closed on its own first), and still running asks for the
-    termination again."""
+    termination again.
+
+    An :attr:`ObservedStatus.UNSEALED` completion of the pinned lineage refunds at once, as
+    the seller's failure (:data:`UNSEALED_REASON`): its result is not ciphertext, so it is no
+    delivery whatever the cancel or the clock say."""
     if not job.open:
         return job, []
     if obs.status is ObservedStatus.NOT_FOUND:
         if now >= job.deadline:
-            gone = "the job's workflow is gone" if job.run_id else "seller never started the job"
+            gone = "the job's workflow is gone" if job.pin else "seller never started the job"
             return _fail(job, gone)
         return job, []
-    if job.run_id is not None and obs.run_id != job.run_id:
+    if job.pin is not None and obs.pin != job.pin:
         return tick(job, now)
-    if obs.provenance is not Provenance.VERIFIED or not obs.run_id:
+    if obs.provenance is not Provenance.VERIFIED or not obs.pin:
         if now >= job.deadline:
             if obs.provenance is Provenance.OCCUPIED:
                 return _fail(job, OCCUPIED_REASON)
@@ -314,9 +336,11 @@ def observe(job: JobRecord, obs: Observation, now: datetime) -> tuple[JobRecord,
                 return _fail(job, NOT_FROM_BUYER_REASON)
             return _fail(job, "seller workflow not started by the buyer's call")
         return job, []
-    if job.run_id is None:
-        job = replace(job, run_id=obs.run_id)
+    if job.pin is None:
+        job = replace(job, pin=obs.pin)
     match obs.status:
+        case ObservedStatus.UNSEALED:
+            return _fail(job, UNSEALED_REASON)
         case ObservedStatus.COMPLETED:
             if obs.closed_at is not None and obs.closed_at > job.deadline:
                 return _fail(job, "delivered after max_duration")
@@ -417,7 +441,7 @@ def cancel(job: JobRecord, party: str, now: datetime) -> tuple[JobRecord, list[E
     first closes ``job-<id>`` to late starts, decisions I16.)
 
     A job with an observed run takes two steps, because that run can complete at any
-    moment and its delivery reaches the buyer's own Nexus call whatever escrow says: a
+    moment and its delivery reaches the buyer's own start whatever escrow says: a
     refund issued first would let a buyer cancel a nearly finished job and keep both the
     result and the money. Step one, here: the request is recorded
     (:attr:`JobRecord.cancel_requested_at`), the job stays open, and the only effect is
@@ -431,7 +455,7 @@ def cancel(job: JobRecord, party: str, now: datetime) -> tuple[JobRecord, list[E
         return job, []
     if not job.open:
         raise EscrowError("not_open", f"job is {job.state.value}")
-    if job.run_id is None:
+    if job.pin is None:
         return _buyer_canceled(job, stop=EffectKind.CANCEL_WORKFLOW)
     requested = replace(job, cancel_requested_at=job.cancel_requested_at or now)
     return requested, [Effect(EffectKind.TERMINATE_RUN, job.job_id, BUYER_CANCEL_REASON)]

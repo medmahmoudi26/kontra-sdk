@@ -19,7 +19,7 @@ import jwt
 import pytest
 import pytest_asyncio
 from cryptography.hazmat.primitives.asymmetric import ec
-from temporalio.api.common.v1 import WorkflowExecution, WorkflowType
+from temporalio.api.common.v1 import Payload, WorkflowExecution, WorkflowType
 from temporalio.api.enums.v1 import EventType, WorkflowIdConflictPolicy, WorkflowIdReusePolicy
 from temporalio.api.taskqueue.v1 import TaskQueue
 from temporalio.api.workflowservice.v1 import (
@@ -34,13 +34,16 @@ from kontra._control import OCCUPY_WORKFLOW_TYPE
 from kontra.auth import Session
 from kontra.codec import ENCODING
 from kontra.codec.age import decrypt
-from kontra.contract.names import job_workflow_id, new_job_id
+from kontra.codec.stream import STREAM_ENCODING, open_item, parse_envelope
+from kontra.contract.names import PROGRESS_TOPIC, job_workflow_id, new_job_id
 from kontra.gate_client import models as m
 from kontra.profile import Profile
 from kontra.serve import BoundOffering, Worker
 from kontra.serve.progress import INTERVAL_ENV
 from kontra.testing import Marketplace, TestParty
 from kontra.testing.devserver import DevServer
+from kontra.testing.marketplace import SERVE_UPLOAD_BUDGET
+from kontra.types import ProgressRecord
 
 from . import seller
 from .flows import EchoChild, beat, count, shout, sync_beat
@@ -83,7 +86,7 @@ async def world(
 ) -> AsyncIterator[World]:
     with pytest.MonkeyPatch.context() as env:
         env.setenv(INTERVAL_ENV, "0")  # every heartbeat, in order (acceptance 13)
-        async with Marketplace(dev_server=dev_server, progress_rate_per_s=10_000) as mp:
+        async with Marketplace(dev_server=dev_server) as mp:
             acme = await mp.party("acme")
             bob = await mp.party(f"bob-{uuid.uuid4().hex[:6]}", balance="1000.00")
             bound = seller.bind(write_offering(tmp_path_factory.mktemp("acme")))
@@ -472,38 +475,94 @@ async def _blob_count(world: World) -> int:
 # --------------------------------------------------------------------------- progress & history
 
 
-async def _events(world: World, job_id: str) -> list[m.ProgressEvent]:
+async def _events(world: World, job_id: str) -> list[m.StreamEvent]:
     gate = world.mp.gate
 
-    async def get() -> list[m.ProgressEvent]:
+    async def get() -> list[m.StreamEvent]:
         return list(gate.jobs[job_id].events)
 
     return await gate.run(get)
 
 
-async def test_heartbeats_reach_the_gate_in_order_and_only_as_ciphertext(world: World) -> None:
+async def _drain(events: Any) -> None:
+    async for _ in events:
+        pass
+
+
+async def _relaying(world: World, job_id: str) -> None:
+    """Until the gate relays the job's stream (its buyer listens and it is pinned)."""
+    gate = world.mp.gate
+
+    async def running() -> bool:
+        return gate.jobs[job_id].relay.running
+
+    for _ in range(200):
+        if await gate.run(running):
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("the gate never relayed the job's stream")
+
+
+async def test_heartbeats_reach_the_buyer_in_order_and_only_as_ciphertext(world: World) -> None:
     """Acceptance 13, the seller's half: 100 heartbeats (interval 0) from an async activity,
-    then 3 from a sync one in a thread, all forwarded in order, encrypted to the buyer."""
-    value = {"text": MARKER, "beats": 100, "sync_beats": 3}
+    then 3 from a sync one in a thread, all published in order on the job stream's
+    kontra.progress topic (decisions I31) and relayed by the gate while the buyer listens,
+    sealed to the job's parties."""
+    value = {"text": MARKER, "beats": 100, "sync_beats": 3, "hold": True}
     hired = await world.buyer.hire(world.entry, value)
-    await (await world.buyer.start(hired, value, result_type=Shout)).result()
-    # Each activity settled its heartbeats before returning: they are all there by the
-    # time the result is (the gate refuses progress once it has seen the job close).
-    beats = [
-        e for e in await _events(world, hired.job_id) if e.source is m.ProgressSource.HEARTBEAT
-    ]
-    assert [e.activity for e in beats] == ["beat"] * 100 + ["sync_beat"] * 3
+    handle = await world.buyer.start(hired, value, result_type=Shout)
+    events: list[m.StreamEvent] = []
+
+    async def listen() -> None:
+        stream = world.buyer.party.gate.stream(hired.job_id, topics=[PROGRESS_TOPIC])
+        async for event in stream:
+            events.append(event)
+
+    listener = asyncio.create_task(listen())
+    await _relaying(world, hired.job_id)
+    await asyncio.sleep(0.5)  # the relay's first poll waits in the job
+    root = world.mp.client("acme").get_workflow_handle(job_workflow_id(hired.job_id))
+    await root.signal("release")
+    await handle.result()
+    await asyncio.wait_for(listener, 60)  # ends once the job is closed and its relay drained
+    beats = [e for e in events if e.kind is m.StreamEventKind.ITEM]
+    assert [e.topic for e in beats] == [PROGRESS_TOPIC] * 103
     seen = []
     for e in beats:
         assert e.ciphertext_b64 is not None
+        assert e.offset is not None
         raw = base64.b64decode(e.ciphertext_b64)
         assert MARKER.encode() not in raw
-        seen.append(json.loads(decrypt(raw, world.buyer.party.identity)))
-    assert [d["percent"] for d in seen] == [*range(1, 101), 1001, 1002, 1003]
-    assert seen[0] == {"percent": 1, "message": f"1 {MARKER}"}
-    with pytest.raises(Exception):  # noqa: B017,PT011 -- only the buyer can read them
-        decrypt(base64.b64decode(beats[0].ciphertext_b64 or ""), world.seller.identity)
-    assert MARKER not in json.dumps([e.model_dump(mode="json") for e in beats])
+        record = ProgressRecord.model_validate_json(
+            open_item(raw, [world.buyer.party.identity], topic=PROGRESS_TOPIC, offset=e.offset).data
+        )
+        seen.append((record.activity, record.details))
+    assert [a for a, _ in seen] == ["beat"] * 100 + ["sync_beat"] * 3
+    assert [d["percent"] for _, d in seen] == [*range(1, 101), 1001, 1002, 1003]
+    assert seen[0][1] == {"percent": 1, "message": f"1 {MARKER}"}
+    open_item(  # the seller's whole set reads its own items too; nobody else does
+        base64.b64decode(beats[0].ciphertext_b64 or ""),
+        [world.seller.identity],
+        topic=PROGRESS_TOPIC,
+        offset=beats[0].offset or 0,
+    )
+    assert MARKER not in json.dumps([e.model_dump(mode="json") for e in events])
+    stored = await _events(world, hired.job_id)
+    assert MARKER not in json.dumps([e.model_dump(mode="json") for e in stored])
+
+
+async def test_the_marketplace_stores_stream_items_within_a_test_machines_budget(
+    world: World,
+) -> None:
+    """``mp.serve`` gives the worker's codec ``SERVE_UPLOAD_BUDGET`` (8 s) where ``kontra
+    serve`` gives 2 s: the heartbeat test above counts every item, and a loaded test machine
+    can take longer than 2 s to store an answer's 64 items in the fake gate's bucket (an item
+    not stored in time is a gap). The stubs keep their own tests, with a small budget
+    (``tests/codec/test_stream_envelope.py``, ``tests/serve/test_stream_hosting.py``)."""
+    plugin = world.worker.plugin
+    assert plugin is not None
+    assert plugin.codec is not None
+    assert plugin.codec.stream_upload_budget == SERVE_UPLOAD_BUDGET == 8.0
 
 
 def _payloads(node: Any, path: str = "") -> list[tuple[str, dict[str, Any]]]:
@@ -540,13 +599,22 @@ async def test_every_payload_in_the_sellers_history_is_encrypted(world: World) -
     """The root handler workflow, its activities, its local activity and its child: no
     plaintext in history (the marker scan of seam ⑤). Only the ``kontra-job`` header is
     plain, by design, and it carries the job id alone; Temporal's local-activity marker
-    metadata is Temporal's, not ours."""
-    value = {"text": f"{MARKER} history", "beats": 2}
+    metadata is Temporal's, not ours. The job's stream is there too (decisions I31): the
+    heartbeats' publish signals are encrypted like any job payload, and a poll's answer is
+    the stream envelope, each item sealed on its own."""
+    value = {"text": f"{MARKER} history", "beats": 2, "hold": True}
     hired = await world.buyer.hire(world.entry, value)
-    await (await world.buyer.start(hired, value, result_type=Shout)).result()
+    handle = await world.buyer.start(hired, value, result_type=Shout)
+    listener = asyncio.create_task(_drain(world.buyer.party.gate.stream(hired.job_id)))
+    await _relaying(world, hired.job_id)
     seller_client = world.mp.client("acme")
     root = job_workflow_id(hired.job_id)
+    await seller_client.get_workflow_handle(root).signal("release")
+    await handle.result()
+    await asyncio.wait_for(listener, 60)
     encrypted = base64.b64encode(ENCODING).decode()
+    envelope = base64.b64encode(STREAM_ENCODING).decode()
+    envelopes = 0
     checked = 0
     for wf_id in (root, f"{root}-echo"):
         history = await seller_client.get_workflow_handle(wf_id).fetch_history()
@@ -565,9 +633,30 @@ async def test_every_payload_in_the_sellers_history_is_encrypted(world: World) -
                 assert set(p["metadata"]) == {"encoding"}
                 assert json.loads(base64.b64decode(p["data"])) == hired.job_id
                 continue
+            if path.endswith(
+                "UpdateAcceptedEventAttributes.acceptedRequest.input.args.payloads[0]"
+            ):
+                # The relay's poll: the gate sends it, and has no key -- the topics a buyer
+                # may read (public, in the catalog) and an offset, nothing else.
+                assert json.loads(base64.b64decode(p["data"])) == {
+                    "from_offset": json.loads(base64.b64decode(p["data"]))["from_offset"],
+                    "topics": [PROGRESS_TOPIC],
+                }
+                continue
+            if p["metadata"]["encoding"] == envelope:
+                assert "workflowExecutionUpdateCompletedEventAttributes" in path, path
+                parse_envelope(
+                    Payload(
+                        metadata={k: base64.b64decode(v) for k, v in p["metadata"].items()},
+                        data=base64.b64decode(p["data"]),
+                    )
+                )  # strict: every item's ciphertext is an age file
+                envelopes += 1
+                continue
             assert p["metadata"]["encoding"] == encrypted, path
             checked += 1
     assert checked >= 8  # inputs, results, activity and child payloads were all seen
+    assert envelopes >= 1  # the relay polled: its answers are envelopes
 
 
 async def test_the_gate_observes_the_delivery_as_ciphertext_to_the_buyer(world: World) -> None:
@@ -582,7 +671,6 @@ async def test_the_gate_observes_the_delivery_as_ciphertext_to_the_buyer(world: 
         await world.mp.gate.sweep()
     assert view.state is m.JobState.COMPLETED
     stored = await gate.result(hired.job_id)
-    from temporalio.api.common.v1 import Payload
 
     payload = Payload()
     payload.ParseFromString(base64.b64decode(stored.payload.b64))

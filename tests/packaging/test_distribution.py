@@ -73,6 +73,7 @@ def test_the_wheel_has_what_kontra_dev_and_the_contract_read(dist: Path) -> None
         "kontra/_spec/x-kontra.v2.json",
         "kontra/_spec/x-kontra.v1.json",  # read-only, for the jobs hired under it
         "kontra/_spec/kontra-types.v1.json",
+        "kontra/_spec/offering-streams.v1.json",
         "kontra/templates/offering/worker.py.tmpl",
         "kontra/cli/_console.html",  # kontra dev's graph page, which the codec server serves
         "kontra/testing/fake_gate.py",
