@@ -93,7 +93,7 @@ async def world(
     previous = os.environ.get(INTERVAL_ENV)
     os.environ[INTERVAL_ENV] = "0"  # forward every heartbeat at once
     try:
-        async with Marketplace(dev_server=dev_server, progress_rate_per_s=10_000) as mp:
+        async with Marketplace(dev_server=dev_server) as mp:
             acme = await mp.party("acme")
             root = tmp_path_factory.mktemp("acme")
             bound = words_offering(root)
@@ -342,7 +342,9 @@ async def test_status_shows_the_latest_progress_decrypted(world: World) -> None:
         assert status["deadline"] is not None
         await (await k.job(stuck["job_id"])).cancel()  # the test's cleanup, not a tool
 
-        # A job that heartbeat five times and finished: the last of them, in order.
+        # A job that heartbeat five times and finished: the last of them, in order. Its
+        # buyer asked for its status while it ran: the gate relayed its stream from then on
+        # (progress is live, decisions I31).
         beats = await ok(
             client,
             "hire",
@@ -350,6 +352,7 @@ async def test_status_shows_the_latest_progress_decrypted(world: World) -> None:
             input={"text": "count", "mode": "beats", "beats": 5},
             max_price=1,
         )
+        await ok(client, "status", job_id=beats["job_id"])
         await ok(client, "result", job_id=beats["job_id"])
         await until(
             lambda: ok(client, "status", job_id=beats["job_id"]),
@@ -599,7 +602,7 @@ class _Stream:
     that ends after it."""
 
     def __init__(self) -> None:
-        self.arrival: asyncio.Future[m.ProgressEvent] = asyncio.get_running_loop().create_future()
+        self.arrival: asyncio.Future[m.StreamEvent] = asyncio.get_running_loop().create_future()
         self.waiting = asyncio.Event()
         self.reads = 0
         self.cancelled = False
@@ -608,7 +611,7 @@ class _Stream:
     def __aiter__(self) -> _Stream:
         return self
 
-    async def __anext__(self) -> m.ProgressEvent:
+    async def __anext__(self) -> m.StreamEvent:
         self.reads += 1
         if self.reads > 1:
             raise StopAsyncIteration
@@ -627,15 +630,15 @@ class _StreamKontra:
     """The two calls ``status`` makes on its client to read progress."""
 
     def __init__(self, stream: _Stream) -> None:
-        def progress(job_id: str, *, after: int) -> _Stream:
+        def stream_of(job_id: str, *, topics: Any, history: bool, after: int) -> _Stream:
             return stream
 
-        self.gate = SimpleNamespace(progress=progress)
-        self.read: list[m.ProgressEvent] = []
+        self.gate = SimpleNamespace(stream=stream_of)
+        self.read: list[m.StreamEvent] = []
 
-    def _progress(self, event: m.ProgressEvent) -> SimpleNamespace:
+    def _progress(self, event: m.StreamEvent, job_id: str = "") -> SimpleNamespace:
         self.read.append(event)
-        return SimpleNamespace(source=event.source)
+        return SimpleNamespace(source=m.ProgressSource.HISTORY)
 
 
 class _DeliveredJob:
@@ -657,8 +660,10 @@ class _DeliveredJob:
         return "view"
 
 
-def _event() -> m.ProgressEvent:
-    return m.ProgressEvent(seq=1, at=datetime.now(UTC), source=m.ProgressSource.HISTORY)
+def _event() -> m.StreamEvent:
+    return m.StreamEvent(
+        cursor=1, kind=m.StreamEventKind.HISTORY, at=datetime.now(UTC), state=m.JobState.WORKING
+    )
 
 
 async def test_cancel_of_status_that_lands_as_progress_arrives_is_kept() -> None:

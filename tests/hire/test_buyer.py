@@ -25,8 +25,8 @@ import pytest_asyncio
 from temporalio.client import WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
 
-from kontra.codec.age import AgeError, decrypt
-from kontra.contract.names import job_workflow_id
+from kontra.codec.age import AgeError, decrypt, generate_identity
+from kontra.contract.names import PROGRESS_TOPIC, job_workflow_id
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
 from kontra.hire import (
@@ -309,8 +309,10 @@ async def test_a_delivery_after_the_operation_timed_out_is_still_the_buyers(
 
 
 async def test_progress_shows_100_heartbeats_in_order_decrypted(world: World) -> None:
-    """Acceptance 13: heartbeats with {percent, message} from a plain activity, in order,
-    and the gate holds only ciphertext for them."""
+    """Acceptance 13: heartbeats with {percent, message} from a plain activity, in order --
+    published on the job stream's kontra.progress topic and relayed by the gate while the
+    buyer listens -- and the gate holds only ciphertext for them, sealed to the job's
+    parties."""
     buyer = await world.buyer()
     job = await buyer.k.hire(world.key(), text="go", mode="beats", beats=100)
     events: list[Progress] = [p async for p in job.progress()]
@@ -326,29 +328,36 @@ async def test_progress_shows_100_heartbeats_in_order_decrypted(world: World) ->
     assert (await job.result()).text == "GO"
 
     stored = await world.gate(lambda g: list(g.jobs[job.job_id].events))
-    sealed = [base64.b64decode(e.ciphertext_b64) for e in stored if e.ciphertext_b64]
+    items = [e for e in stored if e.kind is m.StreamEventKind.ITEM]
+    assert {e.topic for e in items} == {PROGRESS_TOPIC}
+    sealed = [base64.b64decode(e.ciphertext_b64 or "") for e in items]
     assert len(sealed) == 100
+    stranger = generate_identity()[0]
     for raw in sealed:
         assert raw.startswith(AGE_MAGIC)
-        assert b"beat" not in raw
+        # "beat " with its space: an age header is base64 and spaces, never a base64 run
+        # followed by a space, so this cannot match a key by chance as "beat" alone can
+        assert b"beat " not in raw
+        assert b'"message"' not in raw
+        decrypt(raw, world.seller.identity)  # the job's parties: the seller wrote it
         with pytest.raises(AgeError):
-            decrypt(raw, world.seller.identity)  # for the buyer only
+            decrypt(raw, stranger)
 
 
 async def test_stopping_progress_early_closes_the_stream(world: World) -> None:
     buyer = await world.buyer()
     job = await buyer.k.hire(world.key(), text="go", mode="beats", beats=5)
-    real_progress = buyer.k.gate.progress
+    real_stream = buyer.k.gate.stream
     closed: list[bool] = []
 
-    async def recorded(job_id: str, *, after: int = 0) -> AsyncIterator[m.ProgressEvent]:
+    async def recorded(job_id: str, **kw: Any) -> AsyncIterator[m.StreamEvent]:
         try:
-            async for event in real_progress(job_id, after=after):
+            async for event in real_stream(job_id, **kw):
                 yield event
         finally:
             closed.append(True)
 
-    buyer.k.gate.progress = recorded  # type: ignore[method-assign]
+    buyer.k.gate.stream = recorded  # type: ignore[method-assign]
     async with contextlib.aclosing(job.progress()) as events:
         async for _ in events:
             break

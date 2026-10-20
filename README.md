@@ -79,9 +79,9 @@ kontra serve                  # run the worker; on a dev profile it publishes th
 |---|---|
 | `offering.yaml` | name, version, limits, display text. Declarative; names no code |
 | `models.py` | input and output types; the published contract is derived from them |
-| `workflows.py`, `activities.py` | the job, in Temporal through the façade: `from kontra import workflow, activity`, **never `temporalio`** |
+| `workflows.py`, `activities.py` | the job, in vanilla Temporal: `from temporalio import workflow, activity`, **never `kontra`**, so it runs on any Temporal worker as it is (all but `Artifact` I/O, which needs the Kontra runtime `worker.py` installs) |
 | `quote.py` | the price, computed from the input |
-| `worker.py` | binds workflow and quote to the offering; every `temporalio.worker.Worker` option |
+| `worker.py` | binds workflow and quote to the offering; every `temporalio.worker.Worker` option and plugin; the one file that imports `kontra` |
 
 Against the real marketplace:
 
@@ -184,10 +184,11 @@ See [docs/buyers.md](docs/buyers.md).
   and the buyer's accept, reject and cancel calls. Neither party's word moves money. A job not
   delivered by its deadline refunds the buyer; a delivery the buyer does not reject within the
   review window pays the seller.
-- **The Authorizer.** Kontra runs its own Temporal server. Every token on the public frontend
-  is one weak role, `<namespace>:worker`, confined to its own namespace by an allowlist; no
-  token can reach an Operator or Admin API, so a compromised seller machine cannot repoint an
-  offering. The policy is in [`temporal/authorizer`](temporal/authorizer), public so you can
+- **The Authorizer.** Kontra runs its own Temporal server. Every party's token on the public
+  frontend is one weak role, `<namespace>:worker`, confined to its own namespace by an
+  allowlist; the platform's only other tokens are narrower still (one job's stream relay, the
+  rollout of Kontra's own workers). No token can reach an Operator or Admin API, so a
+  compromised seller machine cannot repoint an offering. The policy is in [`temporal/authorizer`](temporal/authorizer), public so you can
   read the rules you run under.
 - **Logins and keys.** A person signs in through a device code that only their own screen
   shows, approved in the browser or through a mailed link whose page asks for that code. A
@@ -204,7 +205,7 @@ What Kontra can and cannot see, the threat model, and the limits: [docs/security
 | [docs/sellers.md](docs/sellers.md) | writing, testing, publishing and serving an offering |
 | [docs/buyers.md](docs/buyers.md) | hiring from the CLI, a script, a workflow, or an agent |
 | [docs/security.md](docs/security.md) | threat model, encryption and the Authorizer |
-| [docs/architecture.md](docs/architecture.md) | the five seams, the one-way rule, how names are built |
+| [docs/architecture.md](docs/architecture.md) | the six seams, the one-way rule, how names are built |
 | [docs/decisions.md](docs/decisions.md) | implementation decisions, checked against Temporal and nexgen |
 | [spec/](spec/README.md) | the contract document's `x-kontra` extension and reserved types |
 | [temporal/authorizer](temporal/authorizer/README.md) | the Temporal server, its policy and its configuration |

@@ -2,7 +2,7 @@
 
 from datetime import timedelta
 
-from kontra import workflow
+from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from activities import act_a, act_b

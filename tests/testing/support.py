@@ -7,6 +7,7 @@ import asyncio
 import base64
 import inspect
 import json
+import threading
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -30,7 +31,9 @@ from kontra._control import (
     TemporalError,
 )
 from kontra.auth import Session, login
+from kontra.codec import age, check_sealed
 from kontra.contract import derive_document, parse_offering
+from kontra.engine import NotSealed
 from kontra.escrow import Observation, ObservedStatus, Provenance
 from kontra.gate_client import models as m
 from kontra.workers import offline
@@ -90,6 +93,26 @@ def unwire(w: m.WirePayload) -> Payload:
 def quote_payload(**fields: Any) -> Payload:
     """A seller's plaintext ``KontraQuote`` answer."""
     return json_payload(fields)
+
+
+#: The key :func:`sealed` seals to: these tests' own, no job's.
+SEALED_KEY = age.generate_identity()
+_sealed: dict[bytes, bytes] = {}
+_sealing = threading.Lock()
+
+
+def sealed(raw: bytes) -> bytes:
+    """``raw`` inside a delivery envelope as the seller's codec stores a job's result
+    (``binary/kontra-age``, ``kontra-v`` 1, an age file -- to :data:`SEALED_KEY`): what a
+    TemporalEngine hands the gate as a ``SealedPayload``. The same bytes for the same ``raw``
+    in one test process (a gate thread included), so a test can compare them."""
+    with _sealing:
+        if raw not in _sealed:
+            _sealed[raw] = Payload(
+                metadata={"encoding": b"binary/kontra-age", "kontra-v": b"1"},
+                data=age.encrypt(raw, [SEALED_KEY[1]]),
+            ).SerializeToString(deterministic=True)
+        return _sealed[raw]
 
 
 def ok_quote(amount_minor: int = 1234, seconds: int = 3600) -> Payload:
@@ -154,6 +177,8 @@ class ScriptedControl:
         default_factory=list[tuple[str, str, BuyerCall, str | None]]
     )
     cancels: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
+    #: the ``first_run_id`` of every cancel_workflow call ("" for none)
+    cancel_chains: list[str] = field(default_factory=list[str])
     terminates: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
     terminate_chains: list[str] = field(default_factory=list[str])
     #: every occupy_job call: (namespace, workflow id, reason)
@@ -173,6 +198,8 @@ class ScriptedControl:
     summarised: list[tuple[str, str, str | None]] = field(
         default_factory=list[tuple[str, str, str | None]]
     )
+    #: what history_size answers for every run: (events, bytes) -- the relay's pace
+    history: tuple[int, int] = (10, 1000)
     fail_stops: int = 0
     #: what describe_task_queue answers, by (namespace, task queue); else nothing reported
     task_queues: dict[tuple[str, str], dict[m.TaskQueueType, m.TaskQueueTypeInfo]] = field(
@@ -188,14 +215,23 @@ class ScriptedControl:
         workflow_id: str,
         status: ObservedStatus,
         result: bytes | None = None,
+        *,
+        seal: bool = True,
         **kw: Any,
     ) -> None:
         """Script what the next observations of ``workflow_id`` see. Unless ``provenance`` /
-        ``run_id`` say otherwise, it is the run the buyer's call started (``run-1``), as
-        :class:`~kontra._control.Control` would have verified it."""
+        ``pin`` say otherwise, it is the run the buyer's call started (``run-1``), as
+        :class:`~kontra._control.Control` would have verified it. ``result`` is the stored
+        result: sealed with :func:`sealed` unless it is a delivery envelope already, or
+        ``seal=False`` (a seller that bypassed the codec: the engine reports UNSEALED)."""
         if status is not ObservedStatus.NOT_FOUND:
             kw.setdefault("provenance", Provenance.VERIFIED)
-            kw.setdefault("run_id", "run-1")
+            kw.setdefault("pin", "run-1")
+        if result is not None and seal:
+            try:
+                check_sealed(result)
+            except NotSealed:
+                result = sealed(result)
         self.observations[(namespace, workflow_id)] = (Observation(status=status, **kw), result)
 
     async def ensure_namespace(
@@ -258,7 +294,13 @@ class ScriptedControl:
         self.summarised.append((namespace, workflow_id, pinned))
         return self.summaries.get((namespace, workflow_id))
 
-    async def cancel_workflow(self, namespace: str, workflow_id: str, reason: str) -> None:
+    async def history_size(self, namespace: str, workflow_id: str) -> tuple[int, int] | None:
+        return self.history
+
+    async def cancel_workflow(
+        self, namespace: str, workflow_id: str, reason: str, first_run_id: str = ""
+    ) -> None:
+        self.cancel_chains.append(first_run_id)
         if self.fail_stops:
             self.fail_stops -= 1
             raise TemporalError("frontend down")

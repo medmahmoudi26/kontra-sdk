@@ -19,6 +19,12 @@ Format summary (all of it is here, nothing else is accepted):
 * ChaCha20-Poly1305 STREAM: 64 KiB plaintext chunks, nonce = 11-byte big-endian counter
   || last-chunk flag, so truncation and reordering are detected.
 
+A file is fresh randomness unless a seed is given (:func:`seal_key`, :func:`seed_for`): then
+its file key, ephemeral keys and nonce derive from the seed, so the same seed, recipients and
+plaintext make the same file -- how a worker re-seals a stream item to the bytes it stored
+before (decisions I39). The seed is keyed by the worker's own secret, never by the plaintext
+alone, so it is not convergent encryption.
+
 Keys are Bech32: identities ``AGE-SECRET-KEY-1...`` and recipients ``age1...``, the same
 strings ``age``/``rage``/``pyrage`` use, so a party can decrypt a delivery with the ``age``
 CLI during a dispute (decisions I7).
@@ -57,11 +63,14 @@ __all__ = [
     "encrypt_stream",
     "generate_identity",
     "header_size",
+    "is_age_file",
     "is_identity",
     "is_recipient",
     "new_header",
     "public_key_of",
     "recipient_count",
+    "seal_key",
+    "seed_for",
 ]
 
 #: Plaintext bytes per STREAM chunk (fixed by the format).
@@ -202,6 +211,27 @@ def public_key_of(identity: str) -> str:
     return _recipient_str(_parse_identity(identity).public_key().public_bytes_raw())
 
 
+#: The HKDF info of :func:`seal_key`, and the HMAC domain of :func:`seed_for`.
+_SEAL_INFO = b"kontra stream item seal v1"
+_SEED_LEN = 32
+
+
+def seal_key(identity: str) -> bytes:
+    """A key only the holder of ``identity`` can derive, for :func:`seed_for`: HKDF-SHA256 of
+    the identity's X25519 secret (decisions I39). Never a key anything is encrypted *to*."""
+    secret = _parse_identity(identity).private_bytes_raw()
+    return _hkdf(secret, b"", _SEAL_INFO)
+
+
+def seed_for(key: bytes, message: bytes) -> bytes:
+    """The seed :func:`encrypt` derives a file from, for ``message`` under a :func:`seal_key`:
+    HMAC-SHA256. Whoever lacks the key cannot compute it, so a seeded ciphertext confirms no
+    guess at its plaintext (it is not convergent encryption)."""
+    if len(key) != _SEED_LEN:
+        raise AgeError("a seal key is 32 bytes")
+    return hmac.new(key, _SEAL_INFO + b"\x00" + message, sha256).digest()
+
+
 # --------------------------------------------------------------------------- primitives
 
 
@@ -305,21 +335,42 @@ def recipient_count(recipients: Iterable[str]) -> int:
     return len(_distinct(recipients))
 
 
-def new_header(recipients: Iterable[str]) -> tuple[bytes, ChunkSealer]:
+def new_header(
+    recipients: Iterable[str], *, seed: bytes | None = None
+) -> tuple[bytes, ChunkSealer]:
     """Start a file: the header (nonce included, exactly :func:`header_size` bytes) and the
-    sealer for its payload. Duplicate recipients collapse into one stanza."""
+    sealer for its payload. Duplicate recipients collapse into one stanza.
+
+    ``seed`` (32 bytes, :func:`seed_for`): the file key, each stanza's ephemeral key and the
+    nonce are derived from it instead of drawn at random, so the same seed, recipients and
+    plaintext make the same file, byte for byte. Each is a distinct HKDF output, and a seed
+    is never reused for another plaintext (:func:`seed_for` covers it), so no key or nonce is
+    reused across two files; the file is still a standard age file anyone with an identity
+    opens. Without it, every file is fresh randomness."""
     publics = _distinct(recipients)
-    file_key = os.urandom(_FILE_KEY)
+    if seed is not None and len(seed) != _SEED_LEN:
+        raise AgeError("a seed is 32 bytes")
+
+    def derived(info: bytes, n: int) -> bytes:
+        assert seed is not None
+        return _hkdf(seed, b"", b"kontra-age/" + info)[:n]
+
+    file_key = os.urandom(_FILE_KEY) if seed is None else derived(b"file-key", _FILE_KEY)
     parts = [_VERSION_LINE, b"\n"]
-    for public in publics:
-        eph = X25519PrivateKey.generate()
+    for index, public in enumerate(publics):
+        if seed is None:
+            eph = X25519PrivateKey.generate()
+        else:
+            eph = X25519PrivateKey.from_private_bytes(
+                derived(b"ephemeral/" + index.to_bytes(4, "big"), 32)
+            )
         share = eph.public_key().public_bytes_raw()
         wrap_key = _hkdf(_exchange(eph, public), share + public, _X25519_INFO)
         body = ChaCha20Poly1305(wrap_key).encrypt(_ZERO_NONCE, file_key, None)
         parts += [b"-> ", _X25519_TAG, b" ", _b64(share), b"\n", _b64(body), b"\n"]
     parts.append(b"---")
     through_dashes = b"".join(parts)
-    nonce = os.urandom(_NONCE)
+    nonce = os.urandom(_NONCE) if seed is None else derived(b"nonce", _NONCE)
     header = through_dashes + b" " + _b64(_header_mac(file_key, through_dashes)) + b"\n" + nonce
     return header, ChunkSealer(file_key, nonce)
 
@@ -399,6 +450,20 @@ def _parse_header(buf: bytes | bytearray) -> tuple[list[_Stanza], bytes, bytes, 
         stanzas.append(_Stanza(args, _unb64(b"".join(body_lines))))
 
 
+def is_age_file(data: bytes) -> bool:
+    """Whether ``data`` has an age v1 file's structure: the version line, at least one
+    well-formed recipient stanza, the header's MAC line, the payload nonce, and at least one
+    sealed chunk's tag after it. Nothing is decrypted and no key is needed, so it says what
+    the bytes are shaped as, not to whom they are sealed: plaintext behind the version line
+    is refused, a forged header is not (seam ⑥'s ``Sealed`` and ``check_sealed``, decisions
+    I32: a check against a seller side that did not seal, not against one that forges)."""
+    try:
+        parsed = _parse_header(data)
+    except AgeError:
+        return False
+    return parsed is not None and len(data) - parsed[3] >= _NONCE + _TAG
+
+
 def _identities(identity: str | Sequence[str]) -> list[X25519PrivateKey]:
     items = [identity] if isinstance(identity, str) else list(identity)
     if not items:
@@ -435,8 +500,8 @@ class Encryptor:
     proves it is not the last one (the last chunk carries a flag in its nonce).
     """
 
-    def __init__(self, recipients: Iterable[str]) -> None:
-        self.header, self._sealer = new_header(recipients)
+    def __init__(self, recipients: Iterable[str], *, seed: bytes | None = None) -> None:
+        self.header, self._sealer = new_header(recipients, seed=seed)
         self._buf = bytearray()
         self._index = 0
         self._emitted_header = False
@@ -533,8 +598,9 @@ class Decryptor:
 # --------------------------------------------------------------------------- one-shot & streams
 
 
-def encrypt(plaintext: bytes, recipients: Iterable[str]) -> bytes:
-    enc = Encryptor(recipients)
+def encrypt(plaintext: bytes, recipients: Iterable[str], *, seed: bytes | None = None) -> bytes:
+    """``plaintext`` as an age file to ``recipients``; ``seed``: see :func:`new_header`."""
+    enc = Encryptor(recipients, seed=seed)
     return enc.update(plaintext) + enc.finalize()
 
 

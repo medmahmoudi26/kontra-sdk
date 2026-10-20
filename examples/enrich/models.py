@@ -1,8 +1,8 @@
 """Pydantic In/Out types. The workflow's signature is the contract: `kontra publish` derives
 the JSON Schema from these (`extra="forbid"` becomes `additionalProperties: false`).
 
-`Artifact` is the only Kontra type allowed here (D1): a reference to an encrypted file in the
-claim-check bucket, never the bytes.
+`Artifact` (`kontra.types`) is the one Kontra type a seller's models use (decisions I29): a
+reference to an encrypted file in the claim-check bucket, never the bytes.
 """
 
 from typing import Annotated

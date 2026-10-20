@@ -20,7 +20,8 @@ rather than workflow code.
 ## How it survives a crash
 
 `cook` starts `claude` with `asyncio.create_subprocess_exec` and reads its `stream-json` events
-one line at a time. Each line is a heartbeat (the buyer sees it as progress), and the
+one line at a time. Each line is a heartbeat (the buyer sees the latest as progress, every few
+seconds), and the
 `result` event is the activity's return value. The workflow runs `cook` with a 20-second
 `heartbeat_timeout`: kill the worker and Temporal notices within it, then retries `cook` on
 whichever worker polls next. While `claude` is quiet (a long model turn) `cook` heartbeats

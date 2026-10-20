@@ -1,8 +1,9 @@
 """The nested project's activities: their bodies never run under `kontra graph`."""
 
 from models import NestedInput
+from temporalio import activity
 
-from kontra import Page, activity
+from kontra.contrib.parallel import Page
 
 
 @activity.defn

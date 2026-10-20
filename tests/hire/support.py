@@ -212,9 +212,7 @@ async def open_world(
     if made is not None:
         gate_options["ledger"] = made
     try:
-        async with Marketplace(
-            dev_server=dev_server, progress_rate_per_s=10_000, **gate_options
-        ) as mp:
+        async with Marketplace(dev_server=dev_server, **gate_options) as mp:
             acme = await mp.party("acme")
             bound = {
                 "main": text_offering(root),

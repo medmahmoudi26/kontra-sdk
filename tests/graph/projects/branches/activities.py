@@ -1,8 +1,7 @@
 """The branches project's activities: their bodies never run under `kontra graph`."""
 
 from models import BranchesInput, Plan, Verdict
-
-from kontra import activity
+from temporalio import activity
 
 
 @activity.defn
