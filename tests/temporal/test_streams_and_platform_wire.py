@@ -8,7 +8,8 @@ typed requests; this file proves the same cells against the real server binary w
 * the gate's **stream relay** for job J (``names.relay_subject``, no permissions) polls its
   job's stream and reads its offset with only ``UpdateWorkflowExecution`` and
   ``QueryWorkflow`` -- the strict wire shape (I30, Q1) -- and is refused everything else,
-  the stock ``WorkflowStreamClient.subscribe()`` included;
+  the stock ``WorkflowStreamClient.subscribe()`` included, and any request past the
+  Authorizer's size cap (``RelayRequestMax``);
 * the **worker controller** (KON-15) rolls out a versioned worker of Kontra's own in the
   platform namespace, and is refused everywhere else;
 * a **party token** steers its own jobs (updates, queries, signals, cancel, terminate), and
@@ -20,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import timedelta
@@ -31,7 +33,7 @@ from conftest import Cluster, connect_public
 from google.protobuf.duration_pb2 import Duration
 from google.protobuf.field_mask_pb2 import FieldMask
 from temporalio.api.batch.v1 import BatchOperationReset
-from temporalio.api.common.v1 import Payload, Payloads, WorkflowExecution, WorkflowType
+from temporalio.api.common.v1 import Header, Payload, Payloads, WorkflowExecution, WorkflowType
 from temporalio.api.deployment.v1 import WorkerDeploymentVersion as DeploymentVersion
 from temporalio.api.enums.v1 import (
     ResetReapplyType,
@@ -114,6 +116,9 @@ STREAM_PUBLISH = "__temporal_workflow_stream_publish"
 #: Each relay RPC's deadline. A poll still waiting when it passes is re-sent with the same
 #: update id.
 RELAY_RPC_TIMEOUT = timedelta(seconds=10)
+#: The Authorizer's ``RelayRequestMax`` (temporal/authorizer): the largest relay request, in
+#: encoded bytes, it allows.
+RELAY_REQUEST_MAX = 4 * 1024
 COMPLETED = (
     UpdateWorkflowExecutionLifecycleStage.UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED
 )
@@ -547,6 +552,76 @@ async def test_relay_is_denied_everything_else(cluster: Cluster, cell: str) -> N
     job_id = names.new_job_id()
     relay = await connect_public(cluster, SELLER, api_key=cluster.signer.relay(SELLER, job_id))
     await assert_denied(f"relay-J/{cell}", RELAY_DENIED[cell](cluster, relay, job_id))
+
+
+async def test_relay_requests_past_the_size_cap_are_refused(cluster: Cluster) -> None:
+    """A relay request is at most ``RelayRequestMax`` bytes, whatever field makes it larger
+    (decisions I30): a poll past the cap in its topics, its identity or a header, and an
+    offset query past it in its arguments, are refused by that check and no other; the
+    relay's own poll on the same job still answers, and the job runs on."""
+    async with stream_job(cluster, steps=2) as (_seller, job_id, handle):
+        workflow_id = handle.id
+        relay = await connect_public(cluster, SELLER, api_key=cluster.signer.relay(SELLER, job_id))
+
+        async def poll(
+            topics: list[str], identity: str = "kontra-relay", header: Header | None = None
+        ) -> UpdateWorkflowExecutionRequest:
+            args = await relay.data_converter.encode([PollInput(topics=topics, from_offset=0)])
+            return UpdateWorkflowExecutionRequest(
+                namespace=SELLER,
+                workflow_execution=wf(workflow_id),
+                wait_policy=WaitPolicy(lifecycle_stage=COMPLETED),
+                request=UpdateRequest(
+                    meta=UpdateMeta(update_id=str(uuid.uuid4()), identity=identity),
+                    input=UpdateInput(
+                        name=names.STREAM_POLL_UPDATE,
+                        args=Payloads(payloads=args),
+                        header=header,
+                    ),
+                ),
+            )
+
+        padding = "p" * RELAY_REQUEST_MAX
+        # More 64-character topics than any offering has (eight streams and kontra.progress).
+        many = [f"t{i:03d}" + "x" * 60 for i in range(RELAY_REQUEST_MAX // 64)]
+        genuine = await poll(["log", "progress"])
+        assert genuine.ByteSize() <= RELAY_REQUEST_MAX
+        refused: dict[str, Callable[[], Awaitable[Any]]] = {}
+        for label, request in {
+            "topics": await poll(many),
+            "identity": await poll(["log", "progress"], identity=padding),
+            "header": await poll(
+                ["log", "progress"],
+                header=Header(fields={"pad": Payload(data=padding.encode())}),
+            ),
+        }.items():
+            assert request.ByteSize() > RELAY_REQUEST_MAX, label
+            refused[f"Update(poll)@J past the size cap: {label}"] = functools.partial(
+                relay.workflow_service.update_workflow_execution,
+                request,
+                timeout=RELAY_RPC_TIMEOUT,
+            )
+        offset = _query(SELLER, workflow_id, names.STREAM_OFFSET_QUERY)
+        offset.query.query_args.payloads.append(Payload(data=padding.encode()))
+        assert offset.ByteSize() > RELAY_REQUEST_MAX
+        refused["Query(offset)@J past the size cap: args"] = functools.partial(
+            relay.workflow_service.query_workflow, offset, timeout=RELAY_RPC_TIMEOUT
+        )
+        for cell, call in refused.items():
+            with pytest.raises(RPCError) as denied:
+                await call()
+            assert denied.value.status == RPCStatusCode.PERMISSION_DENIED, cell
+            reason = denial_reason(denied.value)
+            assert reason.endswith(f"at most {RELAY_REQUEST_MAX} bytes"), (cell, reason)
+            record(f"relay-J/{cell}", "deny", "PERMISSION_DENIED")
+
+        answered = await assert_allowed(
+            "relay-J/Update(poll)@J under the size cap, after the refusals",
+            relay_poll(relay, SELLER, workflow_id, topics=["log", "progress"], from_offset=0),
+        )
+        assert stream_items(relay, answered)
+        description = await handle.describe()
+        assert description.status == WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_RUNNING
 
 
 @pytest.mark.parametrize(

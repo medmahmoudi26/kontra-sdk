@@ -44,10 +44,13 @@ nothing else, so the root hosts the stream (``temporalio.contrib.workflow_stream
 * **History guard.** A poll is refused at validation, ``KontraStreamFull``, once the run's
   history is past half of Kontra's pinned limits (:data:`STREAM_HISTORY_EVENTS`,
   :data:`STREAM_HISTORY_BYTES`). A rejected update is not written to history, so past it no
-  poll adds to the history: the relay's share stays near half of the limits (the job's own
-  work has the other half). It bounds history growth only: a burst of oversized poll
-  requests ends a run whatever this answers (the SDK echoes refused updates too), which only
-  the Authorizer can refuse (``docs/security.md``, residual risks).
+  poll adds to the history: the relay's share stays near half of the limits (a job someone
+  listens to must keep its own work under the other half). It bounds history growth only. A burst of oversized poll
+  requests would end a run whatever this answers (the SDK echoes refused updates too): the
+  Authorizer refuses a relay request over 4 KiB (decisions I30), and with both, what a relay
+  token's polls do to the job's history is bounded. Neither bounds the answers: the polls one
+  workflow task completes answer in one reply, which concurrent polls can push past gRPC's
+  4 MiB limit, ending the run (``docs/security.md``, residual risks; decisions I31).
 * **Drain.** A relay sleeps between polls, so a job that publishes and returns would close
   before the next poll. When the run returns or fails and any poll was seen in the chain,
   the root waits (at most :data:`DRAIN_TIMEOUT`) for a poll to have answered up to the

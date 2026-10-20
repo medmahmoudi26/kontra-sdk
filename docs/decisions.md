@@ -1805,8 +1805,16 @@ changed, all deny to allow: two for the stream relay, ten for the worker control
   Every other request type, a type under another API's name (Temporal itself hands the
   cross-namespace command check a workflow task's response under `SignalWorkflowExecution`),
   an update inside `ExecuteMultiOperation`, a stream handshake (no request) and the Nexus HTTP
-  dispatch are denied. The rule reads those two typed fields and nothing else -- no run id,
-  update id, payload, header, callback or link. **Strict wire shape (owner, Q1):** the relay
+  dispatch are denied. The rule reads those two typed fields and the request's encoded size,
+  and nothing else -- no run id, update id, payload, header, callback or link is read, though
+  each counts toward the size. **A relay request is at most `RelayRequestMax`, 4 KiB** (the
+  #52 review): `proto.Size` of the whole typed request, so identity, header, arguments and
+  topics all count, compared with the constant, one integer comparison, after the handler
+  name and the subject. The largest request the gate's relay builds is 898 bytes (nine
+  topics: an offering's eight streams named with 64 characters and `kontra.progress`; the
+  largest offset; a 32-character namespace; the pinned run id; a pid@hostname identity), so
+  4 KiB is over four times a genuine poll, and the offset query is about 110 bytes. A
+  party's own requests are not capped. **Strict wire shape (owner, Q1):** the relay
   makes only those two calls; it re-sends its Update with the same update id and wait policy
   COMPLETED until the answer carries the outcome (the server finds an update by its id), with an
   empty run id so it follows a continue-as-new; `StreamDraining` is retried after a cooldown with
@@ -1920,38 +1928,58 @@ the sentence above) and `docs/security.md`.
 - Residual risk: a relay that presented another update's id would get that update's outcome
   (the server matches an update by id alone); update ids are random ids the relay never sees,
   and outcomes are ciphertext to the job's parties.
-- **Residual risk: a leaked relay token can end its job** (*amended by I31*: a job root now
-  refuses polls at validation once its history is past half of the pinned limits, and a
-  refused poll is not written to history, so the guard bounds the history growth described
-  next -- but not the risk: a burst of concurrent polls with oversized requests still
-  terminates the run, guard or not, and only the Authorizer can refuse those; see I31's
-  history budget). With only its two allowed calls, it
-  polls from offset 0 again and again, each time with a new update id, and so appends up to
-  `history.maxTotalUpdates` completed updates of up to about 1 MB each to job J's history. Past
-  `limit.historySize.error` (20 MiB, pinned) Temporal terminates the run
+- **The relay's size cap closes what the #52 review found.** A leaked relay token's requests
+  could still end its job by their size alone: every workflow task must fit in Temporal's
+  4 MiB gRPC message, Temporal terminates a run whose workflow task it cannot deliver, and
+  #52's poll guard cannot refuse an oversized poll, because a refused update's request
+  travels in the workflow task all the same. With `RelayRequestMax`, what a relay token's
+  requests add to one workflow task of its job is at most `history.maxInFlightUpdates` (10,
+  Temporal's default, not changed by Kontra) times 4 KiB, two orders of magnitude below the
+  limit. #52's poll guard (polls refused at validation, so not written to history, once the
+  run's history is past half of Kontra's pinned limits) bounds what polls add to the job's
+  history, and could not bound this; the cap bounds what their requests add to a workflow
+  task. With both, the burst the #52 review found no longer ends a job. Neither bounds the
+  polls' answers: the residual risk next.
+- **Residual risk: a leaked relay token can end its job** (*amended by I31*). Since #52, not by
+  the history growth described next: a job root refuses polls at validation once its history is
+  past half of the pinned limits, a refused poll is not written to history, and with the size
+  cap above that bounds what a leaked relay token can do to its job's history (the guard plus
+  the polls in flight; a job someone listens to must keep its own history under the other half).
+  The risk stands another way, measured with both in place: the polls one workflow task
+  completes answer together in the worker's reply to that task, up to 512 KiB each, and
+  concurrent polls of the size the cap allows can make that reply pass the 4 MiB limit, which
+  terminates the run (see I31's history budget). As first found, with only its two allowed
+  calls, it polls from offset 0 again and again, each time with a new update id, and so appends
+  up to `history.maxTotalUpdates` completed updates of up to about 1 MB each to job J's history.
+  Past `limit.historySize.error` (20 MiB, pinned) Temporal terminates the run
   (`enforceHistorySizeCheck`, reason "Workflow history size exceeds limit."), and escrow refunds
   the job as "seller workflow terminated", against the seller. Any stream above about 10.5 KB
-  (20 MiB / 2,000) is enough, and one of about 1 MB takes about twenty polls
-  (`test_relay_polls_alone_can_end_their_job`, over the wire). The session is revoked only when
-  the job closes or the last listener leaves, so a leaked token stays live while a buyer
-  listens. The Authorizer cannot bound this, because it does not read the payload. Mitigations,
-  recorded and **not adopted here** (the owner decides): handler workflows that host a stream
-  continue-as-new on `workflow.info().is_continue_as_new_suggested()` (escrow follows the pinned
-  chain, and the relay's empty run id follows the current run), which turns the termination
-  into churn; #52's relay polls only from the tail, with topics, which bounds a genuine relay's
-  cost but not a leaked token's, since that token picks its own offset; a per-namespace
-  `history.maxTotalUpdates` pin chosen with `limit.historySize.error` in mind, which bounds it
-  only together with continue-as-new (20 MiB at 1 MB a poll is about twenty updates, a cap a
-  genuine subscription would hit too).
+  (20 MiB / 2,000) is enough, and one of about 1 MB takes about twenty polls (measured over the
+  wire). The session is revoked only when the job closes or the last listener leaves, so a
+  leaked token stays live while a buyer listens. The Authorizer cannot bound this: its size cap
+  holds a relay's requests, the cost is in the answers, and it does not read the payload.
+  Mitigations, recorded and **not adopted here** (the owner decides): handler workflows that
+  host a stream continue-as-new on `workflow.info().is_continue_as_new_suggested()` (escrow
+  follows the pinned chain, and the relay's empty run id follows the current run), which turns
+  the termination into churn; #52's relay polls only from the tail, with topics (I31 chose
+  offset 0, once per job), which bounds a genuine relay's cost but not a leaked token's, since
+  that token picks its own offset; a per-namespace `history.maxTotalUpdates` pin chosen with
+  `limit.historySize.error` in mind, which bounds it only together with continue-as-new (20 MiB
+  at 1 MB a poll is about twenty updates, a cap a genuine subscription would hit too).
 - #51 documents that a seller who turns on Worker Versioning gets no tasks.
 
 Tested: the Go deny matrix, every cell with its typed request, against Kontra's and Temporal's
-two authorizers (319 cells, 253 of them denials that Temporal's no-op authorizer allows; 957
-checks); a sweep of all 191 surfaces against 26 kinds of caller, five namespaces and a
-favourable, a hostile and no request (99,320 decisions, the expected rule restated in the
-test); Temporal's own authorization interceptor handing the relay rule the decoded request;
-and `tests/temporal` over the wire against the real binary (58 tests), the relay, controller,
-self-access and escrow cells included. What a relay's polls cost a job's history is stated
+two authorizers (331 cells, 260 of them denials that Temporal's no-op authorizer allows; 993
+checks), the relay's size cap among them (the largest genuine poll and the offset query
+allowed; a poll past the cap by its topics, its identity or a header, and an offset query by
+its arguments or a header, denied; a party's oversized update and query allowed); a sweep of
+all 191 surfaces against 26 kinds of caller, five namespaces and five requests -- a favourable
+one, the same past the relay's cap, two hostile ones and none (124,150 decisions, the expected
+rule restated in the test); the cap at its edge (`TestRelayRequestMax`: exactly 4 KiB passes,
+one byte more does not); Temporal's own authorization interceptor handing the relay rule the
+decoded request; and `tests/temporal` over the wire against the real binary (59 tests), the
+relay, controller, self-access and escrow cells included, and a relay poll past the cap
+refused while the relay's own poll on the same job still answers. What a relay's polls cost a job's history is stated
 above and in `docs/security.md`, not pinned by a wire test: that test would be a ready-made
 recipe in a public repository.
 
@@ -2085,35 +2113,46 @@ with two prototypes whose results are below.
   signal is about four events, a relayed poll about five more (measured: 20 activity publish
   batches cost 95 events, 192 with a relay polling). Against Kontra's pinned
   `limit.historyCount.error` (20,480), yesterday's one-a-second forwarding with a listening
-  relay would terminate a job, refunded against the seller, in about 52 minutes. Adopted:
-  **the job's poll guard** -- a root refuses a poll at validation (`KontraStreamFull`) once
-  its history is past half of the pinned limits (10,240 events or 10 MiB; a test pins `==
-  error // 2`); a rejected update is not written to history, so no poll, whether a genuine
-  relay's or a leaked relay token's, grows the job further, and the relay stops with
-  `gap{history_budget}` -- and **a budgeted ProgressForwarder**: the latest details at most
-  every 5 s (`KONTRA_PROGRESS_INTERVAL` still overrides; 0 publishes every heartbeat, batched),
-  the interval doubling every 360 items up to 300 s, at most 1,000 items per job (about 4,000
+  relay would terminate a job, refunded against the seller, in about 52 minutes. Adopted: **the
+  job's poll guard** -- a root refuses a poll at validation (`KontraStreamFull`) once its
+  history is past half of the pinned limits (10,240 events or 10 MiB; a test pins `== error //
+  2`); a rejected update is not written to history, so no poll, whether a genuine relay's or a
+  leaked relay token's, grows the job further, and the relay stops with `gap{history_budget}` --
+  and **a budgeted ProgressForwarder**: the latest details at most every 5 s
+  (`KONTRA_PROGRESS_INTERVAL` still overrides; 0 publishes every heartbeat, batched), the
+  interval doubling every 360 items up to 300 s, at most 1,000 items per job (about 4,000
   events, a fifth of the limit), then one log line and nothing more; an activity's latest
-  heartbeat is published when it returns, whatever the interval. The count is per worker
-  process (each one that runs the job's activities has its own) and survives the job going
-  quiet: a job forgotten after five idle minutes keeps its count for 31 days, past the
-  longest `max_duration`. **What the guard bounds, and what it does not.** It bounds what
-  polls add to the history: past it, polls are refused and not stored, so their share is the
-  guard plus the polls in flight (Temporal's `maxInFlightUpdates`, 10, of at most 512 KiB
-  each). It caps the relay's share near half of the limits, not the job's total: the relay's
-  events stay, so a job someone listens to needs its own history under the other half
-  (measured with the limits scaled down: a job whose own work reached about 85% of them
-  completed unlistened and was terminated with a genuine relay listening, which the guard had
-  stopped at half). Capping the relay's own share (counting answered polls and their bytes in
-  the interceptor) is the better bound, recorded, not built. **I30's residual risk "a leaked
-  relay token can end its job" stands:** a burst of concurrent polls with oversized requests
-  makes the worker's answer to the workflow task carrying them pass gRPC's limit (the SDK
-  echoes every update request it accepts or rejects), and Temporal terminates the run
-  (`GrpcMessageTooLarge`) whether the job accepts or refuses those polls, and with no poll
-  handler at all (measured; the shape before #52 too). No validator can stop what is echoed
-  when it is refused. The Authorizer can: the relay rule has the typed request, and a genuine
-  poll is about a hundred bytes, so a relay request larger than a few KiB is refused there --
-  a change for #59's branch, reported, not made here.
+  heartbeat is published when it returns, whatever the interval. The count is per worker process
+  (each one that runs the job's activities has its own) and survives the job going quiet: a job
+  forgotten after five idle minutes keeps its count for 31 days, past the longest
+  `max_duration`. **What the guard bounds, and what it does not.** It bounds what polls add to
+  the history: past it, polls are refused and not stored, so their share is the guard plus the
+  polls in flight (Temporal's `maxInFlightUpdates`, 10, of at most 512 KiB each). It caps the
+  relay's share near half of the limits, not the job's total: the relay's events stay, so a job
+  someone listens to needs its own history under the other half (measured with the limits scaled
+  down: a job whose own work reached about 85% of them completed unlistened and was terminated
+  with a genuine relay listening, which the guard had stopped at half). Capping the relay's own
+  share (counting answered polls and their bytes in the interceptor) is the better bound,
+  recorded, not built. **The guard and #59's request cap (I30) together bound what a leaked
+  relay token can do to its job's history.** The guard stops its polls at half of the limits;
+  the cap, 4 KiB a relay request (the gate's largest poll is 898 bytes), refuses the burst this
+  change's review measured -- concurrent polls with oversized requests made the worker's reply
+  to the workflow task carrying them pass gRPC's 4 MiB limit, since the SDK echoes every update
+  request it accepts or rejects, and Temporal terminated the run (`GrpcMessageTooLarge`) whether
+  the job accepted or refused them, and with no poll handler at all (the shape before #52 too);
+  no validator can refuse what is echoed when it is refused. The residual, as measured: a relay
+  listening still costs a job history, its share up to the guard, whoever holds the token, so a
+  job someone listens to must keep its own history under the other half (above). **And I30's
+  residual risk "a leaked relay token can end its job" still stands, through the answers:** the
+  polls one workflow task completes answer together in the worker's reply to that task, up to
+  512 KiB each and up to `maxInFlightUpdates` (10) of them, and concurrent polls of the size the
+  cap allows can make that reply pass the 4 MiB limit; Temporal terminates the run
+  (`GrpcMessageTooLarge`; measured with the pinned limits, the history far below the guard). The
+  cap holds requests and the guard holds history, so neither reaches it. What would, recorded,
+  not built (the owner decides): a budget for the answers of one workflow task in the
+  interceptor (a poll past it answered with no items and `more_ready`, so the relay polls
+  again), an envelope small enough that the polls in flight fit one reply, or a lower pinned
+  `history.maxInFlightUpdates`.
 * **Delivery semantics.** Live: a buyer who never listens before the job closes gets nothing
   of its stream but history events (a relay attaching after a short job closed reads nothing;
   items published before a continue-as-new of a Kontra-hosted stream nobody polled are not
@@ -2125,9 +2164,10 @@ with two prototypes whose results are below.
   could open if it ever read the seller's history (it cannot: the buyer has no Temporal access
   to the seller's namespace). Harness-internal activities' heartbeats are forwarded as any
   seller activity's are (owner, OD10, asked on #52). Item schemas in the contract (OD11).
-* **The authorizer: no new cell.** The relay's two calls are #59's; the forwarder's and the
-  turn mirror's publish signal and the seller's own subscriptions are the party allowlist on
-  its own job; the gate's pacing reads the internal frontend. The relay loop's wire test
+* **The authorizer: no new cell here.** The relay's two calls are #59's, and so is the request
+  cap this change's review asked for (I30, merged in); the forwarder's and the turn mirror's
+  publish signal and the seller's own subscriptions are the party allowlist on its own job; the
+  gate's pacing reads the internal frontend. The relay loop's wire test
   (`tests/temporal/test_relay_loop_wire.py`) belongs to this change, not to #59's branch.
 
 **Rejected.** A Kontra-owned poll update (it duplicates the contrib's long-poll and changes
@@ -2145,16 +2185,18 @@ activity mirrors; Kontra hosts a stream on every job root), and `docs/security.m
 
 Tested: the envelope and the codec branches, JSON nested past the stack refused, the
 interceptor's cut sealed whole for every size class and recipient count, and a re-read large
-item stored once per job (`tests/codec/test_stream_envelope.py`); the streams rule through
-the code and the spec (`tests/contract/test_offering_streams.py`); hosting, early handlers,
-the drain (a short job's tail that passes one envelope included), a continue-as-new chain, the
-guard and replay (`tests/serve/test_stream_hosting.py`); every relay classification (a
-`TruncatedOffset` at offset 0 backed off, not spun on), the same update id re-sent, a
-look-alike chain refused, `start=` required and no contrib import
-(`tests/serve/test_relay.py`); the forwarder, its budget across a quiet spell
-(`tests/serve/test_progress.py`); the mirror and its checkpoint (`tests/serve/test_turn.py`);
-the FakeGate's relay, caps (a spent budget one gap), resume and listener rules
-(`tests/testing/test_stream_relay.py`); `job.stream()` (`tests/hire/test_stream.py`); seam ⑤'s
-marker scans of every run's history, the raw SSE and the gate's store, with a misbehaving
-relay, for a workflow entry and a bound handler (`tests/serve/test_streams.py`); and the loop
-over the wire with a relay token (`tests/temporal/test_relay_loop_wire.py`).
+item stored once per job (`tests/codec/test_stream_envelope.py`); the streams rule through the
+code and the spec (`tests/contract/test_offering_streams.py`); hosting, early handlers, the
+drain (a short job's tail that passes one envelope included), a continue-as-new chain, the guard
+and replay (`tests/serve/test_stream_hosting.py`); every relay classification (a
+`TruncatedOffset` at offset 0 backed off, not spun on), the same update id re-sent, a look-alike
+chain refused, `start=` required and no contrib import (`tests/serve/test_relay.py`); the
+forwarder, its budget across a quiet spell (`tests/serve/test_progress.py`); the mirror and its
+checkpoint (`tests/serve/test_turn.py`); the FakeGate's relay, caps (a spent budget one gap),
+resume and listener rules (`tests/testing/test_stream_relay.py`); `job.stream()`
+(`tests/hire/test_stream.py`); seam ⑤'s marker scans of every run's history, the raw SSE and the
+gate's store, with a misbehaving relay, for a workflow entry and a bound handler
+(`tests/serve/test_streams.py`); and the loop over the wire with a relay token, under #59's
+request cap (`tests/temporal/test_relay_loop_wire.py`). What a leaked token's concurrent polls
+do (the residual risk above) was measured on a dev server with the pinned limits, and is not
+pinned by a test, for the reason I30 gives: it would be a recipe.
