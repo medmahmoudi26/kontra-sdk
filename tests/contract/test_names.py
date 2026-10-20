@@ -112,3 +112,38 @@ def test_the_installed_temporalio_uses_the_same_stream_handlers(golden: dict[str
     assert golden["stream_poll_update"] == _stream._POLL_UPDATE  # pyright: ignore[reportPrivateUsage]
     assert golden["stream_offset_query"] == _stream._OFFSET_QUERY  # pyright: ignore[reportPrivateUsage]
     assert _stream._PUBLISH_SIGNAL not in (STREAM_POLL_UPDATE, STREAM_OFFSET_QUERY)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_stream_names_of_the_relay_and_its_publishers() -> None:
+    """#52: the publish signal Kontra's forwarder and turn mirror send, the reserved progress
+    topic, and the prefix an offering may not list."""
+    from temporalio.contrib.workflow_streams import _stream  # pyright: ignore[reportPrivateUsage]
+
+    assert names.STREAM_PUBLISH_SIGNAL == _stream._PUBLISH_SIGNAL  # pyright: ignore[reportPrivateUsage]
+    assert names.PROGRESS_TOPIC == "kontra.progress"
+    assert names.PROGRESS_TOPIC.startswith(names.RESERVED_TOPIC_PREFIX)
+    for name in ("PROGRESS_TOPIC", "RESERVED_TOPIC_PREFIX", "STREAM_PUBLISH_SIGNAL"):
+        assert name in names.__all__
+
+
+def test_the_poll_wire_shape_the_relay_reads_without_the_contrib() -> None:
+    """``kontra._relay`` builds the poll's input and the codec reads its result by these
+    field names and error types (Public Preview): a rename upstream fails here."""
+    import dataclasses
+
+    from temporalio.contrib.workflow_streams import (
+        PollInput,
+        PollResult,
+        WorkflowStreamState,
+        _types,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    def fields(cls: type) -> list[str]:
+        return [f.name for f in dataclasses.fields(cls)]
+
+    assert fields(PollInput) == ["topics", "from_offset"]
+    assert fields(PollResult) == ["items", "next_offset", "more_ready"]
+    assert fields(_types._WorkflowStreamWireItem) == ["topic", "data", "offset"]  # pyright: ignore[reportPrivateUsage]
+    assert "base_offset" in fields(WorkflowStreamState)
+    assert _types.STREAM_DRAINING_ERROR_TYPE == "StreamDraining"
+    assert _types.TRUNCATED_OFFSET_ERROR_TYPE == "TruncatedOffset"

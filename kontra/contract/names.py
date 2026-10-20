@@ -32,9 +32,12 @@ from functools import total_ordering
 __all__ = [
     "HANDLE_MAX",
     "PLATFORM_NAMESPACE",
+    "PROGRESS_TOPIC",
     "RESERVED_HANDLES",
+    "RESERVED_TOPIC_PREFIX",
     "STREAM_OFFSET_QUERY",
     "STREAM_POLL_UPDATE",
+    "STREAM_PUBLISH_SIGNAL",
     "WORKER_CONTROLLER_SUBJECT",
     "NameError_",
     "OfferingId",
@@ -307,6 +310,15 @@ PLATFORM_NAMESPACE = "kontra-system"
 #: these names, never on the contrib package.
 STREAM_POLL_UPDATE = "__temporal_workflow_stream_poll"
 STREAM_OFFSET_QUERY = "__temporal_workflow_stream_offset"
+#: The stream's publish signal: what a seller's publishers (and Kontra's progress forwarder
+#: and turn mirror) send to ``job-<id>``. Never a relay's: the authorizer refuses it one.
+STREAM_PUBLISH_SIGNAL = "__temporal_workflow_stream_publish"
+#: The topic of a job's stream that carries the seller's heartbeats as progress
+#: (:class:`kontra.serve.progress.ProgressForwarder`): relayed for every job, whatever the
+#: offering lists (decisions I31).
+PROGRESS_TOPIC = "kontra.progress"
+#: Topic names an offering may not list (``offering.yaml`` ``streams:``): Kontra's own.
+RESERVED_TOPIC_PREFIX = "kontra."
 
 
 def relay_subject(namespace: str, job_id: str) -> str:

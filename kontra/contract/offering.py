@@ -4,6 +4,11 @@ Everything here is readable by the catalog, the console and agents without execu
 Python, and nothing here names code (D11). The binding of a workflow and a quote function
 to the offering is code, in ``worker.py``; this loader refuses keys that try to put it in
 the yaml, and values that look like an import path.
+
+``streams:`` lists the topics of the job's workflow stream a buyer may read (decisions I31):
+data names, never code. It is validated here (and stated language-neutrally in
+``spec/offering-streams.v1.json``) but is **not** an ``x-kontra`` fact: it is not in the
+contract hash, and travels as catalog data (``PublishRequest.streams``), fixed per version.
 """
 
 from __future__ import annotations
@@ -17,7 +22,13 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from kontra.contract.errors import OfferingError
-from kontra.contract.names import NameError_, OfferingId, Version, validate_handle
+from kontra.contract.names import (
+    RESERVED_TOPIC_PREFIX,
+    NameError_,
+    OfferingId,
+    Version,
+    validate_handle,
+)
 from kontra.contract.units import format_duration, format_size, parse_duration, parse_size
 
 __all__ = [
@@ -26,7 +37,11 @@ __all__ = [
     "MAX_DURATION_RANGE",
     "MAX_OUTPUT_BYTES_MAX",
     "REVIEW_WINDOW_RANGE",
+    "STREAMS_MAX",
+    "TOPIC_PATTERN",
     "OfferingSpec",
+    "check_streams",
+    "check_topic",
     "load_offering",
     "parse_offering",
 ]
@@ -42,8 +57,14 @@ MAX_CONCURRENT_JOBS_MAX = 10_000
 DESCRIPTION_MAX = 2000
 PRICING_HINT_MAX = 200
 TAGS_MAX = 16
+#: A workflow-stream topic an offering lists (``streams:``): ASCII, a letter first, at most
+#: 64 characters. Unanchored: match it whole (``fullmatch``, or ``^...$`` in a schema).
+TOPIC_PATTERN = r"[A-Za-z][A-Za-z0-9_.-]{0,63}"
+#: The most topics one offering lists.
+STREAMS_MAX = 8
 
 _TAG = re.compile(r"[a-z0-9][a-z0-9-]{0,31}", re.ASCII)
+_TOPIC = re.compile(TOPIC_PATTERN, re.ASCII)
 _IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 #: ``workflows.EnrichFlow``, ``workflows:EnrichFlow``, ``quote:quote``.
 _SYMBOL = re.compile(
@@ -73,8 +94,8 @@ _CODE_KEYS = frozenset(
 
 _KEYS_HINT = (
     "offering.yaml holds name, version, description, pricing_hint, tags, max_duration, "
-    "review_window, max_concurrent_jobs, max_output_bytes, artifact_retention and "
-    "uses_hosted_model"
+    "review_window, max_concurrent_jobs, max_output_bytes, artifact_retention, "
+    "uses_hosted_model and streams"
 )
 
 
@@ -215,6 +236,44 @@ def check_hosted_model(value: object) -> bool:
     return value
 
 
+def check_topic(value: object) -> str:
+    """One topic name of ``streams:`` (or of a stream request): :data:`TOPIC_PATTERN`, whole."""
+    if not isinstance(value, str) or _TOPIC.fullmatch(value) is None:
+        if not isinstance(value, str):
+            shown = f"of type {type(value).__name__}"
+        else:
+            shown = repr(value) if len(value) <= 80 else f"of {len(value)} characters"
+        raise ValueError(
+            f"topic {shown} must be ASCII letters, digits, '_', '.' and '-', start with a "
+            "letter, and be at most 64 characters"
+        )
+    return value
+
+
+def check_streams(value: object) -> tuple[str, ...]:
+    """``streams:``: the workflow-stream topics a buyer may read (decisions I31). At most
+    :data:`STREAMS_MAX` distinct :func:`check_topic` names, none of them Kontra's own
+    (``kontra.``, any case: ``kontra.progress`` is relayed for every job). Returned sorted:
+    one spelling per list, so a catalog comparing two lists compares tuples."""
+    if not isinstance(value, list | tuple):
+        raise ValueError("must be a list of topic names, e.g. [turn_events]")
+    items: list[object] = list(value)  # pyright: ignore[reportUnknownArgumentType]
+    if len(items) > STREAMS_MAX:
+        raise ValueError(f"at most {STREAMS_MAX} topics")
+    topics: list[str] = []
+    for item in items:
+        topic = check_topic(item)
+        if topic.lower().startswith(RESERVED_TOPIC_PREFIX):
+            raise ValueError(
+                f"topic {topic!r} is reserved: kontra.progress is relayed for every job; "
+                "name your own topics"
+            )
+        if topic in topics:
+            raise ValueError(f"topic {topic!r} appears twice")
+        topics.append(topic)
+    return tuple(sorted(topics))
+
+
 # --------------------------------------------------------------------------- the model
 
 
@@ -234,6 +293,9 @@ class OfferingSpec(BaseModel):
     max_output_bytes: int = 1000**3
     artifact_retention: timedelta = timedelta(days=7)
     uses_hosted_model: bool = False
+    #: The topics of the job's workflow stream a buyer may read: catalog data, never in the
+    #: contract hash (:meth:`canonical` leaves it out). Sorted.
+    streams: tuple[str, ...] = ()
 
     @field_validator("name", mode="before")
     @classmethod
@@ -290,12 +352,18 @@ class OfferingSpec(BaseModel):
     def _uses_hosted_model(cls, v: object) -> bool:
         return check_hosted_model(v)
 
+    @field_validator("streams", mode="before")
+    @classmethod
+    def _streams(cls, v: object) -> tuple[str, ...]:
+        return check_streams(v)
+
     @property
     def offering_id(self) -> OfferingId:
         return OfferingId.from_parts(self.name, self.version)
 
     def canonical(self) -> dict[str, Any]:
-        """The facts as they appear in ``x-kontra`` (canonical strings, unset omitted)."""
+        """The facts as they appear in ``x-kontra`` (canonical strings, unset omitted).
+        ``streams`` is not one of them: it is catalog data, outside the contract hash."""
         out: dict[str, Any] = {
             "name": self.name,
             "version": self.version,
