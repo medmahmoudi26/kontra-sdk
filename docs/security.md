@@ -34,7 +34,7 @@ What that means concretely, and what enforces it:
 | One seller forges another seller's Nexus result | the callback guard (below) |
 | A buyer reads, signals or cancels a seller's handler workflow | the Authorizer: a buyer's token has no call in the seller's namespace, including the job it paid for |
 | A seller resets or deletes a workflow, or a buyer deletes its call records or shortens their retention, to change what escrow sees | the Authorizer: resets, deletes, namespace updates, batch operations and schedules are denied to every token |
-| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, each request at most 4 KiB and shaped as the gate's relay sends it, at most 10 a second, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as ciphertext and cannot publish to it, and its requests together cannot make the job's workflow task too large for Temporal to deliver. It **can end that job**: every poll's result is written to the job's history, and enough polls push the job past Temporal's history size limit, which terminates it, a refund against the seller ([the stream relay](#the-stream-relay)) |
+| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, each request at most 4 KiB and shaped as the gate's relay sends it, at most 10 a second, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as ciphertext and cannot publish to it, and its requests together cannot make the job's workflow task too large for Temporal to deliver. Its polls spend that job's history, which this policy cannot bound; the bound is the job's own ([the stream relay](#the-stream-relay)) |
 | The worker controller's credential leaks | rollouts of Kontra's own workers in the platform namespace: no seller namespace, no workflow start, no compute config |
 | A buyer forges or alters a hold token (amount, seller, expiry, contract) | ES256 signature checked offline by the seller's handler, with audience, expiry, seller namespace, offering and contract hash |
 | A buyer replays a hold token | the handler workflow id is built from the job id and started with reject-duplicate: one execution per hold; a cancel before the job started occupies that id, so the refunded hold cannot start it either |
@@ -317,25 +317,15 @@ history: Temporal stores a completed Update's outcome in the history
 returns, up to the stream's response cap of about 1 MB. A genuine relay therefore doubles a
 stream's volume in history (each item once in the publish signal that wrote it, and again in
 the poll that read it) and spends one of the run's updates per poll (`history.maxTotalUpdates`,
-Temporal's default of 2,000, pinned in `dynamicconfig/kontra.yaml`). A leaked relay token can
-spend them on purpose. Polling from offset 0 again and again, each time with a new update id,
-it appends up to 2,000 completed updates of up to about 1 MB each, and once the history passes
-`limit.historySize.error` (20 MiB, pinned in `dynamicconfig/kontra.yaml`) Temporal terminates
-the run. Escrow then refunds the job as "seller workflow terminated", against the seller. Any
-stream above about 10.5 KB is enough; one of about 1 MB takes about twenty polls (measured
-against the built server). The token stays live while a buyer listens, because its session is
-revoked only when the job closes or the last listener leaves.
-
-The Authorizer cannot bound this: its cap holds each request to 4 KiB, but the cost is in the
-answers, which it never sees. Three mitigations are
-recorded and none is adopted yet (decisions I30). A handler workflow that hosts a stream can
-continue-as-new when `workflow.info().is_continue_as_new_suggested()`: that turns the
-termination into churn, because escrow follows the pinned chain and the relay's empty run id
-follows its current run. The gate's relay (#52) polls only from the tail, with topics: that
-keeps a genuine relay's share of history to what its buyer reads, but does nothing against a
-leaked token, which picks its own offset. A per-namespace `history.maxTotalUpdates` below the
-pinned 2,000 bounds it only together with continue-as-new: 20 MiB at 1 MB a poll is about
-twenty updates, which would also cap a genuine subscription's polls per run.
+Temporal's default of 2,000, pinned in `dynamicconfig/kontra.yaml`). A leaked relay token's polls
+spend them too. The Authorizer cannot bound what those polls add to history: its cap holds
+each request to 4 KiB, but the cost is in the answers, which it never sees. Left unbounded, it
+would end in Temporal's history limit, which terminates the run, a refund against the seller.
+The token stays live while a buyer listens, because its session is revoked only when the job
+closes or the last listener leaves. The bound belongs to the job, not to this policy: #52's
+poll guard, and the follow-up the owner asked for on #59 (stream items by reference, a per-run
+poll budget). Continue-as-new on handler workflows was considered and rejected by the owner: it
+puts a rule on seller code.
 
 ### The worker controller
 
@@ -439,14 +429,11 @@ deadline rule.
   before 28 a machine on the host's own network that routes the `control` subnet through the
   host may too, unless the host's `FORWARD` policy drops it; the address is the same on every
   install (`KONTRA_CONTROL_NET`.2).
-- **A leaked stream-relay token can end its job.** Its two calls are enough: every poll's
-  result is written to the job's history, and enough of them push the job past Temporal's
-  history size limit, which terminates it, a refund against the seller. The Authorizer caps
-  each relay request at 4 KiB, which keeps its requests from ending the job by their size,
-  requires the shape the gate's relay sends and holds the token to 10 requests a second, which
-  slows it, but cannot bound what the answers add to history (it never sees them); see
-  [the stream relay](#the-stream-relay) for the numbers and the mitigations recorded in
-  decisions I30.
+- **A leaked stream-relay token spends its job's history.** Every poll's result is written to
+  the job's history. The Authorizer caps each relay request at 4 KiB, requires the shape the
+  gate's relay sends and holds the token to 10 requests a second, but cannot bound what the
+  answers add (it never sees them); the bound is the job's, see
+  [the stream relay](#the-stream-relay) and decisions I30.
 - **Token lifetime.** A worker token's session revoked at the gate is refused by Kontra's
   Temporal server within its revocation poll (5 s), as long as the server can reach the
   gate's list (`GET /v1/auth/revocations`); while it cannot, the token stays valid until its

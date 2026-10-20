@@ -116,11 +116,10 @@ not apply to a party's own requests. Callbacks are the callback guard's, which a
 relay and the controller as to every other token. A relay needs nothing else: re-sending its
 Update with the same update id returns the outcome, and with an empty run id it follows a
 continue-as-new. `PollWorkflowExecutionUpdate` is denied because it names no update and
-would read any update's outcome by id. Every completed poll's outcome (up to the stream's
-~1 MB response cap) is written to the job's history, so a leaked relay token, re-polling from
-offset 0, can push the job past `limit.historySize.error` and have Temporal terminate it;
-the size cap holds requests, not answers, and the authorizer never sees an answer, so it cannot
-bound that (`docs/security.md`, decisions I30).
+would read any update's outcome by id. Every completed poll's outcome is written to the job's
+history, so a leaked relay token's polls spend it; the size cap holds requests, not answers,
+and the authorizer never sees an answer, so it cannot bound that: the job's side does
+(`docs/security.md`, decisions I30).
 
 Then the request's shape: a poll's one argument with metadata exactly `{encoding: json/plain}`
 and no header, the offset query neither (`relayShaped`; the count and metadata are compared,
