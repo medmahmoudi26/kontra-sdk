@@ -51,6 +51,8 @@ def test_the_update_signal_and_topic_names_are_the_harnesses() -> None:
     assert ae.TOOL_APPROVAL_UPDATE == ai.TOOL_APPROVAL_UPDATE
     assert ae.PROVIDE_CALLBACK_RESULT_UPDATE == ai.PROVIDE_CALLBACK_RESULT_UPDATE
     assert ae.TURN_EVENTS_TOPIC == events.TURN_EVENTS_TOPIC
+    assert ae.AGENT_INTERFACE_QUERY == ai.AGENT_INTERFACE_QUERY
+    assert {ae.INTERFACE_NAME, ae.INTERFACE_PARAMETERS} <= _fields(ai.AcceptedFunction)
 
 
 def test_the_message_and_reply_fields_are_the_harnesses() -> None:

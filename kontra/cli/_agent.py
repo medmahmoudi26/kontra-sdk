@@ -27,10 +27,12 @@ import json
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 from google.protobuf import json_format
 from temporalio.api.common.v1 import Payload
+from temporalio.common import RawValue
 from temporalio.converter import PayloadCodec, PayloadConverter
 
 from kontra import graph
@@ -44,12 +46,12 @@ if TYPE_CHECKING:
     from temporalio.client import Client, WorkflowExecutionDescription
 
 __all__ = [
+    "BATCH_RUNS",
     "SUBAGENT_DEPTH",
     "SUBAGENT_HISTORIES",
     "TURN_WORKFLOW",
     "AgentRun",
     "Reader",
-    "batch_progress",
     "started_children",
 ]
 
@@ -63,6 +65,11 @@ _ITEM_B64_MAX = (STREAM_ITEM_MAX + 2) // 3 * 4
 #: What a reader remembers of what history made final.
 _CACHE = 4096
 _BATCH = "kontra.batch.v1"
+#: The runs of one batch child read for its progress (it continues as new as it goes).
+BATCH_RUNS = 64
+#: How long the agent's worker has to say its handlers' input types.
+_INTERFACE_TIMEOUT = timedelta(seconds=3)
+_CLOSED_OK = "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED"
 
 
 @dataclass
@@ -119,43 +126,6 @@ def started_children(history: Mapping[str, Any]) -> dict[str, tuple[int, str | N
     return found
 
 
-def batch_progress(painted: graph.Graph, children: Mapping[str, Any]) -> None:
-    """Each batch node's ``progress`` (OD3), from its child's history the console already read:
-    ``{"done", "total", "pages"}`` -- the item activity's completions of its schedulings, and
-    whether a ``pages=`` activity ran beside it (the batch's own first run says it)."""
-    for node in painted.get("nodes") or []:
-        ref = node.get("ref") or {}
-        name = node.get("name")
-        if node.get("kind") != "child" or not isinstance(name, str) or not name.startswith(_BATCH):
-            continue
-        history = children.get(ref.get("workflow_id") or "")
-        if not isinstance(history, Mapping):
-            continue
-        scheduled: dict[int, str] = {}
-        done: dict[str, int] = {}
-        for event in history.get("events") or []:
-            attrs = event.get("activityTaskScheduledEventAttributes")
-            event_id = _int(event.get("eventId"))
-            if isinstance(attrs, dict) and event_id is not None:
-                scheduled[event_id] = str((attrs.get("activityType") or {}).get("name"))
-            closed = event.get("activityTaskCompletedEventAttributes")
-            if isinstance(closed, dict):
-                kind = scheduled.get(_int(closed.get("scheduledEventId")) or 0)
-                if kind is not None:
-                    done[kind] = done.get(kind, 0) + 1
-        totals: dict[str, int] = {}
-        for kind in scheduled.values():
-            totals[kind] = totals.get(kind, 0) + 1
-        if not totals:
-            continue
-        item = max(totals, key=lambda k: (totals[k], k))
-        node["progress"] = {
-            "done": done.get(item, 0),
-            "total": totals[item],
-            "pages": len(totals) > 1,
-        }
-
-
 class _Budget:
     def __init__(self, left: int) -> None:
         self.left = left
@@ -172,6 +142,10 @@ class Reader:
             OrderedDict()
         )
         self._tool_ids: OrderedDict[tuple[str, str | None, int], list[str]] = OrderedDict()
+        #: A batch child's spec and each page's item count, opened once (history is final).
+        self._batch: OrderedDict[tuple[str, str | None, int], Any] = OrderedDict()
+        #: Each agent run's handlers' input types (its ``agent_interface``), asked once.
+        self._interfaces: OrderedDict[tuple[str, str | None], dict[str, str]] = OrderedDict()
 
     # ------------------------------------------------------------------ the agent
 
@@ -231,6 +205,151 @@ class Reader:
                 _remember(self._polls, key, found)
             out += found
         return out
+
+    async def input_types(self, client: Client, agent: AgentRun) -> dict[str, str]:
+        """Each handler's input type (``sweep`` -> ``SweepRequest``): the ``title`` of the
+        ``parameters`` schema the agent's ``agent_interface`` query answers, opened with this
+        machine's codec. Asked once per run, and nothing when the agent's worker does not
+        answer in time (the turn header then shows the input's fields)."""
+        key = (agent.workflow_id, agent.run_id)
+        found = self._interfaces.get(key)
+        if found is not None:
+            return found
+        found = {}
+        try:
+            raw = await client.get_workflow_handle(agent.workflow_id, run_id=agent.run_id).query(
+                ae.AGENT_INTERFACE_QUERY, result_type=RawValue, rpc_timeout=_INTERFACE_TIMEOUT
+            )
+            [value] = await _decode_inputs(
+                self._codec(), {"payloads": [json_format.MessageToDict(raw.payload)]}
+            )
+        except Exception:  # no worker, not a harness agent, sealed to another key
+            value = None
+        for handler in value if isinstance(value, list) else []:
+            if not isinstance(handler, dict):
+                continue
+            name, schema = handler.get(ae.INTERFACE_NAME), handler.get(ae.INTERFACE_PARAMETERS)
+            title = schema.get("title") if isinstance(schema, dict) else None
+            if isinstance(name, str) and isinstance(title, str):
+                found[name] = title[: _session.SUMMARY_MAX]
+        _remember(self._interfaces, key, found)
+        return found
+
+    # ------------------------------------------------------------------ batches (OD3)
+
+    async def batch_progress(
+        self,
+        client: Client,
+        painted: graph.Graph,
+        children: Mapping[str, Any],
+        watched: list[tuple[str, str, int]],
+    ) -> None:
+        """Each batch node's ``progress``, from its child's own runs -- the first one the
+        console read (``children``), then each it continued as new into, up to
+        :data:`BATCH_RUNS` -- ``{"done", "failed", "pages", "total", "bound"}``: the item
+        activity's completions and failures, the ``pages=`` activity's completions (None for
+        ``items=``), and how many items there are. ``total`` is the batch's own count when its
+        spec opens with this machine's codec (``items=``'s length, or the items of the pages
+        fetched so far), else what it scheduled; ``bound`` says it may grow (``7/≥8``) while
+        the batch runs. An open run read is added to ``watched``: it grows while the run's
+        history does not."""
+        for node in painted.get("nodes") or []:
+            ref = node.get("ref") or {}
+            name, workflow_id = node.get("name"), ref.get("workflow_id")
+            if (
+                node.get("kind") != "child"
+                or not isinstance(name, str)
+                or not name.startswith(_BATCH)
+            ):
+                continue
+            first = children.get(workflow_id) if isinstance(workflow_id, str) else None
+            if not isinstance(first, Mapping) or not isinstance(workflow_id, str):
+                continue
+            runs: list[tuple[str | None, Mapping[str, Any]]] = [(_run_of(first), first)]
+            while len(runs) < BATCH_RUNS and (following := _continued(runs[-1][1])):
+                runs.append((following, await self.history(client, workflow_id, following)))
+            last_id, last = runs[-1]
+            if last_id is not None and not _closed(last):
+                watched.append((workflow_id, last_id, len(last.get("events") or [])))
+            node["progress"] = await self._progress(workflow_id, runs)
+
+    async def _progress(
+        self, workflow_id: str, runs: Sequence[tuple[str | None, Mapping[str, Any]]]
+    ) -> dict[str, Any]:
+        first_run = runs[0][0]
+        spec = await self._spec(workflow_id, first_run, runs[0][1])
+        counts: dict[str, int] = {}
+        for _run_id, history in runs:
+            for _event_id, name, _inputs in _scheduled(history):
+                counts[name] = counts.get(name, 0) + 1
+        if spec is not None:
+            item, pages, listed = spec
+        else:  # sealed to another key: the activity it scheduled most, the other its pages
+            item = max(counts, key=lambda k: (counts[k], k)) if counts else None
+            pages = next((k for k in sorted(counts) if k != item), None)
+            listed = None
+        done = failed = fetched = 0
+        found: int | None = 0  # the items of the pages fetched, while each one opens
+        for run_id, history in runs:
+            names = {event_id: name for event_id, name, _ in _scheduled(history)}
+            for event in history.get("events") or []:
+                ok = event.get("activityTaskCompletedEventAttributes")
+                attrs = ok or event.get("activityTaskFailedEventAttributes")
+                attrs = attrs or event.get("activityTaskTimedOutEventAttributes")
+                if not isinstance(attrs, dict):
+                    continue
+                kind = names.get(_int(attrs.get("scheduledEventId")) or 0)
+                if kind == item:
+                    done, failed = (done + 1, failed) if ok else (done, failed + 1)
+                elif kind == pages and ok:
+                    fetched += 1
+                    where = (workflow_id, run_id, _int(event.get("eventId")) or 0)
+                    count = await self._page_items(where, attrs.get("result"))
+                    found = found + count if found is not None and count is not None else None
+        over = _completed(runs[-1][1])
+        if listed is not None:  # items=: the batch's own count
+            total, bound = listed, False
+        elif spec is not None and pages is not None and found is not None:
+            total, bound = found, not over  # pages=: at least what the pages fetched hold
+        else:
+            total, bound = counts.get(item or "", 0), not over
+        return {
+            "done": done,
+            "failed": failed,
+            "pages": fetched if pages is not None else None,
+            "total": max(total, done + failed),
+            "bound": bound,
+        }
+
+    async def _spec(
+        self, workflow_id: str, run_id: str | None, history: Mapping[str, Any]
+    ) -> tuple[str | None, str | None, int | None] | None:
+        """A batch's item activity, its ``pages=`` activity and ``items=``'s length, from the
+        spec its first run was started with (``kontra.contrib.parallel._Spec``); None when
+        that does not open with this machine's codec."""
+        key = (workflow_id, run_id, 0)
+        if key not in self._batch:
+            values = await _decode_inputs(self._codec(), _started_input(history))
+            spec = values[0] if values else None
+            found = None
+            if isinstance(spec, dict):
+                item, pages, listed = spec.get("activity"), spec.get("pages"), spec.get("items")
+                found = (
+                    item if isinstance(item, str) else None,
+                    pages if isinstance(pages, str) else None,
+                    len(listed) if isinstance(listed, list) else None,
+                )
+            _remember(self._batch, key, found)
+        return self._batch[key]
+
+    async def _page_items(self, key: tuple[str, str | None, int], result: object) -> int | None:
+        """How many items the page a ``pages=`` activity returned holds (None: it does not
+        open); only the count is kept."""
+        if key not in self._batch:
+            values = await _decode_inputs(self._codec(), result)
+            items = values[0].get("items") if values and isinstance(values[0], dict) else None
+            _remember(self._batch, key, len(items) if isinstance(items, list) else None)
+        return self._batch[key]
 
     @staticmethod
     def in_bucket(history: Mapping[str, Any]) -> bool:
@@ -308,8 +427,9 @@ class Reader:
         depth: int = 1,
         budget: _Budget | None = None,
         watched: list[tuple[str, str, int]] | None = None,
-    ) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
-        """Each subagent's child node (``handoffs``) and its view (``{"rows"}`` nested, or
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Each subagent's child node and the event that started it (``handoffs``: ``{"node",
+        "event_id"}``) and its view (``{"rows"}`` nested, or
         ``{"reason"}`` linking out), by the workflow id its ``subagent_started`` event names --
         whole and opaque, and only one the agent's own history says it started. Bounded:
         :data:`SUBAGENT_DEPTH` deep, :data:`SUBAGENT_HISTORIES` histories in all. An open
@@ -317,7 +437,7 @@ class Reader:
         budget = budget or _Budget(SUBAGENT_HISTORIES)
         started = started_children(agent.history)
         where = agent.workflow_id if agent.case == "a" else None
-        handoffs: dict[str, str] = {}
+        handoffs: dict[str, dict[str, Any]] = {}
         views: dict[str, dict[str, Any]] = {}
         for _offset, event in sorted(items, key=lambda it: it[0]):
             body = event.get(ae.EVENT)
@@ -332,7 +452,7 @@ class Reader:
             initiated, run_id = started[workflow_id]
             node = index.get((where, initiated)) if index is not None else None
             if node is not None:
-                handoffs[workflow_id] = node
+                handoffs[workflow_id] = {"node": node, "event_id": initiated}
             if depth > SUBAGENT_DEPTH:
                 views[workflow_id] = {"reason": f"nested deeper than {SUBAGENT_DEPTH} subagents"}
             elif budget.left <= 0:
@@ -417,6 +537,33 @@ def _decode_item(b64: str) -> object:
     payload = Payload()
     payload.ParseFromString(base64.b64decode(b64))
     return PayloadConverter.default.from_payloads([payload])[0]
+
+
+def _continued(history: Mapping[str, Any]) -> str | None:
+    """The run ``history`` continued as new into, by the id its own last event names."""
+    events = history.get("events") or []
+    attrs = events[-1].get("workflowExecutionContinuedAsNewEventAttributes") if events else None
+    run_id = attrs.get("newExecutionRunId") if isinstance(attrs, dict) else None
+    return run_id if isinstance(run_id, str) else None
+
+
+def _started_input(history: Mapping[str, Any]) -> object:
+    events = history.get("events") or []
+    attrs = events[0].get("workflowExecutionStartedEventAttributes") if events else None
+    return attrs.get("input") if isinstance(attrs, dict) else None
+
+
+def _run_of(history: Mapping[str, Any]) -> str | None:
+    """The run ``history`` is, as its own first event names it (only to key what is kept)."""
+    events = history.get("events") or []
+    attrs = events[0].get("workflowExecutionStartedEventAttributes") if events else None
+    run_id = attrs.get("originalExecutionRunId") if isinstance(attrs, dict) else None
+    return run_id if isinstance(run_id, str) else None
+
+
+def _completed(history: Mapping[str, Any]) -> bool:
+    events = history.get("events") or []
+    return bool(events) and str(events[-1].get("eventType")) == _CLOSED_OK
 
 
 def _scheduled(history: Mapping[str, Any]) -> list[tuple[int, str, object]]:

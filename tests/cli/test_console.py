@@ -566,6 +566,40 @@ async def test_a_batch_child_s_history_is_kept_once_it_closed(tmp_path: Path) ->
     assert list(console._children) == [child]
 
 
+async def test_a_session_the_renderer_cannot_take_is_an_empty_one_not_a_failed_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One item the renderer raises on must not take the run's graph (and its stream, and the
+    POST routes) down with it: the pane says ``undecodable`` and the log says why."""
+
+    build = console_module._session.build
+
+    def boom(items: Any, **kwargs: Any) -> Any:
+        if items:  # the empty session the pane falls back to still renders
+            raise OverflowError("cannot convert float infinity to integer")
+        return build(items, **kwargs)
+
+    async def items(*args: Any) -> list[tuple[int, dict[str, Any]]]:
+        return [(0, {"event": {"type": "turn_started"}, "turn_id": "t"})]
+
+    async def nothing(*args: Any, **kwargs: Any) -> Any:
+        return ({}, {}) if "watched" in kwargs else {}
+
+    console = Console(tmp_path, _codec)
+    monkeypatch.setattr(console._reader, "items", items)
+    for name in ("tool_links", "subagents", "input_types"):
+        monkeypatch.setattr(console._reader, name, nothing)
+    monkeypatch.setattr(console_module._session, "build", boom)
+    agent = console_module._agent.AgentRun("w", "r", "b", {"events": []})
+    desc: Any = type("Desc", (), {"task_queue": "q"})()
+    try:
+        session, shown = await console._session_of(Any, desc, agent, {}, [])  # type: ignore[arg-type]
+    finally:
+        console.close()
+    assert (session["empty"], session["reason"], shown) == (True, "undecodable", [])
+    assert "the session of w: OverflowError" in capsys.readouterr().err
+
+
 def test_a_quiet_stream_says_it_is_alive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Nothing changed for :data:`_KEEPALIVE` seconds: a comment line, so that a proxy or
     the browser does not drop the stream; a frame resets the count."""

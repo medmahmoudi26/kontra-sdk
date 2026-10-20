@@ -31,6 +31,7 @@ __all__ = [
     "AGENT_EVENT_TYPES",
     "AGENT_HANDLERS",
     "AGENT_INIT_DATA",
+    "AGENT_INTERFACE_QUERY",
     "APPROVAL_APPROVED",
     "APPROVAL_REASON",
     "APPROVAL_REMEMBER",
@@ -58,6 +59,8 @@ __all__ = [
     "EVENT_TYPE",
     "GENERIC_GLYPH",
     "HARNESS_PIN",
+    "INTERFACE_NAME",
+    "INTERFACE_PARAMETERS",
     "MESSAGE_ACCEPTED",
     "MESSAGE_HANDLER_END",
     "MESSAGE_HANDLER_ERROR",
@@ -120,6 +123,11 @@ REPLY_FIELDS = ("turn_number", "turn_id", "message_id", "disposition", "accepted
 CLOSE_SIGNAL = "close"
 #: The workflow-stream topic the agent publishes its events on.
 TURN_EVENTS_TOPIC = "turn_events"
+#: The query that answers the agent's handlers (``AcceptedFunction``s): each one's name and
+#: its input's JSON schema, whose ``title`` is the input type (the console's turn header).
+AGENT_INTERFACE_QUERY = "agent_interface"
+INTERFACE_NAME = "name"
+INTERFACE_PARAMETERS = "parameters"
 
 #: The update that answers a tool-approval request, and the fields of its arg
 #: (``ToolApprovalDecision``) and its reply (``ToolApprovalResult``).

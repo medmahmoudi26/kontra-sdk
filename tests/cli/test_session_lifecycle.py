@@ -278,6 +278,9 @@ async def test_a_hired_turn_is_read_from_its_agent_child_drawn_nested(
         "4 domains",
         "completed",
     )
+    # sweep(SweepRequest): the input's type, as the agent's own agent_interface query says it.
+    assert turn["input_type"] == "SweepRequest"
+    assert session["stream"] == "turn_events"
     assert _row(session, "turn.started")["summary"] == "input: 4 domains"
     assert _row(session, "model.response")["summary"] == "“plan first”"
 
@@ -299,6 +302,8 @@ async def test_a_hired_turn_is_read_from_its_agent_child_drawn_nested(
     handoff = _row(session, "handoff")
     assert handoff["node"] == inside["CertChecker"]["id"]
     assert handoff["workflow_id"] == inside["CertChecker"]["ref"]["workflow_id"]
+    assert handoff["event_id"] == inside["CertChecker"]["ref"]["event_id"]  # what started it
+    assert {c["node"] for c in handoff["children"]} == {handoff["node"]}  # they link there too
     nested = [(c["label"], c["summary"]) for c in handoff["children"]]
     assert ("tool.call", "fetch_cert \N{MULTIPLICATION SIGN}4") in nested
     assert nested[-1][0] == "response"

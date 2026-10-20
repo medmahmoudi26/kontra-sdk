@@ -567,7 +567,7 @@ class Console:
         painted = graph.merge(static, live) if static is not None else live
         painted["static_graph"] = static is not None
         painted["handler"] = static is None and await self._handler_run(client, desc)
-        _agent.batch_progress(painted, children)
+        await self._reader.batch_progress(client, painted, children, watched)
         subagents: list[tuple[str, str, int]] = []
         session, items = await self._session_of(client, desc, agent, index, subagents)
         hosts = {n["parent"] for n in live["nodes"] if isinstance(n.get("parent"), str)}
@@ -616,6 +616,20 @@ class Console:
         }
         if not agent.started:
             return _empty(meta, "no-events"), []
+        try:
+            return await self._rendered(client, agent, meta, index, watched)
+        except Exception as e:  # an item the renderer cannot take: the graph still answers
+            _log(f"the session of {agent.workflow_id}: {_said(e)}")
+            return _empty(meta, "undecodable"), []
+
+    async def _rendered(
+        self,
+        client: Client,
+        agent: _agent.AgentRun,
+        meta: dict[str, Any],
+        index: Mapping[graph.CommandAt, str],
+        watched: list[tuple[str, str, int]],
+    ) -> tuple[dict[str, Any], list[tuple[int, dict[str, Any]]]]:
         items = await self._reader.items(agent.workflow_id, agent.run_id, agent.history)
         if not items:
             polled = bool(_session.stream_poll_outcomes(agent.history))
@@ -629,8 +643,15 @@ class Console:
         handoffs, subagents = await self._reader.subagents(
             client, agent, items, index, watched=watched
         )
+        # The turn header's sweep(SweepRequest): the agent's own word for its input's type.
+        types = await self._reader.input_types(client, agent)
         session = _session.build(
-            items, agent=meta, nodes=nodes, handoffs=handoffs, subagents=subagents
+            items,
+            agent=meta,
+            nodes=nodes,
+            handoffs=handoffs,
+            subagents=subagents,
+            input_types=types,
         )
         handler = next((t["handler"] for t in session["turns"] if t["handler"]), None)
         if handler and meta["type"]:
@@ -807,7 +828,8 @@ def _stat(snap: _Snapshot, rev: int) -> dict[str, Any]:
 def _empty(agent: dict[str, Any], reason: str) -> dict[str, Any]:
     """A session with no rows, and why: ``no-agent`` (the run is no agent), ``no-events``
     (none yet), ``not-in-history`` (a run nobody polled: its events are in its in-memory log
-    alone), ``in-bucket`` (a job root's stream: its items are in the bucket, I39)."""
+    alone), ``in-bucket`` (a job root's stream: its items are in the bucket, I39),
+    ``undecodable`` (the renderer could not take what was read; the log says why)."""
     session = _session.build([], agent=agent)
     session.update(empty=True, reason=reason)
     return session
