@@ -8,12 +8,13 @@ the agent names no model, so it runs the one the worker's Agents SDK defaults to
 
 from datetime import timedelta
 
-from kontra import workflow
+from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from activities import lookup_pantry
     from agents import Agent, Runner  # OpenAI's Agents SDK: your dependency, allowed
     from models import CookInput, Dish
+    from temporalio.openai_agents.workflow import activity_as_tool
 
 INSTRUCTIONS = (
     "You are a chef. Look in the pantry (its shelves are fridge, dry and spices) before you "
@@ -29,11 +30,7 @@ class ChefFlow:
         chef = Agent(
             name="chef",
             instructions=INSTRUCTIONS,
-            tools=[
-                workflow.activity_as_tool(
-                    lookup_pantry, start_to_close_timeout=timedelta(seconds=30)
-                )
-            ],
+            tools=[activity_as_tool(lookup_pantry, start_to_close_timeout=timedelta(seconds=30))],
         )
         result = await Runner.run(chef, inp.craving, max_turns=8)
         return Dish(recipe=str(result.final_output))

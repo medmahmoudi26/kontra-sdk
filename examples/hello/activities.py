@@ -3,8 +3,7 @@
 real offering does its work here, and heartbeats as it would for Temporal."""
 
 from models import HelloOutput
-
-from kontra import activity
+from temporalio import activity
 
 
 @activity.defn

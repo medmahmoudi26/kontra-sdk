@@ -15,7 +15,10 @@ The job is the shapes `kontra graph` draws (the README has the graph):
 import asyncio
 from datetime import timedelta
 
-from kontra import RetryPolicy, workflow
+from temporalio import workflow
+from temporalio.common import RetryPolicy
+
+from kontra.contrib.parallel import execute_activities_in_parallel
 
 with workflow.unsafe.imports_passed_through():
     from activities import (
@@ -74,7 +77,7 @@ class SweepFlow:
         )
 
         # One activity per URL, each retried on its own: a child workflow, kontra.batch.v1.
-        found = await workflow.execute_activities_in_parallel(
+        found = await execute_activities_in_parallel(
             check_headers,
             items=p.urls,
             reduce=tally,

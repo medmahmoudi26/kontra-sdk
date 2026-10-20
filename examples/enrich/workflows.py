@@ -4,7 +4,8 @@ the job touches, `Artifact`, comes from models.py as the activity's return value
 
 from datetime import timedelta
 
-from kontra import RetryPolicy, workflow
+from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from activities import URL_DEADLINE_SECONDS, fetch_batch, write_records

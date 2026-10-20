@@ -5,7 +5,8 @@ kontra façade is imported (D1), which is Temporal's own objects: with
 
 from datetime import timedelta
 
-from kontra import RetryPolicy, workflow
+from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from activities import head_batch

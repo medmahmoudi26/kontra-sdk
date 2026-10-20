@@ -5,7 +5,8 @@ binary's own session. Temporal through the kontra façade (D1); nothing here kno
 
 from datetime import timedelta
 
-from kontra import RetryPolicy, workflow
+from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from activities import cook

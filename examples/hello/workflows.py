@@ -4,7 +4,8 @@ it with the id `job-<job id>` when a buyer hires the offering."""
 
 from datetime import timedelta
 
-from kontra import RetryPolicy, workflow
+from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from activities import greet

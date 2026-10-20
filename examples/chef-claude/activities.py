@@ -30,8 +30,8 @@ from pathlib import Path
 from typing import Any
 
 from models import CookInput, Dish
-
-from kontra import ApplicationError, activity
+from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 #: What the binary may use, and is allowed to without asking.
 TOOLS = "WebSearch"

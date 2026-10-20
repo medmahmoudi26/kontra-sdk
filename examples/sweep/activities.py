@@ -56,8 +56,7 @@ from models import (
     SweepInput,
     SweepSummary,
 )
-
-from kontra import activity
+from temporalio import activity
 
 T = TypeVar("T")
 

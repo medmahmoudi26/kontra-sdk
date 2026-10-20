@@ -36,8 +36,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from models import Artifact, Batch, Record
-
-from kontra import activity
+from temporalio import activity
 
 #: The title is found in two linear searches. The one-regex way,
 #: `<title[^>]*>(.*?)</title>`, backtracks: on 200 kB of `<title>` repeated it spends over a

@@ -8,9 +8,11 @@ from datetime import timedelta
 from workflows import SweepFlow
 
 from kontra import serve
+from kontra.contrib.parallel import ParallelPlugin
 
 serve(
     SweepFlow,
+    plugins=[ParallelPlugin()],
     max_concurrent_activities=50,  # a batch keeps 50 URLs in flight
     graceful_shutdown_timeout=timedelta(seconds=60),
 )

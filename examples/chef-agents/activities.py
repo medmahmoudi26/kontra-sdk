@@ -3,7 +3,7 @@ workflows.py): its name, docstring and argument become the tool's, and every cal
 activity -- retried, recorded, and run on this worker. Temporal through the kontra façade
 (D1). A real offering reads its stock here."""
 
-from kontra import activity
+from temporalio import activity
 
 PANTRY: dict[str, list[str]] = {
     "fridge": ["eggs", "butter", "parmesan", "lemons"],

@@ -11,8 +11,14 @@ model's name is the SDK's `OPENAI_DEFAULT_MODEL`, from this worker's environment
 import os
 from datetime import timedelta
 
-from agents import set_default_openai_api, set_default_openai_client, set_tracing_disabled
+from agents import (
+    OpenAIProvider,
+    set_default_openai_api,
+    set_default_openai_client,
+    set_tracing_disabled,
+)
 from openai import AsyncOpenAI
+from temporalio.openai_agents import ModelActivityParameters, OpenAIAgentsPlugin
 from workflows import ChefFlow
 
 from kontra import serve
@@ -28,4 +34,13 @@ set_default_openai_client(
 set_default_openai_api("chat_completions")  # what OpenAI-compatible servers speak
 set_tracing_disabled(True)  # the SDK's traces would go to api.openai.com
 
-serve(ChefFlow, max_concurrent_activities=10, graceful_shutdown_timeout=timedelta(seconds=30))
+serve(
+    ChefFlow,
+    max_concurrent_activities=10,
+    graceful_shutdown_timeout=timedelta(seconds=30),
+    # model_provider=OpenAIProvider(): the model activity then dials the default client set
+    # above; the plugin's own default builds AsyncOpenAI() from the environment instead.
+    plugins=[
+        OpenAIAgentsPlugin(model_params=ModelActivityParameters(), model_provider=OpenAIProvider())
+    ],
+)
