@@ -23,7 +23,11 @@ model whose two schemas differ is two definitions, ``ReportInput`` and ``ReportO
   used, its use site's constraints *conjoined* with its own, never overriding them
   (:func:`inline_non_object_defs`);
 * what nexgen cannot lower identically in four languages (other unions, tuples, untyped
-  ``dict``/``Any``, unsupported formats) is refused with a fix-it naming the field.
+  ``dict``/``Any``, unsupported formats) is refused with a fix-it naming the field, and so
+  is what pydantic's own schema does not describe: a ``Field`` constraint pydantic applies
+  to an instance (a model, a ``RootModel``, a plain ``Enum``, null), which refuses every
+  value; an output serializer with no return annotation; an output ``timedelta`` written as
+  an ISO duration (``"PT1.5S"``), which ``format: duration`` refuses.
 
 Schema-first: a hand-written Nexus document is validated, gains the reserved definitions
 it lacks and the ``x-kontra`` facts, and is otherwise emitted unchanged.
@@ -82,15 +86,141 @@ _ARTIFACT = "KontraArtifact"
 #: (pydantic writes ``Report-Input``, and a contract's definition names are identifiers).
 _MODE_SUFFIX = {"validation": "Input", "serialization": "Output"}
 
+#: Where the generator leaves what derivation must refuse, for :func:`lower_schema` to refuse
+#: at the field's path (the generator knows the type, not where it is used). Never published:
+#: lowering refuses every node that has it, and the catalog refuses the keyword.
+_REFUSED = "x-kontra-refused"
+
+#: pydantic's own constraint checks (``Field(max_length=...)`` where the type has no native
+#: constraint of that name: pydantic wraps the type in an after-validator applying one).
+_CHECKS_MODULE = "pydantic._internal._validators"
+_LENGTH_CHECKS = frozenset(
+    {"min_length_validator", "max_length_validator", "pattern_str_validator"}
+)
+_NUMBER_CHECKS = frozenset(
+    {
+        "greater_than_validator",
+        "greater_than_or_equal_validator",
+        "less_than_validator",
+        "less_than_or_equal_validator",
+        "multiple_of_validator",
+    }
+)
+
+
+def _instance_check(check: Any, target: Mapping[str, Any]) -> str | None:
+    """Why pydantic's constraint ``check`` (a ``functools.partial`` of one of its own
+    validators) refuses every value of the type ``target`` describes, or None when it
+    applies. pydantic applies such a check to the validated *instance*: the ``Code`` of a
+    ``RootModel``, a model, a plain ``Enum`` member -- which it cannot measure or compare --
+    while the JSON Schema it writes puts the constraint beside the type's ``$ref``, where it
+    reads as a bound on the value (decisions I38)."""
+    func = getattr(check, "func", None)
+    if getattr(func, "__module__", None) != _CHECKS_MODULE:
+        return None
+    name = str(getattr(func, "__name__", ""))
+    keywords = cast(dict[str, Any], getattr(check, "keywords", {}))
+    said = ", ".join(f"{k}={v!r}" for k, v in keywords.items())
+    kind, cls = target.get("type"), target.get("cls")
+    title = getattr(cls, "__name__", "the type")
+    if kind in ("model", "dataclass"):
+        fix = (
+            f"put the constraint inside {title}'s own type "
+            f"(class {title}(RootModel[Annotated[..., Field({said})]]))"
+            if target.get("root_model")
+            else f"constrain {title}'s fields instead"
+        )
+    elif kind == "enum":
+        sub = target.get("sub_type")
+        if (sub == "str" and name in _LENGTH_CHECKS) or (
+            sub in ("int", "float") and name in _NUMBER_CHECKS
+        ):
+            return None  # a str/int Enum's member is that str or int, which it measures
+        fix = f"use a Literal of the values it allows, or make {title} a str or int Enum"
+    elif kind == "nullable":  # an Optional type alias: the check is applied to None too
+        return (
+            f"Field({said}) applies to null as well as to a value, and pydantic cannot "
+            "measure null, so the model refuses it while the contract would accept it; put "
+            f"the constraint on the type inside the Optional, Annotated[T, Field({said})] | None"
+        )
+    else:
+        return None
+    return (
+        f"Field({said}) applies to the {title} instance itself, which pydantic cannot "
+        "measure, so the model refuses every value (a TypeError inside pydantic) where the "
+        f"contract would accept some; {fix}"
+    )
+
 
 class _Generator(GenerateJsonSchema):
     """pydantic's generator, minus the noise and with the reserved names pinned. In
     serialization mode (an output) every field the reply always carries is required and
     no default is written: a default says what an *absent* member means, and an output's
-    member is never absent."""
+    member is never absent. What it cannot describe soundly it marks (:data:`_REFUSED`)
+    for lowering to refuse where it is used: a constraint pydantic checks against an
+    instance, a serializer with no return type, a timedelta written as an ISO duration."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        #: Every core definition seen, by ref: a ``definition-ref``'s target.
+        self._core_defs: dict[str, Mapping[str, Any]] = {}
+        #: Per definition: pydantic's own name choices, and the full list in priority
+        #: order, each marked whether it is Kontra's spelling (see :meth:`get_defs_ref`).
+        self._own_names: dict[DefsRef, list[DefsRef]] = {}
+        self._name_choices: dict[DefsRef, list[tuple[DefsRef, bool]]] = {}
 
     def field_title_should_be_set(self, schema: Any) -> bool:
         return False
+
+    def definitions_schema(self, schema: core_schema.DefinitionsSchema) -> JsonSchemaValue:
+        for definition in schema["definitions"]:
+            ref = definition.get("ref")
+            if isinstance(ref, str):
+                self._core_defs[ref] = cast(Mapping[str, Any], definition)
+        return super().definitions_schema(schema)
+
+    def function_after_schema(
+        self, schema: core_schema.AfterValidatorFunctionSchema
+    ) -> JsonSchemaValue:
+        js = super().function_after_schema(schema)
+        target: Mapping[str, Any] = cast(Mapping[str, Any], schema["schema"])
+        if target.get("type") == "definition-ref":
+            target = self._core_defs.get(str(target.get("schema_ref")), target)
+        why = _instance_check(cast(Mapping[str, Any], schema["function"]).get("function"), target)
+        return js if why is None else {**js, _REFUSED: why}
+
+    def ser_schema(
+        self,
+        schema: core_schema.SerSchema
+        | core_schema.IncExSeqSerSchema
+        | core_schema.IncExDictSerSchema,
+    ) -> JsonSchemaValue | None:
+        # pydantic falls back to the validated type when a serializer function has no return
+        # annotation; what it writes is then unknown, and the contract would guess.
+        if schema["type"] in ("function-plain", "function-wrap") and (
+            schema.get("return_schema") is None
+        ):
+            return {
+                _REFUSED: "is written by a serializer with no return annotation, so the contract "
+                "cannot say what the buyer receives; annotate its return type "
+                "(def _at(self, value) -> int, PlainSerializer(..., return_type=int), or "
+                "-> dict[str, int] on a @model_serializer)"
+            }
+        return super().ser_schema(schema)
+
+    def timedelta_schema(self, schema: core_schema.TimedeltaSchema) -> JsonSchemaValue:
+        js = super().timedelta_schema(schema)
+        if self.mode == "serialization" and js.get("format") == "duration":
+            # pydantic writes an ISO 8601 duration ("PT1.5S", "P2D", "-PT1S"); format:
+            # duration is nexgen's whole-second, time-only "PT…H…M…S", which those break.
+            return {
+                **js,
+                _REFUSED: "is a timedelta, which pydantic writes as an ISO 8601 duration that "
+                "format: duration refuses whenever it has a fraction of a second, a day or a "
+                "sign ('PT1.5S', 'P2D', '-PT1S'); write it as seconds: model_config = "
+                "ConfigDict(ser_json_timedelta='float'), or a float field",
+            }
+        return js
 
     def field_is_required(
         self,
@@ -131,21 +261,48 @@ class _Generator(GenerateJsonSchema):
 
     def get_defs_ref(self, core_mode_ref: CoreModeRef) -> DefsRef:
         """pydantic's choices of a name, most readable first, with Kontra's spelling of a
-        mode (pydantic falls back to it only where one model's two modes differ) and the
-        reserved ``KontraArtifact`` pinned. Construction only: nothing reads a name back."""
+        mode and the reserved ``KontraArtifact`` pinned. Construction only: nothing reads a
+        name back.
+
+        pydantic takes, for each definition, the first choice no other definition wants
+        (with another schema), and falls back to the mode it was generated in only where
+        one model's two modes differ: ``Report``, ``Report-Input``, ``mod__Report``,
+        ``mod__Report-Input``, ``mod__Report__1``, ``mod__Report-Input__1``. Kontra spells
+        each mode choice as an identifier (``ReportInput``), so a seller's own class can
+        now want the same string (a ``ReportInput`` of theirs) -- and a choice two
+        definitions want is neither's. So a Kontra spelling another definition owns as one
+        of pydantic's choices is never offered: the seller's class keeps its name. Last
+        before pydantic's ``-`` name (which the catalog refuses) is
+        ``mod__Report__1_Input``: no ordinary class or module name produces it, since its
+        last segment starts with a digit."""
         ref = super().get_defs_ref(core_mode_ref)
         core_ref, mode = core_mode_ref
         if core_ref.startswith(_ARTIFACT_REF_PREFIX) and core_ref.endswith(f":{id(Artifact)}"):
-            self._prioritized_defsref_choices[ref] = [DefsRef(_ARTIFACT), ref]
-            return ref
-        suffix = _MODE_SUFFIX[mode]
-        choices = self._prioritized_defsref_choices[ref]
-        # pydantic's own (``-Output``) stays last: it never collides, so a choice always exists
-        self._prioritized_defsref_choices[ref] = [
-            *(DefsRef(c.replace(f"-{suffix}", suffix)) for c in choices),
-            ref,
-        ]
+            pinned = DefsRef(_ARTIFACT)
+            self._own_names[ref] = [pinned]
+            self._name_choices[ref] = [(pinned, False)]
+        else:
+            suffix = _MODE_SUFFIX[mode]
+            own = [c for c in self._prioritized_defsref_choices[ref] if "-" not in c]
+            self._own_names[ref] = own
+            self._name_choices[ref] = [
+                (DefsRef(c.replace(f"-{suffix}", suffix)), "-" in c)
+                for c in self._prioritized_defsref_choices[ref]
+            ] + [(DefsRef(f"{c}_{suffix}"), True) for c in own[-1:]]
+        self._settle_names()
         return ref
+
+    def _settle_names(self) -> None:
+        """Every definition's choices, without the Kontra spellings another one owns
+        (:meth:`get_defs_ref`): pydantic reads them only once every name is known."""
+        owners: dict[DefsRef, set[DefsRef]] = {}
+        for ref, own in self._own_names.items():
+            for name in own:
+                owners.setdefault(name, set()).add(ref)
+        for ref, choices in self._name_choices.items():
+            self._prioritized_defsref_choices[ref] = [
+                name for name, ours in choices if not (ours and owners.get(name, set()) - {ref})
+            ] + [ref]
 
 
 # --------------------------------------------------------------------------- lowering
@@ -161,11 +318,14 @@ def lower_schema(node: Any, path: str) -> Any:
     if not isinstance(node, dict):
         return node
     src = cast(dict[str, Any], node)
+    refused = src.get(_REFUSED)
+    if isinstance(refused, str):
+        raise ContractError(path, refused)
     if not src:
         raise ContractError(
             path,
-            "accepts anything (Any, a bare list/dict, or a serializer with no return "
-            "annotation); give it a type, e.g. list[str] or dict[str, int]",
+            "accepts anything (Any, a bare list/dict, or a serializer returning Any); give it "
+            "a type, e.g. list[str] or dict[str, int]",
         )
     out: dict[str, Any] = {}
     for key, value in src.items():
@@ -333,12 +493,56 @@ def _conjoin(key: str, defined: Any, used: Any, *, name: str, path: str) -> Any:
     )
 
 
+#: Pairs of bounds that two sides may each write one of: the lower must not pass the upper.
+_COUNT_BOUNDS = (
+    ("minLength", "maxLength", "string"),
+    ("minItems", "maxItems", "array"),
+    ("minContains", "maxContains", "array"),  # with a ``contains``; without one, vacuous
+)
+
+
+def _empty_range(merged: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Two bounds of ``merged`` that no value of its type meets, as their keywords, or
+    None. A bound constrains one JSON type and passes every other value, so an inverted
+    pair is unsatisfiable only where ``type`` says the value is of that type. (A written-out
+    definition is never an object: ``minProperties``/``maxProperties`` cannot invert here.)"""
+    kind = merged.get("type")
+    for low, high, of in _COUNT_BOUNDS:
+        lo, hi = merged.get(low), merged.get(high)
+        if kind != of or not (_is_number(lo) and _is_number(hi)):
+            continue
+        if low == "minContains" and "contains" not in merged:
+            continue
+        if cast(float, lo) > cast(float, hi):
+            return low, high
+    if kind not in ("number", "integer"):
+        return None
+    for low in ("minimum", "exclusiveMinimum"):
+        for high in ("maximum", "exclusiveMaximum"):
+            lo, hi = merged.get(low), merged.get(high)
+            if not (_is_number(lo) and _is_number(hi)):
+                continue
+            lo, hi = cast(float, lo), cast(float, hi)
+            if kind == "integer":  # the integers each allows, inclusive
+                lo = math.floor(lo) + 1 if low == "exclusiveMinimum" else math.ceil(lo)
+                hi = math.ceil(hi) - 1 if high == "exclusiveMaximum" else math.floor(hi)
+                empty = lo > hi
+            else:
+                exclusive = low == "exclusiveMinimum" or high == "exclusiveMaximum"
+                empty = lo > hi or (lo == hi and exclusive)
+            if empty:
+                return low, high
+    return None
+
+
 def _write_out(
     name: str, use: Mapping[str, Any], body: Mapping[str, Any], path: str
 ) -> dict[str, Any]:
     """The definition ``name`` written out at a use site (``use``, its ``$ref`` and
     siblings): the use site's annotations replace the definition's, every other keyword
-    both write is conjoined (:func:`_conjoin`), and the rest of each is kept."""
+    both write is conjoined (:func:`_conjoin`), and the rest of each is kept. Bounds on
+    two keywords that no value meets together (the type's ``minLength`` 5, the field's
+    ``maxLength`` 3) are refused like two that share one."""
     merged = {k: copy.deepcopy(v) for k, v in body.items() if k != "title"}
     for key, value in use.items():
         if key == "$ref":
@@ -347,6 +551,19 @@ def _write_out(
             merged[key] = value
         else:
             merged[key] = _conjoin(key, merged[key], value, name=name, path=path)
+    empty = _empty_range(merged)
+    if empty is not None:
+
+        def said(key: str) -> str:
+            who = "this field" if key in use and _same(use[key], merged[key]) else name
+            return f"{who} says {key} {merged[key]!r}"
+
+        low, high = empty
+        raise ContractError(
+            path,
+            f"no value satisfies both: {said(low)} and {said(high)}, and a $ref and its "
+            "siblings both hold. Fix one of the two",
+        )
     return merged
 
 
@@ -386,11 +603,27 @@ def inline_non_object_defs(defs: Mapping[str, Any]) -> dict[str, Any]:
     ``enum`` values, ``integer`` within ``number``, the least common ``multipleOf`` -- and
     one that cannot be written as one value (two different patterns, an empty ``enum``
     intersection) is refused, naming the field and both values, rather than published
-    looser than the seller's model validates."""
-    inline = {n: cast(dict[str, Any], b) for n, b in defs.items() if not _is_named_type(b)}
+    looser than the seller's model validates. A documented alias of one of these (a
+    ``RootModel[Color]`` with a docstring, ``{$ref: Color, description}``) is one too, and
+    so is an alias of that: once written out, its body is no longer an alias."""
+    inline = {n for n, b in defs.items() if not _is_named_type(b)}
+    while more := {n for n, b in defs.items() if n not in inline and _alias_of(b) in inline}:
+        inline |= more
+    bodies = {n: cast(dict[str, Any], defs[n]) for n in inline}
     return {
-        n: _substitute(b, inline, join_path("$defs", n)) for n, b in defs.items() if n not in inline
+        n: _substitute(b, bodies, join_path("$defs", n)) for n, b in defs.items() if n not in inline
     }
+
+
+def _alias_of(body: Any) -> str | None:
+    """The definition a bare ``$ref`` alias (:func:`_is_named_type`) names, or None."""
+    if not isinstance(body, Mapping) or "type" in body or "oneOf" in body:
+        return None
+    alias = cast(Mapping[str, Any], body)
+    ref = alias.get("$ref")
+    if not _is_named_type(alias) or not isinstance(ref, str) or not ref.startswith("#/$defs/"):
+        return None
+    return ref.removeprefix("#/$defs/")
 
 
 # --------------------------------------------------------------------------- derive

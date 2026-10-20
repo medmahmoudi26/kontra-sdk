@@ -10,12 +10,20 @@ by_alias=True)``, validate against the published contract, and read back through
 from __future__ import annotations
 
 import json
-import re
+from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    WrapSerializer,
+    field_serializer,
+    model_serializer,
+)
 from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.exceptions import ApplicationError
 
@@ -44,6 +52,7 @@ from .zoo import (
     Serialized,
     SplitAlias,
     Tagged,
+    Times,
 )
 
 MARKER = "kontra-serialized-marker-7c2e"
@@ -161,15 +170,74 @@ class DefaultsOutput(BaseModel):
 
 
 def test_a_seller_name_never_collides_with_a_split(enrich_spec: OfferingSpec) -> None:
-    """pydantic picks the first name only one schema wants, so ``Defaults``'s output and a
-    seller's own ``DefaultsOutput`` both fall back to longer, distinct names; the document
-    is still one the catalog accepts."""
+    """A seller's own ``DefaultsOutput`` keeps its name; ``Defaults``'s output, which would
+    have taken it, falls back to its module-qualified spelling. The document is one the
+    catalog accepts."""
     doc = derive(enrich_spec, DefaultsOutput, Defaults)
     info = validate_document(doc)
     names = sorted(_defs(doc))
-    assert len(names) == 3
-    assert all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,99}", n) for n in names), names
-    assert info.output_type != info.input_type
+    qualified = f"{_module(Defaults)}__DefaultsOutput"  # pydantic's module-qualified choice
+    assert names == ["DefaultsInput", "DefaultsOutput", qualified]
+    assert doc["$defs"]["DefaultsOutput"]["properties"]["d"] == {"$ref": "#/$defs/DefaultsInput"}
+    assert info.output_type == qualified
+
+
+def _module(model: type[BaseModel]) -> str:
+    """The module part of pydantic's qualified definition names (``tests.contract.zoo``
+    as ``tests__contract__zoo``; how pytest imported it decides the dots)."""
+    return model.__module__.replace(".", "__")
+
+
+class Report(BaseModel):
+    """A seller's nested model with a default, so its two modes differ."""
+
+    n: int = 0
+
+
+class ReportInput(BaseModel):
+    """The common naming: ``XInput`` and ``XOutput`` around a shared ``X``, in one module."""
+
+    report: Report
+
+
+class ReportOutput(BaseModel):
+    report: Report
+    note: str
+
+
+class Job(BaseModel):
+    report: Report
+
+
+def test_a_sellers_x_input_and_x_output_keep_their_names(enrich_spec: OfferingSpec) -> None:
+    """``ReportInput`` and ``ReportOutput`` are the seller's; ``Report``'s two modes would
+    have wanted the same spellings, in the same module, so neither offers them and each takes
+    the name no class produces (``...__Report__1_Input``): valid, distinct, deterministic.
+    Before, every readable choice was wanted twice, and the split fell back to pydantic's
+    ``Report-Input``, which the catalog refuses."""
+    doc = derive(enrich_spec, ReportInput, ReportOutput)
+    split = f"{_module(Report)}__Report__1"
+    assert sorted(_defs(doc)) == [
+        "ReportInput",
+        "ReportOutput",
+        f"{split}_Input",
+        f"{split}_Output",
+    ]
+    assert doc["$defs"]["ReportInput"]["properties"]["report"] == {"$ref": f"#/$defs/{split}_Input"}
+    assert doc["$defs"]["ReportOutput"]["properties"]["report"] == {
+        "$ref": f"#/$defs/{split}_Output"
+    }
+    validate_document(doc)
+    assert derive(enrich_spec, ReportInput, ReportOutput) == doc  # deterministic
+    # the split's output spelling is no class's here: the split takes it
+    assert sorted(_defs(derive(enrich_spec, Job, ReportInput))) == [
+        "Job",
+        "ReportInput",
+        "ReportOutput",
+        f"{split}_Input",
+    ]
+    one_side = derive(enrich_spec, ReportInput, Plain)
+    assert sorted(_defs(one_side)) == ["Plain", "Report", "ReportInput"]
 
 
 class Money(BaseModel):
@@ -183,6 +251,89 @@ def test_a_decimal_output_is_the_string_it_is_written_as(enrich_spec: OfferingSp
     assert doc["$defs"]["Money"]["properties"]["amount"] == {"type": "string"}
     with pytest.raises(ContractError, match="Decimal"):
         derive(enrich_spec, Money, Plain)
+
+
+class NoAnnotation(BaseModel):
+    at: datetime
+
+    @field_serializer("at")
+    def _at(self, v):  # no return annotation: what pydantic falls back from
+        return int(v.timestamp())
+
+
+class PlainNoReturn(BaseModel):
+    at: Annotated[datetime, PlainSerializer(lambda v: int(v.timestamp()))]
+
+
+class WrapNoReturn(BaseModel):
+    at: Annotated[datetime, WrapSerializer(lambda v, nxt: nxt(v))]
+
+
+class ModelNoAnnotation(BaseModel):
+    a: int
+
+    @model_serializer
+    def _ser(self):  # no return annotation
+        return {"A": self.a}
+
+
+class ReturnsAny(BaseModel):
+    at: datetime
+
+    @field_serializer("at")
+    def _at(self, v: datetime) -> Any:
+        return int(v.timestamp())
+
+
+@pytest.mark.parametrize(
+    ("model", "path"),
+    [
+        (NoAnnotation, "$defs.NoAnnotation.properties.at"),
+        (PlainNoReturn, "$defs.PlainNoReturn.properties.at"),
+        (WrapNoReturn, "$defs.WrapNoReturn.properties.at"),
+        (ModelNoAnnotation, "$defs.ModelNoAnnotation"),
+    ],
+)
+def test_a_serializer_with_no_return_annotation_is_refused(
+    enrich_spec: OfferingSpec, model: type[BaseModel], path: str
+) -> None:
+    """pydantic falls back to the field's validated type for its schema (``date-time``)
+    while the serializer writes something else (an integer, other keys): every delivery
+    would break the published output. Refused at the field, naming the fix; its input is
+    the validated type and still derives."""
+    with pytest.raises(ContractError) as refused:
+        derive(enrich_spec, Plain, model)
+    assert refused.value.path == path
+    assert "serializer with no return annotation" in refused.value.message
+    assert "annotate its return type" in refused.value.message
+    derive(enrich_spec, model, Plain)
+    with pytest.raises(ContractError, match=r"a serializer returning Any"):
+        derive(enrich_spec, Plain, ReturnsAny)
+
+
+class Took(BaseModel):
+    took: timedelta
+
+
+def test_a_timedelta_output_written_as_an_iso_duration_is_refused(
+    enrich_spec: OfferingSpec,
+) -> None:
+    """pydantic writes ``timedelta(seconds=1.5)`` as ``"PT1.5S"``, a day as ``"P1D"``:
+    ``format: duration`` (nexgen's whole-second, time-only grammar, and the contract's)
+    refuses both, so the output is refused, pointing at seconds; as seconds
+    (``ser_json_timedelta="float"``, the zoo's ``Times``) it is a number. The input stays
+    ``format: duration``."""
+    with pytest.raises(ContractError) as refused:
+        derive(enrich_spec, Plain, Took)
+    assert refused.value.path == "$defs.Took.properties.took"
+    assert "ser_json_timedelta='float'" in refused.value.message
+    for took in (timedelta(seconds=1.5), timedelta(days=2), timedelta(seconds=-1)):
+        written = Took(took=took).model_dump(mode="json")["took"]
+        assert written in ("PT1.5S", "P2D", "-PT1S")
+    inp = derive(enrich_spec, Took, Plain)["$defs"]["Took"]["properties"]["took"]
+    assert inp == {"type": "string", "format": "duration"}
+    out = _defs(derive(enrich_spec, Times))["TimesOutput"]["properties"]
+    assert out["took"] == out["half"] == {"type": "number"}
 
 
 # --------------------------------------------------------------------------- re-keying
