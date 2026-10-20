@@ -1,4 +1,4 @@
-"""Temporal activities through the kontra façade (D1): `activity` is Temporal's. Progress is
+"""Plain Temporal activities: `activity` is `temporalio`'s. Progress is
 the heartbeat you would write for Temporal anyway, and the file upload goes through the
 `Artifact` type that lives in models.py.
 
@@ -36,8 +36,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from models import Artifact, Batch, Record
-
-from kontra import activity
+from temporalio import activity
 
 #: The title is found in two linear searches. The one-regex way,
 #: `<title[^>]*>(.*?)</title>`, backtracks: on 200 kB of `<title>` repeated it spends over a

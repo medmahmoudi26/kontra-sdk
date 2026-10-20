@@ -1,13 +1,18 @@
-"""The batch tests' activities and reducers, through the façade as a seller writes them.
-Module-level, as ``execute_activities_in_parallel`` requires; importable in the sandbox."""
+"""The batch tests' activities and reducers, in vanilla temporalio as a seller writes them.
+Module-level, as ``execute_activities_in_parallel`` requires; importable in the sandbox. One
+pager returns the helper's :class:`Page`, another a model of the seller's own (``Words``):
+a page is anything with a list ``items`` and a ``next``."""
 
 from __future__ import annotations
 
 import asyncio
 
-from kontra import ApplicationError, Page, activity
+from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
-from .models import Hit, Tally
+from kontra.contrib.parallel import Page
+
+from .models import Hit, Tally, Words
 
 #: Items per page of the paged sources.
 PAGE = 7
@@ -35,15 +40,16 @@ async def offsets(cursor: int | None) -> Page[int]:
 
 
 @activity.defn
-async def tokens(cursor: str | None) -> Page[str]:
-    """Token paging: three pages of words; the second one empty, as some APIs return."""
+async def tokens(cursor: str | None) -> Words:
+    """Token paging: three pages of words; the second one empty, as some APIs return. The
+    page is the seller's own model, not the helper's ``Page``."""
     pages = {
         None: (["alpha", "beta"], "t1"),
         "t1": ([], "t2"),
         "t2": (["gamma"], None),
     }
     words, nxt = pages[cursor]
-    return Page(items=words, next=nxt)
+    return Words(items=words, next=nxt)
 
 
 @activity.defn

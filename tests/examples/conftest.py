@@ -4,8 +4,9 @@ serves the example sellers -- ``examples/enrich``, ``examples/legacy-actor``,
 ``examples/hello`` and ``examples/sweep``, each its own ``python worker.py`` process; the
 chefs are started by their own tests -- next to local web sites for them to fetch.
 
-Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once into the temp
-directory; with neither the binary nor the network, these tests are skipped."""
+Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once and
+checksum-verified (``kontra.devgate.temporal_cli``); with neither the binary nor the network,
+these tests are skipped."""
 
 from __future__ import annotations
 
@@ -74,7 +75,7 @@ async def market(
     dev_server: DevServer, sites: Sites, tmp_path_factory: pytest.TempPathFactory
 ) -> AsyncIterator[Market]:
     # Every heartbeat reaches the buyer (the gate's per-job rate is the real gate's concern).
-    async with Marketplace(dev_server=dev_server, progress_rate_per_s=10_000) as mp:
+    async with Marketplace(dev_server=dev_server) as mp:
         acme = await mp.party("acme")
         logs = tmp_path_factory.mktemp("sellers")
         env = seller_env(acme.home, sites)

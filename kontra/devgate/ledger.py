@@ -1,7 +1,9 @@
 """An in-memory :class:`~kontra.ledger.Ledger`: the reference adapter of seam ④.
 
-``kontra.testing.fake_ledger()`` returns one. The fake gate runs on it, and it is the first
-adapter proven against :mod:`kontra.testing.ledger_contract`. The Postgres adapter is this
+``kontra.testing.fake_ledger()`` returns one (``kontra.testing.ledger`` re-exports it). The dev
+gate runs on it -- so it lives here, beside the gate, and ``kontra dev`` never imports the
+testing package (decisions I34, OD2) -- and it is the first adapter proven against
+:mod:`kontra.testing.ledger_contract`. The Postgres adapter is this
 file with rows instead of dicts: same events, same legs, same refusals in the same order.
 
 Accounting (decisions I9): every call that changes anything records one *event*, a set of
@@ -45,7 +47,7 @@ Choices the PRD leaves open, made here and enforced on every adapter by the suit
   ``CurrencyMismatch``), then ``UnknownHold``, then the repeat rule, then
   ``IllegalTransition``, then ``InvalidSplit``, then ``InsufficientFunds``.
 * **Amounts fit §9.1's ``bigint``.** A lock, deposit or withdrawal above
-  :data:`~kontra.testing.ledger_contract.MAX_MINOR` is ``InvalidAmount``: the price is the
+  :data:`~kontra.ledger.MAX_MINOR` is ``InvalidAmount``: the price is the
   seller's to choose, and the Postgres adapter could not store it.
 * **Currencies.** Balances are per (party, currency) and never mix. A ledger settles a set
   of currencies (default: all of :data:`~kontra.ledger.CURRENCIES`); a call in any other
@@ -66,6 +68,7 @@ from datetime import UTC, datetime
 
 from kontra.ledger import (
     CURRENCIES,
+    MAX_MINOR,
     PLATFORM_PARTY,
     WORLD_PARTY,
     Account,
@@ -89,7 +92,6 @@ from kontra.ledger import (
     fee_for,
     next_state,
 )
-from kontra.testing.ledger_contract import MAX_MINOR
 
 __all__ = ["InMemoryLedger"]
 

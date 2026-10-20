@@ -73,9 +73,19 @@ def test_the_wheel_has_what_kontra_dev_and_the_contract_read(dist: Path) -> None
         "kontra/_spec/x-kontra.v2.json",
         "kontra/_spec/x-kontra.v1.json",  # read-only, for the jobs hired under it
         "kontra/_spec/kontra-types.v1.json",
+        "kontra/_spec/offering-streams.v1.json",
         "kontra/templates/offering/worker.py.tmpl",
         "kontra/cli/_console.html",  # kontra dev's graph page, which the codec server serves
-        "kontra/testing/fake_gate.py",
+        # The dev gate (decisions I34, OD2): the implementation and its re-export under the old name.
+        "kontra/devgate/__init__.py",
+        "kontra/devgate/gate.py",
+        "kontra/devgate/__main__.py",
+        "kontra/devgate/stack.py",
+        "kontra/devgate/state.py",
+        "kontra/devgate/store.py",
+        "kontra/devgate/temporal.py",
+        "kontra/devgate/temporal_cli.py",
+        "kontra/testing/fake_gate/__init__.py",
         # What the platform gate imports, never copies (decisions I24, I25).
         "kontra/_passkeys.py",
         "kontra/_jobkeys.py",
