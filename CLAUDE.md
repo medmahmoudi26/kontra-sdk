@@ -48,7 +48,8 @@ crosses a seam updates that seam's test **in the same PR**.
   examples/*/activities.py` must print nothing; `tests/examples/test_imports.py` checks the rest (and
   runs `examples/hello` without `worker.py` on a plain Temporal worker).
 - Kontra never imports `temporal_agent_harness` at runtime: `kontra/serve/turn.py` holds the harness's
-  wire shape as constants, checked against the harness in `tests/serve/test_turn.py`.
+  wire shape as constants, checked against the harness in `tests/serve/test_turn.py`, and
+  `kontra/contract/harness.py` reads its schema through its CLI (`tests/contract/test_harness.py`).
 - Every seam has a fake in `kontra.testing`, so a seller tests a full lifecycle without containers.
 - The PyPI distribution is `kontra-sdk`; `kontra` on PyPI is someone else's package. Never add a bare
   `kontra` dependency anywhere.

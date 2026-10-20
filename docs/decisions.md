@@ -2094,7 +2094,7 @@ and `kontra contract` warn where they differ, and seam ③ asserts the verdict.
   output excludes a required field fails every job besides: `as_output` validates the reply,
   which lacks it. This issue changes no derivation and no golden (`examples/*/contract.yaml`
   are byte-identical); the fix -- derive the output in serialization mode, or refuse these at
-  binding -- changes contract hashes and is a decision for the owner. Separately, the harness's
+  binding -- changes contract hashes and is a decision for the owner: kontra-sdk#63. Separately, the harness's
   own schema keys an aliased output by alias while the harness publishes the reply by field
   name; Kontra re-keys it by alias (I29), so the contract and the job agree, and the harness's
   TypeScript for such a reply does not match what its own stream carries.
@@ -2107,7 +2107,7 @@ and `kontra contract` warn where they differ, and seam ③ asserts the verdict.
   refuses. Correct for annotations (a field's own `description` or `default`), wrong for
   assertions. This issue changes no derivation and no golden; the fix (fold only annotations,
   and write an overlapping assertion as `allOf` or refuse it, which nexgen's subset may not
-  take) changes contract hashes for such models and is the owner's decision. Until then this
+  take) changes contract hashes for such models and is the owner's decision: kontra-sdk#64. Until then this
   check reports every such field, at `kontra publish` and in the zoo's `overlap` handler.
 - **Rejected.** Calling `agent_schema` in-process (`sys.modules` or an import): Kontra would
   depend on a Python API of the harness and break I29's rule, for the same document the CLI

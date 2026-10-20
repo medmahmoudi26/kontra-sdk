@@ -582,16 +582,22 @@ with workflow.unsafe.imports_passed_through():
 
 
 class Sweep(BaseModel):
+    """A host to sweep."""
+
     host: str
 
 
 class Report(BaseModel):
+    """What the sweep found."""
+
     host: str
     open: int
 
 
 @agent.defn
 class ReconAgent:
+    """Sweeps hosts, one per message."""
+
     @agent.init
     def __init__(self, config: AgentConfig) -> None:
         self._runner = AgentWorkflowRunner(
