@@ -6,8 +6,9 @@ temporalio's own context plumbing."""
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -78,13 +79,40 @@ class Keys:
 
 
 class Blobs:
-    def __init__(self) -> None:
+    """An in-memory claim-check bucket, and a job's stream blobs (``StreamStore``): which job
+    each was stored for, how many uploads there were, and an optional failure or delay."""
+
+    def __init__(self, *, delay: float = 0.0, fail: bool = False) -> None:
         self.data: dict[str, bytes] = {}
         self.gets = 0
         self.limits: list[int | None] = []
+        self.scopes: dict[str, str] = {}
+        #: Stream blobs uploaded (absent before), and every ``put_stream`` call's size.
+        self.uploads = 0
+        self.calls: list[int] = []
+        self.delay = delay
+        self.fail = fail
 
     async def put(self, sha256: str, data: bytes) -> None:
         self.data[sha256] = data
+
+    async def put_stream(
+        self, job_id: str, blobs: Sequence[tuple[str, bytes]], done: Callable[[str], None]
+    ) -> None:
+        self.calls.append(len(blobs))
+        if self.fail:
+            raise CodecError("the bucket is down")
+        for digest, data in blobs:
+            if digest in self.data:
+                done(digest)  # stored already: nothing uploaded
+                continue
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            assert sha256(data).hexdigest() == digest
+            self.data[digest] = data
+            self.scopes[digest] = job_id
+            self.uploads += 1
+            done(digest)
 
     async def get(self, sha256: str, *, limit: int | None = None) -> bytes:
         self.gets += 1

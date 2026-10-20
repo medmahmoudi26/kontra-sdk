@@ -8,13 +8,14 @@ delivery envelope (``binary/kontra-age``, ``kontra-v`` 1, an age file of the inn
 sealed in an activity (a workflow may not draw randomness); a ``plain`` job returns its
 result in the clear, as a seller that bypassed the codec would. The job hosts its own stream
 the way the contrib's poll handler does, by its wire names, answering with the stream envelope
-(:mod:`kontra.codec.stream`) whose items are age files: what the gate's relay reads."""
+(:mod:`kontra.codec.stream`) whose items are references to age files stored in :data:`BLOBS`
+(the job's stream blobs, which the harness's adapter reads): what the gate's relay reads."""
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
+import hashlib
 import json
 from datetime import timedelta
 from typing import Any
@@ -39,6 +40,8 @@ LISTED, UNLISTED = "events", "secret"
 FIRST = ((LISTED, 0), (UNLISTED, 1), (LISTED, 2))
 LATER = ((LISTED, 3), (UNLISTED, 4), (LISTED, 5))
 QUOTE_DOCUMENT = b'{"amount_minor":1234,"currency":"USD","max_duration_seconds":600,"status":"ok"}'
+#: The stream blobs the seller's activities stored, by sha256 (the bucket, in this process).
+BLOBS: dict[str, bytes] = {}
 _SEALED = {"encoding": b"binary/kontra-age", "kontra-v": b"1"}
 _PLAIN = {"encoding": b"json/plain"}
 
@@ -51,15 +54,21 @@ async def seal(text: str, to: str) -> bytes:
 
 
 @activity.defn
-async def seal_items(texts: list[str], to: str) -> list[str]:
-    """Stream items sealed one by one (base64 age files)."""
-    return [base64.b64encode(age.encrypt(t.encode(), [to])).decode("ascii") for t in texts]
+async def seal_items(texts: list[str], to: str) -> list[tuple[str, int]]:
+    """Stream items sealed one by one, each stored in :data:`BLOBS`: (sha256, size)."""
+    out: list[tuple[str, int]] = []
+    for t in texts:
+        ct = age.encrypt(t.encode(), [to])
+        digest = hashlib.sha256(ct).hexdigest()
+        BLOBS[digest] = ct
+        out.append((digest, len(ct)))
+    return out
 
 
 @workflow.defn(name="EngineContractJob")
 class ContractJob:
     def __init__(self) -> None:
-        self._log: list[tuple[str, str]] = []
+        self._log: list[tuple[str, str, int]] = []
         self._done = False
 
     async def _publish(self, items: tuple[tuple[str, int], ...], marker: str, to: str) -> None:
@@ -67,7 +76,9 @@ class ContractJob:
         sealed = await workflow.execute_activity(
             seal_items, args=[texts, to], start_to_close_timeout=timedelta(seconds=30)
         )
-        self._log.extend((topic, ct) for (topic, _), ct in zip(items, sealed, strict=True))
+        self._log.extend(
+            (topic, digest, size) for (topic, _), (digest, size) in zip(items, sealed, strict=True)
+        )
 
     @staticmethod
     async def _until_asked() -> None:
@@ -104,11 +115,11 @@ class ContractJob:
         offset, topics = args["from_offset"], set(args["topics"])
         await workflow.wait_condition(lambda: len(self._log) > offset or self._done)
         items = [
-            {"topic": topic, "offset": i, "ct": ct}
-            for i, (topic, ct) in enumerate(self._log)
+            {"topic": topic, "offset": i, "size": size, "sha256": digest}
+            for i, (topic, digest, size) in enumerate(self._log)
             if i >= offset and topic in topics
         ]
-        envelope = {"v": 1, "items": items, "next_offset": len(self._log), "more_ready": False}
+        envelope = {"v": 2, "items": items, "next_offset": len(self._log), "more_ready": False}
         data = json.dumps(envelope, separators=(",", ":")).encode()
         return RawValue(
             Payload(metadata={"encoding": STREAM_ENCODING, "kontra-v": b"1"}, data=data)

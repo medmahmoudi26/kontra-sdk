@@ -171,6 +171,11 @@ async def test_every_row_answers_the_real_client(world: World, tmp_path: Path) -
     digest = hashlib.sha256(b"blob").hexdigest()
     await blobs.put(digest, b"blob")  # create_blob
     assert await blobs.get(digest) == b"blob"  # get_blob
+    stored: list[str] = []  # create_stream_blobs: the job's stream items (decisions I39)
+    item = b"age-encryption.org/v1\nstream item"
+    await blobs.put_stream(one.job_id, [(hashlib.sha256(item).hexdigest(), item)], stored.append)
+    assert stored == [hashlib.sha256(item).hexdigest()]
+    assert await blobs.get(stored[0]) == item  # its seller reads it
 
     control.observe_as(
         seller.profile.party, job_workflow_id(one.job_id), ObservedStatus.COMPLETED, b"cipher"

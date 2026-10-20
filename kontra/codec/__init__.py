@@ -69,18 +69,27 @@ The reply of a handled operation carries no Python stack trace (:func:`data_conv
 temporalio chains the exception behind its own handler errors, and the reply of a generated
 service is plaintext in the caller's history and the platform's.
 
-A job's workflow stream crosses the boundary sealed item by item (decisions I31,
+A job's workflow stream crosses the boundary sealed item by item (decisions I31, I39,
 :mod:`kontra.codec.stream`). Kontra's workflow interceptor marks the answer of a stream poll
-on a job root (``kontra-stream: poll/v1``); :meth:`KontraCodec.encode` turns it into the
-stream envelope, each item sealed on its own (a topic the buyer may read to the seller's set
-and the job's buyer key, any other to the seller's set alone, its name hidden), the offsets
-in the clear; :meth:`KontraCodec.decode` turns the envelope back into the exact poll result.
-A marked offset answer (``offset/v1``) passes in plaintext: a log length. A marked payload
-anywhere but a seller's job workflow is refused, never encrypted some other way.
+on a job root (``kontra-stream: poll/v1``); :meth:`KontraCodec.encode` seals each item on its
+own (a topic the buyer may read to the seller's set and the job's buyer key, any other to the
+seller's set alone, its name hidden), deterministically for this worker (a seed under
+:func:`kontra.codec.age.seal_key` of its identity), stores it in the claim-check bucket scoped
+to the job (a :class:`~kontra.codec.stream.StreamStore`: :class:`GateBlobStore`), and writes
+the stream envelope: references, the offsets in the clear. Uploads share one budget per
+workflow-task completion (temporalio makes one codec copy per completion it encodes):
+:data:`~kontra.codec.stream.STREAM_UPLOAD_BUDGET` seconds for all of its answers together,
+after which an item not stored is a stub, so a slow bucket costs items, never the task.
+:meth:`KontraCodec.decode` fetches the references and turns the envelope back into the exact
+poll result. A marked offset answer (``offset/v1``) passes in plaintext: a log length. A
+marked payload anywhere but a seller's job workflow is refused, never encrypted some other
+way.
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import copy
 import json
 import re
@@ -111,7 +120,10 @@ from kontra.codec.stream import (
     POLL_MARK,
     STREAM_ENCODING,
     STREAM_MARK,
+    STREAM_UPLOAD_BUDGET,
     EnvelopeError,
+    PollFailure,
+    StreamStore,
 )
 from kontra.contract.names import job_id_from_workflow_id
 from kontra.engine import AGE_MAGIC, NotSealed
@@ -217,14 +229,61 @@ class BlobGate(Protocol):
 
     async def get_blob(self, sha256: str) -> m.BlobUrl: ...
 
+    async def create_stream_blobs(
+        self, job_id: str, req: m.StreamBlobsCreate
+    ) -> m.StreamBlobUrls: ...
+
+
+#: Stream items uploaded at once by one :meth:`GateBlobStore.put_stream`.
+_PUT_CONCURRENCY = 16
+
 
 class GateBlobStore:
     """:class:`BlobStore` on the gate's presigned bucket URLs (``POST /v1/blobs``,
-    ``GET /v1/blobs/{sha256}``). The bucket only ever sees ciphertext; the gate's client
-    credential never goes to the bucket (``gate.http``)."""
+    ``GET /v1/blobs/{sha256}``), and :class:`~kontra.codec.stream.StreamStore` on the job's
+    stream blobs (``POST /v1/jobs/{job_id}/stream/blobs``: one call for an answer's items,
+    readable by the job's seller and the gate alone). The bucket only ever sees ciphertext;
+    the gate's client credential never goes to the bucket (``gate.http``)."""
 
     def __init__(self, gate: BlobGate) -> None:
         self._gate = gate
+
+    async def put_stream(
+        self, job_id: str, blobs: Sequence[tuple[str, bytes]], done: Callable[[str], None]
+    ) -> None:
+        """One gate call for the URLs, then the PUTs not already stored, a few at once, each
+        reported to ``done`` once the bucket took it. Every PUT names its digest
+        (``x-amz-checksum-sha256``, which the gate signs into the URL), so a bucket refuses
+        bytes that are not the blob's."""
+        if not blobs:
+            return
+        urls = await self._gate.create_stream_blobs(
+            job_id,
+            m.StreamBlobsCreate(blobs=[m.BlobCreate(sha256=d, size=len(b)) for d, b in blobs]),
+        )
+        by_digest = {u.sha256: u for u in urls.blobs}
+        gate = asyncio.Semaphore(_PUT_CONCURRENCY)
+
+        async def put(digest: str, data: bytes) -> None:
+            url = by_digest.get(digest)
+            if url is None:
+                return  # the gate did not answer for it: a stub
+            if url.exists:
+                done(digest)
+                return
+            checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+            async with gate:
+                resp = await self._gate.http.put(
+                    url.url,
+                    content=data,
+                    headers={"Content-Length": str(len(data)), "x-amz-checksum-sha256": checksum},
+                )
+            if resp.is_success:
+                done(digest)
+
+        async with asyncio.TaskGroup() as tg:
+            for digest, data in blobs:
+                tg.create_task(put(digest, data))
 
     async def put(self, sha256: str, data: bytes) -> None:
         url = await self._gate.create_blob(m.BlobCreate(sha256=sha256, size=len(data)))
@@ -347,11 +406,16 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         self._services = generated
         self._max_claim_check = max_claim_check
         self._context: SerializationContext | None = None
-        #: Claim-checked stream items stored already, shared by every context's copy.
+        #: Stream items stored already, shared by every context's copy (a cache).
         self._stream_refs = _stream.BlobRefs()
+        #: Seeds this worker's deterministic sealing of stream items (decisions I39).
+        self._seal_key = age.seal_key(identity)
         #: Claim-checks fetched under this context: the input of one handled Nexus operation
         #: (temporalio makes a context, so a copy of this codec, per Nexus task).
         self._fetched = 0
+        #: The end of this copy's upload window for stream items (event-loop time): one
+        #: budget for every answer one workflow-task completion carries.
+        self._uploads_until: float | None = None
 
     @property
     def role(self) -> Literal["seller", "buyer"]:
@@ -376,7 +440,20 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         clone = copy.copy(self)
         clone._context = context
         clone._fetched = 0
+        clone._uploads_until = None
         return clone
+
+    def _upload_deadline(self) -> float:
+        """When this copy's stream uploads must be done: temporalio makes a codec copy per
+        workflow-task completion it encodes and encodes its payloads one after another, so
+        the window opens at the copy's first stream answer and every later answer of the
+        completion shares it (:data:`~kontra.codec.stream.STREAM_UPLOAD_BUDGET` in all). A
+        copy still used long after its window closed (twice the budget) opens a new one."""
+        now = asyncio.get_running_loop().time()
+        until = self._uploads_until
+        if until is None or now > until + STREAM_UPLOAD_BUDGET:
+            until = self._uploads_until = now + STREAM_UPLOAD_BUDGET
+        return until
 
     # ------------------------------------------------------------------ recipients
 
@@ -506,29 +583,20 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         if self._buyer_keys is None:
             raise CodecError(f"cannot seal job {job_id}'s stream: no buyer key lookup")
         buyer = await _resolve(self._buyer_keys.buyer_key, job_id, "buyer")
+        store = self._blobs if isinstance(self._blobs, StreamStore) else None
         try:
             return await _stream.seal_poll(
                 p,
                 buyer_recipients=_distinct([*self._recipients, buyer]),
                 seller_recipients=list(self._recipients),
-                put_blob=self._put_blob if self._blobs is not None else None,
-                refs=self._stream_refs,
+                store=store,
                 scope=job_id,
+                refs=self._stream_refs,
+                seal_key=self._seal_key,
+                deadline=self._upload_deadline(),
             )
         except (EnvelopeError, age.AgeError) as e:
             raise CodecError(f"cannot seal job {job_id}'s stream: {e}") from e
-
-    async def _put_blob(self, ciphertext: bytes) -> tuple[str, int]:
-        """A sealed stream item above the inline limit, to the blob store."""
-        assert self._blobs is not None
-        digest = sha256(ciphertext).hexdigest()
-        try:
-            await self._blobs.put(digest, ciphertext)
-        except CodecError:
-            raise
-        except Exception as e:
-            raise CodecError(f"claim-check upload failed: {e}") from e
-        return digest, len(ciphertext)
 
     async def _open_stream(self, p: Payload) -> Payload:
         """A stream envelope as the poll result it was sealed from."""
@@ -809,7 +877,11 @@ class KontraFailureConverter(
         self, exception: BaseException, payload_converter: PayloadConverter, failure: Failure
     ) -> None:
         ctx = self._context
-        if not (isinstance(ctx, NexusSerializationContext) and _handling(ctx)):
+        # A stream poll's failure (Kontra's interceptor raises it) loses its traceback too:
+        # it is part of an accepted poll's outcome in the job's history, which the relay's
+        # bound counts at a fixed size (decisions I39).
+        handled = isinstance(ctx, NexusSerializationContext) and _handling(ctx)
+        if not handled and not isinstance(exception, PollFailure):
             super().to_failure(exception, payload_converter, failure)
             return
         held: list[tuple[BaseException, Any]] = []

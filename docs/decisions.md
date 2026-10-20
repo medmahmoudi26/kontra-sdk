@@ -195,7 +195,9 @@ login   : auth only       -- it adds a recipient; it never decides one
   the gate (`GET /v1/jobs/{id}/seller`).
 * Failure messages and stack traces are encoded too (`encode_common_attributes`).
 * Above 256 KiB of ciphertext a payload is claim-checked: uploaded to the bucket,
-  content-addressed by the ciphertext's sha256, and replaced by a reference.
+  content-addressed by the ciphertext's sha256, and replaced by a reference. *Amended by
+  I39:* every item of a job's stream is stored that way, whatever its size, scoped to the
+  job, and a poll's answer is the list of references.
 * Artifacts use the same age format, streamed in 64 KiB chunks, uploaded in parts, so
   memory stays flat regardless of size. `Artifact.sha256` is of the plaintext; the gate
   records the ciphertext's.
@@ -1970,7 +1972,19 @@ the sentence above) and `docs/security.md`.
   history, and could not bound this; the cap bounds what their requests add to a workflow
   task. With both, the burst the #52 review found no longer ends a job. Neither bounds the
   polls' answers; I31's answer budget does (the residual risk next).
-- **Residual risk: a leaked relay token can end its job** (*amended by I31*). Since #52, not by
+- **Residual risk, closed by I39: what a leaked relay token adds to a run is bounded.** (The
+  owner's answer on #59: the history size limit must not be what bounds a hostile re-poller.)
+  Poll answers are references to the job's blobs (at most 13,504 bytes), a run accepts at
+  most 1,000 polls, a relay request is shaped as the relay builds it and held to ten a second;
+  so whoever holds the token, whatever offsets it polls from, it adds to one run at most
+  5,010 events and 10.25 MiB, plus one workflow-task triple beside each of the seller's own
+  tasks (I39's formula). A job survives it when its own history, counted with each of its
+  workflow-task triples twice, stays under 15,470 events and 9.74 MiB (under about 7,700
+  events suffices): *conditional*, as the relay's share has always been. Tested over the wire
+  with real relay tokens (`tests/temporal/test_relay_bound_wire.py`): the job survives and
+  completes; no test ends one. What a token holder can still do is deny the job's stream (I39's
+  residual). The text below is the risk as it stood before I39.
+- **Residual risk (before I39): a leaked relay token can end its job** (*amended by I31*). Since #52, not by
   the history growth described next: a job root refuses polls at validation once its history is
   past half of the pinned limits, a refused poll is not written to history, and with the size
   cap above that bounds what a leaked relay token can do to its job's history (the guard plus
@@ -2027,8 +2041,9 @@ self-access and escrow cells included, a relay poll past the cap and eleven miss
 requests refused while the relay's own poll on the same job still answers (the job's history
 unchanged by the refusals), and a relay past its burst refused with `RelayRateReason` while
 another job's relay and the seller are not, until its bucket refills. What a relay's polls cost a job's history is stated
-above and in `docs/security.md`, not pinned by a wire test: that test would be a ready-made
-recipe in a public repository.
+above and in `docs/security.md`; *amended by I39:* it is pinned by a wire test that shows the
+attack failing (`tests/temporal/test_relay_bound_wire.py`: the job survives and completes),
+never one that ends a job.
 
 ## I31. Streams cross the boundary through the job's own workflow stream, sealed per item (kontra-sdk#52; decisions 5, 6 of #50)
 
@@ -2066,8 +2081,10 @@ with two prototypes whose results are below.
   `streams`, by task queue, and `kontra.progress`); `CompositePayloadConverter` passes a
   `RawValue` through untouched -- and `KontraCodec` turns it into the **stream envelope**
   (`kontra/codec/stream.py`): `{"v": 1, "items": [{"topic", "offset", "ct"}...], "next_offset",
-  "more_ready"}`, encoding `binary/kontra-stream`. Each item is the age ciphertext of its own
-  `Payload` with its topic and offset sealed inside (`kontra-topic`, `kontra-offset`), so a
+  "more_ready"}`, encoding `binary/kontra-stream` (*amended by I39:* `{"v": 2, "items":
+  [{"topic", "offset", "size", "sha256"}...]}`, every item a reference to its blob, at most
+  64 an answer; what follows about inline items, 256 KiB and 512 KiB is v1's). Each item is
+  the age ciphertext of its own `Payload` with its topic and offset sealed inside (`kontra-topic`, `kontra-offset`), so a
   buyer checks both against the event and a gate cannot relabel or reorder items. A listed
   topic is sealed to the seller's recipient set and the job's buyer key and named in the clear;
   any other to the seller's set alone, its name `null`. Items above 256 KiB of ciphertext are
@@ -2134,7 +2151,10 @@ with two prototypes whose results are below.
   each item is still polled once. A listener leaving pauses the relay after 30 s, the offset
   kept; a buyer's resume never moves it (a buyer-chosen offset would hand every buyer the
   leaked-token amplification of I30). `kontra._relay` keeps `start="tail"` for a gate that
-  wants it, but `start=` has no default: a gate that omits it gets an error, not the tail.
+  wants it, but `start=` has no default: a gate that omits it gets an error, not the tail. *Amended by
+  I39:* **OD2 kept, with a reason**: the start offset is no term of the relay's bound (a token
+  holder picks its own offset, so a tail-only relay would bound nothing more), and with
+  references a genuine relay's catch-up from 0 costs ceil(N/64) polls of one run's 1,000.
 * **Seam ②** (OD4: a hard cut in this 0.x release). `POST` and `GET
   /v1/jobs/{id}/progress`, `ProgressPost` and `ProgressEvent` are gone. `GET
   /v1/jobs/{id}/stream` (the job's buyer or seller) serves SSE of `StreamEvent{cursor, kind:
@@ -2166,7 +2186,9 @@ with two prototypes whose results are below.
   relay would terminate a job, refunded against the seller, in about 52 minutes. Adopted: **the
   job's poll guard** -- a root refuses a poll at validation (`KontraStreamFull`) once its
   history is past half of the pinned limits (10,240 events or 10 MiB; a test pins `== error //
-  2`); a rejected update is not written to history, so no poll, whether a genuine relay's or a
+  2`; *amended by I39:* and once the run accepted 1,000 polls, `STREAM_POLLS_MAX`; and,
+  retryably, `KontraStreamBusy` while six polls are in flight or for an offset past the end); a
+  rejected update is not written to history, so no poll, whether a genuine relay's or a
   leaked relay token's, grows the job further, and the relay stops with `gap{history_budget}` --
   and **a budgeted ProgressForwarder**: the latest details at most every 5 s
   (`KONTRA_PROGRESS_INTERVAL` still overrides; 0 publishes every heartbeat, batched), the
@@ -2217,7 +2239,9 @@ with two prototypes whose results are below.
   the cut, and the drain's count of it, replay the same. Measured again on a dev server with the
   pinned limits: the job keeps running, and no workflow task's answers pass 1.5 MiB. The two
   other bounds recorded with it, an envelope small enough that the polls in flight fit one reply
-  and a lower pinned `history.maxInFlightUpdates`, are not needed. What I30's risk keeps is the
+  and a lower pinned `history.maxInFlightUpdates`, are not needed. (*Amended by I39:* answers
+  are references now, at most 13,504 bytes, so ten in flight are under a tenth of the budget:
+  kept, not reached; `STREAM_ANSWER_BUDGET` is the constant 1.5 MiB.) What I30's risk keeps is the
   relay's share of the history (above): a leaked token can spend it at once, where a genuine
   relay spends it as the stream grows. A poll names at most nine topics (`kontra._relay`: the
   offering's eight streams and `kontra.progress`), so the gate's largest stays far under the
@@ -2250,6 +2274,7 @@ seller's); an `agent` alias; `streams:` in `x-kontra` (a hashed document with un
 **Amends** I3 and I30 (the relay's stop, its cost, the residual risk above), I7 (the stream
 envelope; a plaintext log length; external storage above the envelope limit), I29 (the turn
 activity mirrors; Kontra hosts a stream on every job root), and `docs/security.md`.
+**Amended by** I39 (references, the poll budget, OD2's reason).
 **Supersedes** the bespoke progress channel (PRD §8.4's `POST .../progress`).
 
 Tested: the envelope and the codec branches, JSON nested past the stack refused, the
@@ -2458,3 +2483,138 @@ served catalog reads and the card without the engine, the Workers view
 buyer-facing schema carrying it (`tests/gate_client/test_routes.py`); `UNSEALED` and the
 engine-neutral record (`tests/escrow/test_escrow.py`); `serve(engine=)`, `engine_for` and the
 hash lock's `engine_fixed` (`tests/serve`); a pinned ASK (`tests/control/test_control.py`).
+
+## I39. Stream items cross by reference, and a relay token's share of a run is bounded (kontra-sdk#59, #52)
+
+_The owner's answer on #59 directs this: stream payloads through the claim-check bucket, poll
+outcomes as references, with the poll guard a provable bound, a test that a hostile re-poller
+cannot push a run past `limit.historySize.error`, OD2 kept if the bound holds, no
+continue-as-new mitigation (a rule on seller code). The choices below it does not name -- 64
+items an answer, 1,000 polls a run, six in flight, the gate dereferencing, stubs, the upload
+budget, per-worker sealing, job-scoped blobs -- were taken by the implementer in the owner's
+place and are listed on #59. The request's shape and the relay's rate, which the bound relies
+on, are #59's own rules (I30, Q10 and Q11)._
+
+* **Every stream item is a reference.** A poll's answer is envelope v2
+  (`kontra/codec/stream.py`): `{"v": 2, "items": [{topic | null, offset, size, sha256 |
+  null}], next_offset, more_ready}`, at most `STREAM_ITEMS_MAX` = 64 entries of at most
+  `REF_ENTRY_MAX` = 209 bytes, `ENVELOPE_MAX` = 13,504 bytes in all (v1 carried up to 512 KiB
+  of ciphertext); a test builds the largest entry. Kontra's workflow interceptor cuts every
+  answer at 64 items (the contrib's own truncation). The item is sealed as before (I31: its
+  topic and offset inside, listed topics to the seller's set and the job's buyer key), and the
+  seller's codec stores the ciphertext in the claim-check bucket at encode time, scoped to the
+  job (`POST /v1/jobs/{job_id}/stream/blobs`, one call an answer, by the job's seller;
+  readable by that seller and the gate's own reader, 404 for anyone else), keyed by its
+  sha256. History holds no item ciphertext at all.
+* **Who writes, and when it fails.** The seller's worker, in `KontraCodec`, through a
+  `StreamStore` (`GateBlobStore` in production). Uploads share **one budget per workflow-task
+  completion**, `STREAM_UPLOAD_BUDGET` = 2 s for all its answers together: temporalio encodes a
+  completion's payloads one after another, in one codec copy (`DataConverter.with_context`
+  per completion), so a per-answer deadline would multiply. Past the budget, or when the
+  bucket fails, an item is a **stub** (`sha256: null`, its size kept): the relay records a gap
+  `unavailable`, a later read stores it; a bucket outage costs items, never a workflow task.
+* **A re-read stores nothing new.** Items are **sealed deterministically per worker**: the age
+  file key, ephemeral keys and nonce derive from `HMAC(seal_key, job, recipients, sealed
+  plaintext)`, `seal_key = HKDF(the worker's age identity)`. The same worker re-sealing an item
+  writes the same bytes, which the gate finds stored, whatever its cache (`BlobRefs`, 65,536
+  entries, per process) evicted; another worker writes another blob, once. It is not
+  convergent encryption: without the worker's secret no one can confirm a guess at an item.
+* **The gate dereferences** (in `kontra._relay`, through the engine adapter's
+  `stream_blobs`): each listed item's blob is fetched -- none above `stream_item_max` -- and
+  kept only if it is exactly the size and sha256 its reference names and an age file;
+  otherwise the item has no ciphertext and the gate records `gap{unavailable}` (above the
+  cap, `too_large`). The gate's store, its caps, the SSE stream and `job.stream()` are as in
+  I31; seam ② gains the route and the gap reason.
+* **The poll guard** (the job root's validator; a refusal is a rejection: written nowhere, no
+  update spent): `KontraStreamFull` once the run accepted `STREAM_POLLS_MAX` = 1,000 polls
+  (half of the pinned `history.maxTotalUpdates`, so the other 1,000 stay the seller's own) or
+  its history is past half the limits (I31); `KontraStreamBusy`, retryable, while
+  `STREAM_PARKED_MAX` = 6 polls are in flight (`history.maxInFlightUpdates` less four: the
+  seller always keeps slots for its own updates) or, once the run's code is under way, for an
+  offset past the stream's end. The count is workflow state, incremented first in the handler:
+  at most 1,000 polls are accepted in a run, exactly (tested). A poll's own failure is a
+  `PollFailure`: a fixed message, no traceback, so a failed outcome is a small constant.
+* **The request, at the Authorizer** (seam ①; I30's Q10 and Q11, #59). A relay request is
+  shaped as `kontra._relay` builds it -- a poll's one `json/plain` argument and no header, the
+  offset query neither -- because the seller's worker decodes every payload of a request before
+  any validator of the job's could refuse it: a poll whose argument is a Kontra ciphertext, a
+  claim-check reference (which the codec would fetch, up to 64 MiB) or a stream envelope
+  failed the job's workflow task on every attempt (measured in the critique). And a relay
+  subject is held to `RelayRate`, 10 requests a second (`RelayBurst` 20), past which the
+  Authorizer refuses with `RelayRateReason` and `kontra._relay` waits. Both rules, their
+  deny-matrix cells and their wire tests are I30's (`temporal/authorizer`,
+  `tests/temporal/test_streams_and_platform_wire.py`); the bound below relies on them.
+* **The bound.** Whoever holds a relay token, whatever offsets it polls from, it adds to one
+  run at most
+
+      R_e <= 5 P + C_e + 3 W_s                          = 5,010 + 3 W_s events
+      R_b <= min(P b_max, G_b + F b_max) + C_b + w_t W_s = 10,752,828 bytes + w_t W_s
+
+  with P = 1,000, F = 10, G_b = 10 MiB, C_e = 10 and C_b = 2 KiB (the drain at the run's end),
+  and b_max = 26,502 bytes, the most one accepted poll writes: its workflow task's events
+  (4 KiB, every string the seller worker's), the request echoed twice (`accepted_request`,
+  and `meta` in the completion: two `RelayRequestMax`), the answer (13,568). A refused poll
+  writes nothing, except when a seller event lands while its speculative workflow task is in
+  flight: Temporal then keeps that task (`closeTransactionHandleSpeculativeWorkflowTask`), one
+  more triple at most beside each of the seller's own W_s tasks, w_t bytes each (about 200 B
+  with typical names, at most 4 KiB). For padded requests the bytes guard binds, not P (51%
+  of `limit.historySize.error`); at a genuine request's size P does (about 8 MB). **A run
+  survives any token holder when `E_own + 3 W_s < 15,470` events and `B_own + w_t W_s <
+  10,218,692` bytes (9.74 MiB)** -- its own history counted with each of its workflow-task
+  triples twice; since `3 W_s <= E_own`, under 7,735 events suffices on that side. Each run of
+  a continue-as-new chain is bounded alike: the update limits, the history limits and the
+  poll count are all per run. Preconditions: a stream Kontra's interceptor answers (a seller
+  that replaces the poll handler takes its job out, and the relay stops at `protocol`); the
+  request shape and the rate (the Authorizer, one frontend for the rate only). The numbers are
+  pinned against `kontra.yaml` and `authorizer.go` (`tests/serve/test_interceptors.py`,
+  `tests/relay_bound.py`).
+* **OD2 kept** (I31): no term of the bound depends on where the gate's relay starts.
+* **The genuine relay, by stream rate.** A run relays at most P x K = 64,000 items -- a stream
+  of 50 items a second for about 21 minutes of continuous listening -- before the relay stops
+  with `history_budget`; `kontra._relay` paces by its own count of the run's answers
+  (`own_pace`: its interval for the first 500, 10 s to 750, 60 s after), so a quiet stream
+  listened to all along lasts about five hours of polling a run.
+
+**Residual (asked on #59, question A).** A token holder cannot end a job whose own history
+meets the condition above, but can still **deny its stream**: spend the run's 1,000 polls
+(about 100 s at ten a second; the gate's relay then stops with one `history_budget` gap, no
+silent loss), hold six polls in flight, or spend the subject's rate; the workflow cannot tell
+its polls from the gate's. The relay chain -- update ids constructed from the offset, the
+Authorizer requiring that form, the root admitting only its chain's next id -- would close it;
+it changes I30's relay rule and Q1, so it is not built here.
+
+**Rejected.** Convergent encryption (anyone holding a ciphertext could confirm a guess); a
+dedup map per job (memory for every listened job, lost on a restart or another worker);
+references the buyer fetches (seam ② and two calls per item, for a store the gate keeps
+anyway); a per-answer upload deadline (a completion carries up to ten); continue-as-new on
+the server's suggestion (owner: a rule on seller code); tail-only polling (no term of the
+bound); a lower `history.maxTotalUpdates` (bounds nothing alone; genuine streams hit it);
+`exposeAuthorizerErrors` for a typed rate error (an isolation setting, pinned off); K = 128
+(about 36% more items a run for a larger b_max).
+
+**Amends** I7 (every stream item claim-checked, job-scoped), I30 (the residual risk; the wire
+test; the bound relies on its Q10 and Q11), I31 (the envelope, the guard, OD2's reason, the
+answer budget kept unreached), the Authorizer's README and `docs/security.md`.
+
+Tested: the envelope's fixed sizes, references, stubs, a failing bucket, the shared upload
+budget, a re-read storing nothing new past the cache, per-worker sealing, swapped references,
+the strict reader and `verified_item` (`tests/codec/test_stream_envelope.py`); the formula and
+the pins (`tests/serve/test_interceptors.py`); the poll budget exactly, refused polls writing
+nothing, busy refusals, six in flight with the seller's own update answered, an early poll
+through the guard, a slow bucket never timing a task out (and failing if the budget were per
+answer), the cut at 64 (`tests/serve/test_stream_hosting.py`); dereference and verification,
+the rate and busy waited on, own pacing (`tests/serve/test_relay.py`); the gate's scopes and
+`unavailable` gaps (`tests/testing/test_stream_relay.py`); the adapter's reader
+(`tests/engine`); seam ⑤'s scans of the job's blobs and of history without ciphertext
+(`tests/serve/test_streams.py`); seam ②'s route and gap; and over the wire
+(`tests/temporal/test_relay_bound_wire.py`; the Authorizer's shape and rate cells are I30's):
+the relay, refused for its rate, waiting and reading on; and the owner's test -- ten token
+holders a job re-polling from 0 with fresh ids as fast as admitted, at a
+genuine size (job A) and padded to exactly 4 KiB (job B), while each job does its own work and
+then past the guard: every sample under both error limits and running, both jobs completed and
+replayed, the growth against twins doing the same work within the formula. Measured: A
+accepted exactly 1,000 polls and grew 3,997 events and 8,144,930 bytes (its worst sample 4,476
+events, 8,244,272 bytes); B was stopped by the bytes guard after 653 polls, growing 2,685
+events and 10,445,747 bytes (worst 3,164 events, 10,545,098 bytes); the seller's own tasks 98
+a job, their triples at most 324 bytes; the legitimate relay read the stream from 0 and was
+told the budget was spent; about two minutes.

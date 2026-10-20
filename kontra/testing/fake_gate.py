@@ -987,7 +987,8 @@ class FakeGate:
     history limits it paces against (Kontra's pinned ones). ``stream_item_max``,
     ``stream_topic_budget``, ``stream_job_budget``: what it stores (an item above the first
     is a gap; past a budget, one gap, and the relay polls that topic no more, or stops);
-    ``stream_listeners_max``: listeners per job.
+    ``stream_listeners_max``: listeners per job. ``blob_put_delay``: seconds every blob
+    upload (``PUT`` of a signed URL) takes, for tests of a slow bucket.
 
     The clock offset (:meth:`advance`) moves token ``iat``/``exp`` too: a seller's
     handler verifying a hold token issued *after* an advance on the machine's clock sees
@@ -1036,6 +1037,7 @@ class FakeGate:
         stream_topic_budget: int = m.STREAM_TOPIC_BUDGET,
         stream_job_budget: int = m.STREAM_JOB_BUDGET,
         stream_listeners_max: int = m.STREAM_LISTENERS_MAX,
+        blob_put_delay: float = 0.0,
         input_retention: timedelta = timedelta(days=7),
         orphan_upload_ttl: timedelta = timedelta(hours=24),
         keepalive: float = 5.0,
@@ -1101,6 +1103,7 @@ class FakeGate:
         self.stream_topic_budget = stream_topic_budget
         self.stream_job_budget = stream_job_budget
         self.stream_listeners_max = stream_listeners_max
+        self.blob_put_delay = blob_put_delay
         self.input_retention = input_retention
         self.orphan_upload_ttl = orphan_upload_ttl
         self.keepalive = keepalive
@@ -1119,8 +1122,11 @@ class FakeGate:
                         control,
                         signer=self.signer,
                         address=self.temporal_address,
-                        # This gate relays through its control plane's own client.
+                        # This gate relays through its control plane's own client, and
+                        # reads a job's stream blobs from its own store.
                         relay_service=internal_relay_service(control),
+                        stream_blobs=self,
+                        stream_item_max=stream_item_max,
                         worker_ttl=WORKER_TTL,
                         relay_interval=relay_interval,
                         relay_rpc_timeout=relay_rpc_timeout,
@@ -1167,6 +1173,9 @@ class FakeGate:
         self.job_key_proof_key = jk.proof_key(secrets.token_bytes(32))
         self.artifacts: dict[str, _Artifact] = {}
         self.blobs: dict[str, bytes] = {}
+        #: The job a stream blob belongs to, and its seller, by sha256 (decisions I39): set
+        #: when its seller creates it, readable by that seller and this gate's relay only.
+        self.blob_scopes: dict[str, tuple[str, str]] = {}
         self._party_locks: dict[str, asyncio.Lock] = {}
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -3968,8 +3977,10 @@ class FakeGate:
                 continue  # its budget's gap is stored; nothing more of it is
             # Ciphertext by type: an item is a kontra.engine.Sealed age file, or None.
             gap: m.StreamGapReason | None = None
-            if item.sealed is None or item.size > self.stream_item_max:
+            if item.size > self.stream_item_max:
                 gap = m.StreamGapReason.TOO_LARGE
+            elif item.sealed is None:
+                gap = m.StreamGapReason.UNAVAILABLE  # not stored, or not what it names
             elif state.topic_bytes.get(item.topic, 0) + item.size > self.stream_topic_budget:
                 gap = m.StreamGapReason.TOPIC_BUDGET
             elif state.job_bytes + item.size > self.stream_job_budget:
@@ -4471,6 +4482,9 @@ class FakeGate:
             raise GateHTTPError(
                 413, "too_large", f"a claim-check blob is at most {MAX_BLOB_BYTES} bytes"
             )
+        if req.sha256 in self.blob_scopes:
+            # A job's stream blob: never handed out here (a GET URL would skip its scope).
+            raise GateHTTPError(409, "blob_scope", "this blob belongs to a job's stream")
         exp, expires_at = self._exp()
         if req.sha256 in self.blobs:
             url = self._sign_url("GET", f"/_blob/b/{req.sha256}", None, exp)
@@ -4478,9 +4492,57 @@ class FakeGate:
         url = self._sign_url("PUT", f"/_blob/b/{req.sha256}", req.size, exp)
         return m.BlobUrl(sha256=req.sha256, url=url, exists=False, expires_at=expires_at)
 
-    def get_blob(self, sha256: str) -> m.BlobUrl:
+    def create_stream_blobs(
+        self, who: Principal, job_id: str, req: m.StreamBlobsCreate
+    ) -> m.StreamBlobUrls:
+        """``POST /v1/jobs/{job_id}/stream/blobs`` (decisions I39): the job's seller's blobs
+        for one poll's answer, scoped to the job. A digest stored for anything else is
+        refused (409 ``blob_scope``); one of this job's is ``exists``."""
+        job = self.job_for(job_id, who.party)
+        if who.party != job.record.seller:
+            raise GateHTTPError(403, "forbidden", "only the job's seller stores its stream")
+        scope = (job.record.seller, job_id)
+        out: list[m.BlobUrl] = []
+        exp, expires_at = self._exp()
+        for blob in req.blobs:
+            if blob.size > MAX_BLOB_BYTES:
+                raise GateHTTPError(413, "too_large", f"a blob is at most {MAX_BLOB_BYTES} bytes")
+            known = self.blob_scopes.get(blob.sha256)
+            if known is None and blob.sha256 in self.blobs:
+                raise GateHTTPError(409, "blob_scope", "this blob is not this job's stream's")
+            if known is not None and known != scope:
+                raise GateHTTPError(409, "blob_scope", "this blob is another job's stream's")
+            self.blob_scopes[blob.sha256] = scope
+            if blob.sha256 in self.blobs:
+                url = self._sign_url("GET", f"/_blob/b/{blob.sha256}", None, exp)
+                out.append(
+                    m.BlobUrl(sha256=blob.sha256, url=url, exists=True, expires_at=expires_at)
+                )
+            else:
+                url = self._sign_url("PUT", f"/_blob/b/{blob.sha256}", blob.size, exp)
+                out.append(
+                    m.BlobUrl(sha256=blob.sha256, url=url, exists=False, expires_at=expires_at)
+                )
+        return m.StreamBlobUrls(blobs=out)
+
+    async def read_stream_blob(self, job_id: str, sha256: str, size: int) -> bytes | None:
+        """The engine adapter's reader of a job's stream blobs (``TemporalEngine``'s
+        ``stream_blobs``): the blob if it is ``job_id``'s, and no larger than ``size`` bytes.
+        The relay verifies the rest."""
+        job = self.jobs.get(job_id)
+        data = self.blobs.get(sha256)
+        if job is None or data is None or len(data) > size:
+            return None
+        if self.blob_scopes.get(sha256) != (job.record.seller, job_id):
+            return None  # another job's, or no job's: never read for this one
+        return data
+
+    def get_blob(self, sha256: str, who: Principal | None = None) -> m.BlobUrl:
         if sha256 not in self.blobs:
             raise GateHTTPError(404, "blob_not_found", "no such blob")
+        scope = self.blob_scopes.get(sha256)
+        if scope is not None and (who is None or who.party != scope[0]):
+            raise GateHTTPError(404, "blob_not_found", "no such blob")  # its seller's only
         exp, expires_at = self._exp()
         return m.BlobUrl(
             sha256=sha256,
@@ -5098,13 +5160,19 @@ def _build_app(gate: FakeGate) -> FastAPI:
         return gate.create_blob(body)
 
     async def get_blob(who: PartyOrWorker, sha256: str) -> m.BlobUrl:
-        return gate.get_blob(sha256)
+        return gate.get_blob(sha256, who)
+
+    async def create_stream_blobs(
+        who: PartyOrWorker, job_id: str, body: m.StreamBlobsCreate
+    ) -> m.StreamBlobUrls:
+        return gate.create_stream_blobs(who, job_id, body)
 
     add("create_artifact", create_artifact)
     add("complete_artifact", complete_artifact)
     add("download_artifact", download_artifact)
     add("create_blob", create_blob)
     add("get_blob", get_blob)
+    add("create_stream_blobs", create_stream_blobs)
 
     # ---------------------------------------------------------------- money & disputes
 
@@ -5196,6 +5264,8 @@ def _build_app(gate: FakeGate) -> FastAPI:
         gate.check_url(request, "PUT", size)
         if sha256 in gate.blobs:
             return Response(status_code=200)  # content-addressed: already stored, unchanged
+        if gate.blob_put_delay:
+            await asyncio.sleep(gate.blob_put_delay)  # a slow bucket (tests)
         data = await read_exact(request, size)
         if hashlib.sha256(data).hexdigest() != sha256:
             raise GateHTTPError(400, "bad_digest", "the bytes do not hash to the blob's sha256")

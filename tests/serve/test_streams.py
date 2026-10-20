@@ -11,11 +11,12 @@ place (``<marker>-<offering>-<topic>-<where>-<run>-<i>``):
 * **H**, a bound handler (``streams: [turn_events]``) whose agent publishes a note on a topic
   of its own, ``private_notes``, and whose reply carries a marker.
 
-Scanned: every run's history as Temporal stores it (publish signals, poll answers,
-continue-as-new input), the raw SSE bytes the buyer receives, the gate's store; and a
-misbehaving relay (asking for unlisted topics, or every topic) gets unlisted items it cannot
-open and whose names it cannot read. The agent child's poll answers are sealed to the seller
-alone."""
+Scanned: every run's history as Temporal stores it (publish signals, poll answers --
+references only, no item ciphertext at all (decisions I39) --, continue-as-new input), the
+job's stream blobs in the bucket (each an age file), the raw SSE bytes the buyer receives,
+the gate's store; and a misbehaving relay (asking for unlisted topics, or every topic) gets
+unlisted items it cannot open and whose names it cannot read. The agent child's poll answers
+are sealed to the seller alone."""
 
 from __future__ import annotations
 
@@ -76,6 +77,19 @@ class Job:
     async def stored(self) -> list[m.StreamEvent]:
         async def get() -> list[m.StreamEvent]:
             return list(self.mp.gate.jobs[self.job_id].events)
+
+        return await self.mp.gate.run(get)
+
+    async def blobs(self) -> dict[str, bytes]:
+        """The job's stream blobs in the gate's bucket: what the seller's worker stored."""
+
+        async def get() -> dict[str, bytes]:
+            gate = self.mp.gate
+            return {
+                d: gate.blobs[d]
+                for d, (_, job) in gate.blob_scopes.items()
+                if job == self.job_id and d in gate.blobs
+            }
 
         return await self.mp.gate.run(get)
 
@@ -230,11 +244,13 @@ async def _w(mp: Marketplace, acme: TestParty, bound: Any) -> None:
     unlisted = [i for i in env.items if i.topic is None]
     assert len(unlisted) == 8
     assert {i.topic for i in env.items} == {None, LISTED, PROGRESS_TOPIC}
+    stored = await job.blobs()
     for item in unlisted:
-        assert item.ciphertext is not None
+        assert item.sha256 is not None
+        ct = stored[item.sha256]
         with pytest.raises(AgeError):
-            decrypt(item.ciphertext, bob.identity)
-        sealed = s.open_item(item.ciphertext, [acme.identity], topic=AUDIT, offset=item.offset)
+            decrypt(ct, bob.identity)
+        sealed = s.open_item(ct, [acme.identity], topic=AUDIT, offset=item.offset)
         assert AUDIT in json.dumps(CONVERTER.from_payload(sealed))
 
     await mp.client(acme.namespace).get_workflow_handle(job.wf).signal("finish")
@@ -248,6 +264,21 @@ async def _w(mp: Marketplace, acme: TestParty, bound: Any) -> None:
     for text in runs:
         assert MARKER not in text
         assert AUDIT not in _without_misbehaving_polls(text)
+        # Every poll's answer is references: no item's ciphertext is in the history.
+        for p in _update_results(json.loads(text)):
+            if p.metadata.get("encoding") == s.STREAM_ENCODING:
+                assert all(
+                    i.sha256 is None or len(i.sha256) == 64 for i in s.parse_envelope(p).items
+                )
+                assert b"YWdlLWVuY3J5cHRpb24" not in p.data
+                assert b"age-encryption" not in p.data
+    # The bucket: the job's stream blobs are age files, no marker, no unlisted topic's name.
+    blobs = await job.blobs()
+    assert len(blobs) >= 16
+    for data in blobs.values():
+        assert data.startswith(s.AGE_MAGIC)
+        assert MARKER.encode() not in data
+        assert AUDIT.encode() not in data
     # The SSE bytes and the gate's store: no marker, no unlisted name, ciphertext only.
     assert MARKER.encode() not in raw
     assert AUDIT.encode() not in raw
@@ -328,6 +359,7 @@ async def test_a_bound_handlers_stream_leaks_nothing(dev_server: DevServer, tmp_
                 out = await handle.result()
                 raw = await asyncio.wait_for(sse, 120)
                 stored = json.dumps([e.model_dump(mode="json") for e in await job.stored()])
+                bucket = await job.blobs()
                 child = agent_workflow_id(hired.job_id)
                 child_runs = await histories(job.plain, child)
                 wrapper_runs = await histories(job.plain, job.wf)
@@ -335,6 +367,10 @@ async def test_a_bound_handlers_stream_leaks_nothing(dev_server: DevServer, tmp_
     for text in (*child_runs, *wrapper_runs, stored, raw.decode()):
         assert MARKER not in text
         assert NOTES_TOPIC not in text
+    for data in bucket.values():
+        assert data.startswith(s.AGE_MAGIC)
+        assert MARKER.encode() not in data
+        assert NOTES_TOPIC.encode() not in data
     # The buyer reads the agent's events, the reply among them, from the job's stream.
     items = [e for e in sse_items(raw) if e.kind is m.StreamEventKind.ITEM]
     replies = []

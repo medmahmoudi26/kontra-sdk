@@ -22,7 +22,9 @@ adds what the Protocol asks of an adapter and nothing of its own about money.
 * The internal frontend is reached only through :class:`kontra._control.Control` (the relay's
   pace too: :meth:`~kontra._control.Control.history_size`); the relay reads where
   ``relay_service`` dials (the public frontend, or a dev server's own:
-  :func:`kontra._control.internal_relay_service`).
+  :func:`kontra._control.internal_relay_service`), and dereferences each item from the job's
+  stream blobs through ``stream_blobs`` (the gate's own reader, scoped to the job: decisions
+  I39), handing the gate the same :class:`~kontra.engine.Sealed` items as before.
 
 Nexus, namespaces, task queues and run ids stay in this module: the Protocol names none of
 them. Two reads are Temporal by definition and stay outside it, as extensions of this class:
@@ -106,6 +108,7 @@ __all__ = [
     "QUOTE_OPERATION",
     "WORKER_TTL",
     "Signer",
+    "StreamBlobs",
     "TemporalEngine",
     "worker_token",
 ]
@@ -146,6 +149,14 @@ class Signer(Protocol):
     def issuer(self) -> str: ...
 
     def sign(self, claims: Mapping[str, Any]) -> str: ...
+
+
+class StreamBlobs(Protocol):
+    """The gate's own reader of a job's stream blobs (decisions I39): the blob named
+    ``sha256`` if it is one of ``job_id``'s (created by its seller for its stream) and at most
+    ``size`` bytes are read; else None. The relay checks its size, digest and age shape."""
+
+    async def read_stream_blob(self, job_id: str, sha256: str, size: int) -> bytes | None: ...
 
 
 def _utcnow() -> datetime:
@@ -279,8 +290,10 @@ class TemporalEngine:
     party's worker dials (``Isolation.address``). ``relay_service``: dials a
     ``WorkflowService`` on the PUBLIC frontend carrying a given relay JWT, for :meth:`stream`
     (called again with a fresh token before the last expires); a dev server's own frontend,
-    which judges no token, is :func:`kontra._control.internal_relay_service`. Without one the
-    adapter relays no streams (``StreamStopped("unsupported")``). ``relay_interval``,
+    which judges no token, is :func:`kontra._control.internal_relay_service`.
+    ``stream_blobs``: the gate's reader of a job's stream blobs, where the relay dereferences
+    each item (``stream_item_max``: none larger is fetched). Without both the adapter relays
+    no streams (``StreamStopped("unsupported")``). ``relay_interval``,
     ``relay_rpc_timeout`` and ``history_limits`` tune the relay's pace (the platform's 2 s, a
     poll's deadline, the server's history limits); ``worker_ttl`` is a worker's and a relay
     token's life; ``clock`` is the gate's (tokens, a start's deadline)."""
@@ -292,6 +305,8 @@ class TemporalEngine:
         signer: Signer,
         address: str,
         relay_service: Callable[[str], Awaitable[RelayService]] | None = None,
+        stream_blobs: StreamBlobs | None = None,
+        stream_item_max: int = m.STREAM_ITEM_MAX,
         worker_ttl: timedelta = WORKER_TTL,
         relay_interval: float = MIN_INTERVAL,
         relay_rpc_timeout: float = 30.0,
@@ -302,6 +317,8 @@ class TemporalEngine:
         self._signer = signer
         self._address = address
         self._relay_service = relay_service
+        self._stream_blobs = stream_blobs
+        self._stream_item_max = stream_item_max
         self._worker_ttl = worker_ttl
         self._relay_interval = relay_interval
         self._relay_rpc_timeout = relay_rpc_timeout
@@ -497,10 +514,17 @@ class TemporalEngine:
         session: str,
     ) -> AsyncGenerator[StreamBatch, None]:
         h = _parse(handle)
-        if self._relay_service is None:
-            raise StreamStopped("unsupported", "this adapter has no frontend to relay from")
+        if self._relay_service is None or self._stream_blobs is None:
+            raise StreamStopped(
+                "unsupported", "this adapter has no frontend or bucket to relay from"
+            )
         service = _Renewing(lambda: self._relay_token(h, session), self._relay_service, self._clock)
         await service.dial()
+        reader = self._stream_blobs
+
+        async def fetch(sha: str, size: int) -> bytes | None:
+            return await reader.read_stream_blob(h.job, sha, size)  # scoped to this job
+
         batches = relay(
             service,
             namespace=h.seller,
@@ -512,6 +536,8 @@ class TemporalEngine:
             pace=self._pace(h),
             min_interval=self._relay_interval,
             rpc_timeout=self._relay_rpc_timeout,
+            blobs=fetch,
+            item_max=self._stream_item_max,
         )
         try:
             async for batch in batches:

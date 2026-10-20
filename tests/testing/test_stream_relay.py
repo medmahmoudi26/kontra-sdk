@@ -1,10 +1,11 @@
-"""A job's stream on the fake gate (decisions I31), over a served gate so the SSE stream is
-real: the relay (``kontra._relay``) started once the job is pinned and its first listener
-attaches, from offset 0 (OD2); items, gaps and history events interleaved by cursor; the
-offset kept across listener gaps; replay from the store (``after``, ``Last-Event-ID``); the
-caps (256 KiB per item, per-topic and per-job budgets, eight listeners); unknown topics
-refused; a relay stop recorded as a gap; and the stream ending once the job is closed and its
-relay finished.
+"""A job's stream on the fake gate (decisions I31, I39), over a served gate so the SSE stream
+is real: the relay (``kontra._relay``) started once the job is pinned and its first listener
+attaches, from offset 0 (OD2); each item dereferenced from the job's stream blobs, which only
+its seller creates and only it and the gate's relay read; items, gaps and history events
+interleaved by cursor; the offset kept across listener gaps; replay from the store (``after``,
+``Last-Event-ID``); the caps (256 KiB per item, per-topic and per-job budgets, eight
+listeners); an item not stored, or not the job's, a gap; unknown topics refused; a relay stop
+recorded as a gap; and the stream ending once the job is closed and its relay finished.
 
 The seller's Temporal is scripted here (:class:`FakeTemporal` answers the relay's two calls
 from a log of sealed items); the same relay against a real worker is
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import time
 from collections.abc import AsyncIterator, Callable
@@ -59,12 +61,15 @@ def _doc(**facts: Any) -> dict[str, Any]:
 @dataclass
 class FakeTemporal:
     """The seller's Temporal as the relay sees it: its two calls answered from a log of
-    sealed items (topic None: one the buyer may not read). (The gate's describe, which paces
-    the relay, is the control plane's: ``ScriptedControl.history``.)"""
+    sealed items (topic None: one the buyer may not read), each a reference to its blob,
+    which ``store`` puts where the seller's worker would: the gate's stream blobs of the job.
+    (The gate's describe, which paces the relay, is the control plane's:
+    ``ScriptedControl.history``.)"""
 
-    log: list[tuple[str | None, bytes | None, int]] = field(
-        default_factory=list[tuple[str | None, bytes | None, int]]
+    log: list[tuple[str | None, str | None, int]] = field(
+        default_factory=list[tuple[str | None, str | None, int]]
     )
+    store: Callable[[str, bytes], None] | None = None
     #: Every poll: (topics, from_offset, first_execution_run_id).
     polls: list[tuple[list[str], int, str]] = field(
         default_factory=list[tuple[list[str], int, str]]
@@ -76,13 +81,21 @@ class FakeTemporal:
     def workflow_service(self) -> FakeTemporal:
         return self
 
-    def publish(self, topic: str | None, n: int = 1, *, size: int | None = None) -> None:
+    def publish(
+        self, topic: str | None, n: int = 1, *, size: int | None = None, stored: bool = True
+    ) -> None:
+        """``n`` items; ``size``: one that large (its blob never stored); ``stored`` False: a
+        stub (the seller's worker did not store it in time)."""
         for _ in range(n):
             if size is not None:
-                self.log.append((topic, None, size))  # claim-checked: too large to relay
+                self.log.append((topic, None, size))
                 continue
             ct = encrypt(f"item {len(self.log)}".encode(), [KEY[1]])
-            self.log.append((topic, ct, len(ct)))
+            digest = hashlib.sha256(ct).hexdigest()
+            if stored:
+                assert self.store is not None
+                self.store(digest, ct)
+            self.log.append((topic, digest if stored else None, len(ct)))
 
     async def update_workflow_execution(self, req: Any, retry: bool = False, metadata: Any = None, timeout: Any = None) -> UpdateWorkflowExecutionResponse:  # noqa: ASYNC109  # fmt: skip
         args = json.loads(req.request.input.args.payloads[0].data)
@@ -101,14 +114,15 @@ class FakeTemporal:
         if len(self.log) <= offset:
             return UpdateWorkflowExecutionResponse()  # returned at ACCEPTED: sent again
         items: list[dict[str, Any]] = []
-        for i, (topic, ct, size) in enumerate(self.log):
+        next_offset, more = len(self.log), False
+        for i, (topic, digest, size) in enumerate(self.log):
             if i < offset or (topic is not None and topic not in args["topics"]):
                 continue
-            if ct is None:
-                items.append({"topic": topic, "offset": i, "size": size, "ct": None})
-            else:
-                items.append({"topic": topic, "offset": i, "ct": base64.b64encode(ct).decode()})
-        env = {"v": 1, "items": items, "next_offset": len(self.log), "more_ready": False}
+            if len(items) == s.STREAM_ITEMS_MAX:  # the job root's cut
+                next_offset, more = i, True
+                break
+            items.append({"topic": topic, "offset": i, "size": size, "sha256": digest})
+        env = {"v": 2, "items": items, "next_offset": next_offset, "more_ready": more}
         return _answer(
             Payload(
                 metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"},
@@ -171,6 +185,12 @@ async def make_live(tmp_path: Path, **options: Any) -> AsyncIterator[Live]:
     q = await buyer.gate.quote("acme/enrich", wire(json_payload({"text": "x"})))
     assert q.quote_id is not None
     job = await buyer.gate.hire(q.quote_id, buyer_key=_A_BUYER_KEY)
+
+    def store(digest: str, ct: bytes) -> None:
+        gate.blobs[digest] = ct
+        gate.blob_scopes[digest] = ("acme", job.job_id)
+
+    temporal.store = store
     try:
         yield Live(gate, control, temporal, seller, buyer, job, tmp_path)
     finally:
@@ -340,6 +360,77 @@ async def test_too_large_items_and_spent_budgets_are_gaps(tmp_path: Path) -> Non
             ("gap", PROGRESS_TOPIC, 5, m.StreamGapReason.JOB_BUDGET),
         ]
         assert seen[0].size == 300_000
+
+
+@pytest.mark.timeout(60)
+async def test_an_item_not_stored_or_not_the_jobs_is_a_gap(live: Live) -> None:
+    """An item the seller's worker did not store (a stub), whose blob is gone, or whose blob is
+    another job's (a seller listing a digest it does not own): ``unavailable``, with its
+    offset; the gate's reader never reads another job's blob for this one."""
+    live.temporal.publish(LISTED)
+    live.temporal.publish(LISTED, stored=False)
+    live.temporal.publish(LISTED)
+    live.temporal.publish(LISTED)
+    gone, foreign = live.temporal.log[2][1], live.temporal.log[3][1]
+    assert gone is not None
+    assert foreign is not None
+    del live.gate.blobs[gone]
+    live.gate.blob_scopes[foreign] = ("acme", "f" * 32)
+    live.running()
+    seen: list[m.StreamEvent] = []
+    task = _follow(live, seen)
+    await _until(_count(seen, 4))
+    live.completed()
+    await asyncio.wait_for(task, 20)
+    assert [(e.kind.value, e.offset, e.reason) for e in seen] == [
+        ("item", 0, None),
+        ("gap", 1, m.StreamGapReason.UNAVAILABLE),
+        ("gap", 2, m.StreamGapReason.UNAVAILABLE),
+        ("gap", 3, m.StreamGapReason.UNAVAILABLE),
+    ]
+
+
+@pytest.mark.timeout(60)
+async def test_stream_blobs_are_the_jobs_sellers(live: Live) -> None:
+    """``POST /v1/jobs/{id}/stream/blobs``: the job's seller only; a blob of it is read by
+    that seller (``GET /v1/blobs/{sha256}``), 404 for anyone else, and never handed out by
+    the claim-check route; a digest stored for another job, or for no job, is refused."""
+    ct = encrypt(b"stream item", [KEY[1]])
+    digest = hashlib.sha256(ct).hexdigest()
+    req = m.StreamBlobsCreate(blobs=[m.BlobCreate(sha256=digest, size=len(ct))])
+    with pytest.raises(GateError) as e:
+        await live.buyer.gate.create_stream_blobs(live.job.job_id, req)
+    assert e.value.status == 403
+    [url] = (await live.seller.gate.create_stream_blobs(live.job.job_id, req)).blobs
+    assert not url.exists
+    async with httpx.AsyncClient(timeout=10) as http:
+        put = await http.put(url.url, content=ct, headers={"Content-Length": str(len(ct))})
+    assert put.status_code == 200
+    [again] = (await live.seller.gate.create_stream_blobs(live.job.job_id, req)).blobs
+    assert again.exists
+    assert (await live.seller.gate.get_blob(digest)).exists
+    with pytest.raises(GateError) as e:
+        await live.buyer.gate.get_blob(digest)
+    assert e.value.status == 404
+    with pytest.raises(GateError) as e:
+        await live.buyer.gate.create_blob(m.BlobCreate(sha256=digest, size=len(ct)))
+    assert e.value.status == 409
+    assert await live.gate.read_stream_blob(live.job.job_id, digest, len(ct)) == ct
+    assert await live.gate.read_stream_blob(live.job.job_id, digest, len(ct) - 1) is None
+    assert await live.gate.read_stream_blob("f" * 32, digest, len(ct)) is None
+    # A claim-check blob (no job's) is not a stream blob of this job.
+    plain = encrypt(b"claim-checked", [KEY[1]])
+    plain_digest = hashlib.sha256(plain).hexdigest()
+    live.gate.blobs[plain_digest] = plain
+    other = m.StreamBlobsCreate(blobs=[m.BlobCreate(sha256=plain_digest, size=len(plain))])
+    with pytest.raises(GateError) as e:
+        await live.seller.gate.create_stream_blobs(live.job.job_id, other)
+    assert e.value.status == 409
+    assert await live.gate.read_stream_blob(live.job.job_id, plain_digest, len(plain)) is None
+    too_many = m.StreamBlobsCreate.model_construct(blobs=[req.blobs[0]] * (m.STREAM_BLOBS_MAX + 1))
+    with pytest.raises(GateError) as e:
+        await live.seller.gate.create_stream_blobs(live.job.job_id, too_many)
+    assert e.value.status == 422
 
 
 @pytest.mark.timeout(60)

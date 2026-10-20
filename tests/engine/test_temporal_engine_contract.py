@@ -17,6 +17,7 @@ from typing import Any
 import jwt
 import pytest
 from contract_flows import (
+    BLOBS,
     QUOTE_DOCUMENT,
     ContractJob,
     make_handler,
@@ -67,6 +68,13 @@ class DeadControl:
         return unreachable
 
 
+class _Blobs:
+    """The gate's reader of the job's stream blobs: what the seller's activities stored."""
+
+    async def read_stream_blob(self, job_id: str, sha256: str, size: int) -> bytes | None:
+        return BLOBS.get(sha256)
+
+
 class TemporalHarness:
     enforces_isolation = False  # a dev server runs no authorizer (E18: tests/temporal)
     buyer_presence = True
@@ -89,6 +97,7 @@ class TemporalHarness:
             signer=self.signer,
             address=self.dev.grpc_address,
             relay_service=internal_relay_service(control),  # one frontend, no token judged
+            stream_blobs=_Blobs(),
             relay_interval=0.2,
         )
 

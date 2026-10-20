@@ -1,4 +1,5 @@
-"""The stream envelope: a workflow stream's poll result, sealed item by item (decisions I31).
+"""The stream envelope: a workflow stream's poll result, sealed item by item, the items stored
+in the claim-check bucket and the answer a list of references (decisions I31, I39).
 
 ``temporalio.contrib.workflow_streams`` answers a poll (``__temporal_workflow_stream_poll``)
 with one ``PollResult`` -- every item's ``Payload`` base64-encoded inside one JSON value -- and
@@ -6,57 +7,69 @@ the codec chain runs once, on that whole value. Encrypted whole, the gate's rela
 neither topics nor offsets; encrypted whole to the buyer, a relay that asked for every topic
 would hand the buyer the seller's private ones. So Kontra's workflow interceptor marks a poll
 result on a job root (:data:`STREAM_MARK` = :data:`POLL_MARK`, with the topics the buyer may
-read under :data:`BUYER_TOPICS_KEY`) and :class:`~kontra.codec.KontraCodec` turns the marked
-payload into this envelope (:func:`seal_poll`)::
+read under :data:`BUYER_TOPICS_KEY`), cut to at most :data:`STREAM_ITEMS_MAX` items, and
+:class:`~kontra.codec.KontraCodec` turns the marked payload into this envelope
+(:func:`seal_poll`)::
 
     Payload.metadata = {"encoding": "binary/kontra-stream", "kontra-v": "1"}
     Payload.data     = UTF-8 JSON, at most ENVELOPE_MAX bytes:
-    {"v": 1,
-     "items": [{"topic": "turn_events" | null, "offset": 42, "ct": "<base64 age>"},
-               {"topic": ... | null, "offset": 43, "size": N, "ref": {"sha256": ..., "size": N}},
-               {"topic": ... | null, "offset": 44, "size": N, "ct": null}],
+    {"v": 2,
+     "items": [{"topic": "turn_events" | null, "offset": 42, "size": 1311, "sha256": "<hex>"},
+               {"topic": ... | null, "offset": 43, "size": 880, "sha256": null}],
      "next_offset": 57, "more_ready": false}
 
 * Each item is sealed on its own: the age ciphertext of the item's own ``Payload`` with two
   more metadata keys, :data:`SEALED_TOPIC_KEY` and :data:`SEALED_OFFSET_KEY`, so the topic
-  and the offset are authenticated by the ciphertext and a buyer checks both against what the
-  relay says (:func:`open_item`): a gate cannot relabel or reorder items.
+  and the offset are authenticated by the ciphertext and a reader checks both against what the
+  relay says (:func:`open_item`): a gate, a bucket or a token holder cannot relabel, reorder or
+  swap items.
 * A topic the buyer may read (the offering's ``streams:`` and ``kontra.progress``) is sealed
   to the seller's recipients and the job's buyer key, and named in the clear; any other topic
   to the seller's recipients only, its name ``null`` (it lives inside the ciphertext only).
-* An item whose ciphertext is above :data:`ITEM_INLINE_MAX` goes to the blob store (a
-  ``ref``, fetched by the seller's own decode; the relay records a gap), or is a stub
-  (``ct: null``) without one.
-* The envelope stays within :data:`ENVELOPE_MAX`: sealing stops before the item that would
-  cross it, with ``next_offset`` at that item and ``more_ready`` true -- the contrib's own
-  truncation protocol, so a subscriber simply polls again.
-* ``next_offset``, ``more_ready`` and the offsets are in the clear by design: they are the
-  log's length and positions, which the platform reads from the history's size anyway.
+* **Every item is a reference** (decisions I39): its ciphertext goes to the claim-check bucket
+  under its sha256, scoped to the job (:class:`StreamStore`), and the envelope names its
+  ``size`` and ``sha256``. An item not stored -- no store, a store that failed, or the
+  completion's upload budget spent -- is a stub, ``sha256: null``: the relay records a gap, and
+  a later read stores it. So every answer has a fixed upper size: at most
+  :data:`STREAM_ITEMS_MAX` entries of at most :data:`REF_ENTRY_MAX` bytes.
+* **Sealed deterministically per worker.** With a seal key (:func:`kontra.codec.age.seal_key`
+  of the worker's identity) an item's file derives from a seed over the job, the recipients and
+  its sealed plaintext, so the same worker re-sealing the same item writes the same bytes, and
+  a re-read stores nothing new however long ago the item was first answered. The seed needs the
+  worker's secret: no one else can confirm a guess at an item.
+* ``next_offset``, ``more_ready``, the offsets and sizes are in the clear by design: they are
+  the log's length and positions, which the platform reads from the history's size anyway.
 
-:func:`open_poll` restores the exact ``PollResult`` JSON for the seller's codec, so a stock
-``WorkflowStreamClient`` keeps working. :func:`parse_envelope` is the relay's reader: no key,
-strict, and it refuses any ``ct`` that is not an age file, so plaintext never reaches a
-gate's storage. The offset query's answer is marked too (:data:`OFFSET_MARK`) and passes the
-codec in plaintext: a log length.
+:func:`open_poll` restores the exact ``PollResult`` JSON for the seller's codec, fetching each
+reference, so a stock ``WorkflowStreamClient`` keeps working. :func:`parse_envelope` is the
+relay's reader: no key, strict; :func:`verified_item` is what the relay keeps of a fetched
+blob (its size and digest checked, an age file), so plaintext never reaches a gate's storage.
+The offset query's answer is marked too (:data:`OFFSET_MARK`) and passes the codec in
+plaintext: a log length.
 
-Imports only the standard library, protobuf, :mod:`kontra.codec.age` and
-:mod:`kontra.contract`: the gate's relay (:mod:`kontra._relay`) reads envelopes with it.
+Imports only the standard library, protobuf, ``temporalio.api``/``temporalio.exceptions``,
+:mod:`kontra.codec.age` and :mod:`kontra.contract`: the gate's relay (:mod:`kontra._relay`)
+reads envelopes with it, and Kontra's workflow interceptor takes its constants and
+:class:`PollFailure` inside the sandbox.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import json
+import logging
 import re
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Protocol, cast, runtime_checkable
 
 from google.protobuf.message import DecodeError
 from temporalio.api.common.v1 import Payload
+from temporalio.exceptions import ApplicationError
 
 from kontra.codec import age
 from kontra.contract.names import PROGRESS_TOPIC
@@ -66,28 +79,40 @@ __all__ = [
     "AGE_MAGIC",
     "BUYER_TOPICS_KEY",
     "ENVELOPE_MAX",
-    "ITEM_INLINE_MAX",
+    "ENVELOPE_VERSION",
     "OFFSET_MARK",
     "POLL_MARK",
+    "REF_ENTRY_MAX",
     "SEALED_OFFSET_KEY",
     "SEALED_TOPIC_KEY",
+    "STREAM_BUSY",
     "STREAM_ENCODING",
+    "STREAM_ERROR",
+    "STREAM_FULL",
+    "STREAM_ITEMS_MAX",
     "STREAM_MARK",
+    "STREAM_POLLS_MAX",
+    "STREAM_REFS_MAX",
+    "STREAM_UPLOAD_BUDGET",
     "BlobRefs",
     "Envelope",
     "EnvelopeError",
     "EnvelopeItem",
     "ItemUnreadable",
+    "PollFailure",
+    "StreamStore",
     "buyer_topics",
     "envelope_bound",
-    "items_that_fit",
     "offset_payload",
     "open_item",
     "open_poll",
     "parse_envelope",
     "parse_offset",
     "seal_poll",
+    "verified_item",
 ]
+
+log = logging.getLogger("kontra.codec.stream")
 
 #: The encoding of an envelope in history.
 STREAM_ENCODING = b"binary/kontra-stream"
@@ -100,12 +125,38 @@ BUYER_TOPICS_KEY = "kontra-stream-buyer"
 #: Inside a sealed item: its topic and its offset (ASCII decimal).
 SEALED_TOPIC_KEY = "kontra-topic"
 SEALED_OFFSET_KEY = "kontra-offset"
-#: The largest envelope: under Temporal's ``limit.blobSize.warn`` (512 KiB) and far under
-#: Kontra's pinned ``.error`` (2 MiB). It is never claim-checked or stored externally: the
-#: relay must read it.
-ENVELOPE_MAX = 512 * 1024
-#: The largest item ciphertext carried inline (and relayed); above it, a ``ref`` or a stub.
-ITEM_INLINE_MAX = 256 * 1024
+#: The envelope's own version (its JSON ``v``): references only (decisions I39).
+ENVELOPE_VERSION = 2
+#: The most items one answer lists. Kontra's workflow interceptor cuts an answer here (the
+#: contrib's own truncation: ``next_offset`` at the first left out, ``more_ready``).
+STREAM_ITEMS_MAX = 64
+#: The longest item entry, its comma included: a 64-character topic (``check_topic`` admits no
+#: character JSON escapes), a 19-digit offset and size, 64 hex digits
+#: (``tests/codec/test_stream_envelope.py`` builds it).
+REF_ENTRY_MAX = 209
+#: ``{"v":2,"items":[`` ... ``],"next_offset":<19 digits>,"more_ready":false}`` with room.
+_ENVELOPE_FRAME = 128
+#: The largest envelope: :data:`STREAM_ITEMS_MAX` of the largest entries in the frame
+#: (13,504 bytes). It is never claim-checked or stored externally: the relay must read it.
+ENVELOPE_MAX = _ENVELOPE_FRAME + STREAM_ITEMS_MAX * REF_ENTRY_MAX
+#: The most polls a job root accepts in one run: half of Kontra's pinned
+#: ``history.maxTotalUpdates`` (2,000), so the other half stays the seller's own updates'
+#: (decisions I39; a test pins it). Past it a poll is refused (:data:`STREAM_FULL`).
+STREAM_POLLS_MAX = 1_000
+#: The stored items a codec remembers (:class:`BlobRefs`): more than one run's polls can list
+#: (``STREAM_POLLS_MAX * STREAM_ITEMS_MAX``), about 16 MB. A cache: what it forgets is sealed
+#: to the same bytes again (per-worker sealing) and found stored.
+STREAM_REFS_MAX = 65_536
+#: Seconds of uploads one workflow-task completion may spend on its answers' items, all of
+#: them together (temporalio encodes a completion's payloads one after another); past it, an
+#: answer's new items are stubs, so a slow bucket never holds a workflow task past its timeout.
+STREAM_UPLOAD_BUDGET = 2.0
+#: The failure types of a poll a job root refuses (or fails) itself: past its budget (stop),
+#: busy -- too many polls in flight, or an offset past the stream's end (wait, retry) --, any
+#: other failure of the stream's own handler (:class:`PollFailure`).
+STREAM_FULL = "KontraStreamFull"
+STREAM_BUSY = "KontraStreamBusy"
+STREAM_ERROR = "KontraStreamError"
 #: Every age v1 file starts with this line.
 AGE_MAGIC = b"age-encryption.org/v1\n"
 
@@ -117,30 +168,61 @@ _LISTED_MAX = STREAMS_MAX + 1
 #: A log offset or length: what a JSON integer Temporal and Python agree on can hold.
 _INT = re.compile(rb"0|[1-9][0-9]{0,18}", re.ASCII)
 _SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)
-#: ``{"v":1,"items":[`` ... ``],"next_offset":<19 digits>,"more_ready":false}`` with room.
-_ENVELOPE_FRAME = 128
-#: The most a ``Payload`` metadata entry adds beyond its key and value bytes.
-_MAP_ENTRY = 12
-_ITEM_KEYS = frozenset({"topic", "offset", "ct", "size", "ref"})
+_ITEM_KEYS = frozenset({"topic", "offset", "size", "sha256"})
 _TOP_KEYS = frozenset({"v", "items", "next_offset", "more_ready"})
 #: What ``json.loads`` raises on input that is not JSON, or JSON nested too deep to parse.
 _JSON_ERRORS = (ValueError, RecursionError)
+#: Blobs fetched at once for one answer (the seller's own decode).
+_FETCH_CONCURRENCY = 16
 
-#: ``put_blob(ciphertext) -> (sha256, size)``: claim-check storage (the codec's blob store).
-PutBlob = Callable[[bytes], Awaitable[tuple[str, int]]]
+#: The failure types of a poll that keep their name (any other is :data:`STREAM_ERROR`), each
+#: with its one message: a poll's failure is part of its outcome in the job's history.
+_POLL_FAILURES = {
+    STREAM_FULL: "the job's stream accepts no more polls in this run",
+    STREAM_BUSY: "the job's stream is busy, or the offset is past its end: poll again later",
+    STREAM_ERROR: "the job's stream could not answer this poll",
+    "TruncatedOffset": "the offset was truncated from the job's stream",
+    "StreamDraining": "the job's stream is draining for a continue-as-new",
+}
+
 #: ``fetch_blob(sha256, size) -> ciphertext``, verified against both.
 FetchBlob = Callable[[str, int], Awaitable[bytes]]
 
 
-class BlobRefs:
-    """The claim-checked items a codec already stored, by job, sealed plaintext and
-    recipients, at most ``size`` of them (the least recently used go first). A poll that
-    re-reads an item above :data:`ITEM_INLINE_MAX` -- the seller's own subscriber, a relay
-    polling from 0 again -- reuses its blob: sealed afresh, age's randomness would make a
-    new ciphertext, a new sha256 and another upload each time. Keyed per job, so two jobs'
-    identical items never share a blob the platform could link."""
+class PollFailure(ApplicationError):
+    """A poll of a job's stream refused or failed by Kontra's workflow interceptor: one of a
+    fixed set of types, its one message, and -- by :class:`~kontra.codec.KontraFailureConverter`
+    -- no stack trace, so an accepted poll's failed outcome is a small constant (decisions
+    I39). Any type outside the set is :data:`STREAM_ERROR`."""
 
-    def __init__(self, size: int = 1024) -> None:
+    def __init__(self, type: str) -> None:
+        kind = type if type in _POLL_FAILURES else STREAM_ERROR
+        super().__init__(_POLL_FAILURES[kind], type=kind, non_retryable=True)
+
+
+@runtime_checkable
+class StreamStore(Protocol):
+    """Where a seller's codec stores a job's stream items: the claim-check bucket, scoped to
+    the job (``POST /v1/jobs/{job_id}/stream/blobs``, :class:`~kontra.codec.GateBlobStore`)."""
+
+    async def put_stream(
+        self, job_id: str, blobs: Sequence[tuple[str, bytes]], done: Callable[[str], None]
+    ) -> None:
+        """Store each ``(sha256, ciphertext)`` of ``job_id``'s stream, calling ``done(sha256)``
+        for each one stored, or found stored already, as soon as it is. May be cancelled at
+        any point (the codec's upload budget): what ``done`` named is stored."""
+        ...
+
+
+class BlobRefs:
+    """The stream items a codec stored already, by job, sealed plaintext and recipients, at
+    most ``size`` of them (the least recently used go first): a poll that re-reads an item --
+    the seller's own subscriber, a relay polling from 0 again -- reuses its reference without
+    asking the gate. A cache in front of per-worker sealing (the module docstring): what it
+    forgets seals to the same bytes again. Keyed per job, so two jobs' identical items never
+    share a blob the platform could link."""
+
+    def __init__(self, size: int = STREAM_REFS_MAX) -> None:
         if size < 1:
             raise ValueError("size is at least 1")
         self._size = size
@@ -184,12 +266,12 @@ class ItemUnreadable(EnvelopeError):
 @dataclass(frozen=True, slots=True)
 class EnvelopeItem:
     """One item as the relay reads it: ``topic`` is None for a topic the buyer may not read;
-    ``ciphertext`` is None for an item too large to relay (claim-checked, or a stub);
-    ``size`` is the ciphertext's size either way."""
+    ``sha256`` names its blob, or is None for a stub (not stored); ``size`` is the
+    ciphertext's size either way."""
 
     topic: str | None
     offset: int
-    ciphertext: bytes | None
+    sha256: str | None
     size: int
 
 
@@ -227,6 +309,16 @@ def parse_offset(payload: Payload) -> int:
     ):
         raise EnvelopeError("not a Kontra stream offset")
     return int(payload.data)
+
+
+def envelope_bound(items: int) -> int:
+    """At least the size of the envelope :func:`seal_poll` writes for ``items`` items, its
+    frame included: every entry is at most :data:`REF_ENTRY_MAX`. Kontra's workflow
+    interceptor counts the answers of one workflow task with it (pure arithmetic, in the
+    sandbox, the same on every worker)."""
+    if items < 0:
+        raise ValueError("items is >= 0")
+    return _ENVELOPE_FRAME + items * REF_ENTRY_MAX
 
 
 def _listed(marked: Payload) -> frozenset[str]:
@@ -301,144 +393,139 @@ def _sealed_plaintext(inner: Payload, topic: str, offset: int) -> bytes:
     return sealed.SerializeToString()
 
 
-def _b64_len(n: int) -> int:
-    return 4 * -(-n // 3)
-
-
-def _entry_len(entry: dict[str, Any]) -> int:
-    return len(json.dumps(entry, separators=(",", ":"))) + 1  # and its comma
-
-
-def _item_bound(topic: str, offset: int, size: int, visible: bool, recipients: int) -> int:
-    """At least what :func:`seal_poll` counts for the item: ``size`` bytes of serialized
-    ``Payload`` (at most), sealed to at most ``recipients``, inline, claim-checked or a stub."""
-    # The two sealed metadata entries: a map entry is a tag, a length, and a key and a value
-    # field of a tag, a length and the bytes each (_MAP_ENTRY: room for 3-byte varints).
-    plain = size + 2 * _MAP_ENTRY + len(SEALED_TOPIC_KEY) + len(SEALED_OFFSET_KEY)
-    plain += len(topic.encode("utf-8")) + len(str(offset))
-    ct = age.ciphertext_size(plain, max(recipients, 1))
-    shown = topic if visible else None
-    inline = _entry_len({"topic": shown, "offset": offset, "ct": ""})
-    inline += _b64_len(min(ct, ITEM_INLINE_MAX))
-    if ct <= ITEM_INLINE_MAX:
-        return inline
-    ref = {"sha256": "0" * 64, "size": ct}
-    return max(inline, _entry_len({"topic": shown, "offset": offset, "size": ct, "ref": ref}))
-
-
-def items_that_fit(
-    items: Iterable[tuple[str, int, int]], *, buyer_topics: Collection[str], recipients: int
-) -> int:
-    """How many of ``items`` -- ``(topic, offset, size)`` in log order, ``size`` at least the
-    item's serialized ``Payload`` -- an envelope holds for sure when every item is sealed to
-    at most ``recipients`` keys: never fewer than one. Kontra's workflow interceptor trims a
-    poll's answer to it (inside the sandbox: pure arithmetic), so :func:`seal_poll` never
-    trims an answer the workflow already counted as read to the end (its drain)."""
-    total = _ENVELOPE_FRAME
-    count = 0
-    for topic, offset, size in items:
-        total += _item_bound(topic, offset, size, topic in buyer_topics, recipients)
-        if total > ENVELOPE_MAX and count:
-            break
-        count += 1
-    return count
-
-
-def envelope_bound(
-    items: Iterable[tuple[str, int, int]], *, buyer_topics: Collection[str], recipients: int
-) -> int:
-    """At least the size of the envelope :func:`seal_poll` writes for ``items`` (the
-    arguments of :func:`items_that_fit`), its frame included. Kontra's workflow interceptor
-    counts the answers one workflow task carries with it (pure arithmetic, in the sandbox,
-    the same on every worker)."""
-    total = _ENVELOPE_FRAME
-    for topic, offset, size in items:
-        total += _item_bound(topic, offset, size, topic in buyer_topics, recipients)
-    return total
-
-
 async def seal_poll(
     marked: Payload,
     *,
     buyer_recipients: Sequence[str],
     seller_recipients: Sequence[str],
-    put_blob: PutBlob | None,
+    store: StreamStore | None,
+    scope: str,
     refs: BlobRefs | None = None,
-    scope: str = "",
+    seal_key: bytes | None = None,
+    deadline: float | None = None,
 ) -> Payload:
     """A marked poll result as the envelope (see the module docstring). A listed topic is
-    sealed to ``buyer_recipients`` (the seller's set and the job's buyer key), every other
-    to ``seller_recipients``. ``refs``: the claim-checked items stored already, under
-    ``scope`` (the job), reused rather than stored again. Raises :class:`EnvelopeError` for
-    a marked payload that is not one, :class:`age.AgeError` for a recipient that is not
-    one."""
+    sealed to ``buyer_recipients`` (the seller's set and the job's buyer key), every other to
+    ``seller_recipients``; each item to ``store`` under ``scope`` (the job), sealed from a seed
+    under ``seal_key`` when given. ``refs``: the items stored already. ``deadline``: the
+    event-loop time past which nothing more is uploaded (the completion's upload budget); an
+    item not stored by then, or that ``store`` failed to store, is a stub. A store's failure
+    never fails the answer. Raises :class:`EnvelopeError` for a marked payload that is not
+    one, :class:`age.AgeError` for a recipient that is not one."""
     listed = _listed(marked)
     items, next_offset, more_ready = _poll_result(marked)
-    size = _ENVELOPE_FRAME
-    out: list[dict[str, Any]] = []
+    if len(items) > STREAM_ITEMS_MAX:
+        # Kontra's interceptor cuts here first; the contrib's truncation protocol either way.
+        next_offset, more_ready = items[STREAM_ITEMS_MAX][1], True
+        items = items[:STREAM_ITEMS_MAX]
+    entries: list[tuple[str | None, int, int, str]] = []
+    known: set[str] = set()
+    fresh: dict[str, bytes] = {}
+    to_store: list[tuple[str, bytes]] = []
     for topic, offset, inner in items:
         visible = topic in listed
         recipients = buyer_recipients if visible else seller_recipients
         plain = _sealed_plaintext(inner, topic, offset)
-        ct_size = age.ciphertext_size(len(plain), age.recipient_count(recipients))
-        shown = topic if visible else None
-        inline = ct_size <= ITEM_INLINE_MAX
-        if inline:
-            length = _entry_len({"topic": shown, "offset": offset, "ct": ""}) + _b64_len(ct_size)
-        elif put_blob is not None:
-            ref = {"sha256": "0" * 64, "size": ct_size}
-            length = _entry_len({"topic": shown, "offset": offset, "size": ct_size, "ref": ref})
+        key = BlobRefs.key(scope, plain, recipients)
+        ref = refs.get(key) if refs is not None else None
+        if ref is not None:
+            digest, size = ref
+            known.add(digest)
         else:
-            length = _entry_len({"topic": shown, "offset": offset, "size": ct_size, "ct": None})
-        if size + length > ENVELOPE_MAX and out:
-            # The contrib's truncation protocol: the subscriber polls again from here.
-            next_offset, more_ready = offset, True
-            break
-        size += length
-        if inline:
-            ct = base64.b64encode(age.encrypt(plain, recipients)).decode("ascii")
-            out.append({"topic": shown, "offset": offset, "ct": ct})
-        elif put_blob is not None:
-            key = BlobRefs.key(scope, plain, recipients) if refs is not None else None
-            ref = refs.get(key) if refs is not None and key is not None else None
-            if ref is None:
-                ref = await put_blob(age.encrypt(plain, recipients))
-                if refs is not None and key is not None:
-                    refs.put(key, ref)
-            digest, stored = ref
-            out.append(
-                {
-                    "topic": shown,
-                    "offset": offset,
-                    "size": stored,
-                    "ref": {"sha256": digest, "size": stored},
-                }
-            )
-        else:
-            out.append({"topic": shown, "offset": offset, "size": ct_size, "ct": None})
-    envelope = {"v": 1, "items": out, "next_offset": next_offset, "more_ready": more_ready}
+            seed = age.seed_for(seal_key, key) if seal_key is not None else None
+            ct = age.encrypt(plain, recipients, seed=seed)
+            digest, size = hashlib.sha256(ct).hexdigest(), len(ct)
+            if digest not in fresh:
+                fresh[digest] = key
+                to_store.append((digest, ct))
+        entries.append((topic if visible else None, offset, size, digest))
+    stored = await _store(store, scope, to_store, deadline) if to_store else set[str]()
+    if refs is not None:
+        for digest, ct in to_store:
+            if digest in stored:
+                refs.put(fresh[digest], (digest, len(ct)))
+    out = [
+        {
+            "topic": shown,
+            "offset": offset,
+            "size": size,
+            "sha256": digest if digest in known or digest in stored else None,
+        }
+        for shown, offset, size, digest in entries
+    ]
+    envelope = {
+        "v": ENVELOPE_VERSION,
+        "items": out,
+        "next_offset": next_offset,
+        "more_ready": more_ready,
+    }
     return Payload(
         metadata={"encoding": STREAM_ENCODING, _VERSION_KEY: _VERSION},
         data=json.dumps(envelope, separators=(",", ":")).encode("utf-8"),
     )
 
 
+async def _store(
+    store: StreamStore | None, scope: str, blobs: list[tuple[str, bytes]], deadline: float | None
+) -> set[str]:
+    """What of ``blobs`` is stored by ``deadline``: ``store`` is cancelled there, and any
+    failure of it only leaves what it reported stored (the rest are stubs)."""
+    stored: set[str] = set()
+    if store is None:
+        return stored
+    remaining = None if deadline is None else deadline - asyncio.get_running_loop().time()
+    if remaining is not None and remaining <= 0:
+        return stored  # the completion's upload budget is spent: stubs, at no cost
+    try:
+        async with asyncio.timeout(remaining):
+            await store.put_stream(scope, blobs, stored.add)
+    except TimeoutError:
+        log.warning(
+            "job %s: %d of %d new stream items not stored within the upload budget",
+            scope,
+            len(blobs) - len(stored),
+            len(blobs),
+        )
+    except Exception as e:  # a bucket outage costs items, never the workflow task
+        log.warning(
+            "job %s: %d of %d new stream items not stored: %s",
+            scope,
+            len(blobs) - len(stored),
+            len(blobs),
+            type(e).__name__,
+        )
+    return stored
+
+
 async def open_poll(
     envelope: Payload, identities: Sequence[str], *, fetch_blob: FetchBlob | None
 ) -> Payload:
     """The envelope as the ``PollResult`` JSON a stock subscriber expects, opened with this
-    party's ``identities`` (every item is sealed to the seller's set). A ``ref`` is fetched
-    (``fetch_blob`` verifies it), a stub is dropped (an item nobody can relay). An item that
-    will not open, or names another topic or offset than its place, raises
-    :class:`EnvelopeError`."""
-    parsed = _parse(envelope)
+    party's ``identities`` (every item is sealed to the seller's set). Each reference is
+    fetched (``fetch_blob`` verifies it; a few at once); a stub, or every item without
+    ``fetch_blob``, is dropped (an item nobody can relay). An item that will not open, or names
+    another topic or offset than its place, raises :class:`EnvelopeError`."""
+    parsed = parse_envelope(envelope)
+    wanted = [i for i in parsed.items if i.sha256 is not None and fetch_blob is not None]
+    fetched: dict[int, bytes] = {}
+    if wanted:
+        gate = asyncio.Semaphore(_FETCH_CONCURRENCY)
+
+        async def fetch(item: EnvelopeItem) -> None:
+            assert item.sha256 is not None
+            assert fetch_blob is not None
+            async with gate:
+                fetched[item.offset] = await fetch_blob(item.sha256, item.size)
+
+        done = await asyncio.gather(*(fetch(i) for i in wanted), return_exceptions=True)
+        for failed in done:
+            if isinstance(failed, BaseException):
+                raise failed  # the codec's own error (a bucket that did not answer, ...)
     items: list[dict[str, Any]] = []
-    for item, ref in parsed.pairs:
-        ct = item.ciphertext
+    for item in parsed.items:
+        ct = fetched.get(item.offset)
         if ct is None:
-            if ref is None or fetch_blob is None:
-                continue  # a stub, or a claim-check this codec cannot fetch: a gap
-            ct = await fetch_blob(*ref)
+            continue
         inner, topic = _open(ct, identities, item.offset)
         if item.topic is not None and item.topic != topic:
             raise EnvelopeError(f"the item at offset {item.offset} was relabelled")
@@ -491,35 +578,26 @@ def open_item(ct: bytes, identities: Sequence[str], *, topic: str, offset: int) 
 # --------------------------------------------------------------------------- the relay side
 
 
-@dataclass(frozen=True, slots=True)
-class _Parsed:
-    """An envelope with each item's claim-check reference (the seller's codec fetches it)."""
-
-    pairs: list[tuple[EnvelopeItem, tuple[str, int] | None]]
-    next_offset: int
-    more_ready: bool
-
-
-def _ref(value: object, size: int) -> tuple[str, int]:
-    if not isinstance(value, dict) or set(cast(dict[str, Any], value)) != {"sha256", "size"}:
-        raise EnvelopeError("an item's ref is not {sha256, size}")
-    ref = cast(dict[str, Any], value)
-    digest = ref["sha256"]
-    if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
-        raise EnvelopeError("an item's ref names no sha256")
-    if _int(ref["size"], "a ref's size") != size:
-        raise EnvelopeError("an item's ref and size disagree")
-    return digest, size
+def verified_item(data: bytes | None, item: EnvelopeItem) -> bytes | None:
+    """``data``, a blob fetched for ``item``, if it is that item's: exactly ``item.size``
+    bytes, hashing to ``item.sha256``, and an age file (nothing decrypted, no key); else None
+    -- a gap, never plaintext in a gate's storage."""
+    if (
+        data is None
+        or item.sha256 is None
+        or len(data) != item.size
+        or hashlib.sha256(data).hexdigest() != item.sha256
+        or not data.startswith(AGE_MAGIC)
+        or not age.is_age_file(data)
+    ):
+        return None
+    return data
 
 
-def _item(
-    raw: object, next_offset: int, previous: int
-) -> tuple[EnvelopeItem, tuple[str, int] | None]:
-    if not isinstance(raw, dict):
-        raise EnvelopeError("an envelope item is not an object")
+def _item(raw: object, next_offset: int, previous: int) -> EnvelopeItem:
+    if not isinstance(raw, dict) or frozenset(cast(dict[str, Any], raw)) != _ITEM_KEYS:
+        raise EnvelopeError("an envelope item is not {topic, offset, size, sha256}")
     item = cast(dict[str, Any], raw)
-    if not frozenset(item) <= _ITEM_KEYS or "topic" not in item or "offset" not in item:
-        raise EnvelopeError("an envelope item has unknown or missing members")
     topic = item["topic"]
     if topic is not None:
         try:
@@ -529,30 +607,19 @@ def _item(
     offset = _int(item["offset"], "an item's offset")
     if not previous < offset < next_offset:
         raise EnvelopeError("envelope offsets are not increasing below next_offset")
-    if "ref" in item:
-        if "ct" in item:
-            raise EnvelopeError("an envelope item has both ct and ref")
-        size = _int(item.get("size"), "an item's size")
-        return EnvelopeItem(topic, offset, None, size), _ref(item["ref"], size)
-    if "ct" not in item:
-        raise EnvelopeError("an envelope item has neither ct nor ref")
-    ct = item["ct"]
-    if ct is None:
-        return EnvelopeItem(topic, offset, None, _int(item.get("size"), "an item's size")), None
-    if "size" in item or not isinstance(ct, str):
-        raise EnvelopeError("an inline item is {topic, offset, ct}")
-    try:
-        data = base64.b64decode(ct, validate=True)
-    except (binascii.Error, ValueError):
-        raise EnvelopeError("an item's ct is not base64") from None
-    if not data.startswith(AGE_MAGIC):
-        raise EnvelopeError("an item's ct is not an age file")
-    if len(data) > ITEM_INLINE_MAX:
-        raise EnvelopeError(f"an inline item is larger than {ITEM_INLINE_MAX} bytes")
-    return EnvelopeItem(topic, offset, data, len(data)), None
+    size = _int(item["size"], "an item's size")
+    digest = item["sha256"]
+    if digest is not None and (not isinstance(digest, str) or _SHA256.fullmatch(digest) is None):
+        raise EnvelopeError("an item's sha256 is not 64 lowercase hex digits")
+    return EnvelopeItem(topic, offset, digest, size)
 
 
-def _parse(payload: Payload) -> _Parsed:
+def parse_envelope(payload: Payload) -> Envelope:
+    """The relay's reader (no key): :class:`Envelope`, or :class:`EnvelopeError` for
+    anything that is not exactly what :func:`seal_poll` writes -- a wrong encoding or
+    version (a v1 envelope with inline ciphertext included), more than :data:`ENVELOPE_MAX`
+    bytes or :data:`STREAM_ITEMS_MAX` items, unknown or missing members, offsets that do not
+    increase below ``next_offset``, a digest that is not one."""
     if (
         payload.metadata.get("encoding") != STREAM_ENCODING
         or payload.metadata.get(_VERSION_KEY) != _VERSION
@@ -563,33 +630,26 @@ def _parse(payload: Payload) -> _Parsed:
     try:
         value: object = json.loads(payload.data)
     except _JSON_ERRORS:
-        # RecursionError: JSON nested deeper than the interpreter's stack (``[`` * 100,000
-        # is far under ENVELOPE_MAX) -- a hostile worker's answer, refused like any other.
+        # RecursionError: JSON nested deeper than the interpreter's stack (``[`` * 10,000
+        # fits ENVELOPE_MAX) -- a hostile worker's answer, refused like any other.
         raise EnvelopeError("a stream envelope is not JSON") from None
     if not isinstance(value, dict) or frozenset(cast(dict[str, Any], value)) != _TOP_KEYS:
         raise EnvelopeError("a stream envelope is not {v, items, next_offset, more_ready}")
     env = cast(dict[str, Any], value)
     version: object = env["v"]
-    if isinstance(version, bool) or version != 1:
+    if isinstance(version, bool) or version != ENVELOPE_VERSION:
         raise EnvelopeError("unsupported stream envelope version")
     raw_items, more_ready = env["items"], env["more_ready"]
     next_offset = _int(env["next_offset"], "next_offset")
     if not isinstance(raw_items, list) or not isinstance(more_ready, bool):
         raise EnvelopeError("a stream envelope is not {v, items, next_offset, more_ready}")
-    pairs: list[tuple[EnvelopeItem, tuple[str, int] | None]] = []
+    listed = cast(list[object], raw_items)
+    if len(listed) > STREAM_ITEMS_MAX:
+        raise EnvelopeError(f"a stream envelope lists more than {STREAM_ITEMS_MAX} items")
+    items: list[EnvelopeItem] = []
     previous = -1
-    for raw in cast(list[object], raw_items):
-        pair = _item(raw, next_offset, previous)
-        previous = pair[0].offset
-        pairs.append(pair)
-    return _Parsed(pairs, next_offset, more_ready)
-
-
-def parse_envelope(payload: Payload) -> Envelope:
-    """The relay's reader (no key): :class:`Envelope`, or :class:`EnvelopeError` for
-    anything that is not exactly what :func:`seal_poll` writes -- a wrong encoding or
-    version, more than :data:`ENVELOPE_MAX` bytes, unknown members, offsets that do not
-    increase below ``next_offset``, a ``ct`` that is not strict base64 of an age file (so a
-    worker that answered in plaintext, or whole ciphertext, is refused here)."""
-    parsed = _parse(payload)
-    return Envelope(tuple(item for item, _ in parsed.pairs), parsed.next_offset, parsed.more_ready)
+    for raw in listed:
+        item = _item(raw, next_offset, previous)
+        previous = item.offset
+        items.append(item)
+    return Envelope(tuple(items), next_offset, more_ready)

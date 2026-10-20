@@ -267,6 +267,14 @@ ROUTES: tuple[Route, ...] = (
     ),
     Route("create_blob", "POST", f"{P}/blobs", "party|worker", m.BlobCreate, m.BlobUrl),
     Route("get_blob", "GET", f"{P}/blobs/{{sha256}}", "party|worker", None, m.BlobUrl),
+    Route(
+        "create_stream_blobs",
+        "POST",
+        f"{P}/jobs/{{job_id}}/stream/blobs",
+        "party|worker",
+        m.StreamBlobsCreate,
+        m.StreamBlobUrls,
+    ),
     # money
     Route("balance", "GET", f"{P}/balance", "party", None, m.Balance),
     Route("topup", "POST", f"{P}/topup", "party", m.Topup, m.TopupResult),

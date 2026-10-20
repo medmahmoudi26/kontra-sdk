@@ -1,14 +1,18 @@
-"""``kontra._relay``: the gate's stream relay, the strict wire shape of decisions I30 (I31).
+"""``kontra._relay``: the gate's stream relay, the strict wire shape of decisions I30 (I31,
+I39).
 
 Every classification row against a scripted service (what it sends, what it waits, when it
-stops), then over a dev server: the same update id re-sent while a poll waits (one
-``UpdateAccepted`` per logical poll), a look-alike chain refused by ``first_execution_run_id``,
-only the two calls, and no ``temporalio.contrib`` import."""
+stops), the dereference of each reference (fetched, verified, or a gap), the Authorizer's rate
+and the job's busy refusal waited on, the pacing by the run's own poll budget; then over a dev
+server: the same update id re-sent while a poll waits (one ``UpdateAccepted`` per logical
+poll), a look-alike chain refused by ``first_execution_run_id``, only the two calls, and no
+``temporalio.contrib`` import."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import subprocess
 import sys
@@ -18,8 +22,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from temporalio.api.common.v1 import Payload, Payloads
+from google.protobuf.any_pb2 import Any as AnyProto
+from memory_blobs import MemoryBlobs
+from temporalio.api.common.v1 import GrpcStatus, Payload, Payloads
 from temporalio.api.enums.v1 import EventType
+from temporalio.api.errordetails.v1 import PermissionDeniedFailure
 from temporalio.api.failure.v1 import ApplicationFailureInfo, Failure
 from temporalio.api.update.v1 import Outcome
 from temporalio.api.workflowservice.v1 import (
@@ -53,11 +60,27 @@ from .test_stream_hosting import seller_client
 
 JOB = new_job_id()
 KEY = generate_identity()
-CT = base64.b64encode(encrypt(b"sealed", [KEY[1]])).decode()
+CT = encrypt(b"sealed", [KEY[1]])
+DIGEST = hashlib.sha256(CT).hexdigest()
+#: The gate's stream blobs, as the relay's ``blobs`` reads them.
+BLOBS: dict[str, bytes] = {DIGEST: CT}
+
+
+async def fetch(sha256: str, size: int) -> bytes | None:
+    return BLOBS.get(sha256)
+
+
+def ref(topic: str | None, offset: int, data: bytes | None = CT, **kw: Any) -> dict[str, Any]:
+    """An envelope item referring to ``data`` (stored in ``BLOBS``), or a stub (None)."""
+    if data is None:
+        return {"topic": topic, "offset": offset, "size": kw.get("size", 9), "sha256": None}
+    digest = hashlib.sha256(data).hexdigest()
+    BLOBS.setdefault(digest, data)
+    return {"topic": topic, "offset": offset, "size": len(data), "sha256": digest, **kw}
 
 
 def envelope(items: list[dict[str, Any]], next_offset: int, more_ready: bool = False) -> Payload:
-    env = {"v": 1, "items": items, "next_offset": next_offset, "more_ready": more_ready}
+    env = {"v": 2, "items": items, "next_offset": next_offset, "more_ready": more_ready}
     return Payload(
         metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"}, data=json.dumps(env).encode()
     )
@@ -80,8 +103,15 @@ def no_outcome() -> UpdateWorkflowExecutionResponse:
     return UpdateWorkflowExecutionResponse()  # the long poll returned at ACCEPTED
 
 
-def rpc(status: RPCStatusCode) -> RPCError:
-    return RPCError(status.name, status, b"")
+def rpc(status: RPCStatusCode, reason: str | None = None) -> RPCError:
+    """An RPC error; ``reason``: a PERMISSION_DENIED's typed reason, as Temporal's
+    authorization interceptor sends the Authorizer's."""
+    raw = b""
+    if reason is not None:
+        detail = AnyProto()
+        detail.Pack(PermissionDeniedFailure(reason=reason))
+        raw = GrpcStatus(code=int(status), message="Request unauthorized.", details=[detail]).SerializeToString()  # fmt: skip
+    return RPCError(status.name, status, raw)
 
 
 Step = UpdateWorkflowExecutionResponse | RPCError
@@ -170,6 +200,7 @@ async def run(service: Scripted, **kw: Any) -> tuple[list[_relay.RelayBatch], Ba
     kw.setdefault("start", 0)
     kw.setdefault("topics", [LISTED, PROGRESS_TOPIC])
     kw.setdefault("min_interval", 0.0)
+    kw.setdefault("blobs", fetch)
     batches: list[_relay.RelayBatch] = []
     try:
         async for batch in _relay.relay(service, namespace="acme", job_id=JOB, **kw):
@@ -179,7 +210,7 @@ async def run(service: Scripted, **kw: Any) -> tuple[list[_relay.RelayBatch], Ba
     return batches, None
 
 
-ITEM = {"topic": LISTED, "offset": 0, "ct": CT}
+ITEM = ref(LISTED, 0)
 
 
 async def test_the_poll_request_is_the_strict_shape(waits: list[float]) -> None:
@@ -317,6 +348,39 @@ async def test_a_refused_token_stops_the_relay(status: RPCStatusCode, waits: lis
     _, stopped = await run(Scripted([rpc(status)]))
     assert isinstance(stopped, _relay.RelayStopped)
     assert stopped.reason == "denied"
+    # Another reason of the Authorizer's is a refusal too: only its rate's is waited on.
+    _, stopped = await run(Scripted([rpc(status, "kontra: the token is not this workflow's stream relay")]))  # fmt: skip
+    assert isinstance(stopped, _relay.RelayStopped)
+    assert stopped.reason == "denied"
+
+
+async def test_the_authorizers_rate_is_waited_on_not_a_stop(waits: list[float]) -> None:
+    """A relay request past its subject's rate is PERMISSION_DENIED with the Authorizer's
+    ``RelayRateReason`` in the typed details (compared whole): the relay backs off as for
+    RESOURCE_EXHAUSTED, with the same request, and reads on."""
+    limited: list[Step] = [rpc(RPCStatusCode.PERMISSION_DENIED, _relay.RELAY_RATE_REASON)] * 9
+    service = Scripted([*limited, success(envelope([ITEM], 1))])
+    batches, _ = await run(service)
+    assert waits[:9] == [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+    assert len(set(service.ids()[:10])) == 1
+    assert batches[0].items[0].offset == 0
+    # The same reason in the message alone is no reason: the details are what count.
+    plain = RPCError(_relay.RELAY_RATE_REASON, RPCStatusCode.PERMISSION_DENIED, b"")
+    _, stopped = await run(Scripted([plain]))
+    assert isinstance(stopped, _relay.RelayStopped)
+    assert stopped.reason == "denied"
+
+
+async def test_a_busy_job_is_waited_on(waits: list[float]) -> None:
+    """``KontraStreamBusy``: too many polls in flight on the job, or an offset past its end;
+    a rejection, so backed off, never a stop."""
+    busy: list[Step] = [failure(s.STREAM_BUSY)] * 3
+    batches, stopped = await run(Scripted([*busy, success(envelope([ITEM], 1))]))
+    assert waits[:3] == [0.5, 1.0, 2.0]
+    assert stopped is not None
+    assert not isinstance(stopped, _relay.RelayStopped)
+    assert batches[0].items[0].offset == 0
+    assert _relay.STREAM_BUSY == s.STREAM_BUSY == "KontraStreamBusy"
 
 
 @pytest.mark.parametrize(
@@ -324,16 +388,16 @@ async def test_a_refused_token_stops_the_relay(status: RPCStatusCode, waits: lis
     [
         Payload(metadata={"encoding": b"binary/kontra-age", "kontra-v": b"1"}, data=b"age-encryption.org/v1\n..."),
         Payload(metadata={"encoding": b"json/plain"}, data=b'{"items": [], "next_offset": 0, "more_ready": false}'),
-        envelope([{"topic": LISTED, "offset": 0, "ct": base64.b64encode(b'{"plain": true}').decode()}], 1),
-        Payload(metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"}, data=b"[" * 100_000),
+        Payload(metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"}, data=json.dumps({"v": 1, "items": [{"topic": LISTED, "offset": 0, "ct": base64.b64encode(CT).decode()}], "next_offset": 1, "more_ready": False}).encode()),
+        Payload(metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"}, data=b"[" * 10_000),
     ],
-    ids=["whole-ciphertext", "plaintext", "plaintext-item", "nested-past-the-stack"],
+    ids=["whole-ciphertext", "plaintext", "a-v1-envelope", "nested-past-the-stack"],
 )  # fmt: skip
 async def test_an_answer_that_is_not_an_envelope_stops_the_relay(
     answer: Payload, waits: list[float]
 ) -> None:
-    """A worker without #52 answers whole ciphertext, a seller who replaced the handler
-    anything: the relay stores nothing of it."""
+    """A worker without #52 answers whole ciphertext, one before I39 inline ciphertext, a
+    seller who replaced the handler anything: the relay stores nothing of it."""
     batches, stopped = await run(Scripted([success(answer)]))
     assert batches == []
     assert isinstance(stopped, _relay.RelayStopped)
@@ -342,19 +406,76 @@ async def test_an_answer_that_is_not_an_envelope_stops_the_relay(
 
 async def test_unlisted_and_unasked_items_are_dropped(waits: list[float]) -> None:
     items = [
-        {"topic": LISTED, "offset": 0, "ct": CT},
-        {"topic": None, "offset": 1, "ct": CT},
-        {"topic": "other", "offset": 2, "ct": CT},
-        {"topic": PROGRESS_TOPIC, "offset": 3, "size": 300_000, "ct": None},
+        ref(LISTED, 0),
+        ref(None, 1),
+        ref("other", 2),
+        ref(PROGRESS_TOPIC, 3, None, size=300_000),
     ]
     [batch], _ = await run(Scripted([success(envelope(items, 4))]))
-    assert [(i.topic, i.offset, i.ciphertext is None) for i in batch.items] == [
-        (LISTED, 0, False),
-        (PROGRESS_TOPIC, 3, True),
+    assert [(i.topic, i.offset, i.ciphertext) for i in batch.items] == [
+        (LISTED, 0, CT),
+        (PROGRESS_TOPIC, 3, None),
     ]
     assert batch.items[1].size == 300_000
     assert batch.dropped == 2
     assert batch.run_id == "run-1"
+
+
+async def test_each_reference_is_fetched_and_verified(waits: list[float]) -> None:
+    """The relay dereferences every listed item through the gate's reader and keeps only a
+    blob that is the item: its size and sha256, an age file. A stub, a blob missing, short,
+    swapped for another's, plaintext, or a reader that failed, is an item without
+    ciphertext (a gap); an item above ``item_max`` is not even fetched; unlisted items are
+    never fetched."""
+    other = encrypt(b"another item", [KEY[1]])
+    plain = b"age-encryption.org/v1\n-> plaintext pretending"
+    swapped = ref(LISTED, 2)
+    swapped["sha256"] = hashlib.sha256(other).hexdigest()  # names another's bytes
+    BLOBS[swapped["sha256"]] = other
+    items = [
+        ref(LISTED, 0),
+        ref(LISTED, 1, None),  # a stub
+        swapped,
+        ref(LISTED, 3, plain),
+        {"topic": LISTED, "offset": 4, "size": len(CT), "sha256": "e" * 64},  # missing
+        ref(LISTED, 5, encrypt(b"x" * 1000, [KEY[1]])),  # above item_max below
+        ref(None, 6),
+        ref(LISTED, 7, encrypt(b"boom", [KEY[1]])),  # the reader fails for it
+    ]
+    asked: list[str] = []
+    failing = items[7]["sha256"]
+
+    async def reader(sha256: str, size: int) -> bytes | None:
+        asked.append(sha256)
+        if sha256 == failing:
+            raise OSError("bucket down")
+        return BLOBS.get(sha256)
+
+    [batch], _ = await run(Scripted([success(envelope(items, 8))]), blobs=reader, item_max=600)
+    got = {i.offset: i.ciphertext for i in batch.items}
+    assert got == {0: CT, 1: None, 2: None, 3: None, 4: None, 5: None, 7: None}
+    assert items[5]["sha256"] not in asked  # too large: not fetched
+    assert items[6]["sha256"] not in asked or items[6]["sha256"] == DIGEST  # unlisted
+    assert len(asked) == 5
+    # Without a reader, every item comes back without ciphertext.
+    [batch], _ = await run(Scripted([success(envelope([ITEM], 1))]), blobs=None)
+    assert [i.ciphertext for i in batch.items] == [None]
+
+
+async def test_a_full_answer_is_fetched_a_few_at_a_time(waits: list[float]) -> None:
+    items = [ref(LISTED, i, encrypt(f"{i}".encode(), [KEY[1]])) for i in range(s.STREAM_ITEMS_MAX)]
+    at_once = [0, 0]
+
+    async def reader(sha256: str, size: int) -> bytes | None:
+        at_once[0] += 1
+        at_once[1] = max(at_once[1], at_once[0])
+        await asyncio.sleep(0)
+        at_once[0] -= 1
+        return BLOBS.get(sha256)
+
+    [batch], _ = await run(Scripted([success(envelope(items, s.STREAM_ITEMS_MAX))]), blobs=reader)
+    assert all(i.ciphertext is not None for i in batch.items)
+    assert 1 < at_once[1] <= 16
 
 
 async def test_an_answer_held_back_is_polled_again_at_once(waits: list[float]) -> None:
@@ -391,6 +512,28 @@ async def test_pacing(waits: list[float]) -> None:
     service = Scripted([success(envelope([], 1)), success(envelope([], 1))])
     await run(service, min_interval=2.0)
     assert 1.9 < waits[1] <= 2.0  # min_interval less what the poll took
+
+
+async def test_the_runs_own_poll_budget_paces_the_relay(waits: list[float]) -> None:
+    """The run accepts ``STREAM_POLLS_MAX`` polls: the relay waits ``min_interval`` for the
+    first half of them, 10 s to three quarters, 60 s after; a new run (continue-as-new)
+    starts the count again."""
+    half = s.STREAM_POLLS_MAX // 2
+    assert _relay.own_pace(0) == _relay.MIN_INTERVAL
+    assert _relay.own_pace(half - 1, 0.5) == 0.5
+    assert _relay.own_pace(half) == 10.0
+    assert _relay.own_pace(s.STREAM_POLLS_MAX * 3 // 4) == 60.0
+    script: list[Step] = [success(envelope([], 1)) for _ in range(half + 1)]
+    new_run = success(envelope([], 1))
+    new_run.update_ref.workflow_execution.run_id = "run-2"
+    await run(Scripted([*script, new_run, success(envelope([], 1))]), min_interval=2.0)
+    # The wait after answer k of a run is own_pace(k): the 500th and 501st of run-1 wait
+    # 10 s; run-2's first answers count from 1 again.
+    assert all(1.9 < w <= 2.0 for w in waits[: half - 1])
+    assert waits[half - 1] == pytest.approx(10.0, abs=0.1)
+    assert waits[half] == pytest.approx(10.0, abs=0.1)
+    assert 1.9 < waits[half + 1] <= 2.0
+    assert 1.9 < waits[half + 2] <= 2.0
 
 
 def test_pace_for() -> None:
@@ -514,7 +657,7 @@ class Wire:
 @pytest.fixture
 async def wire(dev_server: DevServer) -> AsyncIterator[Wire]:
     queue = f"relay-{uuid.uuid4().hex[:8]}"
-    seller = seller_client(dev_server)
+    seller = seller_client(dev_server, MemoryBlobs())
     async with Worker(
         seller,
         task_queue=queue,

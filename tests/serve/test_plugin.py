@@ -119,22 +119,24 @@ def test_external_storage_must_not_take_a_payload_the_buyer_could_not_read() -> 
 
 
 def test_external_storage_must_not_take_a_stream_envelope() -> None:
-    """A job stream's poll answer is an envelope of up to 512 KiB the gate's relay must read
-    (decisions I31): external storage at or below it (plus framing) is refused, with or
-    without a blob store."""
+    """A job stream's poll answer is an envelope of at most ``ENVELOPE_MAX`` (references,
+    decisions I39) the gate's relay must read: external storage at or below it (plus framing)
+    is refused, with or without a blob store -- with one, the claim-check threshold, which is
+    larger, is the floor."""
     from kontra.codec.stream import ENVELOPE_MAX
 
     identity, recipient = generate_identity()
     plain = KontraCodec(identity, [recipient], role="seller")  # no blob store
     for codec in (_codec(), plain):
-        for threshold in (300 * 1024, ENVELOPE_MAX, ENVELOPE_MAX + 4096):
+        floor = max(codec.claim_check_threshold or 0, ENVELOPE_MAX) + 4096
+        for threshold in (ENVELOPE_MAX, floor):
             with pytest.raises(ServeError, match="stream envelope limit"):
                 KontraPlugin._data_converter(
                     DataConverter(external_storage=_storage(threshold)), codec
                 )
         assert (
             KontraPlugin._data_converter(
-                DataConverter(external_storage=_storage(ENVELOPE_MAX + 4097)), codec
+                DataConverter(external_storage=_storage(floor + 1)), codec
             ).payload_codec
             is codec
         )

@@ -136,6 +136,17 @@ class FilledJob:
     def finish(self) -> None:
         self.done = True
 
+    @workflow.signal
+    def more(self, n: int) -> None:
+        """``n`` more items, published by the workflow."""
+        for i in range(n):
+            self.stream.topic(LISTED).publish({"more": i})
+
+    @workflow.update
+    def ping(self) -> str:
+        """One of the seller's own updates (an approval, say)."""
+        return "pong"
+
 
 @workflow.defn
 class ChainJob:

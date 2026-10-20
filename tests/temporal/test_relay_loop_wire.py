@@ -4,9 +4,11 @@ permission), reads a job's stream to its end with only ``UpdateWorkflowExecution
 ``QueryWorkflow`` -- the two calls the Authorizer allows it -- against the real server binary.
 
 The seller's worker runs Kontra's interceptor and a seller ``KontraCodec`` (a fixed buyer
-key), so every poll's answer is the stream envelope: the relay reads the listed topic's items
-in the clear, each sealed to the job's buyer and the seller, and drops the unlisted topic's,
-whose names it never sees. No authorizer cell is added: these are #59's."""
+key, an in-memory bucket for the stream's items), so every poll's answer is the stream
+envelope of references (decisions I39): the relay reads the listed topic's items in the clear,
+fetches each from the job's blobs, each sealed to the job's buyer and the seller, and drops
+the unlisted topic's, whose names it never sees. No authorizer cell is added: these are #59's
+(the shape and the rate among them, in ``test_streams_and_platform_wire.py``)."""
 
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ from typing import Any
 import pytest
 import temporal_isolation_app as app
 from conftest import Cluster, connect_public
+from memory_blobs import MemoryBlobs
 from temporalio.api.common.v1 import WorkflowExecution
 from temporalio.api.enums.v1 import WorkflowExecutionStatus
 from temporalio.api.workflowservice.v1 import DescribeWorkflowExecutionRequest
@@ -39,6 +42,8 @@ SELLER = app.SELLER_NAMESPACE
 SELLER_KEY = generate_identity()
 BUYER_KEY = generate_identity()
 LISTED, UNLISTED = "progress", "log"  # StreamJob's two topics; the offering lists one
+#: The seller's bucket: its codec stores each stream item there, the relay reads it back.
+BLOBS = MemoryBlobs()
 
 
 class _Keys:
@@ -64,7 +69,9 @@ class Recording:
 
 
 async def _seller(cluster: Cluster) -> Client:
-    codec = KontraCodec(SELLER_KEY[0], [SELLER_KEY[1]], role="seller", buyer_keys=_Keys())
+    codec = KontraCodec(
+        SELLER_KEY[0], [SELLER_KEY[1]], role="seller", buyer_keys=_Keys(), blobs=BLOBS
+    )
     return await connect_public(
         cluster,
         SELLER,
@@ -128,6 +135,7 @@ async def test_the_relay_reads_a_jobs_stream_with_its_two_calls_only(
                     first_execution_run_id=lambda: pinned,
                     min_interval=0.0,
                     rpc_timeout=10.0,
+                    blobs=BLOBS.fetch,
                 ):
                     items += batch.items
                     dropped += batch.dropped
@@ -155,6 +163,7 @@ async def test_the_relay_reads_a_jobs_stream_with_its_two_calls_only(
                     start=0,
                     closed=closed,
                     min_interval=0.0,
+                    blobs=BLOBS.fetch,
                 ):
                     assert batch.items == ()
                     assert batch.dropped == steps
@@ -222,10 +231,11 @@ async def test_the_buyer_key_opens_no_unlisted_item(cluster: Cluster) -> None:
             assert len(unnamed) == 2
             assert {i.topic for i in env.items} == {None, LISTED}
             for item in unnamed:
-                assert item.ciphertext is not None
+                assert item.sha256 is not None
+                ct = BLOBS.data[item.sha256]
                 with pytest.raises(AgeError):
-                    decrypt(item.ciphertext, BUYER_KEY[0])
-                inner = s.open_item(item.ciphertext, [SELLER_KEY[0]], topic=UNLISTED, offset=item.offset)  # fmt: skip
+                    decrypt(ct, BUYER_KEY[0])
+                inner = s.open_item(ct, [SELLER_KEY[0]], topic=UNLISTED, offset=item.offset)
                 assert PydanticPayloadConverter().from_payload(inner, str).startswith("line-")
         finally:
             with contextlib.suppress(RPCError):

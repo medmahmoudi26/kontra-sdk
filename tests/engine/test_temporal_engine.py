@@ -7,7 +7,6 @@ what it withholds (an unsealed delivery), how failures map, and the stream relay
 
 from __future__ import annotations
 
-import base64
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -509,17 +508,28 @@ async def test_workers_is_the_task_queues_view() -> None:
 
 @dataclass
 class Frontend:
-    """The relay's two calls, answered from a log of items."""
+    """The relay's two calls, answered from a log of items, each a reference to its blob in
+    the job's stream blobs (:meth:`read_stream_blob`, what the adapter's ``stream_blobs``
+    reads, recording what it was asked)."""
 
     log: list[tuple[str | None, bytes]]
     polls: list[tuple[list[str], int, str]] = field(
         default_factory=list[tuple[list[str], int, str]]
     )
     failure: str | None = None
+    read: list[tuple[str, str, int]] = field(default_factory=list[tuple[str, str, int]])
+    missing: set[int] = field(default_factory=set[int])
 
     @property
     def workflow_service(self) -> Frontend:
         return self
+
+    async def read_stream_blob(self, job_id: str, sha256: str, size: int) -> bytes | None:
+        self.read.append((job_id, sha256, size))
+        for i, (_, ct) in enumerate(self.log):
+            if sha256_of(ct) == sha256 and i not in self.missing:
+                return ct
+        return None
 
     async def update_workflow_execution(self, req: Any, retry: bool = False, metadata: Any = None, timeout: Any = None) -> UpdateWorkflowExecutionResponse:  # noqa: ASYNC109  # fmt: skip
         args = json.loads(req.request.input.args.payloads[0].data)
@@ -536,8 +546,10 @@ class Frontend:
         items: list[dict[str, Any]] = []
         for i, (topic, ct) in enumerate(self.log):
             if i >= args["from_offset"] and (topic is None or topic in args["topics"]):
-                items.append({"topic": topic, "offset": i, "ct": base64.b64encode(ct).decode()})
-        env = {"v": 1, "items": items, "next_offset": len(self.log), "more_ready": False}
+                items.append(
+                    {"topic": topic, "offset": i, "size": len(ct), "sha256": sha256_of(ct)}
+                )
+        env = {"v": 2, "items": items, "next_offset": len(self.log), "more_ready": False}
         p = Payload(
             metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"},
             data=json.dumps(env).encode(),
@@ -573,12 +585,23 @@ class Dialled:
         raise AssertionError("not asked for the tail")
 
 
+def sha256_of(data: bytes) -> str:
+    return sha256(data).hexdigest()
+
+
 async def test_stream_relays_the_pinned_chain_as_sealed_items() -> None:
+    """Each item dereferenced from the job's stream blobs (decisions I39), scoped to the job,
+    and handed to the gate as the same ``Sealed`` items as before."""
     _secret, recipient = generate_identity()
     ct = encrypt(b"item", [recipient])
     frontend = Frontend([("events", ct), (None, ct), ("events", ct)])
     control = WithClient(frontend)
-    e, _, _ = engine(control, relay_service=internal_relay_service(control), relay_interval=0.01)
+    e, _, _ = engine(
+        control,
+        relay_service=internal_relay_service(control),
+        stream_blobs=frontend,
+        relay_interval=0.01,
+    )
     polls = 0
 
     async def closed() -> bool:
@@ -597,6 +620,45 @@ async def test_stream_relays_the_pinned_chain_as_sealed_items() -> None:
     assert all(i.sealed is not None and i.sealed.data == ct for i in first.items)
     assert (first.next_offset, first.dropped) == (3, 1)
     assert frontend.polls[0] == (["events"], 0, "run-1")
+    assert {job for job, _, _ in frontend.read} == {JOB}  # the job's own blobs only
+
+
+async def test_an_item_too_large_or_not_stored_is_handed_over_without_ciphertext() -> None:
+    """Above ``stream_item_max`` an item is not even fetched; a blob the reader does not have
+    is an item without ``sealed``: the gate records a gap with its size."""
+    _secret, recipient = generate_identity()
+    small, big = encrypt(b"item", [recipient]), encrypt(b"x" * 5000, [recipient])
+    frontend = Frontend(
+        [("events", small), ("events", big), ("events", encrypt(b"y", [recipient]))]
+    )
+    frontend.missing = {2}
+    control = WithClient(frontend)
+    e, _, _ = engine(
+        control,
+        relay_service=internal_relay_service(control),
+        stream_blobs=frontend,
+        stream_item_max=1000,
+        relay_interval=0.01,
+    )
+    polls = 0
+
+    async def closed() -> bool:
+        nonlocal polls
+        polls += 1
+        return polls > 1
+
+    [first, *_] = [
+        b
+        async for b in e.stream(
+            GOLDEN, pin=Pin("run-1"), topics=["events"], after=0, closed=closed, session="s"
+        )
+    ]
+    assert [(i.offset, i.sealed is not None, i.size) for i in first.items] == [
+        (0, True, len(small)),
+        (1, False, len(big)),
+        (2, False, len(frontend.log[2][1])),
+    ]
+    assert sha256_of(big) not in {d for _, d, _ in frontend.read}
 
 
 async def test_the_relay_token_is_the_jobs_own_and_never_a_partys() -> None:
@@ -610,7 +672,7 @@ async def test_the_relay_token_is_the_jobs_own_and_never_a_partys() -> None:
         tokens.append(token)
         return frontend
 
-    e, _, signer = engine(relay_service=relay_service)
+    e, _, signer = engine(relay_service=relay_service, stream_blobs=frontend)
 
     async def never() -> bool:
         return False
@@ -644,7 +706,11 @@ async def test_the_relay_token_is_minted_again_before_it_expires() -> None:
         return Dialled(frontend, claims[-1]["exp"], lambda: now, calls)
 
     e, _, _ = engine(
-        signer=signer, relay_service=relay_service, relay_interval=0.01, clock=lambda: now
+        signer=signer,
+        relay_service=relay_service,
+        stream_blobs=frontend,
+        relay_interval=0.01,
+        clock=lambda: now,
     )
     polls = 0
 
@@ -681,7 +747,11 @@ async def test_the_relay_is_paced_through_the_control_plane() -> None:
         return frontend
 
     e, _, _ = engine(
-        control, relay_service=relay_service, relay_interval=0.01, history_limits=(1000, 10**9)
+        control,
+        relay_service=relay_service,
+        stream_blobs=frontend,
+        relay_interval=0.01,
+        history_limits=(1000, 10**9),
     )
     polls = 0
 
@@ -704,18 +774,26 @@ async def test_the_relay_is_paced_through_the_control_plane() -> None:
     assert [i.offset for b in got for i in b.items] == [0]
 
 
-async def test_an_adapter_with_no_frontend_relays_no_streams() -> None:
+async def test_an_adapter_with_no_frontend_or_bucket_relays_no_streams() -> None:
     """No ``relay_service`` (and a control plane without a frontend of its own gives none:
-    ``internal_relay_service``): no streams."""
+    ``internal_relay_service``), or no ``stream_blobs`` to dereference items from: no
+    streams."""
     assert internal_relay_service(Recorder()) is None
-    e, _, _ = engine()
 
     async def never() -> bool:
         return False
 
-    with pytest.raises(StreamStopped) as stopped:
-        async for _ in e.stream(
-            GOLDEN, pin=Pin("r"), topics=["t"], after=0, closed=never, session="s"
-        ):
-            pass
-    assert stopped.value.reason == "unsupported"
+    async def relay_service(token: str) -> Frontend:
+        return Frontend([])
+
+    for e, _, _ in (
+        engine(),
+        engine(relay_service=relay_service),
+        engine(stream_blobs=Frontend([])),
+    ):
+        with pytest.raises(StreamStopped) as stopped:
+            async for _ in e.stream(
+                GOLDEN, pin=Pin("r"), topics=["t"], after=0, closed=never, session="s"
+            ):
+                pass
+        assert stopped.value.reason == "unsupported"

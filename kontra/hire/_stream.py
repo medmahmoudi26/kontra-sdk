@@ -13,7 +13,8 @@ seller's).
 Delivery: at-least-once from the gate, deduplicated here by the gate's ``cursor`` (a replay
 after a reconnect) and by the item's ``offset`` in the job's log (a gate that re-read a poll).
 An item not sealed for us, or relabelled, is logged and skipped. An item too large to relay,
-or past the gate's budget, is a gap: logged, skipped. The relay stopping (the job's history
+not stored by the seller's worker in time (``unavailable``, decisions I39), or past the gate's
+budget, is a gap: logged, skipped. The relay stopping (the job's history
 budget, a seller worker that does not speak the stream envelope) is
 :class:`~kontra.hire.StreamInterrupted`. The end of the iteration is the gate saying the job
 is closed and its relay finished. ``cursor`` is the last event consumed: pass it as ``after``

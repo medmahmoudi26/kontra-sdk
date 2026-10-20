@@ -34,7 +34,7 @@ What that means concretely, and what enforces it:
 | One seller forges another seller's Nexus result | the callback guard (below) |
 | A buyer reads, signals or cancels a seller's handler workflow | the Authorizer: a buyer's token has no call in the seller's namespace, including the job it paid for |
 | A seller resets or deletes a workflow, or a buyer deletes its call records or shortens their retention, to change what escrow sees | the Authorizer: resets, deletes, namespace updates, batch operations and schedules are denied to every token |
-| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, each request at most 4 KiB and shaped as the gate's relay sends it, at most 10 a second, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as ciphertext -- each item sealed on its own, an unlisted topic's to the seller alone and its name hidden -- and cannot publish to it. With the job's poll guard, what its polls add to the job's history is bounded; its requests cannot make a workflow task too large for Temporal to deliver, nor, with the job's answer budget, can the answers to its polls make the worker's reply to one ([the stream relay](#the-stream-relay)). It can spend the relay's share of the job's history at once, which ends a job whose own history needs more than the other half of the limits (a residual risk, below) |
+| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, each request at most 4 KiB, shaped as the gate's relay builds it, ten a second, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as references to ciphertext -- each item sealed on its own, an unlisted topic's to the seller alone and its name hidden -- and cannot publish to it. What its polls add to a run is bounded whatever offsets it picks: at most 5,010 events and 10.25 MiB, plus one workflow-task triple beside each of the seller's own (decisions I39), so a job whose own history, its triples counted twice, stays under 15,470 events and 9.74 MiB survives it; tested over the wire. Its requests cannot make a workflow task too large, nor reach the seller's codec in a form that fails one ([the stream relay](#the-stream-relay)). It can still deny the job's stream (a residual risk, below) |
 | The worker controller's credential leaks | rollouts of Kontra's own workers in the platform namespace: no seller namespace, no workflow start, no compute config |
 | A buyer forges or alters a hold token (amount, seller, expiry, contract) | ES256 signature checked offline by the seller's handler, with audience, expiry, seller namespace, offering and contract hash |
 | A buyer replays a hold token | the handler workflow id is built from the job id and started with reject-duplicate: one execution per hold; a cancel before the job started occupies that id, so the refunded hold cannot start it either |
@@ -312,8 +312,12 @@ queries (`__stack_trace`) that would show a workflow's internals. A stream must 
 the job's handler workflow itself: the relay reaches `job-<id>` and nothing else.
 
 **What the relay reads.** A poll's answer, as Kontra's codec writes it into the job's history,
-is the stream envelope (decisions I31): the positions and the log's length in the clear, and
-each item sealed on its own, its topic and position inside the ciphertext. A topic the offering
+is the stream envelope (decisions I31, I39): the positions, sizes and the log's length in the
+clear, and for each item a reference -- the sha256 of its ciphertext, stored in the
+claim-check bucket by the seller's worker, readable only by the job's seller and the gate's
+own reader (`POST /v1/jobs/{id}/stream/blobs`) -- each item sealed on its own, its topic and
+position inside the ciphertext. The gate's relay fetches each listed item and keeps it only
+when it is exactly the size and digest its reference names and an age file. A topic the offering
 lists (`offering.yaml` `streams:`, catalog data) and `kontra.progress` are sealed to the
 seller's recipients and the job's buyer key and named; any other topic to the seller's
 recipients alone, its name `null`. So a relay that asks for every topic -- a misbehaving gate,
@@ -327,19 +331,29 @@ activity copies the listed topics onto the job's own stream. Publish signals and
 continue-as-new inputs stay whole payloads encrypted to the buyer and the seller (sealing them
 per item is not in v1): an unlisted topic is the seller's alone in what is relayed.
 
-**What the relay's polls cost the job, and the guard.** Every poll the relay completes is
-written to the job's history: Temporal stores a completed Update's outcome
-(`WorkflowExecutionUpdateCompleted`), up to the envelope's 512 KiB, and every relay poll
-spends one of the run's updates (`history.maxTotalUpdates`, Temporal's default of 2,000,
-pinned in `dynamicconfig/kontra.yaml`). A genuine relay doubles the listed topics' volume in
-history. Before #52 a leaked relay token could spend that on purpose -- polling from offset 0
+**What the relay's polls cost the job: the bound** (decisions I39). Every poll the relay
+completes is written to the job's history: Temporal stores a completed Update's outcome
+(`WorkflowExecutionUpdateCompleted`), references now, at most 13,504 bytes, and every relay
+poll spends one of the run's updates (`history.maxTotalUpdates`, Temporal's default of 2,000,
+pinned in `dynamicconfig/kontra.yaml`). A job root accepts at most 1,000 polls a run
+(`STREAM_POLLS_MAX`, the other half of the updates stays the seller's), refuses any poll while
+six are in flight (`KontraStreamBusy`: the seller always keeps update slots) or, once its
+code is under way, a poll past the stream's end, and stops at half the history limits as
+below. Whoever holds a relay token, whatever offsets it polls from, its polls then add to one
+run at most 5,010 events and 10,752,828 bytes (the bytes guard binds for requests padded to
+the cap), plus one workflow-task triple beside each of the seller's own tasks (a refused
+poll's speculative task Temporal keeps when a seller event lands during it). A job survives
+when its own history, its triples counted twice, stays under 15,470 events and 9.74 MiB;
+each run of a continue-as-new chain is bounded alike. `tests/temporal/test_relay_bound_wire.py`
+shows ten token holders failing to end a job, on the real binary and its pinned limits. What
+follows is how the guard came to be. Before #52 a leaked relay token could spend that on purpose -- polling from offset 0
 again and again until the history passed `limit.historySize.error` (20 MiB, pinned in
 `dynamicconfig/kontra.yaml`) and Temporal terminated the run, refunded against the seller. Now
 every job root refuses a poll at validation (`KontraStreamFull`) once its history is past half
 of the pinned limits (10,240 events or 10 MiB), and Temporal writes nothing to history for a
 refused update. **The guard bounds history growth only:** past it no poll adds to the history
 (the overshoot is the polls in flight, `history.maxInFlightUpdates`, 10, pinned, of at most
-512 KiB each). It caps the relay's share of a job's history near half of the limits, not the
+13,504 bytes each since I39, 512 KiB before). It caps the relay's share of a job's history near half of the limits, not the
 job's total: the relay's events stay, so a job someone listens to needs its own history under
 the other half. The gate's relay paces itself
 from the job's history size too (`kontra._relay.pace_for`) and stops at the same half. The
@@ -357,7 +371,7 @@ answers; the answer budget does. The token stays live while a buyer listens, bec
 session is revoked only when the job closes or the last listener leaves.
 
 **The answer budget.** The polls one workflow task completes answer together in the worker's
-reply to that task, up to 512 KiB each, and the reply must fit gRPC's 4 MiB message or Temporal
+reply to that task, up to 13,504 bytes each (512 KiB before I39), and the reply must fit gRPC's 4 MiB message or Temporal
 terminates the run. Before the budget, concurrent polls of the size the cap allows could pass it
 (measured with the pinned limits, the history far below the guard). Now a job root answers at
 most 1.5 MiB in one workflow task (`STREAM_ANSWER_BUDGET` in `kontra.serve.interceptors`,
@@ -515,7 +529,14 @@ adapter (`kontra.engine.temporal`); a second one ships only once it proves, with
   before 28 a machine on the host's own network that routes the `control` subnet through the
   host may too, unless the host's `FORWARD` policy drops it; the address is the same on every
   install (`KONTRA_CONTROL_NET`.2).
-- **A leaked stream-relay token can end its job.** Not by filling the history any more: polls
+- **A leaked stream-relay token can deny its job's stream** (decisions I39). It cannot end a
+  job whose own history, its workflow-task triples counted twice, stays under 15,470 events and
+  9.74 MiB: its polls add a bounded share ([the stream relay](#the-stream-relay)). It can still
+  spend the run's 1,000 polls (the gate's relay then stops with one `history_budget` gap), hold
+  six polls in flight, or spend its subject's rate: the workflow cannot tell its polls from the
+  gate's. The relay chain (asked on #59) would close it. The bullet below is the risk as it
+  stood before I39.
+- **Before I39: a leaked stream-relay token could end its job.** Not by filling the history any more: polls
   past the job's guard (10,240 events or 10 MiB) are refused at validation and never stored, so
   what polls add is the guard plus the polls in flight ([the stream relay](#the-stream-relay),
   decisions I31), and a job someone listens to pays that share whoever holds the token. Nor by

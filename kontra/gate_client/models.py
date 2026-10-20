@@ -72,6 +72,7 @@ __all__ = [
     "RECENT_CONFIRMATION_SECONDS",
     "REVOCATION_WINDOW_MAX",
     "SHARE_ITEMS_MAX",
+    "STREAM_BLOBS_MAX",
     "STREAM_ITEM_MAX",
     "STREAM_JOB_BUDGET",
     "STREAM_LISTENERS_MAX",
@@ -154,6 +155,8 @@ __all__ = [
     "ShareRefusalCode",
     "SharedJobKeys",
     "StartRequest",
+    "StreamBlobUrls",
+    "StreamBlobsCreate",
     "StreamEvent",
     "StreamEventKind",
     "StreamGapReason",
@@ -225,10 +228,13 @@ _PAGE_MAX = 1000
 #: A serialized Temporal payload: twice the 2 MiB blob limit of Temporal's default and of
 #: Kontra's server (``limit.blobSize.error``), base64. A gate's own limit is lower.
 _PAYLOAD_B64_MAX = 4 * -(-(4 * 1024 * 1024) // 3)
-#: The largest item ciphertext a gate relays from a job's stream (decisions I31): the codec
-#: claim-checks anything larger (``kontra.codec.stream.ITEM_INLINE_MAX``), and the gate
-#: records a ``too_large`` gap instead. Base64 in an event.
+#: The largest item ciphertext a gate relays from a job's stream (decisions I31): the gate
+#: fetches no item above it from the bucket, and records a ``too_large`` gap instead. Base64
+#: in an event.
 STREAM_ITEM_MAX = 256 * 1024
+#: The most blobs one ``POST /v1/jobs/{id}/stream/blobs`` creates: the items of one poll's
+#: answer (``kontra.codec.stream.STREAM_ITEMS_MAX``, decisions I39).
+STREAM_BLOBS_MAX = 64
 _STREAM_B64_MAX = 4 * -(-STREAM_ITEM_MAX // 3)
 #: Relayed ciphertext a gate stores per topic of a job, and per job; past either, one
 #: ``topic_budget`` or ``job_budget`` gap (the first item that did not fit), and nothing
@@ -1409,14 +1415,16 @@ class StreamEventKind(StrEnum):
 
 class StreamGapReason(StrEnum):
     """Why a gap: an item above :data:`STREAM_ITEM_MAX` (``too_large``), past the topic's or
-    the job's stored budget (``topic_budget``, ``job_budget``) -- these carry the item's
-    topic and offset --; or the relay stopped: the job's history budget
-    (``history_budget``), an answer that was not a stream envelope (``relay_failed``), an
-    item the gate refused (``invalid``)."""
+    the job's stored budget (``topic_budget``, ``job_budget``), an item the seller's worker
+    did not store in time or whose blob is missing or not what its reference names
+    (``unavailable``, decisions I39) -- these carry the item's topic and offset --; or the
+    relay stopped: the job's poll budget (``history_budget``), an answer that was not a
+    stream envelope (``relay_failed``), an item the gate refused (``invalid``)."""
 
     TOO_LARGE = "too_large"
     TOPIC_BUDGET = "topic_budget"
     JOB_BUDGET = "job_budget"
+    UNAVAILABLE = "unavailable"
     HISTORY_BUDGET = "history_budget"
     RELAY_FAILED = "relay_failed"
     INVALID = "invalid"
@@ -1557,6 +1565,22 @@ class BlobUrl(_M):
     url: _Long  # presigned PUT (create) or GET (read)
     exists: bool = False
     expires_at: datetime
+
+
+class StreamBlobsCreate(_M):
+    """``POST /v1/jobs/{job_id}/stream/blobs``, by the job's seller: the claim-check blobs
+    of one poll's answer (decisions I39), content-addressed as :class:`BlobCreate` and scoped
+    to the job -- readable by its seller (``GET /v1/blobs/{sha256}``) and the gate's own
+    relay, nobody else."""
+
+    blobs: list[BlobCreate] = Field(min_length=1, max_length=STREAM_BLOBS_MAX)
+
+
+class StreamBlobUrls(_M):
+    """One :class:`BlobUrl` per blob asked for, in no promised order: a PUT URL (signed for
+    its length and its ``x-amz-checksum-sha256``) or, when stored already, ``exists``."""
+
+    blobs: list[BlobUrl] = Field(max_length=STREAM_BLOBS_MAX)
 
 
 # --------------------------------------------------------------------------- money

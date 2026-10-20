@@ -113,6 +113,14 @@ class DeadControl:
         return unreachable
 
 
+class _StreamBlobs:
+    """The gate's reader of a job's stream blobs: what the contract seller's activities
+    stored (decisions I39)."""
+
+    async def read_stream_blob(self, job_id: str, sha256: str, size: int) -> bytes | None:
+        return contract_flows.BLOBS.get(sha256)
+
+
 class WireHarness:
     enforces_isolation = True
     buyer_presence = True
@@ -143,6 +151,7 @@ class WireHarness:
             signer=self.signer,
             address=self.cluster.public_address,
             relay_service=relay_service,
+            stream_blobs=_StreamBlobs(),
             relay_interval=0.2,
             worker_ttl=worker_ttl,
         )

@@ -279,6 +279,10 @@ def _largest_request(model: type[BaseModel]) -> dict[str, Any]:
             "ciphertext_sha256": SHA,
         },
         m.BlobCreate: {"sha256": SHA, "size": 2**40},
+        # One poll's answer: the most items it lists (decisions I39).
+        m.StreamBlobsCreate: {
+            "blobs": [{"sha256": SHA, "size": 2**40}] * m.STREAM_BLOBS_MAX,
+        },
         m.Topup: {"amount_minor": 10**12, "currency": "USD"},
         m.TemporalTokenRequest: {"role": "worker"},
         m.AcceptRequest: {},
@@ -346,6 +350,7 @@ _BODY_LIMIT = {
         m.ArtifactCreate,
         m.ArtifactComplete,
         m.BlobCreate,
+        m.StreamBlobsCreate,
         m.Topup,
         m.TemporalTokenRequest,
         m.AcceptRequest,
@@ -636,6 +641,7 @@ _AT = "2026-10-20T00:00:00Z"
         {"kind": "item", "topic": "kontra.progress", "offset": 5, "ciphertext_b64": "QQ==", "state": "working"},
         {"kind": "gap", "topic": "t", "offset": 3, "size": 300_000, "reason": "too_large"},
         {"kind": "gap", "topic": "t", "offset": 3, "reason": "topic_budget"},
+        {"kind": "gap", "topic": "t", "offset": 4, "size": 900, "reason": "unavailable"},
         {"kind": "gap", "reason": "history_budget"},
         {"kind": "gap", "reason": "relay_failed", "state": "working"},
         {"kind": "history", "state": "working", "activities_completed": 2},

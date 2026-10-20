@@ -876,6 +876,11 @@ class GateClient:
     async def get_blob(self, sha256: str) -> m.BlobUrl:
         return await self._model("get_blob", m.BlobUrl, path={"sha256": sha256})
 
+    async def create_stream_blobs(self, job_id: str, req: m.StreamBlobsCreate) -> m.StreamBlobUrls:
+        return await self._model(
+            "create_stream_blobs", m.StreamBlobUrls, path={"job_id": job_id}, body=req
+        )
+
     # money
     async def balance(self, currency: str = "USD") -> m.Balance:
         return await self._model("balance", m.Balance, params={"currency": currency})

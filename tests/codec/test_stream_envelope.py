@@ -1,17 +1,22 @@
-"""Seam ⑤: the stream envelope (decisions I31, ``kontra.codec.stream``) -- a marked poll result
-sealed item by item, the listed topics to buyer and seller, every other topic to the seller
-alone with its name hidden; trimming, claim-check and stubs; the plaintext offset; the
-refusals (a mark outside a seller's job, a malformed buyer list); relabelling caught; and the
+"""Seam ⑤: the stream envelope (decisions I31, I39, ``kontra.codec.stream``) -- a marked poll
+result sealed item by item, the listed topics to buyer and seller, every other topic to the
+seller alone with its name hidden; every item a reference to its blob in the bucket, scoped to
+the job; stubs, the upload budget and a failing bucket; per-worker sealing (a re-read stores
+nothing new); the fixed upper sizes; the plaintext offset; the refusals (a mark outside a
+seller's job, a malformed buyer list); relabelling and swapped references caught; and the
 relay's strict reader."""
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import json
 from collections.abc import Sequence
 
 import pytest
 from temporalio.api.common.v1 import Payload
+from temporalio.api.failure.v1 import Failure
 from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.contrib.workflow_streams import PollResult
 from temporalio.contrib.workflow_streams._types import (  # pyright: ignore[reportPrivateUsage]
@@ -23,7 +28,7 @@ from temporalio.converter import (
     WorkflowSerializationContext,
 )
 
-from kontra.codec import CodecError, InvalidPayload, KontraCodec
+from kontra.codec import CodecError, InvalidPayload, KontraCodec, KontraFailureConverter
 from kontra.codec import stream as s
 from kontra.codec.age import AgeError, decrypt, encrypt, generate_identity
 from kontra.contract.names import PROGRESS_TOPIC, agent_workflow_id, job_workflow_id
@@ -33,6 +38,7 @@ from .test_codec import BUYER, JOB, SELLER, STRANGER, Blobs, Keys
 MARKER = "KONTRA-STREAM-MARKER-41c2"
 CONVERTER = PydanticPayloadConverter()
 SECOND = generate_identity()  # another of the seller's deployments
+OTHER_JOB = "b" * 32
 
 
 def item(topic: str, offset: int, value: object) -> _WorkflowStreamWireItem:
@@ -59,11 +65,11 @@ def marked(
     return p
 
 
-def codec(**kw: object) -> KontraCodec:
+def codec(job: str = JOB, identity: tuple[str, str] = SELLER, **kw: object) -> KontraCodec:
     kw.setdefault("buyer_keys", Keys())
-    c = KontraCodec(SELLER[0], [SELLER[1], SECOND[1]], role="seller", **kw)  # type: ignore[arg-type]
+    c = KontraCodec(identity[0], [SELLER[1], SECOND[1]], role="seller", **kw)  # type: ignore[arg-type]
     return c.with_context(
-        WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id(JOB))
+        WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id(job))
     )
 
 
@@ -76,11 +82,17 @@ def sample() -> list[_WorkflowStreamWireItem]:
     ]
 
 
+def blob(blobs: Blobs, i: s.EnvelopeItem) -> bytes:
+    assert i.sha256 is not None
+    return blobs.data[i.sha256]
+
+
 async def test_round_trip_restores_the_exact_poll_result() -> None:
+    blobs = Blobs()
     original = marked(sample(), next_offset=9)
-    [envelope] = await codec().encode([original])
+    [envelope] = await codec(blobs=blobs).encode([original])
     assert envelope.metadata["encoding"] == s.STREAM_ENCODING
-    [back] = await codec().decode([envelope])
+    [back] = await codec(blobs=blobs).decode([envelope])
     result = CONVERTER.from_payload(back, PollResult)
     assert result.next_offset == 9
     assert result.more_ready is False
@@ -94,11 +106,17 @@ async def test_round_trip_restores_the_exact_poll_result() -> None:
         assert got.data == want.data  # the item's Payload, byte for byte (keys stripped)
 
 
-async def test_listed_topics_to_buyer_and_seller_the_rest_to_the_seller_only() -> None:
-    [envelope] = await codec().encode([marked(sample())])
+async def test_every_item_is_a_reference_to_its_jobs_blob() -> None:
+    """No ciphertext in the envelope (in history): each item names its blob's size and
+    sha256, stored for the job; listed topics to buyer and seller, the rest to the seller."""
+    blobs = Blobs()
+    [envelope] = await codec(blobs=blobs).encode([marked(sample())])
     raw = envelope.data
     assert MARKER.encode() not in raw
     assert b"private" not in raw  # an unlisted topic's name is inside its ciphertext only
+    assert b"age-encryption" not in raw
+    assert b"YWdlLWVuY3J5cHRpb24" not in raw
+    assert json.loads(raw)["v"] == s.ENVELOPE_VERSION == 2
     env = s.parse_envelope(envelope)
     assert [(i.topic, i.offset) for i in env.items] == [
         ("events", 0),
@@ -106,112 +124,220 @@ async def test_listed_topics_to_buyer_and_seller_the_rest_to_the_seller_only() -
         (PROGRESS_TOPIC, 2),
         ("events", 3),
     ]
+    assert len(blobs.data) == 4
+    assert set(blobs.scopes.values()) == {JOB}
     for i in env.items:
-        assert i.ciphertext is not None
-        assert i.ciphertext.startswith(s.AGE_MAGIC)
-        decrypt(i.ciphertext, SELLER[0])  # the seller's whole set reads every item
-        decrypt(i.ciphertext, SECOND[0])
+        ct = blob(blobs, i)
+        assert (len(ct), hashlib.sha256(ct).hexdigest()) == (i.size, i.sha256)
+        assert s.verified_item(ct, i) == ct
+        assert MARKER.encode() not in ct
+        decrypt(ct, SELLER[0])  # the seller's whole set reads every item
+        decrypt(ct, SECOND[0])
         if i.topic is None:
             with pytest.raises(AgeError):
-                decrypt(i.ciphertext, BUYER[0])
+                decrypt(ct, BUYER[0])
             with pytest.raises(s.ItemUnreadable):
-                s.open_item(i.ciphertext, [BUYER[0]], topic="private", offset=i.offset)
+                s.open_item(ct, [BUYER[0]], topic="private", offset=i.offset)
         else:
             value = CONVERTER.from_payload(
-                s.open_item(i.ciphertext, [BUYER[0]], topic=i.topic, offset=i.offset)
+                s.open_item(ct, [BUYER[0]], topic=i.topic, offset=i.offset)
             )
             assert isinstance(value, dict)
         with pytest.raises(AgeError):
-            decrypt(i.ciphertext, STRANGER[0])
+            decrypt(ct, STRANGER[0])
 
 
 async def test_open_item_catches_a_relabelled_or_reordered_item() -> None:
-    [envelope] = await codec().encode([marked(sample())])
+    blobs = Blobs()
+    [envelope] = await codec(blobs=blobs).encode([marked(sample())])
     first, _, progress, _ = s.parse_envelope(envelope).items
-    assert first.ciphertext is not None
-    assert progress.ciphertext is not None
     with pytest.raises(s.EnvelopeError, match="relabelled"):
-        s.open_item(first.ciphertext, [BUYER[0]], topic=PROGRESS_TOPIC, offset=0)
+        s.open_item(blob(blobs, first), [BUYER[0]], topic=PROGRESS_TOPIC, offset=0)
     with pytest.raises(s.EnvelopeError, match="relabelled"):
-        s.open_item(first.ciphertext, [BUYER[0]], topic="events", offset=2)
-    inner = s.open_item(progress.ciphertext, [BUYER[0]], topic=PROGRESS_TOPIC, offset=2)
+        s.open_item(blob(blobs, first), [BUYER[0]], topic="events", offset=2)
+    inner = s.open_item(blob(blobs, progress), [BUYER[0]], topic=PROGRESS_TOPIC, offset=2)
     assert s.SEALED_TOPIC_KEY not in inner.metadata
     assert s.SEALED_OFFSET_KEY not in inner.metadata
 
 
-async def test_a_swapped_envelope_does_not_decode_for_the_seller() -> None:
-    [envelope] = await codec().encode([marked(sample())])
+async def test_references_swapped_between_offsets_do_not_decode_for_the_seller() -> None:
+    """A bucket, a gate or a token holder that swaps two items' blobs: each item's offset is
+    sealed inside it, so the seller's decode refuses the answer."""
+    blobs = Blobs()
+    [envelope] = await codec(blobs=blobs).encode([marked(sample())])
     env = json.loads(envelope.data)
-    env["items"][0]["ct"], env["items"][3]["ct"] = env["items"][3]["ct"], env["items"][0]["ct"]
+    a, b = env["items"][0], env["items"][3]
+    (a["sha256"], a["size"]), (b["sha256"], b["size"]) = (b["sha256"], b["size"]), (a["sha256"], a["size"])  # fmt: skip
     forged = Payload(metadata=dict(envelope.metadata), data=json.dumps(env).encode())
     with pytest.raises(InvalidPayload, match="relabelled"):
-        await codec().decode([forged])
+        await codec(blobs=blobs).decode([forged])
+    # A reference whose blob is not what it names: refused on fetch.
+    env = json.loads(envelope.data)
+    env["items"][0]["size"] += 1
+    forged = Payload(metadata=dict(envelope.metadata), data=json.dumps(env).encode())
+    with pytest.raises(InvalidPayload, match="does not match"):
+        await codec(blobs=blobs).decode([forged])
 
 
-async def test_trimmed_at_the_envelope_limit_with_the_contribs_truncation_protocol() -> None:
-    big = "x" * (100 * 1024)
-    items = [item("events", i, {"blob": big}) for i in range(8)]
-    [envelope] = await codec().encode([marked(items, next_offset=8)])
-    assert len(envelope.data) <= s.ENVELOPE_MAX
-    env = s.parse_envelope(envelope)
-    assert 0 < len(env.items) < 8
-    assert env.more_ready is True
-    assert env.next_offset == env.items[-1].offset + 1
-    [back] = await codec().decode([envelope])
-    assert CONVERTER.from_payload(back, PollResult).next_offset == env.next_offset
-
-
-async def test_an_item_above_the_inline_limit_is_claim_checked_or_a_stub() -> None:
-    huge = {"blob": "y" * (s.ITEM_INLINE_MAX + 1024)}
-    items = [item("events", 0, {"n": 0}), item("events", 1, huge), item("events", 2, {"n": 2})]
+async def test_an_answer_is_cut_at_the_item_cap_with_the_contribs_truncation_protocol() -> None:
+    """Kontra's interceptor cuts an answer at ``STREAM_ITEMS_MAX``; the codec does too if
+    handed more (the contrib's own truncation protocol)."""
+    items = [item("events", i, {"n": i}) for i in range(s.STREAM_ITEMS_MAX + 6)]
     blobs = Blobs()
     [envelope] = await codec(blobs=blobs).encode([marked(items)])
     env = s.parse_envelope(envelope)
-    assert [i.ciphertext is None for i in env.items] == [False, True, False]
-    assert env.items[1].size > s.ITEM_INLINE_MAX
-    assert len(blobs.data) == 1
+    assert len(env.items) == s.STREAM_ITEMS_MAX
+    assert (env.next_offset, env.more_ready) == (s.STREAM_ITEMS_MAX, True)
     [back] = await codec(blobs=blobs).decode([envelope])
-    result = CONVERTER.from_payload(back, PollResult)
-    assert [i.offset for i in result.items] == [0, 1, 2]  # the seller fetches it
-    assert result.items[1].data == items[1].data
-    # Without a blob store: a stub, which the seller's decode drops (a gap for everyone).
-    [stub] = await codec().encode([marked(items)])
+    assert CONVERTER.from_payload(back, PollResult).next_offset == s.STREAM_ITEMS_MAX
+
+
+def test_the_fixed_sizes() -> None:
+    """The largest entry is ``REF_ENTRY_MAX`` (a 64-character topic, the largest offset and
+    size, a digest), the largest envelope ``ENVELOPE_MAX``: the frame and ``STREAM_ITEMS_MAX``
+    of them. ``envelope_bound`` is what the interceptor counts."""
+    longest = {"topic": "t" * 64, "offset": 10**19 - 1, "size": 10**19 - 1, "sha256": "f" * 64}
+    assert len(json.dumps(longest, separators=(",", ":"))) + 1 == s.REF_ENTRY_MAX
+    envelope = {
+        "v": s.ENVELOPE_VERSION,
+        "items": [longest] * s.STREAM_ITEMS_MAX,
+        "next_offset": 10**19 - 1,
+        "more_ready": False,
+    }
+    assert len(json.dumps(envelope, separators=(",", ":"))) <= s.ENVELOPE_MAX
+    assert s.ENVELOPE_MAX == 128 + s.STREAM_ITEMS_MAX * s.REF_ENTRY_MAX == 13_504
+    assert s.envelope_bound(s.STREAM_ITEMS_MAX) == s.ENVELOPE_MAX
+    assert s.envelope_bound(0) == 128
+    with pytest.raises(ValueError, match=">= 0"):
+        s.envelope_bound(-1)
+    assert s.STREAM_POLLS_MAX * s.STREAM_ITEMS_MAX <= s.STREAM_REFS_MAX
+
+
+async def test_every_envelope_is_within_its_bound() -> None:
+    """Items of every size, listed or not, any recipient count: the envelope is within
+    ``envelope_bound`` of its item count, however large the items are."""
+    keys = [SELLER, *(generate_identity() for _ in range(15))]
+    c = KontraCodec(
+        SELLER[0], [k[1] for k in keys], role="seller", buyer_keys=Keys(), blobs=Blobs()
+    ).with_context(WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id(JOB)))
+    sizes = [10, 100_000, 300_000, 50]
+    items = [
+        item(("events", "private", PROGRESS_TOPIC)[i % 3], 10**12 + i * 7, {"pad": "z" * n})
+        for i, n in enumerate(sizes * 3)
+    ]
+    [envelope] = await c.encode([marked(items, next_offset=10**18)])
+    env = s.parse_envelope(envelope)
+    assert len(env.items) == len(items)
+    assert len(envelope.data) <= s.envelope_bound(len(items))
+    held = marked([], next_offset=10**18, more_ready=True)  # a poll held back: a frame
+    [envelope] = await c.encode([held])
+    assert len(envelope.data) <= s.envelope_bound(0)
+
+
+async def test_without_a_store_every_item_is_a_stub_the_seller_drops() -> None:
+    [stub] = await codec().encode([marked(sample())])
     env = s.parse_envelope(stub)
-    assert env.items[1].ciphertext is None
-    assert json.loads(stub.data)["items"][1]["ct"] is None
+    assert [i.sha256 for i in env.items] == [None] * 4
+    assert all(i.size > 0 for i in env.items)
     [back] = await codec().decode([stub])
-    assert [i.offset for i in CONVERTER.from_payload(back, PollResult).items] == [0, 2]
+    assert CONVERTER.from_payload(back, PollResult).items == []
 
 
-async def test_a_reread_large_item_reuses_its_blob_within_its_job_only() -> None:
-    """Every poll whose answer holds an item above the inline limit would seal and upload it
-    afresh (a new sha256 each time: age is randomised): the codec reuses the stored blob for
-    the same job, item and recipients, and never across jobs."""
-    huge = {"blob": "y" * (s.ITEM_INLINE_MAX + 1024)}
-    items = [item("events", 0, {"n": 0}), item("events", 1, huge)]
-    blobs = Blobs()
-    c = codec(blobs=blobs)
-    refs: list[str] = []
-    for _ in range(3):  # three polls from 0: a seller's subscriber, a relay that re-reads
-        [envelope] = await c.encode([marked(items)])
-        refs.append(json.loads(envelope.data)["items"][1]["ref"]["sha256"])
-    assert len(set(refs)) == 1
-    assert len(blobs.data) == 1
-    # A copy of the codec for another context of the same job shares what it stored.
-    again = c.with_context(
+async def test_a_failing_bucket_costs_items_never_the_answer() -> None:
+    """A store that fails is caught: every new item a stub, the answer encoded. A stub is not
+    remembered, so a later read stores it."""
+    down = Blobs(fail=True)
+    [envelope] = await codec(blobs=down).encode([marked(sample())])
+    assert [i.sha256 for i in s.parse_envelope(envelope).items] == [None] * 4
+    c = codec(blobs=Blobs())
+    [envelope] = await c.encode([marked(sample())])
+    assert all(i.sha256 is not None for i in s.parse_envelope(envelope).items)
+
+
+async def test_one_upload_budget_per_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """temporalio encodes a completion's payloads one after another, in one codec copy: the
+    copy's upload window is shared, so a slow bucket holds the completion at most
+    ``STREAM_UPLOAD_BUDGET``, whatever the number of answers. A new copy (the next
+    completion) opens a new window, and stores what was a stub."""
+    monkeypatch.setattr("kontra.codec.STREAM_UPLOAD_BUDGET", 0.3)
+    slow = Blobs(delay=0.2)  # per upload, one after another
+    copy = codec(blobs=slow)
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    answers = [
+        marked([item("events", 10 * w + i, {"w": w, "i": i}) for i in range(3)], next_offset=10 * w + 3)
+        for w in range(10)
+    ]  # fmt: skip
+    envelopes = [(await copy.encode([a]))[0] for a in answers]
+    took = loop.time() - began
+    assert took < 0.3 + 0.3  # the budget, and one upload cut short: not 10 x 3 x 0.2 s
+    stored = [i.sha256 is not None for e in envelopes for i in s.parse_envelope(e).items]
+    assert 0 < sum(stored) < len(stored)  # some stored in time, the rest stubs
+    assert stored == sorted(stored, reverse=True)  # the window closed once, for good
+    assert len(slow.calls) <= 2  # past the window no answer even asks the bucket
+    again = copy.with_context(
         WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id(JOB))
     )
-    [envelope] = await again.encode([marked(items)])
-    assert json.loads(envelope.data)["items"][1]["ref"]["sha256"] == refs[0]
-    [back] = await again.decode([envelope])
-    assert CONVERTER.from_payload(back, PollResult).items[1].data == items[1].data
-    # Another job's identical item is its own blob: nothing links the two jobs.
+    [late] = await again.encode([answers[-1]])
+    assert any(i.sha256 is not None for i in s.parse_envelope(late).items)
+
+
+async def test_a_reread_stores_nothing_new() -> None:
+    """A thousand polls from 0 (a relay token holder's re-reads) upload each item once: the
+    cache answers them."""
+    blobs = Blobs()
+    c = codec(blobs=blobs)
+    items = [item("events", i, {"n": i}) for i in range(s.STREAM_ITEMS_MAX)]
+    first = None
+    for _ in range(1000):
+        [envelope] = await c.encode([marked(items)])
+        first = first or envelope.data
+        assert envelope.data == first
+    assert blobs.uploads == len(blobs.data) == s.STREAM_ITEMS_MAX
+    assert blobs.calls == [s.STREAM_ITEMS_MAX]  # the gate asked once
+
+
+async def test_a_reread_past_the_cache_seals_the_same_bytes() -> None:
+    """The cache is per process and shared by jobs: two jobs overflowing it evict each
+    other's items, and each re-read seals them again -- to the same bytes (per-worker
+    sealing), so the bucket stores nothing new and nothing is uploaded again."""
+    blobs = Blobs()
+    c = codec(blobs=blobs)
+    c._stream_refs = s.BlobRefs(size=2)  # pyright: ignore[reportPrivateUsage]
+    items = [item("events", i, {"n": i}) for i in range(8)]
     other = c.with_context(
-        WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id("b" * 32))
+        WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id(OTHER_JOB))
     )
-    [envelope] = await other.encode([marked(items)])
-    assert json.loads(envelope.data)["items"][1]["ref"]["sha256"] != refs[0]
-    assert len(blobs.data) == 2
+    [one] = await c.encode([marked(items)])
+    [two] = await other.encode([marked(items)])
+    stored, uploads = len(blobs.data), blobs.uploads
+    assert stored == uploads == 16  # two jobs, their own blobs: nothing links them
+    for _ in range(5):
+        assert (await c.encode([marked(items)]))[0].data == one.data
+        assert (await other.encode([marked(items)]))[0].data == two.data
+    assert (len(blobs.data), blobs.uploads) == (stored, uploads)
+    assert len(blobs.calls) == 12  # the gate was asked (exists), never uploaded to
+
+
+async def test_sealing_is_per_worker_and_per_job() -> None:
+    """The same item sealed by the same worker for the same job is the same file; another
+    worker of the seller (another identity, the same recipients), another job, or a
+    different item is another file: the seed needs the worker's secret."""
+    items = [item("events", 0, {"n": 0})]
+
+    async def ct(c: KontraCodec) -> bytes:
+        blobs = Blobs()
+        c._blobs = blobs  # pyright: ignore[reportPrivateUsage]
+        [envelope] = await c.encode([marked(items)])
+        [i] = s.parse_envelope(envelope).items
+        return blob(blobs, i)
+
+    same = await ct(codec())
+    assert await ct(codec()) == same
+    assert await ct(codec(identity=SECOND)) != same
+    assert await ct(codec(job=OTHER_JOB)) != same
+    # A seeded file is a standard age file: every recipient opens it.
+    assert decrypt(same, SELLER[0]) == decrypt(same, SECOND[0]) == decrypt(same, BUYER[0])
 
 
 def test_blob_refs_are_bounded() -> None:
@@ -227,6 +353,8 @@ def test_blob_refs_are_bounded() -> None:
     assert s.BlobRefs.key("a", b"x", ["k"]) != s.BlobRefs.key("a", b"x", ["k", "l"])
     with pytest.raises(ValueError, match="size"):
         s.BlobRefs(size=0)
+    assert len(s.BlobRefs()._refs) == 0  # pyright: ignore[reportPrivateUsage]
+    assert s.BlobRefs()._size == s.STREAM_REFS_MAX  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_the_offset_is_plaintext_and_validated() -> None:
@@ -316,13 +444,34 @@ async def test_an_unresolvable_buyer_key_fails_closed() -> None:
 
 async def test_unmarked_payloads_in_the_same_batch_take_the_usual_path() -> None:
     plain = CONVERTER.to_payloads([{"x": MARKER}])[0]
-    out = await codec().encode([plain, marked(sample()), s.offset_payload(4)])
+    out = await codec(blobs=Blobs()).encode([plain, marked(sample()), s.offset_payload(4)])
     assert [p.metadata["encoding"] for p in out] == [
         b"binary/kontra-age",
         s.STREAM_ENCODING,
         b"json/plain",
     ]
     assert MARKER.encode() not in out[0].data
+
+
+def test_a_poll_failure_is_a_fixed_outcome_without_a_traceback() -> None:
+    """Kontra's interceptor raises :class:`PollFailure` for a poll it refuses or that fails:
+    a fixed message per type and, through Kontra's failure converter, no stack trace -- an
+    accepted poll's failed outcome is a small constant (decisions I39)."""
+    for kind in (s.STREAM_FULL, s.STREAM_BUSY, "TruncatedOffset", "StreamDraining", "Other"):
+        with pytest.raises(s.PollFailure) as raised:
+            raise s.PollFailure(kind)
+        e = raised.value
+        failure = Failure()
+        converter = KontraFailureConverter().with_context(
+            WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id(JOB))
+        )
+        converter.to_failure(e, CONVERTER, failure)
+        assert failure.stack_trace == ""
+        assert failure.application_failure_info.type == (
+            kind if kind != "Other" else s.STREAM_ERROR
+        )
+        assert e.__traceback__ is not None  # the exception keeps its own
+        assert len(failure.SerializeToString()) < 512
 
 
 # --------------------------------------------------------------------------- the relay's reader
@@ -334,27 +483,37 @@ def envelope(env: object, **meta: bytes) -> Payload:
 
 
 CT = base64.b64encode(encrypt(b"x", [BUYER[1]])).decode()
+D = "0" * 64
+
+
+def ref(offset: int, **kw: object) -> dict[str, object]:
+    return {"topic": "a", "offset": offset, "size": 9, "sha256": D, **kw}
 
 
 @pytest.mark.parametrize(
     "env",
     [
         [],
-        {"v": 2, "items": [], "next_offset": 0, "more_ready": False},
+        {"v": 1, "items": [{"topic": "a", "offset": 0, "ct": CT}], "next_offset": 1, "more_ready": False},
+        {"v": 3, "items": [], "next_offset": 0, "more_ready": False},
         {"v": True, "items": [], "next_offset": 0, "more_ready": False},
-        {"v": 1, "items": [], "next_offset": -1, "more_ready": False},
-        {"v": 1, "items": [], "next_offset": 0, "more_ready": 0},
-        {"v": 1, "items": [], "next_offset": 0, "more_ready": False, "extra": 1},
-        {"v": 1, "items": [{"topic": "a", "offset": 0, "ct": CT}], "next_offset": 0, "more_ready": False},
-        {"v": 1, "items": [{"topic": "a", "offset": 1, "ct": CT}, {"topic": "a", "offset": 1, "ct": CT}], "next_offset": 5, "more_ready": False},
-        {"v": 1, "items": [{"topic": "a", "offset": 0, "ct": base64.b64encode(b'{"plain": 1}').decode()}], "next_offset": 1, "more_ready": False},
-        {"v": 1, "items": [{"topic": "a", "offset": 0, "ct": CT + "!"}], "next_offset": 1, "more_ready": False},
-        {"v": 1, "items": [{"topic": "bad topic", "offset": 0, "ct": CT}], "next_offset": 1, "more_ready": False},
-        {"v": 1, "items": [{"topic": "a", "offset": 0}], "next_offset": 1, "more_ready": False},
-        {"v": 1, "items": [{"topic": "a", "offset": 0, "ct": CT, "x": 1}], "next_offset": 1, "more_ready": False},
-        {"v": 1, "items": [{"topic": "a", "offset": 0, "ct": None}], "next_offset": 1, "more_ready": False},
-        {"v": 1, "items": [{"topic": "a", "offset": 0, "size": 9, "ref": {"sha256": "0" * 64, "size": 8}}], "next_offset": 1, "more_ready": False},
+        {"v": 2, "items": [], "next_offset": -1, "more_ready": False},
+        {"v": 2, "items": [], "next_offset": 0, "more_ready": 0},
+        {"v": 2, "items": [], "next_offset": 0, "more_ready": False, "extra": 1},
+        {"v": 2, "items": [ref(0)], "next_offset": 0, "more_ready": False},
+        {"v": 2, "items": [ref(1), ref(1)], "next_offset": 5, "more_ready": False},
+        {"v": 2, "items": [ref(0, topic="bad topic")], "next_offset": 1, "more_ready": False},
+        {"v": 2, "items": [ref(0, sha256="F" * 64)], "next_offset": 1, "more_ready": False},
+        {"v": 2, "items": [ref(0, sha256="0" * 63)], "next_offset": 1, "more_ready": False},
+        {"v": 2, "items": [ref(0, sha256=1)], "next_offset": 1, "more_ready": False},
+        {"v": 2, "items": [ref(0, size=-1)], "next_offset": 1, "more_ready": False},
+        {"v": 2, "items": [ref(0, size=True)], "next_offset": 1, "more_ready": False},
+        {"v": 2, "items": [ref(0, ct=CT)], "next_offset": 1, "more_ready": False},
+        {"v": 2, "items": [{"topic": "a", "offset": 0, "size": 9}], "next_offset": 1, "more_ready": False},
+        {"v": 2, "items": [{"topic": "a", "offset": 0, "sha256": D}], "next_offset": 1, "more_ready": False},
+        {"v": 2, "items": [ref(i, topic=None) for i in range(s.STREAM_ITEMS_MAX + 1)], "next_offset": 100, "more_ready": True},
     ],
+    ids=lambda env: json.dumps(env)[:60],
 )  # fmt: skip
 def test_parse_envelope_is_strict(env: object) -> None:
     with pytest.raises(s.EnvelopeError):
@@ -362,8 +521,9 @@ def test_parse_envelope_is_strict(env: object) -> None:
 
 
 def test_parse_envelope_refuses_what_is_not_an_envelope() -> None:
-    good = {"v": 1, "items": [{"topic": "a", "offset": 0, "ct": CT}], "next_offset": 1, "more_ready": False}  # fmt: skip
-    assert s.parse_envelope(envelope(good)).items[0].ciphertext == base64.b64decode(CT)
+    good = {"v": 2, "items": [ref(0), ref(2, sha256=None)], "next_offset": 3, "more_ready": False}
+    items = s.parse_envelope(envelope(good)).items
+    assert items == (s.EnvelopeItem("a", 0, D, 9), s.EnvelopeItem("a", 2, None, 9))
     for meta in ({"encoding": b"binary/kontra-age"}, {"kontra-v": b"2"}):
         with pytest.raises(s.EnvelopeError):
             s.parse_envelope(envelope(good, **meta))
@@ -372,12 +532,32 @@ def test_parse_envelope_refuses_what_is_not_an_envelope() -> None:
         s.parse_envelope(huge)
 
 
+def test_a_fetched_blob_is_kept_only_when_it_is_the_item() -> None:
+    """What the relay keeps of a fetched blob: exactly the size and digest its reference
+    names, and an age file -- never plaintext, never another item's bytes."""
+    ct = base64.b64decode(CT)
+    i = s.EnvelopeItem("a", 0, hashlib.sha256(ct).hexdigest(), len(ct))
+    assert s.verified_item(ct, i) == ct
+    plain = b"age-encryption.org/v1\nnot an age file at all, just text"
+    for data, it in (
+        (None, i),
+        (ct[:-1], i),
+        (ct + b"x", i),
+        (ct, s.EnvelopeItem("a", 0, None, len(ct))),
+        (ct, s.EnvelopeItem("a", 0, "0" * 64, len(ct))),
+        (plain, s.EnvelopeItem("a", 0, hashlib.sha256(plain).hexdigest(), len(plain))),
+        (b'{"x": 1}', s.EnvelopeItem("a", 0, hashlib.sha256(b'{"x": 1}').hexdigest(), 8)),
+    ):
+        assert s.verified_item(data, it) is None
+
+
 async def test_the_buyers_codec_cannot_open_an_envelope_with_unlisted_items() -> None:
-    [env] = await codec().encode([marked(sample())])
-    buyer = KontraCodec(BUYER[0], [BUYER[1]], role="buyer", seller_keys=Keys())
+    blobs = Blobs()
+    [env] = await codec(blobs=blobs).encode([marked(sample())])
+    buyer = KontraCodec(BUYER[0], [BUYER[1]], role="buyer", seller_keys=Keys(), blobs=blobs)
     with pytest.raises(InvalidPayload):
         await buyer.decode([env])
-    nexus = codec().with_context(
+    nexus = codec(blobs=blobs).with_context(
         NexusSerializationContext(endpoint="k" + "5" * 32, service="acme.x", operation="execute")
     )
     with pytest.raises(InvalidPayload, match="never a Nexus payload"):
@@ -387,7 +567,7 @@ async def test_the_buyers_codec_cannot_open_an_envelope_with_unlisted_items() ->
 # --------------------------------------------------------------------------- hostile JSON
 
 
-DEEP = b"[" * 100_000  # far under ENVELOPE_MAX, far past the interpreter's stack
+DEEP = b"[" * 10_000  # under ENVELOPE_MAX, past what the JSON parser nests
 
 
 def test_json_nested_past_the_stack_is_an_envelope_error() -> None:
@@ -397,7 +577,7 @@ def test_json_nested_past_the_stack_is_an_envelope_error() -> None:
         s.parse_envelope(
             Payload(metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"}, data=DEEP)
         )
-    inside = b'{"v":1,"items":[' + b"[" * 50_000 + b"]" * 50_000 + b'],"next_offset":1,"more_ready":false}'  # fmt: skip
+    inside = b'{"v":2,"items":[' + b"[" * 5_000 + b"]" * 5_000 + b'],"next_offset":1,"more_ready":false}'  # fmt: skip
     with pytest.raises(s.EnvelopeError):
         s.parse_envelope(
             Payload(metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"}, data=inside)
@@ -409,85 +589,10 @@ async def test_json_nested_past_the_stack_fails_the_codec_closed() -> None:
     with pytest.raises(InvalidPayload, match="not JSON"):
         await codec().decode([nested])
     deep_result = marked(sample())
-    deep_result.data = DEEP
+    deep_result.data = b"[" * 100_000
     with pytest.raises(CodecError, match="not JSON"):
         await codec().encode([deep_result])
     deep_listed = marked(sample())
     deep_listed.metadata[s.BUYER_TOPICS_KEY] = b"[" * 2000  # under the list's 2,048 bytes
     with pytest.raises(CodecError, match="not JSON"):
         await codec().encode([deep_listed])
-
-
-# --------------------------------------------------------------------------- the interceptor's cut
-
-
-def _mixed() -> list[_WorkflowStreamWireItem]:
-    """Every size class: tiny, 100 KB, just under and just over the inline limit, listed
-    and unlisted, at offsets of growing width."""
-    out: list[_WorkflowStreamWireItem] = []
-    sizes = [10, 100_000, 10, s.ITEM_INLINE_MAX - 2_000, 50, s.ITEM_INLINE_MAX + 10, 100_000]
-    for i, n in enumerate(sizes * 3):
-        topic = ("events", "private", PROGRESS_TOPIC)[i % 3]
-        out.append(item(topic, 9_990 + i * 7, {"pad": "z" * n}))
-    out += [item("events", 20_000 + i, {"n": i}) for i in range(400)]  # many tiny ones
-    return out
-
-
-@pytest.mark.parametrize("seller_keys", [1, 2, 16])
-@pytest.mark.parametrize("blobs", [True, False])
-async def test_what_the_interceptor_keeps_is_sealed_whole(seller_keys: int, blobs: bool) -> None:
-    """The workflow interceptor cuts a poll's answer with :func:`items_that_fit` (and the
-    recipients bound); the codec then seals every item it kept, ``next_offset`` and
-    ``more_ready`` unchanged: the drain counts only what the poller is sent. And what the
-    interceptor counts against a workflow task's answer budget, :func:`envelope_bound`, is
-    at least what the codec writes."""
-    keys = [SELLER, *(generate_identity() for _ in range(seller_keys - 1))]
-    c = KontraCodec(
-        SELLER[0],
-        [k[1] for k in keys],
-        role="seller",
-        buyer_keys=Keys(),
-        blobs=Blobs() if blobs else None,
-    ).with_context(WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id(JOB)))
-    rest = _mixed()
-    sent = 0
-    while rest:
-        fit = s.items_that_fit(
-            ((i.topic, i.offset, len(i.data) * 3 // 4) for i in rest),
-            buyer_topics={"events", PROGRESS_TOPIC},
-            recipients=seller_keys + 1,
-        )
-        assert fit >= 1
-        kept, rest = rest[:fit], rest[fit:]
-        end = rest[0].offset if rest else kept[-1].offset + 1
-        [envelope] = await c.encode([marked(kept, next_offset=end, more_ready=bool(rest))])
-        env = s.parse_envelope(envelope)
-        assert len(envelope.data) <= s.ENVELOPE_MAX
-        bound = s.envelope_bound(
-            ((i.topic, i.offset, len(i.data) * 3 // 4) for i in kept),
-            buyer_topics={"events", PROGRESS_TOPIC},
-            recipients=seller_keys + 1,
-        )
-        assert len(envelope.data) <= bound
-        assert [i.offset for i in env.items] == [i.offset for i in kept]
-        assert (env.next_offset, env.more_ready) == (end, bool(rest))
-        sent += 1
-    assert sent > 3  # the answers were cut: the case is not vacuous
-
-
-async def test_an_answer_held_back_is_an_envelope_within_its_bound() -> None:
-    """A poll held back past a workflow task's answer budget: no items, ``more_ready``, at
-    the offset it asked; sealed as any answer, within the frame the interceptor counts."""
-    end = 10**18
-    [envelope] = await codec().encode([marked([], next_offset=end, more_ready=True)])
-    env = s.parse_envelope(envelope)
-    assert (env.items, env.next_offset, env.more_ready) == ((), end, True)
-    assert len(envelope.data) <= s.envelope_bound((), buyer_topics=(), recipients=17)
-
-
-def test_the_cut_keeps_at_least_one_item_and_stops_at_the_limit() -> None:
-    big = [("events", i, s.ITEM_INLINE_MAX) for i in range(5)]
-    assert s.items_that_fit(big, buyer_topics={"events"}, recipients=17) == 1
-    assert s.items_that_fit([], buyer_topics={"events"}, recipients=1) == 0
-    tiny = [("events", i, 10) for i in range(10)]
-    assert s.items_that_fit(tiny, buyer_topics={"events"}, recipients=2) == 10

@@ -13,7 +13,7 @@ from datetime import timedelta
 
 import nexusrpc
 import nexusrpc.handler
-from temporalio import nexus, workflow
+from temporalio import activity, nexus, workflow
 from temporalio.contrib.workflow_streams import WorkflowStream
 
 SELLER_NAMESPACE = "acme"
@@ -227,3 +227,54 @@ class PlatformPing:
     @workflow.run
     async def run(self) -> str:
         return "pong"
+
+
+# --- the relay's bound (decisions I39) -------------------------------------------------
+
+
+@dataclass
+class BoundJobInput:
+    items: int  # published as the run starts, on the listed topic
+    pad: int = 64  # bytes of filler in each
+
+
+@activity.defn
+async def bound_step(n: int) -> int:
+    """A step of the seller's own work: one activity per cycle."""
+    return n
+
+
+@workflow.defn
+class BoundJob:
+    """A seller's handler workflow (`job-<id>`) doing its own work while someone reads its
+    stream: it publishes ``items`` items as it starts; each ``work`` signal runs one activity
+    and publishes one more item (the seller's own workflow tasks); ``finish`` completes it."""
+
+    @workflow.init
+    def __init__(self, job: BoundJobInput) -> None:
+        self.stream = WorkflowStream()
+        self._queue: list[int] = []
+        self._done = False
+
+    @workflow.run
+    async def run(self, job: BoundJobInput) -> str:
+        events = self.stream.topic("events", type=str)
+        for i in range(job.items):
+            events.publish(f"item-{i}-" + "p" * job.pad)
+        while True:
+            await workflow.wait_condition(lambda: bool(self._queue) or self._done)
+            if not self._queue:
+                return "done"
+            n = self._queue.pop(0)
+            await workflow.execute_activity(
+                bound_step, n, start_to_close_timeout=timedelta(seconds=30)
+            )
+            events.publish(f"work-{n}")
+
+    @workflow.signal
+    def work(self, n: int) -> None:
+        self._queue.append(n)
+
+    @workflow.signal
+    def finish(self) -> None:
+        self._done = True

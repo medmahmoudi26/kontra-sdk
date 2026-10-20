@@ -131,6 +131,12 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     ),
     "create_blob": (lambda c: c.create_blob(m.BlobCreate(sha256=SHA, size=1)), {}),
     "get_blob": (lambda c: c.get_blob(SHA), {"sha256": SHA}),
+    "create_stream_blobs": (
+        lambda c: c.create_stream_blobs(
+            JOB, m.StreamBlobsCreate(blobs=[m.BlobCreate(sha256=SHA, size=1)])
+        ),
+        {"job_id": JOB},
+    ),
     "balance": (lambda c: c.balance(), {}),
     "topup": (lambda c: c.topup(1000), {}),
     "disputes": (lambda c: c.disputes(), {}),
