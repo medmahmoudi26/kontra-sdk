@@ -63,6 +63,25 @@ class Excluded(BaseModel):
     secret: str = Field(exclude=True)
 
 
+def _blank(value: str) -> bool:
+    return value == ""
+
+
+def _none(value: int | None) -> bool:
+    return value is None
+
+
+class ExcludedIf(BaseModel):
+    """Fields an ``exclude_if`` leaves out of the serialization when they hold their default:
+    the one kind of output member that may be absent, so not required, and the scalar
+    default is what the seller's model reads in its place (``None``, as everywhere, is no
+    default). Both modes describe it alike: one definition."""
+
+    x: int
+    note: str = Field(default="", exclude_if=_blank)
+    n: int | None = Field(default=None, exclude_if=_none)
+
+
 class SplitAlias(BaseModel):
     """A field read under one name and written under another."""
 
@@ -318,10 +337,12 @@ ARTIFACT = {"key": "0" * 32, "size": 3, "sha256": "a" * 64, "content_type": "tex
 #: name -> (model, an input value for it). Every I33 model is here but ``Overlap``, which has
 #: no valid value (see its docstring). ``Allow``'s value has no other key: one is a member the
 #: closed contract does not declare, refused (§11.3; #53 reports the open output).
+#: ``ExcludedIf``'s has every member: ``test_serialized.py`` leaves them out.
 CASES: dict[str, tuple[type[BaseModel], dict[str, Any]]] = {
     "computed": (Computed, {"w": 2, "h": 3}),
     "computed_alias": (ComputedAlias, {"w": 4}),
     "excluded": (Excluded, {"keep": 1, "secret": "s3cret"}),
+    "excluded_if": (ExcludedIf, {"x": 1, "note": "kept", "n": 2}),
     "split_alias": (SplitAlias, {"in_a": "x"}),
     "camel": (Camel, {"firstName": "Ada"}),
     "serialized": (Serialized, {"at": "2026-10-20T12:00:00Z"}),

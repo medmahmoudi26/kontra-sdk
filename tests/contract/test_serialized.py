@@ -45,6 +45,7 @@ from .zoo import (
     ComputedAlias,
     Defaults,
     Excluded,
+    ExcludedIf,
     Leaf,
     Nested,
     Optionals,
@@ -127,7 +128,8 @@ def test_the_output_is_derived_in_serialization_mode(enrich_spec: OfferingSpec) 
 
 def test_an_output_member_is_required_and_has_no_default(enrich_spec: OfferingSpec) -> None:
     """The reply always carries a defaulted field, so the output requires it, and writes no
-    default (nexgen refuses one on a required member; nothing is ever absent to default)."""
+    default (nexgen refuses one on a required member; nothing is ever absent to default).
+    The one exception, a field an ``exclude_if`` may leave out, is the next test's."""
     defs = _defs(derive(enrich_spec, Defaults))
     assert defs["DefaultsInput"]["required"] == ["req"]
     assert defs["DefaultsInput"]["properties"]["n"] == {"type": "integer", "default": 3}
@@ -143,6 +145,33 @@ def test_an_output_member_is_required_and_has_no_default(enrich_spec: OfferingSp
     assert nested["NestedOutput"]["properties"]["leaf"] == {"$ref": "#/$defs/LeafOutput"}
     assert nested["LeafOutput"]["required"] == ["v"]
     assert "required" not in nested["LeafInput"]
+
+
+def test_a_field_an_exclude_if_leaves_out_keeps_its_default(enrich_spec: OfferingSpec) -> None:
+    """The one output member that may be absent: a field an ``exclude_if`` leaves out of the
+    reply is not required, and its scalar default -- what the seller's model reads in its
+    place, and what a buyer's generated code fills in -- is written beside it, as on the
+    input (``None`` is no default). Both modes describe the model alike: one definition. A
+    reply that leaves both members out is what every reader takes."""
+    doc = derive(enrich_spec, ExcludedIf)
+    info, defs = validate_document(doc), _defs(doc)
+    assert set(defs) == {"ExcludedIf"}
+    body = defs["ExcludedIf"]
+    assert body["required"] == ["x"]
+    assert body["properties"]["note"] == {"type": "string", "default": ""}
+    assert body["properties"]["n"] == {"oneOf": [{"type": "integer"}, {"type": "null"}]}
+
+    instance = ExcludedIf(x=1)
+    wanted = instance.model_dump(mode="json", by_alias=True)
+    assert wanted == {"x": 1}
+    contract = InputValidator(info)
+    [payload] = PydanticPayloadConverter().to_payloads([instance])
+    assert json.loads(payload.data) == wanted
+    contract.validate_output(wanted)
+    assert as_output(ExcludedIf, instance.model_dump(mode="json"), contract) == wanted
+    assert wrap(wanted, info.output_schema).to_dict() == wanted
+    read = ExcludedIf.model_validate(wanted)
+    assert (read.note, read.n) == (body["properties"]["note"]["default"], None)
 
 
 def test_a_model_whose_two_modes_differ_is_two_definitions(enrich_spec: OfferingSpec) -> None:

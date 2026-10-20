@@ -7,8 +7,10 @@ I38): the input in pydantic's *validation* mode (what a buyer may send), the out
 *serialization* mode (what the buyer is delivered: temporalio's pydantic converter, and a
 bound handler's result, write ``model_dump(mode="json", by_alias=True)``) -- computed
 fields present, excluded fields absent, keyed by serialization alias, typed by a
-serializer's return type, and every field required, since the reply always carries it. A
-model whose two schemas differ is two definitions, ``ReportInput`` and ``ReportOutput``.
+serializer's return type, and every field required, without a default, since the reply
+always carries it -- but a field an ``exclude_if`` may leave out, which is not required and
+keeps its scalar default, what the seller's model reads in its place. A model whose two
+schemas differ is two definitions, ``ReportInput`` and ``ReportOutput``.
 
 * ``Optional[T]`` becomes ``oneOf: [T, {type: null}]`` (pydantic writes ``anyOf``);
   ``default: null`` is dropped (it is the absence of a default, and nexgen refuses it);
@@ -155,10 +157,14 @@ def _instance_check(check: Any, target: Mapping[str, Any]) -> str | None:
 class _Generator(GenerateJsonSchema):
     """pydantic's generator, minus the noise and with the reserved names pinned. In
     serialization mode (an output) every field the reply always carries is required and
-    no default is written: a default says what an *absent* member means, and an output's
-    member is never absent. What it cannot describe soundly it marks (:data:`_REFUSED`)
-    for lowering to refuse where it is used: a constraint pydantic checks against an
-    instance, a serializer with no return type, a timedelta written as an ISO duration."""
+    has no default: a default says what an *absent* member means, and such a member is
+    never absent (nexgen refuses a default on a required member). The one output member
+    that may be absent, a field an ``exclude_if`` may leave out of the reply, is not
+    required and keeps pydantic's default, which is what the seller's model reads in its
+    place, and what a buyer's generated code fills in. What it cannot describe soundly it
+    marks (:data:`_REFUSED`) for lowering to refuse where it is used: a constraint pydantic
+    checks against an instance, a serializer with no return type, a timedelta written as an
+    ISO duration."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -168,6 +174,9 @@ class _Generator(GenerateJsonSchema):
         #: order, each marked whether it is Kontra's spelling (see :meth:`get_defs_ref`).
         self._own_names: dict[DefsRef, list[DefsRef]] = {}
         self._name_choices: dict[DefsRef, list[tuple[DefsRef, bool]]] = {}
+        #: The default schema of each output field an ``exclude_if`` may leave out, by id
+        #: (core schemas are dicts), the schema held so that its id stays its own.
+        self._may_be_absent: dict[int, Mapping[str, Any]] = {}
 
     def field_title_should_be_set(self, schema: Any) -> bool:
         return False
@@ -234,8 +243,24 @@ class _Generator(GenerateJsonSchema):
             return field.get("serialization_exclude_if") is None
         return super().field_is_required(field, total)
 
+    def model_field_schema(self, schema: core_schema.ModelField) -> JsonSchemaValue:
+        self._note_may_be_absent(schema)
+        return super().model_field_schema(schema)
+
+    def dataclass_field_schema(self, schema: core_schema.DataclassField) -> JsonSchemaValue:
+        self._note_may_be_absent(schema)
+        return super().dataclass_field_schema(schema)
+
+    def _note_may_be_absent(
+        self, field: core_schema.ModelField | core_schema.DataclassField
+    ) -> None:
+        # The field's own schema is its default's (validators and serializers sit inside).
+        if self.mode == "serialization" and field.get("serialization_exclude_if") is not None:
+            inner = cast(Mapping[str, Any], field["schema"])
+            self._may_be_absent[id(inner)] = inner
+
     def default_schema(self, schema: core_schema.WithDefaultSchema) -> JsonSchemaValue:
-        if self.mode == "serialization":
+        if self.mode == "serialization" and self._may_be_absent.get(id(schema)) is not schema:
             return self.generate_inner(schema["schema"])
         return super().default_schema(schema)
 

@@ -1783,9 +1783,13 @@ result.
   required: pydantic's
   `json_schema_serialization_defaults_required`, for every model whatever its config (a
   model's or a dataclass's dump writes every field; an `exclude_if` field may be left out,
-  and a TypedDict's keys keep pydantic's rule). No default is written in serialization mode:
-  a default says what an absent member means, an output member is never absent, and nexgen
-  refuses a default on a required member. `readOnly` and `writeOnly` are dropped at
+  and a TypedDict's keys keep pydantic's rule). No default is written beside a required
+  output member: a default says what an absent member means, such a member is never absent,
+  and nexgen refuses a default on a required member. The one output member that may be
+  absent, a field an `exclude_if` leaves out of the reply, is not required and keeps its
+  scalar default, as pydantic's serialization schema writes it (and the harness's): it is
+  what the seller's model reads in its place and what a buyer's generated code fills in, as
+  on an input (the zoo's `ExcludedIf`). `readOnly` and `writeOnly` are dropped at
   derivation (pydantic marks every computed field `readOnly`; both are annotations outside
   nexgen's subset); a hand-written document with either is still refused. A `Decimal`
   output, written as a JSON string, is now a `string`; as an input it is still refused.
@@ -1932,7 +1936,8 @@ result.
   titles, a recursive tree, closed and open models -- the workflow entry's and the handler's
   results are the model's `by_alias` dump, validate against the contract and read back
   through `kontra.hire`'s decoding; the output schema of each case; required without
-  defaults; the names, a seller's `XInput`/`XOutput` beside a split `X` in one module, a
+  defaults, but an `exclude_if` field, not required, with its default, whose absence every
+  reader takes; the names, a seller's `XInput`/`XOutput` beside a split `X` in one module, a
   collision with a seller's name, and determinism; serializers without a return annotation
   and ISO `timedelta` outputs refused; `Decimal`; re-keying at every depth; `as_output`
   delivering an excluded field, and failing a reply that is not the output without quoting
