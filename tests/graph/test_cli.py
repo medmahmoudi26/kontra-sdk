@@ -33,7 +33,6 @@ import pytest
 from click.testing import CliRunner, Result
 from temporalio.testing import WorkflowEnvironment
 
-from kontra import activity as kontra_activity
 from kontra.cli import cli
 from kontra.cli._graph import load_static, static_path
 from kontra.cli._mock import explore, server_dir
@@ -72,16 +71,6 @@ def test_server() -> None:
         asyncio.run(start())
     except Exception as e:
         pytest.skip(f"no time-skipping test server: {e}")
-
-
-@pytest.fixture(autouse=True)
-def only_the_projects_activities(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``serve()`` registers every kontra activity defined in the process: in the command's
-    own process, the project's. This one holds every test module's too (``tests/parallel``
-    defines its activities as it is collected), which would be registered on every worker
-    and reported never scheduled. Each test starts with none defined, as ``kontra graph``
-    does; ``load_worker`` imports the project afresh, which defines its own."""
-    monkeypatch.setattr(kontra_activity, "_DEFINED", {})
 
 
 @pytest.fixture
@@ -137,7 +126,7 @@ def test_the_graph_of_every_seller_example_is_its_readmes(home: Path, example: s
     runs, seed 0). After a deliberate change, ``UPDATE_GOLDEN=1 pytest tests/graph/test_cli.py``
     rewrites the blocks; review the diff."""
     if example == "chef-agents" and not AGENTS:
-        pytest.skip("the [agents] extra is not installed")
+        pytest.skip("temporalio-openai-agents (the dev group's) is not installed")
     result = ok(kontra(home, "graph", "--dir", str(EXAMPLES / example), "--mermaid"))
     assert result.stderr == ""  # every activity scheduled, every run closed
     assert not home.exists()  # no profile: nothing saved

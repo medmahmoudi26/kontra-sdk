@@ -1,5 +1,6 @@
-"""``kontra.serve.Worker``: argument checks, the kwargs passthrough (acceptance 10), the hash
-lock's decisions, graceful shutdown on SIGTERM, and request URLs kept out of the log."""
+"""``kontra.serve.Worker``: argument checks, the kwargs passthrough (acceptance 10) with the
+plugin routing, the hash lock's decisions, graceful shutdown on SIGTERM, and request URLs kept
+out of the log."""
 
 from __future__ import annotations
 
@@ -35,10 +36,10 @@ from temporalio.worker import (
 )
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
-from kontra._parallel import _Batch
 from kontra.codec.age import generate_identity
 from kontra.gate_client import GateError
 from kontra.gate_client import models as m
+from kontra.plugin import KontraPlugin
 from kontra.profile import NotLoggedIn, Profile
 from kontra.serve import KontraInterceptor, ServeError, Worker
 from kontra.testing import Marketplace
@@ -76,6 +77,17 @@ def test_unknown_keywords_and_bad_offerings_are_refused(bound: Any) -> None:
         Worker(offerings=[bound, bound])
     with pytest.raises(TypeError, match=r"kontra\.serve\.offering"):
         Worker(offerings=["acme/upper@1.0.0"])  # type: ignore[list-item]
+
+
+def test_two_offerings_of_one_class_are_refused(tmp_path: Path) -> None:
+    """A worker serves the offering whose class it registers (bound by code), so two
+    offerings bound to one class could never be told apart: refused when worker.py is
+    imported."""
+    a, b = (seller.bind(write_offering(tmp_path / n)) for n in "ab")
+    with pytest.raises(ValueError, match="bound to the same class UpperFlow"):
+        Worker(offerings=[a, b])
+    with pytest.raises(ValueError, match="bound to the same class"):
+        KontraPlugin(a, b)
 
 
 def test_construction_does_no_io(bound: Any) -> None:
@@ -210,13 +222,33 @@ def test_every_temporalio_keyword_has_a_sentinel() -> None:
     assert set(SENTINELS) <= _temporal_kwargs()
 
 
+class _WorkerOnly(temporalio.worker.Plugin):
+    """A plugin for the worker alone (not a client plugin): it goes to the inner workers."""
+
+    def configure_worker(self, config: temporalio.worker.WorkerConfig) -> Any:
+        return config
+
+    async def run_worker(self, worker: temporalio.worker.Worker, next: Any) -> None:
+        await next(worker)
+
+    def configure_replayer(self, config: Any) -> Any:
+        return config
+
+    def run_replayer(self, replayer: Any, histories: Any, next: Any) -> Any:
+        return next(replayer, histories)
+
+
 @pytest.mark.temporal
 async def test_every_keyword_reaches_the_inner_worker_unchanged(
     dev_server: DevServer, tmp_path: Path
 ) -> None:
     """Acceptance 10: a sentinel per ``temporalio.worker.Worker`` keyword (read from its
-    signature) is observable unchanged on the inner worker's ``config()``; the three merged
-    ones carry Kontra's part first, then the given values, untouched."""
+    signature) is observable unchanged in the inner worker's configuration; the three merged
+    ones carry Kontra's part first, then the given values, untouched; a sandbox runner gets
+    ``kontra`` passed through (on a copy: the given one is not touched); and ``plugins`` are
+    routed -- a client plugin (``SimplePlugin`` is one) to the client, before Kontra's plugin,
+    which temporalio carries onto every worker of the client; a worker-only one to the inner
+    worker. Either way the sentinel is among the inner worker's effective plugins."""
     names = sorted(_temporal_kwargs())
     groups = [
         [n for n in names if n not in _EXCLUSIVE],
@@ -232,21 +264,33 @@ async def test_every_keyword_reaches_the_inner_worker_unchanged(
             await worker.prepare(session=acme.session)
             try:
                 [inner] = worker.inner_workers
-                config = inner.config()
+                config = inner.config(active_config=True)
                 assert inner.task_queue == bound.key
                 assert config["client"] is worker.client
                 for name, value in given.items():
                     seen = config[name]  # type: ignore[literal-required]
                     if name == "workflows":
                         assert seen[0] is bound.workflow
-                        assert seen[-1] is _Batch
-                        assert all(a is b for a, b in zip(seen[1:-1], value, strict=True)), name
+                        assert all(a is b for a, b in zip(seen[1:], value, strict=True)), name
                     elif name == "nexus_service_handlers":
                         assert type(seen[0]).__name__ == "KontraOffering"
                         assert all(a is b for a, b in zip(seen[1:], value, strict=True)), name
                     elif name == "interceptors":
                         assert isinstance(seen[0], KontraInterceptor)
                         assert all(a is b for a, b in zip(seen[1:], value, strict=True)), name
+                    elif name == "workflow_runner":
+                        assert isinstance(seen, SandboxedWorkflowRunner)
+                        assert seen.restrictions.passthrough_modules == (
+                            value.restrictions.passthrough_modules | {"kontra"}
+                        )
+                        assert "kontra" not in value.restrictions.passthrough_modules
+                    elif name == "plugins":
+                        [sentinel] = value
+                        assert seen == []  # routed to the client: a client plugin
+                        on_client = worker.client.config()["plugins"]  # type: ignore[union-attr]
+                        assert on_client[0] is sentinel
+                        assert isinstance(on_client[-1], KontraPlugin)
+                        assert any(p is sentinel for p in inner._plugins)  # effective
                     elif isinstance(value, list):
                         assert all(a is b for a, b in zip(seen, value, strict=True)), name
                     else:
@@ -257,6 +301,18 @@ async def test_every_keyword_reaches_the_inner_worker_unchanged(
                     if isinstance(v, ThreadPoolExecutor):
                         v.shutdown()
             assert worker.inner_workers == ()
+        # A worker-only plugin goes to the inner worker as given.
+        only = _WorkerOnly()
+        worker = Worker(offerings=[bound], plugins=[only])
+        await worker.prepare(session=acme.session)
+        try:
+            [inner] = worker.inner_workers
+            assert inner.config()["plugins"] == [only]
+            assert isinstance(inner._plugins[0], KontraPlugin)  # the client's first
+            assert inner._plugins[-1] is only
+            assert not any(p is only for p in worker.client.config()["plugins"])  # type: ignore[union-attr]
+        finally:
+            await worker.aclose()
 
 
 @pytest.mark.temporal
@@ -264,18 +320,32 @@ async def test_workflows_run_sandboxed_with_kontra_passed_through_by_default(
     dev_server: DevServer, tmp_path: Path
 ) -> None:
     """Without a ``workflow_runner`` the inner worker gets Temporal's sandbox passing
-    ``kontra`` through, and ``kontra.batch.v1`` is registered once even when given too."""
+    ``kontra`` through; the bound workflow is registered once even when given too, and
+    ``kontra.batch.v1`` only by the helper's own plugin (not a primitive). A runner that is
+    not Temporal's sandbox is the seller's, kept as it is."""
+    from kontra.contrib.parallel import ParallelPlugin, _Batch
+
     async with Marketplace(dev_server=dev_server) as mp:
         acme = await mp.party("acme")
         bound = seller.bind(write_offering(tmp_path))
-        worker = Worker(offerings=[bound], workflows=[_Batch])
+        worker = Worker(offerings=[bound], workflows=[bound.workflow])
         await worker.prepare(session=acme.session)
         try:
             [inner] = worker.inner_workers
-            config = inner.config()
+            config = inner.config(active_config=True)
             runner = config["workflow_runner"]
             assert isinstance(runner, SandboxedWorkflowRunner)
             assert "kontra" in runner.restrictions.passthrough_modules
+            assert config["workflows"] == [bound.workflow]
+        finally:
+            await worker.aclose()
+        unsandboxed = UnsandboxedWorkflowRunner()
+        worker = Worker(offerings=[bound], plugins=[ParallelPlugin()], workflow_runner=unsandboxed)
+        await worker.prepare(session=acme.session)
+        try:
+            [inner] = worker.inner_workers
+            config = inner.config(active_config=True)
+            assert config["workflow_runner"] is unsandboxed
             assert config["workflows"] == [bound.workflow, _Batch]
         finally:
             await worker.aclose()
@@ -380,13 +450,13 @@ def _profile(*, dev: bool) -> Profile:
 async def test_the_hash_lock_refuses_an_unpublished_version_outside_dev(bound: Any) -> None:
     gate = _CatalogGate(None)
     with pytest.raises(ServeError, match=r"acme/upper@\S+ is not published: run `kontra publish`"):
-        await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=False))  # type: ignore[arg-type]
+        await KontraPlugin(bound)._hash_lock(gate, _profile(dev=False))  # type: ignore[arg-type]
     assert gate.published == []
 
 
 async def test_the_hash_lock_publishes_on_a_dev_profile(bound: Any) -> None:
     gate = _CatalogGate(None)
-    hashes = await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=True))  # type: ignore[arg-type]
+    hashes = await KontraPlugin(bound)._hash_lock(gate, _profile(dev=True))  # type: ignore[arg-type]
     assert gate.published == [bound.document()]
     assert hashes == {bound.key: bound.contract_hash()}
 
@@ -396,7 +466,7 @@ async def test_the_hash_lock_names_both_hashes(bound: Any) -> None:
     gate = _CatalogGate(_entry(bound.document(), contract_hash=theirs))
     for dev in (False, True):  # a dev profile does not paper over drift either
         with pytest.raises(ServeError) as refused:
-            await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=dev))  # type: ignore[arg-type]
+            await KontraPlugin(bound)._hash_lock(gate, _profile(dev=dev))  # type: ignore[arg-type]
         assert bound.contract_hash() in str(refused.value)
         assert theirs in str(refused.value)
     assert gate.published == []
@@ -411,12 +481,12 @@ async def test_a_retired_version_with_open_jobs_is_served_with_a_warning(
         [_job(bound.key), _job("acme/other@1.0.0")],
         hired_hash=bound.contract_hash(),
     )
-    hashes = await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=False))  # type: ignore[arg-type]
+    hashes = await KontraPlugin(bound)._hash_lock(gate, _profile(dev=False))  # type: ignore[arg-type]
     assert hashes == {bound.key: bound.contract_hash()}
     assert "is retired but still has 1 open job(s)" in caplog.text
     caplog.clear()
     gate = _CatalogGate(_entry(bound.document(), retired=True), [_job(bound.key)])
-    await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=False))  # type: ignore[arg-type]
+    await KontraPlugin(bound)._hash_lock(gate, _profile(dev=False))  # type: ignore[arg-type]
     assert "still has 1 open job(s); serving them" in caplog.text
 
 
@@ -426,7 +496,7 @@ async def test_a_retired_version_with_open_jobs_is_still_hash_locked(bound: Any)
     theirs = "sha256:" + "2" * 64
     gate = _CatalogGate(None, [_job(bound.key)], hired_hash=theirs)
     with pytest.raises(ServeError) as refused:
-        await Worker(offerings=[bound])._hash_lock(gate, _profile(dev=True))  # type: ignore[arg-type]
+        await KontraPlugin(bound)._hash_lock(gate, _profile(dev=True))  # type: ignore[arg-type]
     assert bound.contract_hash() in str(refused.value)
     assert f"hired under {theirs}" in str(refused.value)
     assert gate.published == []  # a dev profile does not republish a retired version
@@ -457,10 +527,14 @@ async def test_sigterm_shuts_the_worker_down_gracefully(
 
 @pytest.mark.temporal
 async def test_one_worker_serves_several_offerings(dev_server: DevServer, tmp_path: Path) -> None:
-    """One inner worker per offering, each on its own derived task queue, all published."""
+    """One inner worker per offering, each on its own derived task queue, all published
+    (each offering bound to a class of its own: that is how a worker knows which it serves)."""
     async with Marketplace(dev_server=dev_server) as mp:
         acme = await mp.party("acme")
-        a, b = (seller.bind(write_offering(tmp_path / n)) for n in "ab")
+        a, b = (
+            seller.bind(write_offering(tmp_path / "a")),
+            seller.bind_v2(write_offering(tmp_path / "b")),
+        )
         worker = Worker(offerings=[a, b], activities=[shout])
         async with mp.serve(worker, acme):
             assert [w.task_queue for w in worker.inner_workers] == [a.key, b.key]

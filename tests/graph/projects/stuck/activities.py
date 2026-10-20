@@ -1,8 +1,7 @@
 """The stuck project's activities: their bodies never run under `kontra graph`."""
 
 from models import Odd
-
-from kontra import activity
+from temporalio import activity
 
 
 @activity.defn
