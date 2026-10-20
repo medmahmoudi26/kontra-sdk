@@ -34,12 +34,12 @@ from temporalio.client import Client
 from kontra._control import Control
 from kontra.auth import Session, login
 from kontra.contract.names import validate_handle
+from kontra.devgate.gate import DevGate as FakeGate
 from kontra.gate_client import GateClient
 from kontra.gate_client import models as m
 from kontra.ledger import Money
 from kontra.profile import Profile
 from kontra.testing.devserver import DevServer, start_dev_server
-from kontra.testing.fake_gate import FakeGate
 
 if TYPE_CHECKING:
     from kontra.hire import Kontra

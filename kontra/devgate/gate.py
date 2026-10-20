@@ -62,9 +62,7 @@ import math
 import re
 import secrets
 import socket
-import sys
 import threading
-import types
 import warnings
 from collections import deque
 from collections.abc import (
@@ -176,14 +174,14 @@ __all__ = [
     "HOLD_HEADER",
     "SUBJECT_DEVICE_ADDED",
     "SUBJECT_DEVICE_REMOVED",
-    "FakeGate",
+    "DevGate",
     "GateHTTPError",
     "MagicOutcome",
     "Principal",
     "SentMail",
 ]
 
-log = logging.getLogger("kontra.testing.fake_gate")
+log = logging.getLogger("kontra.devgate.gate")
 
 AUD_API = "kontra:api"
 AUD_TEMPORAL = "kontra:temporal"
@@ -406,7 +404,7 @@ class _GateSigner:
     """The gate's key ring as an engine adapter signs with it (:class:`Signer`): the issuer is
     read when a token is minted, since :meth:`FakeGate.serve` changes the gate's URL."""
 
-    def __init__(self, gate: "FakeGate") -> None:
+    def __init__(self, gate: "DevGate") -> None:
         self._gate = gate
 
     @property
@@ -944,7 +942,7 @@ class _Artifact:
 # --------------------------------------------------------------------------- the gate
 
 
-class FakeGate:
+class DevGate:
     """An in-memory gate. Every parameter has a test-friendly default.
 
     ``control``: the Temporal control plane (:class:`kontra._control.Control`), or None for
@@ -1220,7 +1218,7 @@ class FakeGate:
 
     # ------------------------------------------------------------------ running
 
-    async def __aenter__(self) -> "FakeGate":
+    async def __aenter__(self) -> "DevGate":
         await self._startup()
         return self
 
@@ -4771,8 +4769,8 @@ def _parse_range(header: str | None, size: int) -> tuple[int, int] | None:
 # --------------------------------------------------------------------------- the app
 
 
-def _gate_of(request: Request) -> FakeGate:
-    gate: FakeGate = request.app.state.gate
+def _gate_of(request: Request) -> DevGate:
+    gate: DevGate = request.app.state.gate
     return gate
 
 
@@ -4830,7 +4828,7 @@ Resolver = Annotated[Principal, Depends(_auth_resolver)]
 ResolverHuman = Annotated[Principal, Depends(_auth_resolver_human)]
 
 
-def _build_app(gate: FakeGate) -> FastAPI:
+def _build_app(gate: DevGate) -> FastAPI:
     """Every row of ``ROUTES``, registered from the table itself (method, path, response
     model, ``operation_id`` = the row's name), plus the gate's own signed blob URLs."""
 
@@ -5317,16 +5315,18 @@ def _build_app(gate: FakeGate) -> FastAPI:
     return app
 
 
-# --------------------------------------------------------------------------- the factory
+def platform_defaults() -> dict[str, object]:
+    """The timers the platform gate runs on (kontra-cloud ``gate/settings.py``), passed by
+    ``python -m kontra.devgate`` so a dev stack times out and refunds like production:
+    a 2 s sweep, a 30 s grace, a 100.00 signup grant. :class:`DevGate`'s own defaults are
+    test defaults and stay as they are, so no pytest shifts (decisions I34, OD15)."""
+    return {
+        "sweep_interval": 2.0,
+        "grace": timedelta(seconds=30),
+        "signup_grant": "100.00",
+    }
 
 
-class _CallableModule(types.ModuleType):
-    """``kontra.testing.fake_gate`` is both this module and the factory
-    ``kontra.testing.fake_gate(...)``: importing a submodule rebinds the package attribute
-    of the same name to the module, so the module itself answers calls like the factory."""
-
-    def __call__(self, control: TemporalControl | None = None, **options: Any) -> FakeGate:
-        return FakeGate(control, **options)
-
-
-sys.modules[__name__].__class__ = _CallableModule
+#: The dev gate's historical name. The implementation is :class:`DevGate`; a seller suite,
+#: a doc import and :mod:`kontra.testing` keep the old name (decisions I34, OD2).
+FakeGate = DevGate

@@ -167,18 +167,11 @@ temporal: $(TEMPORAL_BIN) ## Build the server binary and the local image kontra-
 .PHONY: temporal-cli
 temporal-cli: $(KONTRA_TEMPORAL_CLI) ## Download the Temporal CLI the dev-server tests use (checksum-verified)
 
-$(TEMPORAL_CLI):
-	@sha='$(TEMPORAL_CLI_SHA256_$(HOST_OS)_$(HOST_ARCH))'; \
-	if [ -z "$$sha" ]; then echo "no pinned Temporal CLI for $(HOST_OS)/$(HOST_ARCH); set KONTRA_TEMPORAL_CLI" >&2; exit 1; fi; \
-	tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
-	url='https://github.com/temporalio/cli/releases/download/v$(TEMPORAL_CLI_VERSION)/temporal_cli_$(TEMPORAL_CLI_VERSION)_$(HOST_OS)_$(HOST_ARCH).tar.gz'; \
-	echo "downloading $$url"; \
-	curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$$tmp/cli.tar.gz" "$$url"; \
-	if command -v sha256sum >/dev/null; then got="$$(sha256sum "$$tmp/cli.tar.gz")"; else got="$$(shasum -a 256 "$$tmp/cli.tar.gz")"; fi; \
-	if [ "$${got%% *}" != "$$sha" ]; then echo "Temporal CLI checksum mismatch: got $${got%% *}, want $$sha" >&2; exit 1; fi; \
-	tar --no-same-owner -xzf "$$tmp/cli.tar.gz" -C "$$tmp" temporal; \
-	mkdir -p "$(@D)"; mv "$$tmp/temporal" "$@"; chmod 0755 "$@"; \
-	echo "Temporal CLI $(TEMPORAL_CLI_VERSION) at $@"
+# One pin, one downloader (decisions I34, OD10): the checksum-verified download lives in
+# kontra.devgate.temporal_cli, which `kontra dev up` and the dev-server tests use too. The
+# TEMPORAL_CLI_SHA256_* above stay (a test pins them equal to the module's).
+$(TEMPORAL_CLI): | venv-present
+	$(BIN)/python -m kontra.devgate.temporal_cli fetch
 
 .PHONY: e2e
 # $(KONTRA_TEMPORAL_CLI) because acceptance 1 scaffolds a project and runs ITS tests, and

@@ -35,10 +35,10 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from kontra._control import TemporalControl
+    from kontra.devgate.gate import DevGate as FakeGate
     from kontra.engine import Engine, EngineName
     from kontra.testing.devserver import DevServer, start_dev_server
     from kontra.testing.engine import FakeEngine
-    from kontra.testing.fake_gate import FakeGate
     from kontra.testing.marketplace import Marketplace, TestParty
     from kontra.testing.passkeys import AuthenticatorRefused, SoftAuthenticator
 
@@ -60,7 +60,7 @@ _LAZY = {
     "DevServer": "kontra.testing.devserver",
     "start_dev_server": "kontra.testing.devserver",
     "FakeEngine": "kontra.testing.engine",
-    "FakeGate": "kontra.testing.fake_gate",
+    "FakeGate": "kontra.devgate.gate",
     "Marketplace": "kontra.testing.marketplace",
     "TestParty": "kontra.testing.marketplace",
     "AuthenticatorRefused": "kontra.testing.passkeys",
@@ -98,9 +98,9 @@ def fake_gate(
     """A :class:`~kontra.testing.fake_gate.FakeGate` on ``control`` (None: no Temporal), or
     on ``engines`` (by name: ``{"temporal": fake_engine()}`` runs jobs with no Temporal).
     ``options`` are its keyword arguments (``resolvers``, ``sweep_interval``, ``grace``...)."""
-    from kontra.testing.fake_gate import FakeGate
+    from kontra.devgate.gate import DevGate
 
-    return FakeGate(control, engines=engines, **options)
+    return DevGate(control, engines=engines, **options)
 
 
 def fake_engine(
