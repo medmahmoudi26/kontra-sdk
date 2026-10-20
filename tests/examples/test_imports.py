@@ -1,32 +1,34 @@
-"""Acceptance 3 (D1): seller ``workflows.py`` and ``activities.py`` reach Temporal only through
-the kontra façade -- ``from kontra import workflow, activity, RetryPolicy, ...`` -- and never
-import ``temporalio`` or ``nexusrpc`` themselves: not by an import statement, not
-dynamically, and not by naming the module in a string. The façade is Temporal's own objects
-re-exported, so replacing ``from kontra import workflow`` with ``from temporalio import
-workflow`` still runs on any Temporal; what it must never bring in is the serving stack
-(gate client, codec, auth), which loading the code is checked for.
+"""Acceptance 3 (decisions I29): a seller's ``workflows.py`` and ``activities.py`` are vanilla
+Temporal. They import ``temporalio`` themselves and nothing from ``kontra``: not by an import
+statement, not dynamically, and not by naming the module in a string. So they run on any
+Temporal worker unmodified, which is checked here by deleting ``worker.py`` and running the
+workflow on a plain ``temporalio.worker.Worker`` with ``kontra`` blocked from importing.
 
-No seller module imports Temporal (the publish gate refuses it anywhere in an offering);
-``models.py`` may use ``kontra.types`` (``Artifact``), and nothing else from kontra. The
-scaffold ``kontra init`` writes is held to the same rules.
+``worker.py`` is the one file of an offering that imports ``kontra`` (it binds the code to the
+offering with ``serve``). Besides it, ``quote.py`` takes ``Quote`` from ``kontra.serve`` and
+nothing else, and ``models.py`` may use ``kontra.types`` (``Artifact``) and nothing else.
+Loading the workflows and activities therefore loads at most ``kontra`` and ``kontra.types``,
+and no ``kontra`` module at all for a seller whose models have no ``Artifact``. The scaffold
+``kontra init`` writes is held to the same rules.
 
-The acceptance text is ``grep -r "import kontra" examples/*/workflows.py
-examples/*/activities.py`` returning nothing; that grep runs here verbatim: the façade is
-imported with ``from kontra import ...``, never ``import kontra``."""
+The acceptance text is ``grep -rE '^\\s*(from|import)\\s+kontra\\b' examples/*/workflows.py
+examples/*/activities.py`` printing nothing; that grep runs here verbatim."""
 
 from __future__ import annotations
 
 import ast
 import json
 import re
+import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 
 import pytest
 
 from kontra.cli._scaffold import render, scaffold
-from kontra.cli._seller_code import check_project
+from kontra.testing.devserver import DevServer
 
 from .support import EXAMPLES, SELLERS
 
@@ -35,32 +37,31 @@ SELLER_MODULES = sorted(p for name in SELLERS for p in (EXAMPLES / name).glob("*
 MODELS = sorted(EXAMPLES.glob("*/models.py"))
 SCAFFOLD = {str(rel): text for rel, text in render("acme", "word-count").items()}
 SCAFFOLD_CODE = ("workflows.py", "activities.py")
-SCAFFOLD_MODULES = sorted(rel for rel in SCAFFOLD if PurePosixPath(rel).suffix == ".py")
-
-#: Temporal, reached by seller code only through the façade.
-TEMPORAL = frozenset({"temporalio", "nexusrpc"})
-#: The kontra modules seller code may import from: the façade and the ``Artifact`` type.
-FACADE = frozenset({"kontra", "kontra.workflow", "kontra.activity", "kontra.types"})
-#: What ``from kontra import ...`` may take in seller code (``Worker`` and ``serve`` are
-#: worker.py's, and load the serving stack).
-FACADE_NAMES = frozenset({"workflow", "activity", "RetryPolicy", "ApplicationError", "Page"})
-#: What may load with the façade, measured: ``kontra/__init__`` loads ``workflow``,
-#: ``activity`` and ``_parallel``; ``kontra.workflow`` loads ``_agents``; ``_parallel`` imports
-#: ``kontra.contract.names``, which runs the ``kontra.contract`` package (whose ``quote``
-#: uses ``kontra.ledger``'s money, and whose derivation ``kontra.types``).
-LOADED_WITH_THE_FACADE = frozenset(
-    {"kontra", "kontra.workflow", "kontra.activity", "kontra._parallel", "kontra._agents"}
-    | {"kontra.types", "kontra.ledger", "kontra.contract"}
+#: The scaffold's offering modules (its tests are the seller's tests, and import anything).
+SCAFFOLD_MODULES = sorted(
+    rel
+    for rel in SCAFFOLD
+    if PurePosixPath(rel).suffix == ".py" and PurePosixPath(rel).parts[0] != "tests"
 )
-#: The serving stack: what worker.py loads, never workflow or activity code.
-SERVING = ("kontra.serve", "kontra.gate_client", "kontra.codec", "kontra.auth", "kontra.hire")
+
+KONTRA = frozenset({"kontra"})
+#: What each file of an offering may take from ``kontra``: module -> the names a ``from``
+#: import of it may take (None: any). A file not named here takes nothing, except
+#: ``worker.py``, which may import anything.
+MAY_IMPORT: Mapping[str, Mapping[str, frozenset[str] | None]] = {
+    "models.py": {"kontra.types": None},
+    "quote.py": {"kontra.serve": frozenset({"Quote"})},
+}
+WORKER = "worker.py"
+#: The most that loading a seller's workflows and activities may load of ``kontra``:
+#: ``kontra.types`` for ``Artifact`` in its models, and the package around it (whose
+#: ``__init__`` loads nothing).
+LOADED_WITH_TYPES = frozenset({"kontra", "kontra.types"})
+#: The acceptance grep (CLAUDE.md, docs/acceptance.md): any import of kontra, at any indent.
+ACCEPTANCE_GREP = r"^\s*(from|import)\s+kontra\b"
 #: Calls that import (or run) code named by a string.
 _DYNAMIC = frozenset(
     {"__import__", "import_module", "find_spec", "run_module", "exec", "eval", "compile"}
-)
-_IMPORT_LINE = re.compile(
-    r"^\s*(?:from\s+(?:temporalio|nexusrpc)\b|import\s+(?:.*[\s,])?(?:temporalio|nexusrpc|kontra)\b)",
-    re.MULTILINE,
 )
 
 
@@ -87,13 +88,13 @@ def imports_of(
     source: str,
     roots: frozenset[str],
     *,
-    allowed: frozenset[str] = frozenset(),
-    names: frozenset[str] | None = None,
+    allowed: Mapping[str, frozenset[str] | None] | None = None,
 ) -> list[str]:
-    """Every way ``source`` reaches a package in ``roots``, except ``from`` imports of
-    modules in ``allowed`` (taking only ``names`` from a package, when given): import
-    statements, dynamic imports and code run from strings that name one, and import-ish
-    calls whose target is not a literal (which no check could clear)."""
+    """Every way ``source`` reaches a package in ``roots``, except ``from`` imports of a module
+    in ``allowed`` taking only the names it allows (any, for None): import statements,
+    dynamic imports and code run from strings that name one, and import-ish calls whose
+    target is not a literal (which no check could clear)."""
+    allowed = allowed or {}
     tree = ast.parse(source)
     prose = _docstrings(tree)
     found: list[str] = []
@@ -104,7 +105,9 @@ def imports_of(
             if node.level == 0 and _under(node.module, roots):
                 if node.module not in allowed:
                     found.append(f"from {node.module} import ...")
-                elif names is not None and "." not in (node.module or ""):
+                    continue
+                names = allowed[node.module]
+                if names is not None:
                     found += [
                         f"from {node.module} import {a.name}"
                         for a in node.names
@@ -130,13 +133,15 @@ def imports_of(
     return found
 
 
-def temporal_imports(source: str) -> list[str]:
-    return imports_of(source, TEMPORAL)
+def kontra_imports(source: str, filename: str = "workflows.py") -> list[str]:
+    """What ``source``, as the file ``filename`` of an offering, reaches in kontra beyond what
+    that file may (see :data:`MAY_IMPORT`)."""
+    return imports_of(source, KONTRA, allowed=MAY_IMPORT.get(filename))
 
 
-def kontra_imports(source: str) -> list[str]:
-    """What seller code reaches in kontra beyond the façade."""
-    return imports_of(source, frozenset({"kontra"}), allowed=FACADE, names=FACADE_NAMES)
+def imports_temporal(source: str) -> bool:
+    """``source`` imports ``temporalio`` itself (an import statement)."""
+    return imports_of(source, frozenset({"temporalio"})) != []
 
 
 def _loaded_kontra(cwd: Path) -> set[str]:
@@ -158,16 +163,7 @@ def _loaded_kontra(cwd: Path) -> set[str]:
     return set(json.loads(result.stdout))
 
 
-def _within_the_facade(loaded: set[str]) -> None:
-    assert {m for m in loaded if m.startswith(SERVING)} == set()
-    assert {
-        m
-        for m in loaded
-        if m not in LOADED_WITH_THE_FACADE and not m.startswith("kontra.contract.")
-    } == set()
-
-
-# --------------------------------------------------------------------------- the checks
+# --------------------------------------------------------------------------- the examples
 
 
 def test_every_seller_is_checked() -> None:
@@ -176,9 +172,10 @@ def test_every_seller_is_checked() -> None:
 
 
 def test_the_acceptance_grep_prints_nothing() -> None:
-    """``grep -r "import kontra" examples/*/workflows.py examples/*/activities.py``."""
+    """``grep -rE '^\\s*(from|import)\\s+kontra\\b' examples/*/workflows.py
+    examples/*/activities.py``."""
     result = subprocess.run(
-        ["grep", "-r", "import kontra", *map(str, SELLER_CODE)],
+        ["grep", "-rE", ACCEPTANCE_GREP, *map(str, SELLER_CODE)],
         capture_output=True,
         text=True,
         check=False,
@@ -186,61 +183,168 @@ def test_the_acceptance_grep_prints_nothing() -> None:
     assert (result.returncode, result.stdout) == (1, "")  # 1: no line matched
 
 
+def test_the_acceptance_grep_finds_an_import() -> None:
+    """Its teeth: every spelling of a kontra import at the start of a line, at any indent."""
+    lines = [
+        "from kontra import workflow",
+        "import kontra",
+        "    from kontra.types import Artifact",
+        "import kontra.serve as s",
+    ]
+    result = subprocess.run(
+        ["grep", "-cE", ACCEPTANCE_GREP],
+        input="\n".join([*lines, "import kontra_tools", "# from kontra import x? no"]) + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.stdout.strip() == str(len(lines))
+
+
 @pytest.mark.parametrize("path", SELLER_CODE, ids=_rel)
-def test_seller_code_imports_temporal_only_through_the_facade(path: Path) -> None:
+def test_seller_code_is_vanilla_temporal(path: Path) -> None:
     source = path.read_text(encoding="utf-8")
-    assert _IMPORT_LINE.findall(source) == []
-    assert temporal_imports(source) == []
     assert kontra_imports(source) == []
+    assert imports_temporal(source)  # Temporal, imported directly
 
 
 @pytest.mark.parametrize("path", SELLER_MODULES, ids=_rel)
-def test_no_seller_module_imports_temporal(path: Path) -> None:
-    """worker.py, quote.py and models.py too: the publish gate refuses Temporal anywhere."""
-    assert temporal_imports(path.read_text(encoding="utf-8")) == []
-
-
-@pytest.mark.parametrize("name", SELLERS)
-def test_kontra_publish_accepts_the_seller_code(name: str) -> None:
-    """The check ``kontra publish`` runs over an offering's modules finds nothing."""
-    assert check_project(EXAMPLES / name) == []
+def test_every_seller_module_imports_only_what_its_file_may(path: Path) -> None:
+    """worker.py imports anything; quote.py only ``kontra.serve.Quote``; models.py only
+    ``kontra.types``; every other module nothing from kontra."""
+    if path.name == WORKER:
+        return
+    assert kontra_imports(path.read_text(encoding="utf-8"), path.name) == []
 
 
 @pytest.mark.parametrize("path", MODELS, ids=_rel)
 def test_models_use_only_kontra_types(path: Path) -> None:
-    found = imports_of(
-        path.read_text(encoding="utf-8"),
-        frozenset({"kontra"}),
-        allowed=frozenset({"kontra.types"}),
-    )
+    found = imports_of(path.read_text(encoding="utf-8"), KONTRA, allowed={"kontra.types": None})
     assert found == []
 
 
 @pytest.mark.parametrize("name", SELLERS)
-def test_loading_seller_code_loads_the_facade_not_the_serving_stack(name: str) -> None:
-    """Importing ``workflows`` and ``activities`` (and what they import) loads kontra's
-    façade and what it needs, never the serving stack. This also catches an import a module
-    makes while it loads, whatever it is spelled as."""
-    _within_the_facade(_loaded_kontra(EXAMPLES / name))
+def test_loading_seller_code_loads_at_most_kontra_types(name: str) -> None:
+    """Importing ``workflows`` and ``activities`` (and what they import) loads no kontra
+    module but ``kontra.types`` and its package, and only when the models use it. This also
+    catches an import a module makes while it loads, whatever it is spelled as."""
+    models = (EXAMPLES / name / "models.py").read_text(encoding="utf-8")
+    uses_types = imports_of(models, KONTRA) != []
+    assert _loaded_kontra(EXAMPLES / name) == (LOADED_WITH_TYPES if uses_types else set())
+
+
+# --------------------------------------------------------------------------- the scaffold
 
 
 @pytest.mark.parametrize("name", SCAFFOLD_CODE)
-def test_the_scaffold_imports_temporal_only_through_the_facade(name: str) -> None:
+def test_the_scaffold_is_vanilla_temporal(name: str) -> None:
     source = SCAFFOLD[name]
-    assert "import kontra" not in source
-    assert _IMPORT_LINE.findall(source) == []
-    assert temporal_imports(source) == []
+    assert re.search(ACCEPTANCE_GREP, source, re.MULTILINE) is None
     assert kontra_imports(source) == []
+    assert imports_temporal(source)
 
 
 @pytest.mark.parametrize("name", SCAFFOLD_MODULES)
-def test_no_scaffold_module_imports_temporal(name: str) -> None:
-    assert temporal_imports(SCAFFOLD[name]) == []
+def test_every_scaffold_module_imports_only_what_its_file_may(name: str) -> None:
+    if name == WORKER:
+        return
+    assert kontra_imports(SCAFFOLD[name], name) == []
 
 
-def test_loading_the_scaffold_loads_the_facade_not_the_serving_stack(tmp_path: Path) -> None:
+def test_loading_the_scaffold_loads_no_kontra(tmp_path: Path) -> None:
     scaffold(tmp_path / "word-count", "acme", "word-count")
-    _within_the_facade(_loaded_kontra(tmp_path / "word-count"))
+    assert _loaded_kontra(tmp_path / "word-count") == set()
+
+
+# --------------------------------------------------------------------------- any Temporal
+
+#: examples/hello without worker.py and quote.py, on a plain Temporal worker, with every
+#: ``kontra`` import refused: Temporal's own client, worker and pydantic converter.
+_ANY_TEMPORAL = r"""
+import asyncio, importlib.abc, json, os, sys, uuid
+
+
+class NoKontra(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "kontra" or name.startswith("kontra."):
+            raise ImportError(f"{name}: kontra is not installed here")
+        return None
+
+
+sys.meta_path.insert(0, NoKontra())
+
+from temporalio.client import Client
+from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.worker import Worker
+
+from activities import greet
+from models import HelloInput
+from workflows import HelloFlow
+
+
+async def main():
+    client = await Client.connect(sys.argv[1], data_converter=pydantic_data_converter)
+    queue = f"any-temporal-{uuid.uuid4().hex}"
+    async with Worker(client, task_queue=queue, workflows=[HelloFlow], activities=[greet]):
+        out = await client.execute_workflow(
+            HelloFlow.run, HelloInput(name="Ada"), id=queue, task_queue=queue
+        )
+    loaded = sorted(m for m in sys.modules if m == "kontra" or m.startswith("kontra."))
+    print(json.dumps({"result": out.model_dump(mode="json"), "kontra": loaded}))
+
+
+asyncio.run(main())
+# Leave without finalizing: with temporalio 1.34 the Rust core's threads can crash it
+# (SIGSEGV) after a clean run, as kontra.cli.main says; what was printed is flushed first.
+sys.stdout.flush()
+os._exit(0)
+"""
+
+
+@pytest.mark.temporal
+def test_without_worker_py_the_code_runs_on_any_temporal(
+    dev_server: DevServer, tmp_path: Path
+) -> None:
+    """The acceptance line "delete ``worker.py`` and the seller's code runs on any Temporal,
+    unmodified": examples/hello copied without ``worker.py`` and ``quote.py`` (the two files
+    that import kontra), run on a plain ``temporalio.worker.Worker`` against the dev server
+    in a process where importing ``kontra`` fails."""
+    project = tmp_path / "hello"
+    shutil.copytree(
+        EXAMPLES / "hello",
+        project,
+        ignore=shutil.ignore_patterns(WORKER, "quote.py", "__pycache__"),
+    )
+    assert not (project / WORKER).exists()
+    result = subprocess.run(
+        [sys.executable, "-c", _ANY_TEMPORAL, dev_server.grpc_address],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"result": {"greeting": "Hi Ada"}, "kontra": []}
+
+
+@pytest.mark.temporal
+def test_the_any_temporal_check_has_teeth(dev_server: DevServer, tmp_path: Path) -> None:
+    """The same run refuses a seller module that imports kontra: the blocker is real."""
+    project = tmp_path / "hello"
+    shutil.copytree(EXAMPLES / "hello", project, ignore=shutil.ignore_patterns(WORKER))
+    activities = project / "activities.py"
+    activities.write_text("import kontra\n" + activities.read_text(encoding="utf-8"))
+    result = subprocess.run(
+        [sys.executable, "-c", _ANY_TEMPORAL, dev_server.grpc_address],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "kontra: kontra is not installed here" in result.stderr
 
 
 # --------------------------------------------------------------------------- the checker's teeth
@@ -249,32 +353,18 @@ def test_loading_the_scaffold_loads_the_facade_not_the_serving_stack(tmp_path: P
 @pytest.mark.parametrize(
     "source",
     [
-        "import temporalio",
-        "from temporalio import workflow",
-        "from temporalio.common import RetryPolicy",
-        "import os, nexusrpc as n",
-        "import importlib\nm = importlib.import_module('temporalio.workflow')",
-        "m = __import__('nexusrpc')",
-        "exec('import temporalio')",
-        "import importlib\nname = 'tempor' + 'alio'\nimportlib.import_module(name)",
-        "MOD = 'temporalio.client'",
-    ],
-)
-def test_the_checker_finds_temporal(source: str) -> None:
-    assert temporal_imports(source) != []
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
         "import kontra",
         "import kontra.workflow",
         "import os, kontra.serve as s",
+        "from kontra import workflow",
+        "from kontra import RetryPolicy, ApplicationError",
+        "from kontra.workflow import x",
+        "from kontra.types import Artifact",
         "from kontra.serve import Quote",
         "from kontra import serve",
-        "from kontra import Worker, workflow",
+        "from kontra import Worker",
         "from kontra import hire",
-        "from kontra._parallel import Page",
+        "from kontra.contrib.parallel import execute_activities_in_parallel",
         "import importlib\nm = importlib.import_module('kontra.hire')",
         "m = __import__('kontra')",
         "exec('import kontra')",
@@ -282,25 +372,43 @@ def test_the_checker_finds_temporal(source: str) -> None:
         "MOD = 'kontra.serve'",
     ],
 )
-def test_the_checker_finds_kontra_beyond_the_facade(source: str) -> None:
+def test_the_checker_finds_any_kontra_in_seller_code(source: str) -> None:
     assert kontra_imports(source) != []
 
 
 @pytest.mark.parametrize(
     "source",
     [
-        '"""Temporal through the façade; with `from temporalio import workflow` it runs."""',
-        "from kontra import RetryPolicy, workflow",
-        "from kontra import ApplicationError, Page, activity",
-        "from kontra.workflow import execute_activities_in_parallel",
-        "from kontra.activity import heartbeat",
-        "from kontra.types import Artifact\nfrom models import Batch",
-        "def f():\n    '''temporalio.workflow does that for you'''\n",
-        "import temporalio_tools  # another package",
+        "from temporalio import workflow",
+        "from temporalio import activity, workflow",
+        "from temporalio.common import RetryPolicy",
+        "from temporalio.exceptions import ApplicationError",
+        "import temporalio",
+        "from temporalio.openai_agents.workflow import activity_as_tool",
+        '"""Runs on any Temporal; worker.py binds it with `from kontra import serve`."""',
+        "def f():\n    '''kontra.serve does that for you'''\n",
         "import kontra_tools  # another package",
-        "MESSAGE = 'temporalio is behind the façade'",
+        "from models import Batch",
+        "MESSAGE = 'kontra is what worker.py imports'",
     ],
 )
-def test_the_checker_passes_facade_code(source: str) -> None:
-    assert temporal_imports(source) == []
+def test_the_checker_passes_vanilla_temporal(source: str) -> None:
     assert kontra_imports(source) == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "source", "ok"),
+    [
+        ("models.py", "from kontra.types import Artifact", True),
+        ("models.py", "from kontra.serve import Quote", False),
+        ("models.py", "from kontra import types", False),
+        ("quote.py", "from kontra.serve import Quote", True),
+        ("quote.py", "from kontra.serve import Quote, Worker", False),
+        ("quote.py", "from kontra import serve", False),
+        ("quote.py", "import kontra.serve", False),
+        ("activities.py", "from kontra.types import Artifact", False),
+        ("helpers.py", "from kontra.serve import Quote", False),
+    ],
+)
+def test_the_checker_holds_each_file_to_its_own_rule(filename: str, source: str, ok: bool) -> None:
+    assert (kontra_imports(source, filename) == []) is ok

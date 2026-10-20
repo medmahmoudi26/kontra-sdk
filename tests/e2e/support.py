@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
@@ -400,7 +400,7 @@ class Party:
         return Kontra(home=self.home, **kwargs)
 
     @contextlib.asynccontextmanager
-    async def temporal(self) -> AsyncIterator[Any]:
+    async def temporal(self) -> AsyncGenerator[Any]:
         """A Temporal client on the party's own namespace, as its worker token allows: what
         the party itself can see (no codec: payloads stay as stored)."""
         session = Session(Profile.load(self.home), home=self.home)
@@ -601,7 +601,7 @@ async def serving(
     log: Path,
     argv: list[str] | None = None,
     env: Mapping[str, str] | None = None,
-) -> AsyncIterator[Serve]:
+) -> AsyncGenerator[Serve]:
     """A seller serving ``keys`` for the block, stopped after it."""
     seller = Serve(directory, party, log, argv=argv, extra_env=dict(env or {}))
     seller.start()

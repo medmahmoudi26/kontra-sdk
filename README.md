@@ -79,9 +79,9 @@ kontra serve                  # run the worker; on a dev profile it publishes th
 |---|---|
 | `offering.yaml` | name, version, limits, display text. Declarative; names no code |
 | `models.py` | input and output types; the published contract is derived from them |
-| `workflows.py`, `activities.py` | the job, in Temporal through the façade: `from kontra import workflow, activity`, **never `temporalio`** |
+| `workflows.py`, `activities.py` | the job, in vanilla Temporal: `from temporalio import workflow, activity`, **never `kontra`**, so it runs on any Temporal worker as it is (all but `Artifact` I/O, which needs the Kontra runtime `worker.py` installs) |
 | `quote.py` | the price, computed from the input |
-| `worker.py` | binds workflow and quote to the offering; every `temporalio.worker.Worker` option |
+| `worker.py` | binds workflow and quote to the offering; every `temporalio.worker.Worker` option and plugin; the one file that imports `kontra` |
 
 Against the real marketplace:
 

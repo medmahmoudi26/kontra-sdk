@@ -1,8 +1,9 @@
-"""Temporal through the façade: kontra.workflow and kontra.activity only (D1)."""
+"""Vanilla Temporal: temporalio only, no kontra import (decisions I29)."""
 
 from datetime import timedelta
 
-from kontra import RetryPolicy, workflow
+from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from activities import reseal

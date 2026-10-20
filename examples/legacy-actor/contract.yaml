@@ -36,7 +36,6 @@ $defs:
         - type: "null"
       server:
         type: string
-        default: ""
       status:
         oneOf:
         - type: integer
@@ -44,6 +43,9 @@ $defs:
       url:
         type: string
     required:
+    - error
+    - server
+    - status
     - url
   KontraQuote:
     description: 'The answer of the quote operation. ok: a fixed price (amount_minor in the currency''s minor unit, e.g. cents) valid for a job of at most max_duration_seconds. rejected: the seller will not take this input, with a reason. busy: try again after eta_seconds.'
@@ -127,4 +129,4 @@ x-kontra:
   max_concurrent_jobs: 20
   max_output_bytes: "10MB"
   artifact_retention: "1d"
-  contract_hash: sha256:21020c25c367f7d4a9cb200a8f3355b1847e0cb134c3cd2f13dca0b0acddd869
+  contract_hash: sha256:734e0eb5e578c5f5a8f716196707921f866f774943e41614d87b21465794d1a2

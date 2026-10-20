@@ -118,20 +118,21 @@ def contract(
 def publish(directory: Path, only: str | None, as_json: bool) -> None:
     """Publish worker.py's offerings to the catalog (needs your login, confirmed within the
     hour: a terminal asks in place)."""
-    from kontra.cli._seller_code import check_project
+    from kontra._compat import temporalio_warning
     from kontra.contract import contract_hash
     from kontra.gate_client import models as m
 
-    root = directory.resolve()
-    refused = "\n".join("  " + f.render(root) for f in check_project(root))
+    # Before worker.py is imported: a temporalio outside the tested range may be why it
+    # fails to (decisions I29). Publishing is not refused for it; serving is.
+    outside = temporalio_warning()
+    if outside is not None:
+        click.echo(f"warning: {outside}", err=True)
     with load_worker(directory) as worker:
         chosen = _pick(worker.offerings, only)
 
         async def go() -> list[m.CatalogEntry]:
             async with cli_session() as session:
                 profile = await session.resolve()
-                if refused and not profile.dev:  # kontra dev is the seller's own
-                    fail("seller code must stay behind the kontra façade:\n" + refused)
                 # No key is sealed into a document any more (spec v2, decisions I7), so
                 # publishing needs none: a seller may add or revoke a recipient without
                 # republishing.
@@ -184,6 +185,7 @@ def serve(directory: Path, metrics: str | None, otlp: str | None) -> None:
     it gracefully)."""
     import logging
 
+    from kontra._compat import temporalio_warning
     from kontra.serve.telemetry import TelemetryError, metrics_runtime, otlp_logs, otlp_tracing
 
     if not logging.getLogger().handlers:
@@ -204,6 +206,11 @@ def serve(directory: Path, metrics: str | None, otlp: str | None) -> None:
         log.info("serving the Temporal SDK's metrics at http://%s/metrics", metrics)
     if tracing is not None:
         log.info("exporting traces and logs to %s", otlp)
+    # Before worker.py is imported (it may fail to on another temporalio); the worker
+    # itself then refuses to start (kontra.plugin.KontraPlugin.prepare).
+    outside = temporalio_warning()
+    if outside is not None:
+        log.warning("%s", outside)
     try:
         with load_worker(directory) as worker:
             worker.run(

@@ -39,7 +39,7 @@ from kontra.codec import (
     data_converter,
 )
 from kontra.codec.age import AgeError, decrypt, encrypt, generate_identity
-from kontra.contract.names import job_workflow_id
+from kontra.contract.names import agent_workflow_id, batch_workflow_id, job_workflow_id
 from kontra.gate_client import models as m
 
 JOB = "0123456789abcdef0123456789abcdef"
@@ -182,6 +182,15 @@ def handling(monkeypatch: pytest.MonkeyPatch) -> None:
         ("seller", WorkflowSerializationContext("acme", "job-" + JOB + "\n"), {"seller"}),
         ("seller", WorkflowSerializationContext("acme", JOB), {"seller"}),
         ("seller", WorkflowSerializationContext("acme", "enrich-1"), {"seller"}),
+        # seller: a bound handler's agent child, and a batch child, are never job-shaped:
+        # their histories are the seller's alone (the job's result reaches the buyer from
+        # the job-<id> wrapper)
+        ("seller", WorkflowSerializationContext("acme", agent_workflow_id(JOB)), {"seller"}),
+        (
+            "seller",
+            WorkflowSerializationContext("acme", batch_workflow_id(job_workflow_id(JOB), "a", "t")),
+            {"seller"},
+        ),
         ("seller", None, {"seller"}),
         # seller: a Nexus *call* its workflow makes (it hires another offering) is a
         # buyer's input: the endpoint's seller and ourselves, never plaintext
