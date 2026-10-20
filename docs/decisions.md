@@ -1941,18 +1941,23 @@ the sentence above) and `docs/security.md`.
   run's history is past half of Kontra's pinned limits) bounds what polls add to the job's
   history, and could not bound this; the cap bounds what their requests add to a workflow
   task. With both, the burst the #52 review found no longer ends a job. Neither bounds the
-  polls' answers: the residual risk next.
+  polls' answers; I31's answer budget does (the residual risk next).
 - **Residual risk: a leaked relay token can end its job** (*amended by I31*). Since #52, not by
   the history growth described next: a job root refuses polls at validation once its history is
   past half of the pinned limits, a refused poll is not written to history, and with the size
   cap above that bounds what a leaked relay token can do to its job's history (the guard plus
   the polls in flight; a job someone listens to must keep its own history under the other half).
-  The risk stands another way, measured with both in place: the polls one workflow task
-  completes answer together in the worker's reply to that task, up to 512 KiB each, and
-  concurrent polls of the size the cap allows can make that reply pass the 4 MiB limit, which
-  terminates the run (see I31's history budget). As first found, with only its two allowed
-  calls, it polls from offset 0 again and again, each time with a new update id, and so appends
-  up to `history.maxTotalUpdates` completed updates of up to about 1 MB each to job J's history.
+  Nor, since I31's answer budget, through the polls' answers: the polls one workflow task
+  completes answer together in the worker's reply to that task, which must fit the 4 MiB gRPC
+  limit, and concurrent polls of the size the cap allows could make it pass that limit and
+  terminate the run (measured with both in place); a job root now answers at most 1.5 MiB in
+  one workflow task and holds any further poll back for a later one. What remains is the
+  relay's share of the history: a leaked token can spend it at once, where a genuine relay
+  spends it as the stream grows, so a job someone listens to whose own history needs more than
+  the other half of the limits is terminated (I31's history budget). As first found, with only
+  its two allowed calls, it polls from offset 0 again and again, each time with a new update id,
+  and so appends up to `history.maxTotalUpdates` completed updates of up to about 1 MB each to
+  job J's history.
   Past `limit.historySize.error` (20 MiB, pinned) Temporal terminates the run
   (`enforceHistorySizeCheck`, reason "Workflow history size exceeds limit."), and escrow refunds
   the job as "seller workflow terminated", against the seller. Any stream above about 10.5 KB
@@ -2130,32 +2135,51 @@ with two prototypes whose results are below.
   forgotten after five idle minutes keeps its count for 31 days, past the longest
   `max_duration`. **What the guard bounds, and what it does not.** It bounds what polls add to
   the history: past it, polls are refused and not stored, so their share is the guard plus the
-  polls in flight (Temporal's `maxInFlightUpdates`, 10, of at most 512 KiB each). It caps the
-  relay's share near half of the limits, not the job's total: the relay's events stay, so a job
-  someone listens to needs its own history under the other half (measured with the limits scaled
-  down: a job whose own work reached about 85% of them completed unlistened and was terminated
-  with a genuine relay listening, which the guard had stopped at half). Capping the relay's own
-  share (counting answered polls and their bytes in the interceptor) is the better bound,
-  recorded, not built. **The guard and #59's request cap (I30) together bound what a leaked
-  relay token can do to its job's history.** The guard stops its polls at half of the limits;
-  the cap, 4 KiB a relay request (the gate's largest poll is 898 bytes), refuses the burst this
-  change's review measured -- concurrent polls with oversized requests made the worker's reply
-  to the workflow task carrying them pass gRPC's 4 MiB limit, since the SDK echoes every update
-  request it accepts or rejects, and Temporal terminated the run (`GrpcMessageTooLarge`) whether
-  the job accepted or refused them, and with no poll handler at all (the shape before #52 too);
-  no validator can refuse what is echoed when it is refused. The residual, as measured: a relay
-  listening still costs a job history, its share up to the guard, whoever holds the token, so a
-  job someone listens to must keep its own history under the other half (above). **And I30's
-  residual risk "a leaked relay token can end its job" still stands, through the answers:** the
+  polls in flight (`history.maxInFlightUpdates`, 10, pinned since #59, of at most 512 KiB each).
+  It caps the relay's share near half of the limits, not the job's total: the relay's events
+  stay, so a job someone listens to needs its own history under the other half (measured with
+  the limits scaled down: a job whose own work reached about 85% of them completed unlistened
+  and was terminated with a genuine relay listening, which the guard had stopped at half).
+  Capping the relay's own share (counting answered polls and their bytes in the interceptor) is
+  the better bound, recorded, not built. **The guard and #59's request cap (I30) together bound
+  what a leaked relay token can do to its job's history.** The guard stops its polls at half of
+  the limits; the cap, 4 KiB a relay request (the gate's largest poll is 898 bytes), refuses the
+  burst this change's review measured -- concurrent polls with oversized requests made the
+  worker's reply to the workflow task carrying them pass gRPC's 4 MiB limit, since the SDK
+  echoes every update request it accepts or rejects, and Temporal terminated the run
+  (`GrpcMessageTooLarge`) whether the job accepted or refused them, and with no poll handler at
+  all (the shape before #52 too); no validator can refuse what is echoed when it is refused. The
+  residual, as measured: a relay listening still costs a job history, its share up to the guard,
+  whoever holds the token, so a job someone listens to must keep its own history under the other
+  half (above). **And the answer budget closes I30's residual risk through the answers.** The
   polls one workflow task completes answer together in the worker's reply to that task, up to
-  512 KiB each and up to `maxInFlightUpdates` (10) of them, and concurrent polls of the size the
-  cap allows can make that reply pass the 4 MiB limit; Temporal terminates the run
-  (`GrpcMessageTooLarge`; measured with the pinned limits, the history far below the guard). The
-  cap holds requests and the guard holds history, so neither reaches it. What would, recorded,
-  not built (the owner decides): a budget for the answers of one workflow task in the
-  interceptor (a poll past it answered with no items and `more_ready`, so the relay polls
-  again), an envelope small enough that the polls in flight fit one reply, or a lower pinned
-  `history.maxInFlightUpdates`.
+  512 KiB each, and with only the guard and the cap, concurrent polls of the size the cap allows
+  could make that reply pass gRPC's 4 MiB limit, and Temporal terminated the run
+  (`GrpcMessageTooLarge`; measured with the pinned limits, the history far below the guard): the
+  cap holds requests and the guard holds history, so neither reached it. Now the job root counts
+  what it answers in each workflow task (`kontra.codec.stream.envelope_bound`, the codec's own
+  arithmetic for the most keys any item is sealed to, so the same on every worker) and answers
+  at most `STREAM_ANSWER_BUDGET`, 1.5 MiB, three full envelopes, in one task: a poll past it is
+  answered with no items and `more_ready`, at the offset it would have started from, so its
+  poller polls again and is answered in a later task -- not a refusal, which the relay would
+  back off from. Only answers that carry items count and the first of a task is always sent, so
+  the stream makes progress; an answer held back is never counted as read, so the drain waits
+  for the poll that carries it. 1.5 MiB leaves the rest of that reply 2.5 MiB: the update
+  requests it echoes (at most `history.maxInFlightUpdates`, 10, of at most `RelayRequestMax`,
+  4 KiB: 40 KiB), the answers with no items (a frame each), and the seller's own commands, one
+  payload at the pinned `limit.blobSize.error` (2 MiB) included; a test sums them under 4 MiB
+  from `kontra.yaml` and `authorizer.go`. A workflow task is told apart by the run's history
+  length (`workflow.info().get_current_history_length()`), checked on temporalio 1.34 in the
+  sandbox: one value for every answer completed in one task's reply (the activations that
+  resolve its local activities included), a larger one for the next, and the same on replay, so
+  the cut, and the drain's count of it, replay the same. Measured again on a dev server with the
+  pinned limits: the job keeps running, and no workflow task's answers pass 1.5 MiB. The two
+  other bounds recorded with it, an envelope small enough that the polls in flight fit one reply
+  and a lower pinned `history.maxInFlightUpdates`, are not needed. What I30's risk keeps is the
+  relay's share of the history (above): a leaked token can spend it at once, where a genuine
+  relay spends it as the stream grows. A poll names at most nine topics (`kontra._relay`: the
+  offering's eight streams and `kontra.progress`), so the gate's largest stays far under the
+  cap.
 * **Delivery semantics.** Live: a buyer who never listens before the job closes gets nothing
   of its stream but history events (a relay attaching after a short job closed reads nothing;
   items published before a continue-as-new of a Kontra-hosted stream nobody polled are not
@@ -2187,13 +2211,19 @@ activity mirrors; Kontra hosts a stream on every job root), and `docs/security.m
 **Supersedes** the bespoke progress channel (PRD §8.4's `POST .../progress`).
 
 Tested: the envelope and the codec branches, JSON nested past the stack refused, the
-interceptor's cut sealed whole for every size class and recipient count, and a re-read large
-item stored once per job (`tests/codec/test_stream_envelope.py`); the streams rule through the
+interceptor's cut sealed whole for every size class and recipient count and within the bound
+it counts, an answer held back sealed within its frame, and a re-read large item stored once
+per job (`tests/codec/test_stream_envelope.py`); the streams rule through the
 code and the spec (`tests/contract/test_offering_streams.py`); hosting, early handlers, the
-drain (a short job's tail that passes one envelope included), a continue-as-new chain, the guard
-and replay (`tests/serve/test_stream_hosting.py`); every relay classification (a
-`TruncatedOffset` at offset 0 backed off, not spun on), the same update id re-sent, a look-alike
-chain refused, `start=` required and no contrib import (`tests/serve/test_relay.py`); the
+drain (a short job's tail that passes one envelope included), the answer budget (with the budget
+scaled down, polls completed in one workflow task answered within it, the rest held back, the
+job running on and every poller reading the whole stream; the drain waiting for answers held
+back), a continue-as-new chain, the guard and replay (`tests/serve/test_stream_hosting.py`);
+the budget and the rest of a workflow task's reply under 4 MiB, from the pinned limits
+(`tests/serve/test_interceptors.py`); every relay classification (a `TruncatedOffset` at offset
+0 backed off, not spun on), an answer held back polled again at once, the same update id
+re-sent, a look-alike chain refused, `start=` required, at most `STREAMS_MAX` + 1 topics and no
+contrib import (`tests/serve/test_relay.py`); the
 forwarder, its budget across a quiet spell (`tests/serve/test_progress.py`); the mirror and its
 checkpoint (`tests/serve/test_turn.py`); the FakeGate's relay, caps (a spent budget one gap),
 resume and listener rules (`tests/testing/test_stream_relay.py`); `job.stream()`
@@ -2201,5 +2231,6 @@ resume and listener rules (`tests/testing/test_stream_relay.py`); `job.stream()`
 gate's store, with a misbehaving relay, for a workflow entry and a bound handler
 (`tests/serve/test_streams.py`); and the loop over the wire with a relay token, under #59's
 request cap (`tests/temporal/test_relay_loop_wire.py`). What a leaked token's concurrent polls
-do (the residual risk above) was measured on a dev server with the pinned limits, and is not
-pinned by a test, for the reason I30 gives: it would be a recipe.
+did before the answer budget, and do with it, was measured on a dev server with the pinned
+limits; no test ends a job, and the budget's tests stay far below gRPC's limit with or without
+the budget, for the reason I30 gives: a test that ended a job would be a recipe.

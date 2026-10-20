@@ -34,7 +34,7 @@ What that means concretely, and what enforces it:
 | One seller forges another seller's Nexus result | the callback guard (below) |
 | A buyer reads, signals or cancels a seller's handler workflow | the Authorizer: a buyer's token has no call in the seller's namespace, including the job it paid for |
 | A seller resets or deletes a workflow, or a buyer deletes its call records or shortens their retention, to change what escrow sees | the Authorizer: resets, deletes, namespace updates, batch operations and schedules are denied to every token |
-| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, each request at most 4 KiB, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as ciphertext -- each item sealed on its own, an unlisted topic's to the seller alone and its name hidden -- and cannot publish to it. With the job's poll guard, what its polls add to the job's history is bounded, and its requests cannot make a workflow task too large for Temporal to deliver. It **can still end that job** (a residual risk, below): the answers of concurrent polls can make the worker's reply to one workflow task too large ([the stream relay](#the-stream-relay)) |
+| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, each request at most 4 KiB, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as ciphertext -- each item sealed on its own, an unlisted topic's to the seller alone and its name hidden -- and cannot publish to it. With the job's poll guard, what its polls add to the job's history is bounded; its requests cannot make a workflow task too large for Temporal to deliver, nor, with the job's answer budget, can the answers to its polls make the worker's reply to one ([the stream relay](#the-stream-relay)). It can spend the relay's share of the job's history at once, which ends a job whose own history needs more than the other half of the limits (a residual risk, below) |
 | The worker controller's credential leaks | rollouts of Kontra's own workers in the platform namespace: no seller namespace, no workflow start, no compute config |
 | A buyer forges or alters a hold token (amount, seller, expiry, contract) | ES256 signature checked offline by the seller's handler, with audience, expiry, seller namespace, offering and contract hash |
 | A buyer replays a hold token | the handler workflow id is built from the job id and started with reject-duplicate: one execution per hold; a cancel before the job started occupies that id, so the refunded hold cannot start it either |
@@ -334,12 +334,21 @@ before the cap such a burst terminated the run whatever the job answered, the gu
 every poll included (measured). Together they bound what a leaked relay token can do to its
 job's history: the relay's share, up to the guard, which a job someone listens to pays whoever
 holds the token, so its own history must stay under the other half. They do not bound the polls'
-answers. The polls one workflow task completes answer together in the worker's reply to that
-task, up to 512 KiB each and up to 10 of them in flight, and concurrent polls of the size the
-cap allows can make that reply pass the 4 MiB gRPC limit, which terminates the run (measured
-with the pinned limits, the history far below the guard). That is the residual risk below; what
-would bound it is recorded in decisions I31, not built. The token stays live while a buyer
-listens, because its session is revoked only when the job closes or the last listener leaves.
+answers; the answer budget does. The token stays live while a buyer listens, because its
+session is revoked only when the job closes or the last listener leaves.
+
+**The answer budget.** The polls one workflow task completes answer together in the worker's
+reply to that task, up to 512 KiB each, and the reply must fit gRPC's 4 MiB message or Temporal
+terminates the run. Before the budget, concurrent polls of the size the cap allows could pass it
+(measured with the pinned limits, the history far below the guard). Now a job root answers at
+most 1.5 MiB in one workflow task (`STREAM_ANSWER_BUDGET` in `kontra.serve.interceptors`,
+counted with the codec's own arithmetic, the same on every worker and on replay). A poll past it
+is answered with no items and `more_ready`, so its poller polls again at once and is answered
+in a later task: it is held back, never refused or dropped, the first answer of every task is
+sent, and the drain does not count an answer held back as read. That leaves 2.5 MiB for the rest
+of the reply: the update requests it echoes (at most `history.maxInFlightUpdates`, 10, pinned,
+of at most 4 KiB each from a relay), the answers held back, and the seller's own commands, one
+payload at the pinned `limit.blobSize.error` (2 MiB) among them (decisions I31).
 
 ### The worker controller
 
@@ -449,13 +458,14 @@ deadline rule.
   decisions I31), and a job someone listens to pays that share whoever holds the token. Nor by
   oversized requests: the Authorizer refuses a relay request over 4 KiB (decisions I30), which
   closes the burst that terminated a run whatever the job answered, since the worker's reply to
-  a workflow task echoes every update request it accepts **or rejects**. What remains is the
-  answers: the polls one workflow task completes answer together in the worker's reply, up to
-  512 KiB each, and concurrent polls of the size the cap allows can make it pass gRPC's 4 MiB
-  limit; Temporal then terminates the run (`GrpcMessageTooLarge`), a refund against the seller
-  -- measured with the pinned limits. Neither the cap (it holds requests) nor the guard (it
-  holds history) reaches it; the possible bounds are recorded in decisions I31 and none is built
-  yet.
+  a workflow task echoes every update request it accepts **or rejects**. Nor by the answers:
+  the polls one workflow task completes answer together in the worker's reply, which concurrent
+  polls could push past gRPC's 4 MiB limit (measured with the pinned limits), and the job's
+  answer budget now holds that reply's answers to 1.5 MiB, holding further polls back for a
+  later task ([the stream relay](#the-stream-relay), decisions I31). What remains is the
+  relay's share of the history: a leaked token can spend all of it at once, where a genuine
+  relay spends it as the stream grows, so a job someone listens to whose own history needs more
+  than the other half of the limits is terminated, a refund against the seller.
 - **Token lifetime.** A worker token's session revoked at the gate is refused by Kontra's
   Temporal server within its revocation poll (5 s), as long as the server can reach the
   gate's list (`GET /v1/auth/revocations`); while it cannot, the token stays valid until its

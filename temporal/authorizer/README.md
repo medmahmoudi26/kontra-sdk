@@ -118,10 +118,11 @@ would read any update's outcome by id. Every completed poll's outcome (up to the
 envelope's 512 KiB) is written to the job's history; a leaked relay token re-polling from
 offset 0 no longer pushes the job past `limit.historySize.error`, because the job refuses
 polls once its history is past half of the pinned limits (#52, decisions I31). The size cap
-holds requests, not answers, and the authorizer reads no payload, so it does not bound the
-answers: the polls one workflow task completes answer in the worker's one reply, which
-concurrent polls can push past the 4 MiB limit, ending the run (`docs/security.md`, residual
-risks; decisions I30, I31).
+holds requests, not answers, and the authorizer reads no payload, so the answers are bounded
+in the job instead: the polls one workflow task completes answer in the worker's one reply,
+and a job root answers at most 1.5 MiB in one task and holds further polls back for a later
+one, so concurrent polls cannot push that reply past the 4 MiB limit (#52's answer budget;
+`docs/security.md`, decisions I30, I31).
 
 The controller is `temporal-worker-controller` rolling out Kontra's own workers. It may make
 the 10 calls in `ControllerAPIs` (describe, promote, ramp, manage, annotate and retire worker

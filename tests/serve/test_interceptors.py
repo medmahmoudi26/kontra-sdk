@@ -90,6 +90,31 @@ def test_the_guard_is_half_the_pinned_limits() -> None:
     assert pinned["limit.blobSize.warn"][0]["value"] >= s.ENVELOPE_MAX
 
 
+def test_the_answer_budget_leaves_room_in_a_workflow_tasks_reply() -> None:
+    """What a root answers in one workflow task (``STREAM_ANSWER_BUDGET``) holds its first
+    answer, cut to one envelope, so the stream makes progress; and with the rest of the
+    worker's reply to that task -- the update requests it echoes (at most
+    ``history.maxInFlightUpdates`` in flight, each a relay's at most ``RelayRequestMax``), the
+    answers with no items, one payload of the seller's at ``limit.blobSize.error`` -- it stays
+    under gRPC's 4 MiB message, which a reply must fit or Temporal ends the run."""
+    import re
+    from pathlib import Path
+
+    import yaml
+
+    root = Path(__file__).resolve().parents[2] / "temporal/authorizer"
+    pinned = yaml.safe_load((root / "dynamicconfig/kontra.yaml").read_text())
+    [in_flight] = pinned["history.maxInFlightUpdates"]
+    [blob] = pinned["limit.blobSize.error"]
+    m = re.search(r"\bRelayRequestMax = (\d+) << (\d+)\b", (root / "authorizer.go").read_text())
+    assert m is not None
+    request = int(m[1]) << int(m[2])
+    held = s.envelope_bound((), buyer_topics=(), recipients=interceptors.RECIPIENTS_BOUND)
+    assert s.ENVELOPE_MAX <= interceptors.STREAM_ANSWER_BUDGET
+    rest = blob["value"] + in_flight["value"] * (request + held)
+    assert interceptors.STREAM_ANSWER_BUDGET + rest < 4 * 1024 * 1024
+
+
 def test_the_hosted_stream_is_the_contribs_own_class() -> None:
     """``WorkflowStream`` reads its caller's frame name: Kontra's subclass must be built from
     an ``__init__``, and must stay the contrib's implementation."""
