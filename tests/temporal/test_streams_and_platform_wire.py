@@ -687,6 +687,9 @@ def _misshapen(workflow_id: str) -> dict[str, RelayRequest]:
         "Update(poll)@J argument a claim-check reference": poll(
             {"encoding": codec.CLAIM_CHECK_ENCODING, "kontra-v": b"1"}, data=reference
         ),
+        "Update(poll)@J argument a stream envelope": poll(
+            {"encoding": b"binary/kontra-stream", "kontra-v": b"1"}
+        ),
         "Update(poll)@J argument an external-storage reference": poll(
             {"encoding": b"json/external-storage-reference"}
         ),

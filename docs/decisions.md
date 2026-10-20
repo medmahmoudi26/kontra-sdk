@@ -2011,7 +2011,7 @@ for another reason spends nothing; another job's relay and a party are not held 
 gone back adds nothing; exactly the burst passes of 200 concurrent requests; full buckets
 swept); Temporal's own authorization interceptor handing the relay rule the decoded request;
 and `tests/temporal` over the wire against the real binary (61 tests), the relay, controller,
-self-access and escrow cells included, a relay poll past the cap and eleven misshapen relay
+self-access and escrow cells included, a relay poll past the cap and twelve misshapen relay
 requests refused while the relay's own poll on the same job still answers (the job's history
 unchanged by the refusals), and a relay past its burst refused with `RelayRateReason` while
 another job's relay and the seller are not, until its bucket refills. What a relay's polls cost a job's history is stated
