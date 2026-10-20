@@ -899,8 +899,8 @@ anyone pays for a run, from mock runs, for `kontra dev`'s [graph page](#the-grap
 a dev profile (`kontra dev up`), `kontra serve` -- and `python worker.py`, whose `serve()`
 knows its directory -- draws the static graph of each workflow offering it serves in the
 background once its start checks have passed, and again whenever the offering's contract hash
-differs from the one the stored graph was drawn from. There is nothing to run for it, and
-serving never waits for it.
+or the project's code differs from what the stored graph was drawn from. There is nothing to
+run for it, and serving never waits for it.
 
 The workflow runs 8 times in Temporal's time-skipping test server, in a child process of the
 worker at a lower priority, with what `serve()` registers -- the bound workflow and the
@@ -952,9 +952,9 @@ at INFO, as `the mock runs said: ...`:
   it.
 
 When the graph cannot be drawn -- no test server and no network to download it, a project
-that fails to import there, mock runs past their time limit (two minutes beyond the runs' own
-deadlines, after which the child and its test server are stopped) -- the worker logs one
-WARNING line (`the graph page's static graph of ... was not drawn: ...`) and serves anyway; the
+that fails to import there, an input type no valid value can be drawn for, mock runs past
+their time limit (two minutes beyond the runs' own deadlines, after which the child and its
+test server are stopped) -- the worker logs one WARNING line (`the graph page's static graph of ... was not drawn: ...`) and serves anyway; the
 page then draws what each run did, and the next start tries again. Production has no graph
 page: a worker serving under any other profile draws nothing, and so does a home without a
 profile file (a worker on `KONTRA_API_KEY` alone). A `Worker` you build in `worker.py` draws
@@ -962,10 +962,12 @@ under `kontra serve`; run as `python worker.py`, or with `KontraPlugin` on your 
 draws only when told the project's directory (`worker.project = Path(__file__).parent`,
 `KontraPlugin(..., project=...)`).
 
-The contract hash covers the types and `offering.yaml`, not what the workflow does: an edit to
-the workflow that keeps its types keeps the graph drawn before it. Remove
-`$KONTRA_HOME/graphs/` and start the worker again to draw it anew. A new version is a new task
-queue, and is drawn at its first start.
+The contract hash covers the types and `offering.yaml`, not what the workflow does, so the
+stored graph also records a hash of the project's code: every file of the project the worker
+imported (its tests, environments and build output aside), and Kontra's version. An edit to
+the workflow or an activity's module that keeps the types draws the graph again at the next
+start, with nothing to republish; a README does not. A new version is a new task queue, and
+is drawn at its first start.
 
 The test server is a binary temporalio downloads once on first use into
 `~/.cache/kontra/temporal-test-server` (under `$XDG_CACHE_HOME` when that is set), a
@@ -974,9 +976,11 @@ first chooses what runs. Anything in that directory someone else owns or can wri
 refused. The server cannot be bound to the loopback: while the mock runs go it listens on
 every interface, on a random port, unauthenticated, so anyone who can reach the machine can
 read the runs there (sampled values, nothing of a buyer's) and start workflows the mock worker
-runs. Stopping the worker stops the child and the server with it. Each offering's graph is
+runs. Stopping the worker stops the child and the server with it, and so does a worker that
+ends without stopping (a closed terminal, SIGKILL): the child's stdin is a pipe from the
+worker, and when it closes the child kills itself and its server. Each offering's graph is
 saved under `$KONTRA_HOME/graphs/` (0600 files in a 0700 directory, by the task queue's hash),
-with the contract hash it was drawn from; one worker of a home draws at a time, and a second
+with the contract hash and the code hash it was drawn from; one worker of a home draws at a time, and a second
 finds the first's graph. It is never sent anywhere: `kontra publish` does not carry it.
 
 ## Running locally: `kontra dev`
