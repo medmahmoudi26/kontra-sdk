@@ -758,8 +758,6 @@ class _Job:
     settled: bool = False
     pending_stop: EffectKind | None = None
     pending_stop_reason: str = ""
-    #: A workflow stop is being carried out: the sweeper does not issue it a second time.
-    stopping: bool = False
     delivery: bytes | None = None
     split: Split | None = None
     resolution_note: str = ""
@@ -3725,25 +3723,18 @@ class FakeGate:
         of ``job-<id>``: that is the pinned chain's run whenever the chain is still open (a
         workflow id has one open run at most), and when it is not, whatever the termination
         hits is a run nobody may work on; what it achieved for the money is read back from
-        the pinned chain by the caller, never assumed. A stop already being carried out is not
-        issued again: the sweeper's next pass retries it only if it failed."""
-        if job.stopping:
-            return
-        job.stopping = True
-        try:
-            if self.control is not None:
-                ns, wf = job.record.seller_ns, job.workflow_id
-                if kind is EffectKind.CANCEL_WORKFLOW:
-                    await self.control.cancel_workflow(ns, wf, reason)
-                elif kind is EffectKind.TERMINATE_RUN:
-                    # Only the pinned chain: a run outside it is never terminated by a cancel.
-                    await self.control.terminate_workflow(
-                        ns, wf, reason, first_run_id=job.record.run_id or ""
-                    )
-                else:
-                    await self.control.terminate_workflow(ns, wf, reason)
-        finally:
-            job.stopping = False
+        the pinned chain by the caller, never assumed."""
+        if self.control is not None:
+            ns, wf = job.record.seller_ns, job.workflow_id
+            if kind is EffectKind.CANCEL_WORKFLOW:
+                await self.control.cancel_workflow(ns, wf, reason)
+            elif kind is EffectKind.TERMINATE_RUN:
+                # Only the pinned chain: a run outside it is never terminated by a cancel.
+                await self.control.terminate_workflow(
+                    ns, wf, reason, first_run_id=job.record.run_id or ""
+                )
+            else:
+                await self.control.terminate_workflow(ns, wf, reason)
         if job.pending_stop is kind:
             job.pending_stop, job.pending_stop_reason = None, ""
 
