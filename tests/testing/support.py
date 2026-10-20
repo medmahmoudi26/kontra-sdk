@@ -7,6 +7,7 @@ import asyncio
 import base64
 import inspect
 import json
+import threading
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -30,9 +31,9 @@ from kontra._control import (
     TemporalError,
 )
 from kontra.auth import Session, login
-from kontra.codec import check_sealed
+from kontra.codec import age, check_sealed
 from kontra.contract import derive_document, parse_offering
-from kontra.engine import AGE_MAGIC, NotSealed
+from kontra.engine import NotSealed
 from kontra.escrow import Observation, ObservedStatus, Provenance
 from kontra.gate_client import models as m
 from kontra.workers import offline
@@ -94,13 +95,24 @@ def quote_payload(**fields: Any) -> Payload:
     return json_payload(fields)
 
 
+#: The key :func:`sealed` seals to: these tests' own, no job's.
+SEALED_KEY = age.generate_identity()
+_sealed: dict[bytes, bytes] = {}
+_sealing = threading.Lock()
+
+
 def sealed(raw: bytes) -> bytes:
     """``raw`` inside a delivery envelope as the seller's codec stores a job's result
-    (``binary/kontra-age``, ``kontra-v`` 1, an age file's first line): what a TemporalEngine
-    hands the gate as a ``SealedPayload``. Deterministic, so a test can compare bytes."""
-    return Payload(
-        metadata={"encoding": b"binary/kontra-age", "kontra-v": b"1"}, data=AGE_MAGIC + raw
-    ).SerializeToString(deterministic=True)
+    (``binary/kontra-age``, ``kontra-v`` 1, an age file -- to :data:`SEALED_KEY`): what a
+    TemporalEngine hands the gate as a ``SealedPayload``. The same bytes for the same ``raw``
+    in one test process (a gate thread included), so a test can compare them."""
+    with _sealing:
+        if raw not in _sealed:
+            _sealed[raw] = Payload(
+                metadata={"encoding": b"binary/kontra-age", "kontra-v": b"1"},
+                data=age.encrypt(raw, [SEALED_KEY[1]]),
+            ).SerializeToString(deterministic=True)
+        return _sealed[raw]
 
 
 def ok_quote(amount_minor: int = 1234, seconds: int = 3600) -> Payload:
@@ -186,6 +198,8 @@ class ScriptedControl:
     summarised: list[tuple[str, str, str | None]] = field(
         default_factory=list[tuple[str, str, str | None]]
     )
+    #: what history_size answers for every run: (events, bytes) -- the relay's pace
+    history: tuple[int, int] = (10, 1000)
     fail_stops: int = 0
     #: what describe_task_queue answers, by (namespace, task queue); else nothing reported
     task_queues: dict[tuple[str, str], dict[m.TaskQueueType, m.TaskQueueTypeInfo]] = field(
@@ -279,6 +293,9 @@ class ScriptedControl:
     ) -> HistorySummary | None:
         self.summarised.append((namespace, workflow_id, pinned))
         return self.summaries.get((namespace, workflow_id))
+
+    async def history_size(self, namespace: str, workflow_id: str) -> tuple[int, int] | None:
+        return self.history
 
     async def cancel_workflow(
         self, namespace: str, workflow_id: str, reason: str, first_run_id: str = ""

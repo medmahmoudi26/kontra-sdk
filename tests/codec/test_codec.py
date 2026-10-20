@@ -1042,3 +1042,12 @@ async def test_what_the_codec_writes_for_a_job_is_a_sealed_delivery() -> None:
         assert MARKER not in SealedPayload(stored).data
     with pytest.raises(NotSealed):
         check_sealed(payload().SerializeToString(deterministic=True))
+    # The envelope's shape with plaintext behind an age file's first line: no age file.
+    stored = inline.SerializeToString(deterministic=True)
+    first_line = inline.data[: inline.data.index(b"\n") + 1]
+    forged = Payload()
+    forged.CopyFrom(inline)
+    forged.data = first_line + b'{"text": "' + MARKER + b'"}'
+    with pytest.raises(NotSealed):
+        check_sealed(forged.SerializeToString(deterministic=True))
+    check_sealed(stored)

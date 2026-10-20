@@ -16,16 +16,17 @@ anything else, which the fake then reports :attr:`~kontra.escrow.ObservedStatus.
 adapter must. The test controls the seller's side, tricks included: :meth:`FakeEngine.serve`,
 :meth:`~FakeEngine.serve_quote`, :meth:`~FakeEngine.offline`, :meth:`~FakeEngine.seller_start`
 (a run the buyer's start did not begin, I15), :meth:`~FakeEngine.seller_revive` (always
-refused after END), :meth:`~FakeEngine.buyer_withdraws` (I16) and :meth:`~FakeEngine.reaches`
-(the isolation probe). ``unreachable = True`` makes every async member raise
-:class:`~kontra.engine.EngineError`.
+refused after END), :meth:`~FakeEngine.buyer_withdraws` (I16), and the isolation probes
+:meth:`~FakeEngine.reaches` and :meth:`~FakeEngine.stops`. ``unreachable = True`` makes every
+async member raise :class:`~kontra.engine.EngineError`.
 
 What it models, each a rule of the contract: a lineage per buyer start, with a random pin that
 a restart within it keeps; provenance by the hold the gate issued (only a run the gate's start
 began, with one of ``holds``, is verified); a start idempotent by job, refused by a fence and by
 a run the seller started first; ASK as a request the code may ignore, END as final; deliveries
 only as :class:`~kontra.engine.SealedPayload`; per-run stream logs of age files; credentials
-confined to their party's jobs.
+confined to their party's side of a job (the seller's run is reached and stopped by the
+seller's credential alone; the buyer's side is its start).
 """
 
 from __future__ import annotations
@@ -245,16 +246,18 @@ class FakeEngine:
         self._programs.pop(offering.key, None)
         self._quotes.pop(offering.key, None)
 
-    def seller_start(self, handle: JobHandle, result: bytes) -> bool:
-        """The seller starts the job's run itself and completes it with ``result`` (I15's
-        attack): never the buyer's lineage. False when a run of the job is open (an engine
-        holds one open run per job at most)."""
+    def seller_start(self, handle: JobHandle, result: bytes | None) -> bool:
+        """The seller starts the job's run itself and completes it with ``result`` -- or,
+        with None, leaves it running until a stop ends it (I15's attack): never the buyer's
+        lineage. False when a run of the job is open (an engine holds one open run per job
+        at most)."""
         job = self._job(_parse(handle))
         if any(r.status is _OPEN for r in job.runs):
             return False
         now = self._clock()
         run = _Run(_new_pin(), by_gate=False, hold=None, started_at=now)
-        run.status, run.result, run.closed_at = ObservedStatus.COMPLETED, result, now
+        if result is not None:
+            run.status, run.result, run.closed_at = ObservedStatus.COMPLETED, result, now
         job.runs.append(run)
         return True
 
@@ -274,10 +277,17 @@ class FakeEngine:
                 run.asked.set()
 
     def reaches(self, credential: str, handle: JobHandle) -> bool:
-        """Whether ``credential`` reaches the job: only its seller's or its buyer's do."""
+        """Whether ``credential`` reaches the job's run, in the seller's home: only the
+        seller's does (the buyer's side of a job is its own start, :meth:`buyer_withdraws`)."""
         plan = _parse(handle)
-        party = self.credentials.get(credential)
-        return party is not None and party in (plan["seller"], plan["buyer"])
+        return self.credentials.get(credential) == plan["seller"]
+
+    def stops(self, credential: str, handle: JobHandle) -> bool:
+        """Whether ``credential`` can stop the job's run or fence the job: only the seller's,
+        whose run it is (ending or occupying it is the seller's loss, E9); never the buyer's
+        or a stranger's."""
+        plan = _parse(handle)
+        return self.credentials.get(credential) == plan["seller"]
 
     def runs(self, handle: JobHandle) -> int:
         """How many runs the job has had (for tests: one start, one lineage)."""

@@ -36,7 +36,15 @@ import math
 import re
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncGenerator, Hashable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Hashable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import aclosing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -89,6 +97,7 @@ from temporalio.api.workflowservice.v1 import (
 from temporalio.client import Client
 from temporalio.service import RPCError, RPCStatusCode
 
+from kontra._relay import RelayService
 from kontra.codec import CLAIM_CHECK_ENCODING
 from kontra.codec import _parse_reference as _reference  # pyright: ignore[reportPrivateUsage]
 from kontra.contract.names import is_endpoint_name
@@ -121,6 +130,7 @@ __all__ = [
     "TemporalError",
     "hold_digest",
     "input_size",
+    "internal_relay_service",
 ]
 
 #: Above the contract's max_duration cap (see :data:`DEFAULT_RETENTION`): the gate's grace
@@ -395,6 +405,8 @@ class TemporalControl(Protocol):
         self, namespace: str, workflow_id: str, pinned: str | None = None
     ) -> HistorySummary | None: ...
 
+    async def history_size(self, namespace: str, workflow_id: str) -> tuple[int, int] | None: ...
+
     async def cancel_workflow(
         self, namespace: str, workflow_id: str, reason: str, first_run_id: str = ""
     ) -> None: ...
@@ -420,6 +432,27 @@ class TemporalControl(Protocol):
         headers: Mapping[str, str],
         schedule_to_close: timedelta,
     ) -> None: ...
+
+
+def internal_relay_service(
+    control: TemporalControl,
+) -> Callable[[str], Awaitable[RelayService]] | None:
+    """The stream relay's frontend where it is the control plane's own: a dev server (and a
+    fake gate on one), whose single frontend judges no relay token, so the token is not sent
+    and the relay reads through this control plane's client. None for a control plane
+    without a client of its own (a test double). A production gate relays on the PUBLIC
+    frontend with the relay token instead (decisions I30); this is the one place the relay
+    is handed the internal frontend, in the only code that talks to it (seam ⑥: the
+    ``relay_service`` of :class:`kontra.engine.temporal.TemporalEngine`)."""
+    client: Any = getattr(control, "client", None)
+    if client is None:
+        return None
+    service: RelayService = client.workflow_service
+
+    async def connect(token: str) -> RelayService:
+        return service
+
+    return connect
 
 
 def _time(ts: Timestamp, present: bool) -> datetime | None:
@@ -1637,6 +1670,17 @@ class Control:
             return _Found(Provenance.NOT_FROM_BUYER)
         # Scheduled, and no Started event says otherwise (none yet, or it named this run).
         return _Found(Provenance.VERIFIED, cancel_requested)
+
+    async def history_size(self, namespace: str, workflow_id: str) -> tuple[int, int] | None:
+        """How long (events) and how large (bytes) the latest run of ``workflow_id``'s
+        history is, as the server describes it, or None when there is no run: what a job's
+        stream relay is paced against (:func:`kontra._relay.pace_for`, decisions I31). Raises
+        :class:`TemporalError` when it cannot say."""
+        d = await self._describe(namespace, workflow_id)
+        if d is None:
+            return None
+        info = d.workflow_execution_info
+        return info.history_length, info.history_size_bytes
 
     async def history_summary(
         self, namespace: str, workflow_id: str, pinned: str | None = None

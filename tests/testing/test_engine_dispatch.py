@@ -229,6 +229,52 @@ async def test_a_publish_naming_no_engine_runs_on_temporal(bench: Bench) -> None
     assert "engine" not in entry.model_dump()  # never in what anyone reads back
 
 
+def _keys(value: Any) -> set[str]:
+    """Every object key anywhere in a JSON value."""
+    if isinstance(value, dict):
+        return {str(k) for k in value} | {k for v in value.values() for k in _keys(v)}
+    if isinstance(value, list):
+        return {k for v in value for k in _keys(v)}
+    return set()
+
+
+async def test_no_catalog_read_carries_the_engine(bench: Bench) -> None:
+    """Decisions I32: the engine is never in what a buyer reads. The model walk in
+    ``tests/gate_client/test_routes.py`` covers every modelled response; these are the served
+    bytes of every catalog read, the A2A agent card (a route with no response model) among
+    them, for a version published on an engine other than the default."""
+    seller = await bench.party("acme")
+    entry = await bench.publish(seller, engine="other")
+    party, name = entry.offering.split("@")[0].split("/")
+    version = entry.version
+    async with httpx.AsyncClient(transport=bench.transport, base_url=bench.gate.base_url) as c:
+        reads = {
+            "search": await c.get("/v1/catalog"),
+            "get_offering": await c.get(f"/v1/catalog/{party}/{name}/{version}"),
+            "card": await c.get(f"/v1/catalog/{party}/{name}/{version}/card"),
+            "by_endpoint": await c.get(f"/v1/endpoints/{entry.endpoint}"),
+        }
+    for route, answer in reads.items():
+        assert answer.status_code == 200, (route, answer.text)
+        assert "engine" not in _keys(answer.json()), route
+    assert reads["card"].json()  # the card is served, and is the document's alone
+
+
+async def test_unsupported_engine_is_a_name_this_gate_neither_knows_nor_runs() -> None:
+    """``PublishRequest.engine`` (decisions I32): a name that is not an engine and that the
+    gate runs no adapter for is 422 ``unsupported_engine``; a known engine a gate has no
+    adapter for (a gate with no Temporal) is recorded, and its sellers are offline."""
+    async with fake_gate(control=None) as gate:
+        assert gate.engines == {}
+        await gate.ensure_party("acme")
+        who = Principal(party="acme", session_id="s", auth_time=gate.now(), kind="api")
+        entry = await gate.publish(who, offering_doc("acme"), (), "temporal")
+        assert gate.offerings[entry.offering].engine == "temporal"
+        with pytest.raises(GateHTTPError) as e:
+            await gate.publish(who, offering_doc("acme", version="2.0.0"), (), "golem")
+        assert (e.value.status, e.value.code) == (422, "unsupported_engine")
+
+
 async def test_the_workers_view_is_temporals_own(bench: Bench) -> None:
     """Owner decision OD8: the Workers view is a Temporal-only extension of its adapter; a
     version on any other adapter has none."""

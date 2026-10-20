@@ -27,9 +27,7 @@ import pytest
 from temporalio.api.common.v1 import Payload, Payloads
 from temporalio.api.failure.v1 import ApplicationFailureInfo, Failure
 from temporalio.api.update.v1 import Outcome
-from temporalio.api.workflow.v1 import WorkflowExecutionInfo
 from temporalio.api.workflowservice.v1 import (
-    DescribeWorkflowExecutionResponse,
     UpdateWorkflowExecutionResponse,
 )
 
@@ -61,7 +59,8 @@ def _doc(**facts: Any) -> dict[str, Any]:
 @dataclass
 class FakeTemporal:
     """The seller's Temporal as the relay sees it: its two calls answered from a log of
-    sealed items (topic None: one the buyer may not read), and the gate's Describe."""
+    sealed items (topic None: one the buyer may not read). (The gate's describe, which paces
+    the relay, is the control plane's: ``ScriptedControl.history``.)"""
 
     log: list[tuple[str | None, bytes | None, int]] = field(
         default_factory=list[tuple[str | None, bytes | None, int]]
@@ -72,7 +71,6 @@ class FakeTemporal:
     )
     failure: str | None = None
     raw: Payload | None = None
-    history: tuple[int, int] = (10, 1000)
 
     @property
     def workflow_service(self) -> FakeTemporal:
@@ -117,11 +115,6 @@ class FakeTemporal:
                 data=json.dumps(env).encode(),
             )
         )
-
-    async def describe_workflow_execution(self, req: Any, retry: bool = False, metadata: Any = None, timeout: Any = None) -> DescribeWorkflowExecutionResponse:  # noqa: ASYNC109  # fmt: skip
-        length, size = self.history
-        info = WorkflowExecutionInfo(history_length=length, history_size_bytes=size)
-        return DescribeWorkflowExecutionResponse(workflow_execution_info=info)
 
 
 def _answer(p: Payload) -> UpdateWorkflowExecutionResponse:
@@ -424,7 +417,7 @@ async def test_a_relay_that_stops_records_a_gap_without_an_item(
 @pytest.mark.timeout(60)
 async def test_the_pace_stops_the_relay_past_half_the_history_limits(tmp_path: Path) -> None:
     async for live in make_live(tmp_path, history_limits=(1000, 10**9)):
-        live.temporal.history = (600, 0)
+        live.control.history = (600, 0)
         live.temporal.publish(LISTED)
         live.running()
         seen: list[m.StreamEvent] = []

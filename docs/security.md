@@ -383,8 +383,11 @@ adapter (`kontra.engine.temporal`); a second one ships only once it proves, with
 - **Isolation (`isolate`).** A party's credential reaches its own jobs and nothing of any other
   party's, and holds no control power: it cannot provision a home, expose a route, fence a job
   or stop a lineage it does not own. Untrusted code runs with it. On Temporal this is the
-  Authorizer's party rule (I3, I30), proven by E18 over the wire on Kontra's server; a dev
-  server proves nothing here, and the contract reports E18 skipped there.
+  Authorizer's party rule (I3, I30), proven by E18 over the wire on Kontra's server -- the
+  buyer's and a stranger's credentials neither describe, terminate, request-cancel nor start
+  under the id of the seller's run of a job, and no party's registers a namespace or creates a
+  Nexus endpoint; a dev server proves nothing here, and the contract reports E18 skipped
+  there.
 - **END is irreversible by the seller.** Once a lineage is ended, no party's credential can
   bring it back or have another run speak for it (E6). On Temporal, Reset is denied to every
   token (I30) and an observation of the pinned chain never reports a run outside it; on an
@@ -397,13 +400,18 @@ adapter (`kontra.engine.temporal`); a second one ships only once it proves, with
   checked when the value is built; a completion that is not sealed is `UNSEALED`, its bytes
   dropped by the adapter, refunded against the seller (OD3; E12). Sealing happens in the
   seller's codec, never in the gate-side adapter, which would otherwise hold plaintext. The one
-  plaintext that crosses is a quote's answer, a price. (The check is structural: the gate holds
-  no key to prove the age file is one to the buyer; the seller who seals to the wrong key has
-  only failed its own delivery.)
+  plaintext that crosses is a quote's answer, a price. A verified completion cannot be handed
+  over without its bytes (`Observed` refuses it), so escrow never pays for a delivery the gate
+  does not hold. (The check is structural -- an age file's version line, recipient stanza,
+  header MAC, nonce and a sealed chunk, so plaintext behind the version line is refused --
+  but the gate holds no key to prove the age file is one to the buyer; the seller who seals to
+  the wrong key, or forges a header over plaintext, has failed its own delivery: the buyer
+  cannot open it.)
 - **The relay credential's scope.** The credential `stream` uses is minted inside the adapter,
   confined to one job's stream and revocable by its session; it is never handed to a party. On
   Temporal it is I30's relay principal (`relay/<namespace>/job-<id>`, no permission), proven by
-  E14 over the wire.
+  E14 over the wire; the adapter mints it again (same subject and session) once half its life
+  is spent, so a job's relay outlives any one token and a leaked one still expires on time.
 - **The handle authorizes nothing.** A job handle is opaque bytes stored on the job row and
   parsed only by the adapter that minted it, strictly and before any I/O (E3). Its integrity is
   the gate database's, as for every job column: a well-formed handle written there by someone

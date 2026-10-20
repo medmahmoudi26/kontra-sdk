@@ -97,7 +97,7 @@ from temporalio.api.common.v1 import Payload
 from kontra import _jobkeys as jk
 from kontra import _passkeys as pk
 from kontra import escrow
-from kontra._control import TemporalControl, input_size
+from kontra._control import TemporalControl, input_size, internal_relay_service
 from kontra._relay import MIN_INTERVAL
 from kontra.codec import InvalidPayload
 from kontra.contract import ContractError, ContractInfo, KontraQuote, agent_card, validate_document
@@ -1119,6 +1119,8 @@ class FakeGate:
                         control,
                         signer=self.signer,
                         address=self.temporal_address,
+                        # This gate relays through its control plane's own client.
+                        relay_service=internal_relay_service(control),
                         worker_ttl=WORKER_TTL,
                         relay_interval=relay_interval,
                         relay_rpc_timeout=relay_rpc_timeout,

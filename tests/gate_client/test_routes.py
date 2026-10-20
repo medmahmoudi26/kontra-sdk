@@ -5,7 +5,10 @@ response model."""
 
 from __future__ import annotations
 
+import re
+import tomllib
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -449,6 +452,20 @@ async def test_the_client_omits_the_default_engine() -> None:
     assert "engine" not in m.PublishRequest(document={}).model_dump(mode="json")
 
 
+def test_the_pydantic_floor_has_what_the_client_relies_on() -> None:
+    """OD11's omitted default engine (and ``buyer_key``'s) is ``Field(exclude_if=)``, and the
+    client reads the gate's answers with ``model_validate_json(extra=)``: both pydantic 2.12.
+    On 2.9-2.11 the first is swallowed as an unknown keyword, so ``engine`` is always sent
+    and a gate that predates it refuses the publish. CI installs only the lock, so the
+    floor in pyproject.toml is pinned here."""
+    root = Path(__file__).resolve().parents[2]
+    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+    [spec] = [d for d in project["dependencies"] if re.match(r"pydantic\b", d)]
+    floor = re.search(r">=\s*(\d+)\.(\d+)", spec)
+    assert floor is not None, spec
+    assert (int(floor[1]), int(floor[2])) >= (2, 12), spec
+
+
 def _properties(schema: Any) -> set[str]:
     """Every property name anywhere in a JSON schema (``$defs`` included)."""
     found: set[str] = set()
@@ -488,8 +505,10 @@ def test_no_buyer_facing_model_carries_the_engine(model: type[Any]) -> None:
 
 
 def test_no_route_answers_with_the_engine() -> None:
-    """Walk every route's response schema: ``engine`` is in none (only PublishRequest, a
-    request, carries it). The gate's OpenAPI snapshot in kontra-cloud asserts the same."""
+    """Walk every modelled response schema: ``engine`` is in none (only PublishRequest, a
+    request, carries it). A route without a response model (the A2A card) is checked on the
+    served bytes (``tests/testing/test_engine_dispatch.py``); the gate's OpenAPI snapshot in
+    kontra-cloud asserts the same."""
     carried = [
         r.name
         for r in ROUTES

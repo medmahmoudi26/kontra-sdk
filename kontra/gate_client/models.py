@@ -1076,7 +1076,9 @@ class PublishRequest(_M):
     another is 409 ``engine_fixed``), and never in anything a buyer reads. Absent means
     :data:`DEFAULT_ENGINE`, and a client sends it only when it is not the default, so a
     client of this version publishes to a gate that predates the field (owner decision
-    OD11 of #55). A name the gate runs no adapter for is 422 ``unsupported_engine``."""
+    OD11 of #55). A name that is not an engine (:data:`ENGINE_NAMES`) and that the gate runs
+    no adapter for is 422 ``unsupported_engine``; a known engine a gate has no adapter for (a
+    fake gate with no Temporal) is recorded, its sellers offline."""
 
     document: dict[str, Any] = Field(max_length=_MEMBERS_MAX)
     streams: _Streams = Field(default_factory=list[str])

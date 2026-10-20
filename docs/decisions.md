@@ -2210,8 +2210,13 @@ as the adapter's internals. `kontra.engine` imports no `temporalio` (a subproces
   Content leaves an adapter only as `SealedPayload` (a delivery: the codec's envelope,
   `binary/kontra-age` with an age file, or `binary/kontra-claim-check`; canonical; `kontra-v`
   1 and no other metadata; `kontra.codec.check_sealed`) or `Sealed` (a relayed stream item, an
-  age file), both checked when the value is built, and `Observed` refuses a result that is not
-  a verified completion's or whose digest is not of its bytes. Sealing is the seller side's
+  age file), both checked when the value is built -- an age file by its structure
+  (`kontra.codec.age.is_age_file`: the version line, a recipient stanza, the header MAC, the
+  nonce, a sealed chunk), so plaintext behind the version line is refused. `Observed` refuses
+  a result that is not a verified completion's or whose digest is not of its bytes, a
+  verified completion without its result, and a digest without one: escrow pays a verified
+  completion as a delivery, so no adapter can hand over one the gate does not hold (one with
+  no bytes reports `UNSEALED`). Sealing is the seller side's
   (Temporal: `KontraCodec` under `KontraPlugin`; an engine without a codec hook: a Kontra guest
   library in the seller's component) -- a gate-side adapter that encrypted would hold
   plaintext. A verified completion whose result is not sealed is the new
@@ -2223,11 +2228,15 @@ as the adapter's internals. `kontra.engine` imports no `temporalio` (a subproces
   Literal["temporal"]` (`ENGINE_NAMES`), **beside the contract hash, not in `x-kontra`**:
   catalog data like `recipients` and `streams`, so no hash, golden or published document
   moves. Fixed per version at its first publish (409 `engine_fixed` with the recorded engine,
-  after the ownership check, so only the owner learns it); a name the gate runs no adapter for
-  is 422 `unsupported_engine`; no buyer-facing model carries it (a test walks every route's
-  response schema). **Changed from the design (OD11):** the SDK omits `engine` when it is the
-  default, and a gate reads its absence as `temporal`, so this release adds no deploy-order
-  dependency of its own on kontra-cloud#45 (an old gate refuses an unknown member). `serve()`
+  after the ownership check, so only the owner learns it); a name that is not an engine and
+  that the gate runs no adapter for is 422 `unsupported_engine` (a known engine a gate has no
+  adapter for -- a fake gate with no Temporal -- is recorded, its sellers offline); no
+  buyer-facing response carries it (a test walks every modelled response schema, another the
+  served bytes of every catalog read, the A2A card included). **Changed from the design
+  (OD11):** the SDK omits `engine` when it is the default (`Field(exclude_if=)`, so the
+  dependency floor is pydantic 2.12, pinned by a test), and a gate reads its absence as
+  `temporal`, so this release adds no deploy-order dependency of its own on kontra-cloud#45
+  (an old gate refuses an unknown member). `serve()`
   derives the engine from the entry's type (`kontra.serve.offering.engine_for`: a
   `@workflow.defn` class or an `@agent.accepts` handler is temporalio code, so `temporal`);
   `serve(..., engine=)`, `offering(..., engine=)` and `KontraPlugin.from_profile(...,
@@ -2242,9 +2251,13 @@ as the adapter's internals. `kontra.engine` imports no `temporalio` (a subproces
   principal, `pin` = that invocation's oplog index, `buyer_canceled` always False; `cancel(ASK)`
   = cancel the pending invocation, `cancel(END)` = interrupt then delete; `fence` = trivial
   (only the gate may invoke job agents); `stream` = Durable Streams from an offset; `isolate` =
-  an environment and a narrowed permission card. A test pins that no member, parameter or field
-  of a type the Protocol hands over is named for a namespace, task queue, run, workflow,
-  activity, Nexus endpoint or history. Golem forced three things into the semantics, now
+  an environment and a narrowed permission card. A test pins that no member, parameter, or
+  public attribute (field, property, method) of a type the Protocol hands over or takes is
+  named for a namespace, task queue, run, workflow, activity, Nexus endpoint or history, with
+  one exemption the test names: the catalog's `OfferingId` (taken by `expose`, `quote` and
+  `JobPlan`) is an offering's id, not a type of this seam, and its `namespace`, `task_queue`
+  and `service_name` are `names.py` derivations (constructed, never parsed) that only the
+  Temporal adapter reads. Golem forced three things into the semantics, now
   written in: END must be irreversible *by the seller* (a resumable interrupt is not END),
   sealing is seller-side, and provenance comes from records the runtime wrote. Restate maps
   cleanly (ingress with an idempotency key, cancel vs kill) but has no offset streams (`stream`
@@ -2263,17 +2276,30 @@ as the adapter's internals. `kontra.engine` imports no `temporalio` (a subproces
   that is the façade crawling back, and the answer is no.
 * **The contract** (`kontra.testing.engine_contract.run_engine_contract`; E1-E18): conformance
   and the pinned members; isolation locally (one home per party, a credential per party and
-  session) and over the wire (E18: a credential reaches its party's job only and holds no
-  control power); handles pure, deterministic, distinct, refused when tampered before any I/O;
-  idempotent start by job (concurrent, late, after completion: one lineage); NOT_FOUND before
-  any start; END final whatever the seller tries; a delivery stands; ASK only a request;
+  session) and over the wire (E18: the seller's credential reaches its job's run; the buyer's,
+  whose side is its own start, and a stranger's neither reach it nor can terminate,
+  request-cancel or fence it; no party's can provision a home or expose a route); handles pure,
+  deterministic, distinct, refused when tampered before any I/O; idempotent start by job
+  (concurrent, late, after completion: one lineage); NOT_FOUND before any start; END final
+  whatever the seller tries, and a stop with a pin stopping nothing outside its lineage (a run
+  of the seller's own stays open, I17); a delivery stands; ASK only a request;
   provenance; the fence (and raced against starts); restarts keep the pin; ciphertext only
   (UNSEALED withheld, a marker the seller's code put in every value found in nothing returned);
   the buyer's withdrawal; streams (topics asked for only, offsets, `after`, `"tail"`, the end);
-  quotes; expose; errors are not facts. Fifteen broken FakeEngines are each rejected on their
-  rule (`tests/engine/broken_engines.py`). The FakeGate dispatches every job op through
+  quotes (the seller's failure an answer, never raised); expose; errors are not facts.
+  Twenty-eight broken FakeEngines are each rejected on their rule, and every rule rejects at
+  least one (a test), so weakening a check -- here or in the platform's copy of the contract
+  -- fails (`tests/engine/broken_engines.py`). The FakeGate dispatches every job op through
   `engines[version.engine]` (`FakeGate(engines=...)`; by default a `TemporalEngine` over its
   control plane), so every FakeGate and Marketplace test runs through the seam.
+* **The relay's credential and pace.** `stream` mints the relay token (I30) inside the adapter
+  and dials its `relay_service` with it, and again with a fresh one once half its life
+  (`worker_ttl`, 15 minutes) is spent: a token only has to be good when a call is admitted,
+  and a job's stream lasts as long as the job, which no one token does (the same subject and
+  session every time, so a revoked session still ends it). Its pace reads the run's history
+  through `Control.history_size`, so `kontra._control` stays the only code that talks to the
+  internal frontend; where that frontend is also the relay's (a dev server, which judges no
+  token), `kontra._control.internal_relay_service` hands it over.
 
 **Rejected.** `start() -> handle` as the only mint (a job starts without the gate); a blocking
 `result()`; `cancel` absorbing `fence` (it would terminate a genuine run before it was pinned,
@@ -2288,8 +2314,9 @@ the protobuf `temporal.api.common.v1.Payload` (a format fact; a Golem adapter wo
 two-field `payload.proto`); no engine check in the hash lock for an existing version (OD5);
 kontra-cloud's `judge_call` stays a `GateControl` extension until it is ported behind
 `observe` (OD7); `isolate`'s provisioning is remembered per process (a gate restart provisions
-again, idempotently); `check_sealed` is structural (the gate holds no key to prove an age file
-is to the buyer).
+again, idempotently); `check_sealed` and `Sealed` are structural: an age file's shape, not to
+whom it is sealed (the gate holds no key to prove an age file is to the buyer), so they stop a
+seller side that did not seal, not one that forges a header.
 
 **Amends** I3 and I30 (the worker and relay tokens are minted through `isolate` and `stream`),
 I6 and I15-I17 (escrow reads `Observation.pin`; `UNSEALED`), I7 (sealed-only is the seam's
@@ -2300,11 +2327,14 @@ Tested: the Protocol's pins, the guardrail, the vocabulary walk, import purity, 
 types and `STOPS` (`tests/engine/test_protocol.py`); the contract against FakeEngine and its
 teeth (`tests/engine/test_fake_engine_contract.py`, `test_engine_contract_teeth.py`); the
 Temporal adapter's handle golden, strict parse vectors and every member's exact control-plane
-call (`tests/engine/test_temporal_engine.py`); the contract against `TemporalEngine` on a dev
+call, the relay token renewed and the pace read through the control plane
+(`tests/engine/test_temporal_engine.py`); the contract against `TemporalEngine` on a dev
 server, every check but E18 (`tests/engine/test_temporal_engine_contract.py`); E1-E3, E14 and
-E18 over the wire on Kontra's server (`tests/temporal/test_engine_isolation_wire.py`); the
-FakeGate's dispatch on FakeEngine -- a whole lifecycle with no Temporal, two engines, the
-engine fixed, the Workers view (`tests/testing/test_engine_dispatch.py`); `PublishRequest.engine`
-and no buyer-facing schema carrying it (`tests/gate_client/test_routes.py`); `UNSEALED` and the
+E18 over the wire on Kontra's server, and a job's relay outliving a 5-second token
+(`tests/temporal/test_engine_isolation_wire.py`); the FakeGate's dispatch on FakeEngine -- a
+whole lifecycle with no Temporal, two engines, the engine fixed, `unsupported_engine`, the
+served catalog reads and the card without the engine, the Workers view
+(`tests/testing/test_engine_dispatch.py`); `PublishRequest.engine`, the pydantic floor and no
+buyer-facing schema carrying it (`tests/gate_client/test_routes.py`); `UNSEALED` and the
 engine-neutral record (`tests/escrow/test_escrow.py`); `serve(engine=)`, `engine_for` and the
 hash lock's `engine_fixed` (`tests/serve`); a pinned ASK (`tests/control/test_control.py`).

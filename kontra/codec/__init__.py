@@ -755,7 +755,8 @@ def check_sealed(data: bytes) -> None:
     """Raise :class:`~kontra.engine.NotSealed` unless ``data`` is exactly one serialized
     Kontra payload envelope as this codec writes it: canonical (deterministic) protobuf, the
     metadata ``{encoding, kontra-v: 1}`` and nothing else, and either ``binary/kontra-age``
-    with an age v1 file as data or ``binary/kontra-claim-check`` with a well-formed reference.
+    with an age v1 file as data (its structure: :func:`kontra.codec.age.is_age_file`) or
+    ``binary/kontra-claim-check`` with a well-formed reference.
 
     What seam ⑥ hands a gate as a delivery (:class:`kontra.engine.SealedPayload`): a result
     that fails this is plaintext, or bytes the codec did not write, and is never a delivery
@@ -771,7 +772,7 @@ def check_sealed(data: bytes) -> None:
         raise NotSealed("not a kontra v1 payload envelope")
     encoding = p.metadata["encoding"]
     if encoding == ENCODING:
-        if not p.data.startswith(AGE_MAGIC):
+        if not p.data.startswith(AGE_MAGIC) or not age.is_age_file(p.data):
             raise NotSealed("a binary/kontra-age payload without an age file")
         return
     if encoding == CLAIM_CHECK_ENCODING:

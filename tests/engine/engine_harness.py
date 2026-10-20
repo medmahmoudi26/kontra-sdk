@@ -145,8 +145,11 @@ class FakeHarness:
     def open_item(self, item: Sealed) -> str:
         return age.decrypt(item.data, [self.identity]).decode()
 
-    async def seller_start(self, handle: JobHandle, job_id: str, marker: str) -> None:
-        self.fake.seller_start(handle, seal_text(f"SELLER {marker}", self.recipient))
+    async def seller_start(
+        self, handle: JobHandle, job_id: str, marker: str, behaviour: Behaviour = "ok"
+    ) -> None:
+        result = None if behaviour == "hang" else seal_text(f"SELLER {marker}", self.recipient)
+        self.fake.seller_start(handle, result)
 
     async def seller_revive(self, handle: JobHandle, job_id: str) -> None:
         self.fake.seller_revive(handle)
@@ -156,6 +159,9 @@ class FakeHarness:
 
     async def reach(self, credential: str, handle: JobHandle) -> bool:
         return self.fake.reaches(credential, handle)
+
+    async def stops(self, credential: str, handle: JobHandle) -> bool:
+        return self.fake.stops(credential, handle)
 
     async def controls(self, credential: str) -> bool:
         return False  # a FakeEngine credential is a party's, with no control power

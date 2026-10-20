@@ -17,7 +17,12 @@ adds what the Protocol asks of an adapter and nothing of its own about money.
 * Credentials are the gate's ES256 JWTs, signed by its key ring (:class:`Signer`): the worker
   token :meth:`TemporalEngine.isolate` mints, and the relay token (no permission, subject
   :func:`~kontra.contract.names.relay_subject`, I30) minted inside :meth:`TemporalEngine.stream`
-  and never handed out.
+  and never handed out -- minted again, and the frontend dialled with it, once half its life
+  is spent, so a job's relay outlives any one token.
+* The internal frontend is reached only through :class:`kontra._control.Control` (the relay's
+  pace too: :meth:`~kontra._control.Control.history_size`); the relay reads where
+  ``relay_service`` dials (the public frontend, or a dev server's own:
+  :func:`kontra._control.internal_relay_service`).
 
 Nexus, namespaces, task queues and run ids stay in this module: the Protocol names none of
 them. Two reads are Temporal by definition and stay outside it, as extensions of this class:
@@ -35,9 +40,13 @@ from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast
 
 from google.protobuf.message import DecodeError
-from temporalio.api.common.v1 import Payload, WorkflowExecution
-from temporalio.api.workflowservice.v1 import DescribeWorkflowExecutionRequest
-from temporalio.service import RPCError
+from temporalio.api.common.v1 import Payload
+from temporalio.api.workflowservice.v1 import (
+    QueryWorkflowRequest,
+    QueryWorkflowResponse,
+    UpdateWorkflowExecutionRequest,
+    UpdateWorkflowExecutionResponse,
+)
 
 from kontra._control import (
     EXECUTE_OPERATION,
@@ -126,7 +135,6 @@ _STOPS: Final[Mapping[str, StopReason]] = {
     "protocol": "protocol",
     "denied": "denied",
 }
-_DESCRIBE_TIMEOUT = timedelta(seconds=10)
 
 
 class Signer(Protocol):
@@ -268,13 +276,14 @@ class TemporalEngine:
 
     ``control``: the control plane on the internal frontend (:class:`kontra._control.Control`,
     or a test double). ``signer``: the gate's key ring. ``address``: the public frontend a
-    party's worker dials (``Isolation.address``). ``relay_service``: a ``WorkflowService`` on
-    the PUBLIC frontend carrying a given relay JWT, for :meth:`stream`; without one the relay
-    reads through ``control.client`` (a dev server, which enforces no token), and an adapter
-    with neither relays no streams (``StreamStopped("unsupported")``). ``relay_interval``,
+    party's worker dials (``Isolation.address``). ``relay_service``: dials a
+    ``WorkflowService`` on the PUBLIC frontend carrying a given relay JWT, for :meth:`stream`
+    (called again with a fresh token before the last expires); a dev server's own frontend,
+    which judges no token, is :func:`kontra._control.internal_relay_service`. Without one the
+    adapter relays no streams (``StreamStopped("unsupported")``). ``relay_interval``,
     ``relay_rpc_timeout`` and ``history_limits`` tune the relay's pace (the platform's 2 s, a
-    poll's deadline, the server's history limits); ``clock`` is the gate's (tokens, a start's
-    deadline)."""
+    poll's deadline, the server's history limits); ``worker_ttl`` is a worker's and a relay
+    token's life; ``clock`` is the gate's (tokens, a start's deadline)."""
 
     def __init__(
         self,
@@ -417,13 +426,13 @@ class TemporalEngine:
             obs, result = await self._control.observe(h.seller, h.workflow_id, h.call(holds), pin)
         except Exception as e:
             raise _engine_error(e) from e
-        if result is None:
-            return Observed(obs)
         if obs.status is not ObservedStatus.COMPLETED or obs.provenance is not Provenance.VERIFIED:
             # Only a verified completion delivers: no bytes leave for anything else.
             return Observed(replace(obs, result_sha256=None, result_size=None))
         try:
-            sealed = SealedPayload(result)
+            # A verified completion the control plane gave no bytes for is no delivery
+            # either (``Control`` itself answers b"" for a completion with no payload).
+            sealed = SealedPayload(result if result is not None else b"")
         except NotSealed:
             # Never hand the gate plaintext: an unsealed completion is not a delivery.
             unsealed = replace(
@@ -488,17 +497,10 @@ class TemporalEngine:
         session: str,
     ) -> AsyncGenerator[StreamBatch, None]:
         h = _parse(handle)
-        internal: Any = getattr(self._control, "client", None)
-        if self._relay_service is not None:
-            token, _expires = self._relay_token(h, session)
-            try:
-                service: RelayService = await self._relay_service(token)
-            except Exception as e:
-                raise _engine_error(e) from e
-        elif internal is not None:
-            service = internal.workflow_service  # a dev server: no token is checked
-        else:
+        if self._relay_service is None:
             raise StreamStopped("unsupported", "this adapter has no frontend to relay from")
+        service = _Renewing(lambda: self._relay_token(h, session), self._relay_service, self._clock)
+        await service.dial()
         batches = relay(
             service,
             namespace=h.seller,
@@ -507,7 +509,7 @@ class TemporalEngine:
             closed=closed,
             start=after,
             first_execution_run_id=lambda: pin,
-            pace=self._pace(internal, h),
+            pace=self._pace(h),
             min_interval=self._relay_interval,
             rpc_timeout=self._relay_rpc_timeout,
         )
@@ -548,39 +550,86 @@ class TemporalEngine:
         )
         return token, expires
 
-    def _pace(self, internal: Any, h: _Handle) -> Callable[[], Awaitable[float | None]] | None:
+    def _pace(self, h: _Handle) -> Callable[[], Awaitable[float | None]]:
         """How long the relay waits between polls: :func:`kontra._relay.pace_for` over the
-        run's history as the internal frontend describes it (what the gate's observer
-        reads); None (stop) from half the server's limits on."""
-        if internal is None:
-            return None
+        run's history as the control plane describes it (what the gate's observer reads,
+        :meth:`~kontra._control.Control.history_size`); None (stop) from half the server's
+        limits on. A describe that fails, or finds no run, keeps the relay's own pace."""
         events_limit, bytes_limit = self._history_limits
         interval = self._relay_interval
 
         async def pace() -> float | None:
             try:
-                d = await internal.workflow_service.describe_workflow_execution(
-                    DescribeWorkflowExecutionRequest(
-                        namespace=h.seller,
-                        execution=WorkflowExecution(workflow_id=h.workflow_id),
-                    ),
-                    retry=True,
-                    timeout=_DESCRIBE_TIMEOUT,
-                )
-            except RPCError:
+                size = await self._control.history_size(h.seller, h.workflow_id)
+            except Exception:
                 return interval
-            info = d.workflow_execution_info
-            paced = pace_for(
-                info.history_length,
-                info.history_size_bytes,
-                events_limit=events_limit,
-                bytes_limit=bytes_limit,
-            )
+            if size is None:
+                return interval
+            paced = pace_for(*size, events_limit=events_limit, bytes_limit=bytes_limit)
             if paced is None:
                 return None
             return interval if paced == MIN_INTERVAL else paced
 
         return pace
+
+
+class _Renewing:
+    """The relay's frontend, dialled with a relay token, and dialled again with a fresh one
+    once half the current one's life is spent (decisions I30: a token lives
+    ``worker_ttl``; a job's stream may last as long as the job). A token only has to be good
+    when a call is admitted, so the half left covers any clock skew under it. The new token
+    has the same subject and session, so a revoked session still ends the relay."""
+
+    def __init__(
+        self,
+        mint: Callable[[], tuple[str, datetime]],
+        connect: Callable[[str], Awaitable[RelayService]],
+        clock: Callable[[], datetime],
+    ) -> None:
+        self._mint = mint
+        self._connect = connect
+        self._clock = clock
+        self._service: RelayService | None = None
+        self._renew_at: datetime | None = None
+
+    async def dial(self) -> RelayService:
+        now = self._clock()
+        if self._service is None or self._renew_at is None or now >= self._renew_at:
+            token, expires = self._mint()
+            try:
+                self._service = await self._connect(token)
+            except Exception as e:
+                raise _engine_error(e) from e
+            self._renew_at = now + (expires - now) / 2
+        return self._service
+
+    async def update_workflow_execution(
+        self,
+        req: UpdateWorkflowExecutionRequest,
+        retry: bool = False,
+        metadata: Mapping[str, str | bytes] | None = None,
+        timeout: timedelta | None = None,  # noqa: ASYNC109 -- temporalio's signature
+    ) -> UpdateWorkflowExecutionResponse:
+        service = await self.dial()
+        if metadata is None:
+            return await service.update_workflow_execution(req, retry=retry, timeout=timeout)
+        return await service.update_workflow_execution(
+            req, retry=retry, metadata=dict(metadata), timeout=timeout
+        )
+
+    async def query_workflow(
+        self,
+        req: QueryWorkflowRequest,
+        retry: bool = False,
+        metadata: Mapping[str, str | bytes] | None = None,
+        timeout: timedelta | None = None,  # noqa: ASYNC109 -- temporalio's signature
+    ) -> QueryWorkflowResponse:
+        service = await self.dial()
+        if metadata is None:
+            return await service.query_workflow(req, retry=retry, timeout=timeout)
+        return await service.query_workflow(
+            req, retry=retry, metadata=dict(metadata), timeout=timeout
+        )
 
 
 if TYPE_CHECKING:  # pyright proves the structural fit: a TemporalEngine is an Engine

@@ -31,7 +31,7 @@ from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.worker import Worker
 
-from kontra._control import TemporalError
+from kontra._control import TemporalError, internal_relay_service
 from kontra.codec import age
 from kontra.contract.names import OfferingId, job_workflow_id, new_endpoint_name
 from kontra.engine import Engine, JobHandle, Sealed, SealedPayload
@@ -83,10 +83,12 @@ class TemporalHarness:
         self._engine = self._new()
 
     def _new(self, control: Any = None) -> TemporalEngine:
+        control = control if control is not None else self.dev.control()
         return TemporalEngine(
-            control if control is not None else self.dev.control(),
+            control,
             signer=self.signer,
             address=self.dev.grpc_address,
+            relay_service=internal_relay_service(control),  # one frontend, no token judged
             relay_interval=0.2,
         )
 
@@ -132,13 +134,15 @@ class TemporalHarness:
     def open_item(self, item: Sealed) -> str:
         return age.decrypt(item.data, [self.identity]).decode()
 
-    async def seller_start(self, handle: JobHandle, job_id: str, marker: str) -> None:
+    async def seller_start(
+        self, handle: JobHandle, job_id: str, marker: str, behaviour: Behaviour = "ok"
+    ) -> None:
         """The seller runs ``job-<id>`` itself, as its own token may (I15's attack)."""
         # A run of the job may be open: the engine holds one at most.
         with contextlib.suppress(WorkflowAlreadyStartedError):
             await self.dev.client_for(self.seller).start_workflow(
                 ContractJob.run,
-                {"b": "ok", "m": marker, "to": self.recipient},
+                {"b": behaviour, "m": marker, "to": self.recipient},
                 id=job_workflow_id(job_id),
                 task_queue=self.offering.task_queue,
                 id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
@@ -165,6 +169,9 @@ class TemporalHarness:
         )
 
     async def reach(self, credential: str, handle: JobHandle) -> bool:
+        raise AssertionError("a dev server enforces no isolation")
+
+    async def stops(self, credential: str, handle: JobHandle) -> bool:
         raise AssertionError("a dev server enforces no isolation")
 
     async def controls(self, credential: str) -> bool:

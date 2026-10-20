@@ -33,7 +33,8 @@ The checks (each raises :class:`EngineContractViolation` naming the rule):
   that opens to the seller's output, stable under its pin and in a second instance.
 * E5 before any start: NOT_FOUND, never an exception, never RUNNING.
 * E6 END on the pinned lineage: TERMINATED, no result, for good -- whatever the seller tries
-  after (a revival, a run of its own).
+  after (a revival, a run of its own); and a stop with a pin stops that lineage only (a run
+  of the seller's own, open meanwhile, is untouched by END or ASK of the pin).
 * E7 a delivery stands: END or ASK after the completion changes nothing.
 * E8 ASK is only a request: a run that ignores it completes, one that honours it is CANCELED.
 * E9 provenance: a run the seller started itself, or one observed with holds the gate did
@@ -49,12 +50,16 @@ The checks (each raises :class:`EngineContractViolation` naming the rule):
 * E14 streams (where the adapter relays them): only the topics asked for, increasing offsets,
   ``next_offset`` past every item, nothing before ``after``, "tail" only what comes next,
   every item opens to what the seller published; the relay of a closed job ends.
-* E15 quotes: OK with the seller's document, TIMEOUT, REFUSED, UNAVAILABLE -- never raised.
+* E15 quotes: OK with the seller's document, TIMEOUT, REFUSED, UNAVAILABLE -- never raised
+  for the seller's own failure.
 * E16 expose: idempotent; a route is never repointed (:class:`RouteConflict`).
 * E17 errors are not facts: an engine that cannot be reached raises
   :class:`~kontra.engine.EngineError` from every member; it never answers NOT_FOUND.
 * E18 isolation over the wire (only where the harness enforces it): the seller's credential
-  reaches its own job, a stranger's does not, and no party's holds control power.
+  reaches its own job's run, neither the buyer's (whose side is its own start) nor a
+  stranger's does, neither of theirs can stop it or fence the job (start under its id), and
+  no party's can provision a home or expose a route. (The seller's own runs of its job are
+  E9's: never the buyer's delivery.)
 
 :func:`run_engine_contract` returns one line per check, ``ok`` or ``SKIPPED`` with why.
 """
@@ -86,6 +91,7 @@ from kontra.engine import (
     JobPlan,
     Observed,
     Pin,
+    QuoteAnswer,
     QuoteKind,
     RouteConflict,
     Sealed,
@@ -224,8 +230,12 @@ class EngineHarness(Protocol):
         """What the seller published inside a relayed stream item."""
         ...
 
-    async def seller_start(self, handle: JobHandle, job_id: str, marker: str) -> None:
-        """The seller runs the job itself, as its own credential allows (I15's attack)."""
+    async def seller_start(
+        self, handle: JobHandle, job_id: str, marker: str, behaviour: Behaviour = "ok"
+    ) -> None:
+        """The seller runs the job itself, as its own credential allows (I15's attack), its
+        code doing ``behaviour`` (``ok``; ``hang``: until a stop ends it). A run of the job
+        that is open already wins: the call then starts nothing."""
         ...
 
     async def seller_revive(self, handle: JobHandle, job_id: str) -> None:
@@ -237,7 +247,16 @@ class EngineHarness(Protocol):
         ...
 
     async def reach(self, credential: str, handle: JobHandle) -> bool:
-        """Whether ``credential`` reaches the job (only called with ``enforces_isolation``)."""
+        """Whether ``credential`` reaches the job's run where it runs, in the seller's home
+        (Temporal: describes ``job-<id>`` in the seller's namespace; only called with
+        ``enforces_isolation``)."""
+        ...
+
+    async def stops(self, credential: str, handle: JobHandle) -> bool:
+        """Whether ``credential`` can stop the job's run -- end it, ask it to stop -- or fence
+        the job, as only the gate may (Temporal: terminate, request-cancel, or start under
+        ``job-<id>`` in the seller's namespace; only called with ``enforces_isolation``, for
+        the buyer's and a stranger's)."""
         ...
 
     async def controls(self, credential: str) -> bool:
@@ -599,7 +618,39 @@ async def _e6(r: _Run) -> str:
                 "E6", f"the ended lineage came back, or another run spoke for it: {later}"
             )
         await asyncio.sleep(r.settle)
-    return "END on the pinned lineage: TERMINATED, no result, whatever the seller tries"
+    # The pin bounds a stop (I17): a run outside the lineage -- the seller's own, open now --
+    # is not touched by END or ASK of the pinned one.
+    await r.until(
+        "E6",
+        "the seller's own runs to close",
+        handle,
+        holds,
+        lambda o: o.observation.pin != pin and _closed(o),
+    )
+    await r.h.seller_start(handle, job_id, r.marker, "hang")
+    other = await r.until(
+        "E6",
+        "a run of the seller's own",
+        handle,
+        holds,
+        lambda o: (
+            o.observation.status is ObservedStatus.RUNNING and o.observation.pin not in (None, pin)
+        ),
+    )
+    for stop in (Stop.END, Stop.ASK):
+        await e.cancel(handle, stop=stop, pin=pin, reason="the pinned lineage only")
+    await asyncio.sleep(r.settle)
+    still = await r.observe(handle, holds)
+    if (
+        still.observation.status is not ObservedStatus.RUNNING
+        or still.observation.pin != other.observation.pin
+    ):
+        raise _violation("E6", f"a stop with a pin reached a run outside its lineage: {still}")
+    await e.cancel(handle, stop=Stop.END, pin=None, reason="done")
+    return (
+        "END on the pinned lineage: TERMINATED, no result, whatever the seller tries; "
+        "a pinned stop stops nothing else"
+    )
 
 
 async def _e8(r: _Run) -> str:
@@ -826,26 +877,31 @@ async def _e14(r: _Run) -> str:
 
 
 async def _e15(r: _Run) -> str:
-    h, e = r.h, r.e
-    ok = await e.quote(h.offering, h.quote_input("ok"), timeout=_QUOTE_TIMEOUT * 3)
-    r.seen.add(ok)
+    h = r.h
+
+    async def quote(offering: OfferingId, input: bytes, within: float) -> QuoteAnswer:
+        try:
+            answer = await r.e.quote(offering, input, timeout=within)
+        except Exception as x:  # the seller's own failure is an answer, never raised
+            raise _violation("E15", f"a quote raised instead of answering: {x!r}") from None
+        r.seen.add(answer)
+        return answer
+
+    ok = await quote(h.offering, h.quote_input("ok"), _QUOTE_TIMEOUT * 3)
     if ok.kind is not QuoteKind.OK or ok.document != h.quote_document():
         raise _violation("E15", f"the seller's quote document was not relayed as it is: {ok}")
     loop = asyncio.get_running_loop()
     began = loop.time()
-    slow = await e.quote(h.offering, h.quote_input("slow"), timeout=_QUOTE_TIMEOUT)
+    slow = await quote(h.offering, h.quote_input("slow"), _QUOTE_TIMEOUT)
     took = loop.time() - began
-    r.seen.add(slow)
     if slow.kind is not QuoteKind.TIMEOUT or took > _QUOTE_TIMEOUT + 3.0:
         raise _violation(
             "E15", f"a slow quote is TIMEOUT within its timeout: {slow} in {took:.1f}s"
         )
-    failed = await e.quote(h.offering, h.quote_input("fail"), timeout=_QUOTE_TIMEOUT * 3)
-    r.seen.add(failed)
+    failed = await quote(h.offering, h.quote_input("fail"), _QUOTE_TIMEOUT * 3)
     if failed.kind is not QuoteKind.REFUSED or failed.document is not None:
         raise _violation("E15", f"a failing quote is REFUSED: {failed}")
-    nobody = await e.quote(h.other_offering, h.quote_input("ok"), timeout=_QUOTE_TIMEOUT)
-    r.seen.add(nobody)
+    nobody = await quote(h.other_offering, h.quote_input("ok"), _QUOTE_TIMEOUT)
     if nobody.kind is not QuoteKind.UNAVAILABLE:
         raise _violation("E15", f"a quote nothing serves is UNAVAILABLE: {nobody}")
     return "quote: OK with the seller's document, TIMEOUT, REFUSED, UNAVAILABLE"
@@ -901,14 +957,25 @@ async def _e18(r: _Run) -> str:
     try:
         if not await h.reach(r.credentials[h.seller], handle):
             raise _violation("E18", "the seller's credential does not reach its own job")
+        if await h.reach(r.credentials[h.buyer], handle):
+            raise _violation("E18", "the buyer's credential reached the seller's side of its job")
         if await h.reach(r.credentials[h.stranger], handle):
             raise _violation("E18", "a stranger's credential reached another party's job")
+        for party in (h.buyer, h.stranger):
+            if await h.stops(r.credentials[party], handle):
+                raise _violation("E18", f"{party}'s credential can stop or fence the job")
         for party, credential in r.credentials.items():
             if await h.controls(credential):
                 raise _violation("E18", f"{party}'s credential holds control power")
+        untouched = await r.observe(handle, holds, pin)
+        if not _running_verified(untouched):
+            raise _violation("E18", f"a party's probe stopped the job's run: {untouched}")
     finally:
         await r.e.cancel(handle, stop=Stop.END, pin=pin, reason="done")
-    return "isolation: a credential reaches its party's job only, and holds no control power"
+    return (
+        "isolation: the seller's credential reaches its job's run, the buyer's and a "
+        "stranger's neither reach, stop nor fence it, and none holds control power"
+    )
 
 
 async def _e12(r: _Run) -> str:

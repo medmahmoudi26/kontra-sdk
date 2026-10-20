@@ -10,13 +10,15 @@ import subprocess
 import sys
 import typing
 from collections.abc import Callable
-from dataclasses import fields, is_dataclass
+from dataclasses import is_dataclass
 from hashlib import sha256
 
 import pytest
 from temporalio.api.common.v1 import Payload
 
 from kontra import _control, engine
+from kontra.codec import age
+from kontra.contract.names import OfferingId, Version
 from kontra.engine import (
     AGE_MAGIC,
     MEMBERS,
@@ -115,22 +117,52 @@ def test_no_member_authors_workflows() -> None:
     assert callables == [("stream", "closed")]
 
 
+#: The one exemption, by name: the catalog's :class:`~kontra.contract.names.OfferingId`, which
+#: ``expose``, ``quote`` and ``JobPlan`` take, is an offering's id, not a type of this seam. Its
+#: ``namespace`` and ``task_queue`` (and ``service_name``, which no word here catches) are
+#: ``kontra.contract.names`` derivations -- constructed, never parsed -- that only the Temporal
+#: adapter reads; another adapter ignores them (decisions I32).
+EXEMPT = frozenset({("OfferingId", "namespace"), ("OfferingId", "task_queue")})
+
+
+def _dataclasses_in(hint: object) -> set[type]:
+    found: set[type] = set()
+    for arg in (hint, *typing.get_args(hint)):
+        if is_dataclass(arg) and isinstance(arg, type):
+            found.add(arg)
+        elif arg is not hint:
+            found |= _dataclasses_in(arg)
+    return found
+
+
 def test_no_temporal_concept_is_in_the_protocols_types() -> None:
     """Designed against Golem: no namespace, task queue, run id, Nexus endpoint or history in
-    a member, a parameter, or a field of anything the Protocol hands over or takes."""
-    types: set[type] = set()
+    a member, a parameter, or a public attribute (field, property or method) of anything the
+    Protocol hands over or takes, or of the types inside those -- but :data:`EXEMPT`."""
+    types: set[type] = {Observation, engine.StreamItem, engine.Liveness, engine.Isolation}
     for member in sorted(MEMBERS - {"name"}):
         fn = getattr(Engine, member)
         for param in inspect.signature(fn).parameters:
             assert not _words(param) & TEMPORAL_WORDS, (member, param)
         for hint in typing.get_type_hints(fn).values():
-            for arg in (hint, *typing.get_args(hint)):
-                if is_dataclass(arg) and isinstance(arg, type):
-                    types.add(arg)
-    types |= {Observation, engine.StreamItem, engine.Liveness, engine.Isolation, JobPlan}
-    for cls in types:
-        for f in fields(cls):
-            assert not _words(f.name) & TEMPORAL_WORDS, (cls.__name__, f.name)
+            types |= _dataclasses_in(hint)
+    todo, seen = list(types), set[type]()
+    while todo:
+        cls = todo.pop()
+        if cls in seen:
+            continue
+        seen.add(cls)
+        for hint in typing.get_type_hints(cls).values():
+            todo.extend(_dataclasses_in(hint))
+    assert {OfferingId, Version, JobPlan, Observation, SealedPayload} <= seen
+    hits = {
+        (cls.__name__, name)
+        for cls in seen
+        for name in dir(cls)
+        if not name.startswith("_") and _words(name) & TEMPORAL_WORDS
+    }
+    assert hits == EXEMPT
+    for cls in seen:
         assert not _words(cls.__name__.lower()) & TEMPORAL_WORDS, cls.__name__
 
 
@@ -187,7 +219,14 @@ def _envelope(encoding: bytes, data: bytes, **meta: bytes) -> bytes:
     return Payload(metadata=metadata, data=data).SerializeToString(deterministic=True)
 
 
-AGE = AGE_MAGIC + b"-> X25519 stanza\n--- mac\nciphertext"
+#: A real age file (to a key nobody keeps), and the shapes that only look like one.
+AGE = age.encrypt(b"ciphertext", [age.generate_identity()[1]])
+LOOKALIKES = (
+    AGE_MAGIC + b'{"secret":"plaintext after the version line"}',
+    AGE_MAGIC + b"-> X25519 stanza\n--- mac\nciphertext",
+    AGE[: AGE.index(b"\n---") + 1],  # a header cut before its MAC line
+    AGE[: -(len(b"ciphertext") + 16)],  # the header and the nonce, no sealed chunk
+)
 REF = b'{"sha256":"' + b"a" * 64 + b'","size":10}'
 
 
@@ -218,6 +257,7 @@ def test_a_sealed_payload_is_the_codecs_envelope(data: bytes) -> None:
         ).SerializeToString(deterministic=True),
         Payload(metadata={"encoding": b"binary/kontra-age"}, data=AGE).SerializeToString(),
         _envelope(b"binary/kontra-age", AGE) + b"\x00",
+        *(_envelope(b"binary/kontra-age", like) for like in LOOKALIKES),
     ],
     ids=[
         "empty",
@@ -230,6 +270,10 @@ def test_a_sealed_payload_is_the_codecs_envelope(data: bytes) -> None:
         "version-2",
         "unversioned",
         "trailing-byte",
+        "plaintext-after-the-version-line",
+        "a-header-that-does-not-parse",
+        "no-mac-line",
+        "no-sealed-chunk",
     ],
 )
 def test_anything_else_is_not_sealed(data: bytes) -> None:
@@ -238,15 +282,18 @@ def test_anything_else_is_not_sealed(data: bytes) -> None:
 
 
 def test_a_stream_item_is_an_age_file() -> None:
+    """Structurally, not by its first line: plaintext behind ``age-encryption.org/v1`` is not
+    an age file (no key is needed to tell)."""
     assert Sealed(AGE).data == AGE
-    for bad in (b"", b"plaintext", AGE[1:]):
+    for bad in (b"", b"plaintext", AGE[1:], *LOOKALIKES):
         with pytest.raises(NotSealed):
             Sealed(bad)
 
 
 def test_an_observation_carries_a_result_only_as_a_delivery() -> None:
     """The type guarantee behind "ciphertext only": a result travels only with a verified
-    completion, and the digest and size are of exactly its bytes."""
+    completion, a verified completion only with its result (escrow pays it as a delivery),
+    and the digest and size are of exactly its bytes -- never of bytes nobody handed over."""
     data = _envelope(b"binary/kontra-age", AGE)
     sealed = SealedPayload(data)
     ok = Observation(
@@ -262,8 +309,14 @@ def test_an_observation_carries_a_result_only_as_a_delivery() -> None:
         lambda: Observed(replace_(ok, provenance=Provenance.NOT_FROM_BUYER), sealed),
         lambda: Observed(replace_(ok, result_sha256="0" * 64), sealed),
         lambda: Observed(replace_(ok, result_size=1), sealed),
-        lambda: Observed(replace_(ok, pin="a pin with spaces")),
-        lambda: Observed(replace_(ok, pin="p" * 129)),
+        lambda: Observed(replace_(ok, pin="a pin with spaces"), sealed),
+        lambda: Observed(replace_(ok, pin="p" * 129), sealed),
+        # A delivery without its bytes: with the digest of something else, or with none.
+        lambda: Observed(ok),
+        lambda: Observed(replace_(ok, result_sha256=None, result_size=None)),
+        # A digest on what is no delivery.
+        lambda: Observed(replace_(ok, status=ObservedStatus.UNSEALED)),
+        lambda: Observed(replace_(ok, status=ObservedStatus.RUNNING, result_sha256=None)),
     ]
     for make in bad:
         with pytest.raises(ValueError, match=r"result|digest|pin"):

@@ -1,6 +1,9 @@
 """Deliberately broken engines: each is :class:`~kontra.testing.FakeEngine` with one bug a real
-adapter could plausibly have. The engine contract must reject every one of them (seam ⑥, as
-``tests/ledger/broken_ledgers.py`` is for seam ④)."""
+adapter could plausibly have. The engine contract must reject every one of them, each on the
+rule its bug breaks, and every rule rejects at least one (seam ⑥, as
+``tests/ledger/broken_ledgers.py`` is for seam ④): a later edit that weakens a check is
+caught here, in this repository and in the copy of the contract the platform runs against its
+own adapter."""
 
 from __future__ import annotations
 
@@ -8,17 +11,22 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Collection
 from dataclasses import replace
 from datetime import datetime
 from hashlib import sha256
-from typing import Literal
+from typing import Literal, cast
 
 from temporalio.api.common.v1 import Payload
 
+from kontra.codec import age
+from kontra.contract.names import OfferingId
 from kontra.engine import (
-    AGE_MAGIC,
     EngineError,
+    EngineName,
     Fenced,
+    Isolation,
     JobHandle,
     Observed,
     Pin,
+    QuoteAnswer,
+    QuoteKind,
     Sealed,
     SealedPayload,
     Stop,
@@ -34,6 +42,59 @@ def _forged(data: bytes) -> SealedPayload:
     bad = object.__new__(SealedPayload)
     object.__setattr__(bad, "data", data)
     return bad
+
+
+def _forged_observed(observation: Observation, result: SealedPayload | None) -> Observed:
+    """An Observed that skipped its own check."""
+    bad = object.__new__(Observed)
+    object.__setattr__(bad, "observation", observation)
+    object.__setattr__(bad, "result", result)
+    return bad
+
+
+class UnknownName(FakeEngine):
+    """Calls itself by a name no gate dispatches by."""
+
+    @property
+    def name(self) -> EngineName:
+        return cast(EngineName, "golem")
+
+
+class OneCredentialPerParty(FakeEngine):
+    """Mints one credential per party, whatever the session: revoking one session's leaves
+    another session's working."""
+
+    async def isolate(self, party: str, *, session: str | None = None) -> Isolation:
+        iso = await super().isolate(party, session=session)
+        if iso.credential is None:
+            return iso
+        mine = next((c for c, p in self.credentials.items() if p == party), iso.credential)
+        return replace(iso, credential=mine)
+
+
+class RunningBeforeStart(FakeEngine):
+    """Reports a job nothing started as running (a buyer could then cancel it as one)."""
+
+    async def observe(
+        self, handle: JobHandle, *, pin: Pin | None, holds: Collection[str]
+    ) -> Observed:
+        seen = await super().observe(handle, pin=pin, holds=holds)
+        if seen.observation.status is ObservedStatus.NOT_FOUND:
+            return Observed(replace(seen.observation, status=ObservedStatus.RUNNING))
+        return seen
+
+
+class BytelessDelivery(FakeEngine):
+    """Hands over a verified completion's digest but not its bytes (by forging the type):
+    escrow would pay for a delivery the gate does not hold."""
+
+    async def observe(
+        self, handle: JobHandle, *, pin: Pin | None, holds: Collection[str]
+    ) -> Observed:
+        seen = await super().observe(handle, pin=pin, holds=holds)
+        if seen.result is None:
+            return seen
+        return _forged_observed(seen.observation, None)
 
 
 class DoubleStart(FakeEngine):
@@ -68,10 +129,77 @@ class RevivableEnd(FakeEngine):
                 run.status = ObservedStatus.COMPLETED
                 run.result = Payload(
                     metadata={"encoding": b"binary/kontra-age", "kontra-v": b"1"},
-                    data=AGE_MAGIC + b"revived",
+                    data=age.encrypt(b"revived", [age.generate_identity()[1]]),
                 ).SerializeToString(deterministic=True)
                 return True
         return False
+
+
+class CancelIgnoresPin(FakeEngine):
+    """A stop with a pin stops every open run of the job, not only the pinned lineage."""
+
+    async def cancel(self, handle: JobHandle, *, stop: Stop, pin: Pin | None, reason: str) -> None:
+        await super().cancel(handle, stop=stop, pin=None, reason=reason)
+
+
+class EndOverwritesDelivery(FakeEngine):
+    """END after a completion turns the delivery into a termination."""
+
+    async def cancel(self, handle: JobHandle, *, stop: Stop, pin: Pin | None, reason: str) -> None:
+        await super().cancel(handle, stop=stop, pin=pin, reason=reason)
+        job = self._jobs.get(_parse(handle)["job"])
+        for run in job.runs if job is not None and stop is Stop.END else ():
+            if pin is None or run.pin == pin:
+                run.status, run.result = ObservedStatus.TERMINATED, None
+
+
+class AskIsEnd(FakeEngine):
+    """ASK ends the run: a seller that would have completed is cut off."""
+
+    async def cancel(self, handle: JobHandle, *, stop: Stop, pin: Pin | None, reason: str) -> None:
+        await super().cancel(handle, stop=Stop.END, pin=pin, reason=reason)
+
+
+class VerifiesSellerRuns(FakeEngine):
+    """A run that carries no hold at all -- the seller's own -- is taken as the buyer's."""
+
+    def _verified(self, run: _Run, holds: Collection[str]) -> bool:
+        return run.hold is None or super()._verified(run, holds)
+
+
+class BuyerNeverCancels(FakeEngine):
+    """Never reports the buyer's withdrawal of its own start: a buyer who withdrew is
+    refunded against the seller."""
+
+    async def observe(
+        self, handle: JobHandle, *, pin: Pin | None, holds: Collection[str]
+    ) -> Observed:
+        seen = await super().observe(handle, pin=pin, holds=holds)
+        return Observed(replace(seen.observation, buyer_canceled=False), seen.result)
+
+
+class RaisesOnRefusal(FakeEngine):
+    """Raises when the seller's quote fails, as if the engine could not be asked."""
+
+    async def quote(
+        self,
+        offering: OfferingId,
+        input: bytes,
+        *,
+        timeout: float,  # noqa: ASYNC109 -- the call's own timeout
+    ) -> QuoteAnswer:
+        answer = await super().quote(offering, input, timeout=timeout)
+        if answer.kind is QuoteKind.REFUSED:
+            raise EngineError(answer.message)
+        return answer
+
+
+class RepointsRoutes(FakeEngine):
+    """A route exposed again for another offering is repointed at it."""
+
+    async def expose(self, offering: OfferingId, route: str) -> None:
+        self.routes.pop(route, None)
+        await super().expose(offering, route)
 
 
 class TrustsAnyRun(FakeEngine):
@@ -140,6 +268,22 @@ class StrangerReaches(FakeEngine):
     """A credential reaches every job, its party's or not."""
 
     def reaches(self, credential: str, handle: JobHandle) -> bool:
+        return credential in self.credentials
+
+
+class BuyerReaches(FakeEngine):
+    """The buyer's credential reaches the seller's side of the job (its run), not only its
+    own start."""
+
+    def reaches(self, credential: str, handle: JobHandle) -> bool:
+        plan = _parse(handle)
+        return self.credentials.get(credential) in (plan["seller"], plan["buyer"])
+
+
+class OutsiderStops(FakeEngine):
+    """Any party's credential can stop a job's run, the seller's or not."""
+
+    def stops(self, credential: str, handle: JobHandle) -> bool:
         return credential in self.credentials
 
 
@@ -241,6 +385,19 @@ class PlaintextItems(FakeEngine):
 
 
 BROKEN: tuple[type[FakeEngine], ...] = (
+    UnknownName,
+    OneCredentialPerParty,
+    RunningBeforeStart,
+    BytelessDelivery,
+    CancelIgnoresPin,
+    EndOverwritesDelivery,
+    AskIsEnd,
+    VerifiesSellerRuns,
+    BuyerNeverCancels,
+    RaisesOnRefusal,
+    RepointsRoutes,
+    BuyerReaches,
+    OutsiderStops,
     DoubleStart,
     SoftEnd,
     RevivableEnd,

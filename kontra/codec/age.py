@@ -57,6 +57,7 @@ __all__ = [
     "encrypt_stream",
     "generate_identity",
     "header_size",
+    "is_age_file",
     "is_identity",
     "is_recipient",
     "new_header",
@@ -397,6 +398,20 @@ def _parse_header(buf: bytes | bytearray) -> tuple[list[_Stanza], bytes, bytes, 
             if len(body_line) < 64:
                 break
         stanzas.append(_Stanza(args, _unb64(b"".join(body_lines))))
+
+
+def is_age_file(data: bytes) -> bool:
+    """Whether ``data`` has an age v1 file's structure: the version line, at least one
+    well-formed recipient stanza, the header's MAC line, the payload nonce, and at least one
+    sealed chunk's tag after it. Nothing is decrypted and no key is needed, so it says what
+    the bytes are shaped as, not to whom they are sealed: plaintext behind the version line
+    is refused, a forged header is not (seam ⑥'s ``Sealed`` and ``check_sealed``, decisions
+    I32: a check against a seller side that did not seal, not against one that forges)."""
+    try:
+        parsed = _parse_header(data)
+    except AgeError:
+        return False
+    return parsed is not None and len(data) - parsed[3] >= _NONCE + _TAG
 
 
 def _identities(identity: str | Sequence[str]) -> list[X25519PrivateKey]:

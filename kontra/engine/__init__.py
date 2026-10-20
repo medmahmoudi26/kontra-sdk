@@ -13,14 +13,20 @@ only through :class:`Engine`. An adapter implements it on one engine --
 
 Nothing here names an engine's own concepts: no namespace, task queue, run id, Nexus endpoint
 or history appears in a type or a parameter (the Protocol was designed against Golem, a Wasm
-engine, as well as Temporal). A job is a :data:`JobHandle` the adapter minted, the lineage
-escrow pins is a :data:`Pin`, a party's place in the engine is an :class:`Isolation`, and
-content leaves an adapter only as :class:`SealedPayload` (a delivery) or :class:`Sealed` (a
-relayed stream item): ciphertext, checked when the value is built. End-to-end encryption is a
-guarantee of this seam (I7), not an engine feature: the seller side of the engine seals
-(Temporal: ``KontraCodec`` under ``KontraPlugin``), and an adapter verifies, and withholds what
-is not sealed (:attr:`~kontra.escrow.ObservedStatus.UNSEALED`). The one plaintext that crosses
-is a quote's answer: a price (I4).
+engine, as well as Temporal). The one exemption is not this seam's type: the catalog's
+:class:`~kontra.contract.names.OfferingId` that :meth:`Engine.expose`, :meth:`Engine.quote` and
+:class:`JobPlan` take carries ``namespace``, ``task_queue`` and ``service_name``, which are
+:mod:`kontra.contract.names` derivations of the offering (constructed, never parsed) that only
+the Temporal adapter reads; another adapter ignores them.
+
+A job is a :data:`JobHandle` the adapter minted, the lineage escrow pins is a :data:`Pin`, a
+party's place in the engine is an :class:`Isolation`, and content leaves an adapter only as
+:class:`SealedPayload` (a delivery) or :class:`Sealed` (a relayed stream item): ciphertext,
+checked when the value is built. End-to-end encryption is a guarantee of this seam (I7), not
+an engine feature: the seller side of the engine seals (Temporal: ``KontraCodec`` under
+``KontraPlugin``), and an adapter verifies, and withholds what is not sealed
+(:attr:`~kontra.escrow.ObservedStatus.UNSEALED`). The one plaintext that crosses is a quote's
+answer: a price (I4).
 
 A handle is opaque bytes. Only the adapter that minted it parses it, strictly and before any
 I/O (:class:`InvalidHandle`); it is never shown to a party and never used to authorize
@@ -163,13 +169,20 @@ class NotSealed(ValueError):
 @dataclass(frozen=True, slots=True)
 class Sealed:
     """One age v1 file: a relayed stream item, sealed by the seller side of the engine per
-    item (decisions I31). Checked on construction: anything else is :class:`NotSealed`."""
+    item (decisions I31). Checked on construction, structurally
+    (:func:`kontra.codec.age.is_age_file`, imported lazily: the version line, a recipient
+    stanza, the header MAC, the nonce, a sealed chunk): anything else is
+    :class:`NotSealed`."""
 
     data: bytes
 
     def __post_init__(self) -> None:
         if not isinstance(self.data, bytes) or not self.data.startswith(AGE_MAGIC):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise NotSealed("a stream item must be an age v1 file")
+        from kontra.codec.age import is_age_file
+
+        if not is_age_file(self.data):
+            raise NotSealed("a stream item must be an age v1 file, not its first line")
 
 
 @final
@@ -254,9 +267,12 @@ class Fenced(StrEnum):
 @dataclass(frozen=True, slots=True)
 class Observed:
     """One observation (:meth:`Engine.observe`). ``observation`` is escrow's own type.
-    ``result`` is set for a verified completion only, and ``observation.result_sha256`` /
-    ``result_size`` are over exactly ``result.data``: checked on construction, so an adapter
-    cannot hand over a delivery escrow would not count, or count one it did not get."""
+    ``result`` is set for a verified completion, and only for one: escrow pays a verified
+    completion as a delivery, so one without its sealed bytes cannot be built (an adapter
+    with no bytes reports UNSEALED, or raises :class:`EngineError`). The observation's
+    ``result_sha256`` and ``result_size`` are over exactly ``result.data``, and absent
+    without a result. Checked on construction, so an adapter cannot hand over a delivery
+    escrow would not count, or count one it did not get."""
 
     observation: Observation
     result: SealedPayload | None = None
@@ -265,9 +281,14 @@ class Observed:
         o = self.observation
         if o.pin is not None and _PIN.fullmatch(o.pin) is None:
             raise ValueError(f"a pin is printable ASCII, at most {PIN_MAX} characters")
+        delivered = o.status is ObservedStatus.COMPLETED and o.provenance is Provenance.VERIFIED
         if self.result is None:
+            if delivered:
+                raise ValueError("a verified completion carries its result (else: UNSEALED)")
+            if o.result_sha256 is not None or o.result_size is not None:
+                raise ValueError("a digest without a result: of bytes nobody handed over")
             return
-        if o.status is not ObservedStatus.COMPLETED or o.provenance is not Provenance.VERIFIED:
+        if not delivered:
             raise ValueError("only a verified completion carries a result")
         if (o.result_sha256, o.result_size) != (
             sha256(self.result.data).hexdigest(),
@@ -458,9 +479,10 @@ class Engine(Protocol):
 
         Before any start the status is NOT_FOUND, never an exception and never RUNNING. With
         ``pin``, the observation is of that lineage only, never of another run of the job. A
-        completion whose result is not Kontra ciphertext is reported UNSEALED and its bytes
-        are withheld. "Cannot say" is an exception, never a status: :class:`EngineError`,
-        :class:`PartyLookupError`, :class:`ObservationIncomplete`.
+        verified completion whose result is not Kontra ciphertext, or that has none, is
+        reported UNSEALED and its bytes are withheld (:class:`Observed` refuses a verified
+        completion without its result). "Cannot say" is an exception, never a status:
+        :class:`EngineError`, :class:`PartyLookupError`, :class:`ObservationIncomplete`.
 
         Temporal: ``Control.observe`` (describe; the request id, callbacks and links resolved
         in the buyer's namespace; the first run id; the chain walk)."""
@@ -510,7 +532,8 @@ class Engine(Protocol):
         reports the job closed and nothing is left, or :class:`StreamStopped`. An item of a
         topic not asked for is never yielded, and a buyer's word never moves the offset. The
         credential the relay uses is minted inside the adapter, confined to this job's
-        stream and revocable by ``session``.
+        stream and revocable by ``session``, and minted again before it expires: a stream
+        lasts as long as its job, not as one credential.
 
         Temporal: :func:`kontra._relay.relay` with the relay principal
         (``sub = relay/<namespace>/job-<id>``, I30) and ``first_execution_run_id = pin``,

@@ -453,7 +453,7 @@ async def await_reply(
     raise StreamEnded
 
 
-#: ``model_validate``'s ``by_alias``/``by_name`` (pydantic 2.11; kontra-sdk takes 2.9 up).
+#: ``model_validate``'s ``by_alias``/``by_name`` (pydantic 2.11; kontra-sdk takes 2.12 up).
 _BY_NAME = "by_name" in inspect.signature(BaseModel.model_validate).parameters
 
 

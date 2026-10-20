@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -20,9 +20,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from temporalio.api.common.v1 import Payload, Payloads
 from temporalio.api.update.v1 import Outcome
-from temporalio.api.workflow.v1 import WorkflowExecutionInfo
 from temporalio.api.workflowservice.v1 import (
-    DescribeWorkflowExecutionResponse,
     UpdateWorkflowExecutionResponse,
 )
 
@@ -36,13 +34,13 @@ from kontra._control import (
     NexusSyncResult,
     Occupation,
     TemporalError,
+    internal_relay_service,
 )
 from kontra._control import ObservationIncomplete as ChainIncomplete
 from kontra.codec import stream as s
 from kontra.codec.age import encrypt, generate_identity
 from kontra.contract.names import OfferingId, job_workflow_id, relay_subject
 from kontra.engine import (
-    AGE_MAGIC,
     EngineError,
     Fenced,
     InvalidHandle,
@@ -54,6 +52,7 @@ from kontra.engine import (
     QuoteKind,
     RouteConflict,
     Stop,
+    StreamBatch,
     StreamStopped,
 )
 from kontra.engine.temporal import AUD_TEMPORAL, HANDLE_PREFIX, TemporalEngine, worker_token
@@ -96,7 +95,8 @@ class Signer:
 
 def sealed_result(text: bytes = b"ciphertext") -> bytes:
     return Payload(
-        metadata={"encoding": b"binary/kontra-age", "kontra-v": b"1"}, data=AGE_MAGIC + text
+        metadata={"encoding": b"binary/kontra-age", "kontra-v": b"1"},
+        data=encrypt(text, [generate_identity()[1]]),
     ).SerializeToString(deterministic=True)
 
 
@@ -112,6 +112,8 @@ class Recorder:
     )
     occupation: Occupation = Occupation.OCCUPIED
     fail: Exception | None = None
+    #: What history_size answers: (events, bytes) of the run's history (the relay's pace).
+    history: tuple[int, int] | None = (10, 1000)
 
     def _call(self, *call: Any) -> None:
         self.calls.append(call)
@@ -155,6 +157,9 @@ class Recorder:
     ) -> HistorySummary | None:
         self._call("history_summary", namespace, workflow_id, pinned)
         return self.summary
+
+    async def history_size(self, namespace: str, workflow_id: str) -> tuple[int, int] | None:
+        return self.history
 
     async def cancel_workflow(
         self, namespace: str, workflow_id: str, reason: str, first_run_id: str = ""
@@ -202,7 +207,7 @@ class Recorder:
 
 def engine(control: Recorder | None = None, **kw: Any) -> tuple[TemporalEngine, Recorder, Signer]:
     control = control or Recorder()
-    signer = Signer()
+    signer: Signer = kw.pop("signer", None) or Signer()
     kw.setdefault("clock", lambda: NOW)
     return TemporalEngine(control, signer=signer, address="frontend:7233", **kw), control, signer
 
@@ -385,6 +390,32 @@ async def test_an_unsealed_delivery_is_withheld() -> None:
     )
 
 
+@pytest.mark.parametrize("digest", [None, "a" * 64], ids=["no-digest", "a-digest"])
+async def test_a_verified_completion_without_bytes_is_no_delivery(digest: str | None) -> None:
+    """A control plane (a double, a future one) that answers a verified completion with no
+    stored bytes -- with or without a digest of some -- never has escrow pay a delivery the
+    gate does not hold: it is UNSEALED, refunded against the seller."""
+    e, control, _ = engine()
+    control.observation = (
+        Observation(
+            ObservedStatus.COMPLETED,
+            provenance=Provenance.VERIFIED,
+            pin="run-1",
+            result_sha256=digest,
+            result_size=None if digest is None else 5,
+        ),
+        None,
+    )
+    seen = await e.observe(GOLDEN, pin=None, holds=())
+    o = seen.observation
+    assert (seen.result, o.status, o.result_sha256, o.result_size) == (
+        None,
+        ObservedStatus.UNSEALED,
+        None,
+        None,
+    )
+
+
 async def test_only_a_verified_completion_hands_over_bytes() -> None:
     e, control, _ = engine()
     for status, provenance in [
@@ -478,13 +509,12 @@ async def test_workers_is_the_task_queues_view() -> None:
 
 @dataclass
 class Frontend:
-    """The relay's two calls and the observer's describe, answered from a log of items."""
+    """The relay's two calls, answered from a log of items."""
 
     log: list[tuple[str | None, bytes]]
     polls: list[tuple[list[str], int, str]] = field(
         default_factory=list[tuple[list[str], int, str]]
     )
-    history: tuple[int, int] = (10, 1000)
     failure: str | None = None
 
     @property
@@ -516,23 +546,39 @@ class Frontend:
         resp.update_ref.workflow_execution.run_id = "run-1"
         return resp
 
-    async def describe_workflow_execution(self, req: Any, retry: bool = False, metadata: Any = None, timeout: Any = None) -> DescribeWorkflowExecutionResponse:  # noqa: ASYNC109  # fmt: skip
-        length, size = self.history
-        info = WorkflowExecutionInfo(history_length=length, history_size_bytes=size)
-        return DescribeWorkflowExecutionResponse(workflow_execution_info=info)
-
 
 class WithClient(Recorder):
+    """A control plane whose client is a dev server's one frontend."""
+
     def __init__(self, frontend: Frontend) -> None:
         super().__init__()
         self.client = frontend
+
+
+@dataclass
+class Dialled:
+    """The relay's frontend as one token dialled it: every call records that token's expiry
+    and the gate's clock when the call was made."""
+
+    frontend: Frontend
+    expires: int
+    clock: Callable[[], datetime]
+    calls: list[tuple[int, datetime]]
+
+    async def update_workflow_execution(self, req: Any, retry: bool = False, metadata: Any = None, timeout: Any = None) -> UpdateWorkflowExecutionResponse:  # noqa: ASYNC109  # fmt: skip
+        self.calls.append((self.expires, self.clock()))
+        return await self.frontend.update_workflow_execution(req, retry, metadata, timeout)
+
+    async def query_workflow(self, req: Any, retry: bool = False, metadata: Any = None, timeout: Any = None) -> Any:  # noqa: ASYNC109  # fmt: skip
+        raise AssertionError("not asked for the tail")
 
 
 async def test_stream_relays_the_pinned_chain_as_sealed_items() -> None:
     _secret, recipient = generate_identity()
     ct = encrypt(b"item", [recipient])
     frontend = Frontend([("events", ct), (None, ct), ("events", ct)])
-    e, _, _ = engine(WithClient(frontend), relay_interval=0.01)
+    control = WithClient(frontend)
+    e, _, _ = engine(control, relay_service=internal_relay_service(control), relay_interval=0.01)
     polls = 0
 
     async def closed() -> bool:
@@ -581,7 +627,87 @@ async def test_the_relay_token_is_the_jobs_own_and_never_a_partys() -> None:
     assert "permissions" not in claims
 
 
+async def test_the_relay_token_is_minted_again_before_it_expires() -> None:
+    """Over the public frontend a token is refused once it expires (decisions I30: 15
+    minutes), and a job's stream lasts as long as the job: the adapter dials again with a
+    fresh token once half the last one's life is spent, so no poll is ever made with an
+    expired token, however long the relay runs."""
+    _secret, recipient = generate_identity()
+    frontend = Frontend([("events", encrypt(b"item", [recipient]))])
+    now = NOW
+    calls: list[tuple[int, datetime]] = []
+    claims: list[dict[str, Any]] = []
+    signer = Signer()
+
+    async def relay_service(token: str) -> Dialled:
+        claims.append(signer.claims(token))
+        return Dialled(frontend, claims[-1]["exp"], lambda: now, calls)
+
+    e, _, _ = engine(
+        signer=signer, relay_service=relay_service, relay_interval=0.01, clock=lambda: now
+    )
+    polls = 0
+
+    async def closed() -> bool:  # each poll answered, the gate's clock moves 5 minutes on
+        nonlocal polls, now
+        polls += 1
+        now += timedelta(minutes=5)
+        return polls > 12
+
+    batches = [
+        b
+        async for b in e.stream(
+            GOLDEN, pin=Pin("run-1"), topics=["events"], after=0, closed=closed, session="sid"
+        )
+    ]
+    assert [i.offset for b in batches for i in b.items] == [0]
+    assert len(calls) > 10  # the relay ran for about an hour of the gate's clock
+    assert all(at.timestamp() < expires for expires, at in calls), calls
+    assert len(claims) >= 4  # one 15-minute token could not have carried it
+    assert {c["sub"] for c in claims} == {relay_subject("acme", JOB)}
+    assert {c["sid"] for c in claims} == {"sid"}  # a revoked session still ends the relay
+
+
+async def test_the_relay_is_paced_through_the_control_plane() -> None:
+    """The relay's pace reads the run's history through the control plane
+    (``Control.history_size``), never around it: a control plane with no client of its own
+    still stops a relay past half the server's limits."""
+    _secret, recipient = generate_identity()
+    frontend = Frontend([("events", encrypt(b"item", [recipient]))])
+    control = Recorder(history=(600, 0))
+    assert not hasattr(control, "client")
+
+    async def relay_service(token: str) -> Frontend:
+        return frontend
+
+    e, _, _ = engine(
+        control, relay_service=relay_service, relay_interval=0.01, history_limits=(1000, 10**9)
+    )
+    polls = 0
+
+    async def closed() -> bool:
+        nonlocal polls
+        polls += 1
+        return polls > 50
+
+    got: list[StreamBatch] = []
+
+    async def drain() -> None:
+        async for b in e.stream(
+            GOLDEN, pin=Pin("run-1"), topics=["events"], after=0, closed=closed, session="s"
+        ):
+            got.append(b)
+
+    with pytest.raises(StreamStopped) as stopped:
+        await drain()
+    assert stopped.value.reason == "budget"
+    assert [i.offset for b in got for i in b.items] == [0]
+
+
 async def test_an_adapter_with_no_frontend_relays_no_streams() -> None:
+    """No ``relay_service`` (and a control plane without a frontend of its own gives none:
+    ``internal_relay_service``): no streams."""
+    assert internal_relay_service(Recorder()) is None
     e, _, _ = engine()
 
     async def never() -> bool:

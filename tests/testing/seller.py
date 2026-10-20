@@ -5,9 +5,9 @@ gate's JWKS (D10, decisions I10) and starts ``job-<id>`` (decisions I6).
 
 Its client (:func:`sealing`) puts a job's payloads in the codec's delivery envelope
 (:class:`EnvelopeCodec`), as a seller's ``KontraCodec`` would: an engine adapter hands the gate
-nothing else as a delivery (seam ⑥, decisions I32). The envelope is the format only -- an age
-file's first line, then the payload in the clear -- so a test reads the result back with
-:func:`unseal_payload`; the real encryption is ``test_payloads_stay_ciphertext_end_to_end``'s."""
+nothing else as a delivery (seam ⑥, decisions I32). The payload is sealed to a key only these
+tests hold (:data:`ENVELOPE_KEY`), not to the job's, so a test reads the result back with
+:func:`unseal_payload`; the job keys' encryption is ``test_payloads_stay_ciphertext_end_to_end``'s."""
 
 from __future__ import annotations
 
@@ -36,28 +36,28 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.nexus import WorkflowRunOperationContext
 from temporalio.worker import Worker
 
+from kontra.codec import age
 from kontra.contract.names import job_id_from_workflow_id, job_workflow_id
-from kontra.engine import AGE_MAGIC
 from kontra.gate_client import models as m
 
 from .seller_flows import EnrichJob, Order, shout
 
 PRICE_PER_CHAR = 100
 _SEALED = b"binary/kontra-age"
+#: The age identity and recipient :class:`EnvelopeCodec` seals to (see the module docstring).
+ENVELOPE_KEY = age.generate_identity()
 
 
 def seal_payload(p: Payload) -> Payload:
-    """``p`` in the delivery envelope's format (not encrypted: see the module docstring)."""
-    return Payload(
-        metadata={"encoding": _SEALED, "kontra-v": b"1"}, data=AGE_MAGIC + p.SerializeToString()
-    )
+    """``p`` in the delivery envelope, an age file to :data:`ENVELOPE_KEY`."""
+    ciphertext = age.encrypt(p.SerializeToString(), [ENVELOPE_KEY[1]])
+    return Payload(metadata={"encoding": _SEALED, "kontra-v": b"1"}, data=ciphertext)
 
 
 def unseal_payload(p: Payload) -> Payload:
     if p.metadata.get("encoding") != _SEALED:
         return p
-    assert p.data.startswith(AGE_MAGIC)
-    return Payload.FromString(p.data[len(AGE_MAGIC) :])
+    return Payload.FromString(age.decrypt(p.data, [ENVELOPE_KEY[0]]))
 
 
 class EnvelopeCodec(PayloadCodec, WithSerializationContext):
