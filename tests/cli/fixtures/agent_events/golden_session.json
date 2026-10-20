@@ -1,0 +1,22 @@
+{
+  "agent": {"case": "a", "interactive": false, "name": "ReconHarnessAgent.sweep", "offering": "acme/recon@1.0.0", "run_id": "0199f0a1-5c3e-7d2a-9b41-6e0c2f8d4a10", "status": "running", "type": "ReconHarnessAgent", "workflow_id": "job-7f3a9c2e5b0d4c1e8a6f2d9b3c7e1a40/agent"},
+  "footer": {"count": 23, "decrypted": "this machine's dev key", "dedupe": "offset", "last_offset": 22},
+  "schema": "temporal-agent-harness/0.6",
+  "truncated": false,
+  "turns": [
+    {"handler": "sweep", "input_keys": ["domains"], "input_summary": "12 domains", "status": "running", "turn_id": "t-0199f0a1", "turn_number": 1, "rows": [
+      {"at": 1760950000.0, "glyph": "▸", "label": "turn.started", "node": null, "offset": 1, "rt": "+00:00", "state": null, "summary": "input: 12 domains", "type": "turn.started"},
+      {"at": 1760950000.6, "glyph": "○", "label": "model.call", "node": null, "offset": 3, "rt": "+00:01", "state": "completed", "summary": "gpt-4o", "type": "model.call"},
+      {"at": 1760950001.4, "glyph": "○", "label": "model.response", "node": null, "offset": 6, "rt": "+00:01", "state": "completed", "summary": "“plan first”", "type": "model.response", "usage": "820→36"},
+      {"at": 1760950001.6, "event_id": 11, "glyph": "▣", "hint": "goal: sweep", "label": "tool.call", "node": "ReconHarnessAgent/plan", "offset": 7, "rt": "+00:02", "state": "completed", "summary": "plan", "tool_id": "call-plan-0", "tool_name": "plan", "type": "tool.call"},
+      {"at": 1760950002.2, "event_id": 11, "glyph": "▣", "label": "tool.result", "node": "ReconHarnessAgent/plan", "offset": 9, "rt": "+00:02", "state": "completed", "summary": "plan 12 targets", "tool_id": "call-plan-0", "tool_name": "plan", "type": "tool.result"},
+      {"at": 1760950002.5, "glyph": "○", "label": "model.call", "node": null, "offset": 10, "rt": "+00:02", "state": "completed", "summary": "gpt-4o", "type": "model.call"},
+      {"at": 1760950003.0, "glyph": "○", "label": "model.response", "node": null, "offset": 11, "rt": "+00:03", "state": "completed", "summary": null, "type": "model.response", "usage": "910→22"},
+      {"at": 1760950003.1, "event_id": 17, "glyph": "▣", "hint": "targets: 12", "label": "tool.call", "node": "ReconHarnessAgent/probe", "node_fallback": true, "offset": 12, "rt": "+00:03", "state": "completed", "summary": "probe", "tool_id": "call-probe-0", "tool_name": "probe", "type": "tool.call"},
+      {"at": 1760950003.8, "children": [{"at": 1760950004.2, "glyph": "○", "label": "model.call", "nested": true, "offset": 2, "state": "completed", "summary": "gpt-4o", "type": "model.call"}, {"at": 1760950004.6, "glyph": "▣", "label": "tool.call", "nested": true, "offset": 4, "state": "scheduled", "summary": "fetch_cert ×12", "type": "tool.call"}, {"at": 1760950006.0, "glyph": "▸", "label": "response", "nested": true, "offset": 16, "state": "completed", "summary": "{expired:1, weak:2}", "type": "response"}], "fetched": true, "glyph": "◆", "label": "handoff", "node": "ReconHarnessAgent/CertChecker", "offset": 14, "rt": "+00:04", "state": "completed", "subagent_id": "a1b2c3-d4e5f6", "summary": "→ cert-checker", "type": "handoff", "workflow_id": "cert-checker-subagent-0199f0a1-9d43-7f71-8c55-4e6f8a0b2c34"},
+      {"at": 1760950007.0, "event_id": 17, "glyph": "▣", "label": "tool.result", "node": "ReconHarnessAgent/probe", "node_fallback": true, "offset": 18, "rt": "+00:07", "state": "completed", "summary": "probe 12/12", "tool_id": "call-probe-0", "tool_name": "probe", "type": "tool.result"},
+      {"at": 1760950007.5, "auto": "escalate", "glyph": "▢", "hint": "to: slack #sec", "label": "approval.requested", "node": null, "offset": 19, "pending": true, "resolution": null, "rt": "+00:08", "state": "working", "summary": "post_findings", "tool_id": "call-post-0", "tool_name": "post_findings", "type": "approval.requested"}
+    ]}
+  ],
+  "version": 1
+}

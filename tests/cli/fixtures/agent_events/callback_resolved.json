@@ -1,0 +1,1 @@
+{"agent_id": "a1b2c3", "event": {"error": null, "outcome": "ok", "tool_id": "call-confirm-0", "tool_name": "confirm", "type": "callback_resolved"}, "message_id": "m-0199f0a1", "timestamp": 1760950000.0, "turn_id": "t-0199f0a1", "turn_number": 1}
