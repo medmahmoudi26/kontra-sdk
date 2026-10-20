@@ -1843,7 +1843,7 @@ result.
     JSON and refuse it without a member; the generated TypeScript client, compiled with
     `tsc --strict` and run, does the same; Go and Java generate. One case is left out of
     the Python run: nexgen refuses a member named `from` (I33's `Aliases`) for Python, a
-    reserved word, with no automatic rename -- older than I38; a follow-up.
+    reserved word, with no automatic rename -- older than I38; a follow-up (kontra-sdk#72).
   - *The buyer's SDK* (`kontra.hire`) validates every delivery against the published output
     schema and wraps it as `Record`s by that schema, unchanged: a delivery is now what the
     schema describes. `job.result(output_type=Model)` takes the buyer's own type, generated
@@ -1918,8 +1918,8 @@ result.
   For an input model with a split alias or an excluded required field, that round trip
   fails every job (measured: `{"out_a": ...}` against a model that reads `in_a`), although
   the contract (validation mode) describes the input exactly. Out of #63's scope, which is
-  the output; a follow-up.
-  Also older than I38 and left as they are, each a follow-up: a naive `datetime` or `time`
+  the output; a follow-up (kontra-sdk#70).
+  Also older than I38 and left as they are, each a follow-up (kontra-sdk#71, #72): a naive `datetime` or `time`
   output (`datetime.now()`) is written without an offset, which `format: date-time` (and
   nexgen's) refuses, so such a result fails the job (`AwareDatetime` describes the output
   exactly; refusing `datetime` outputs would refuse most sellers, an owner's call); a
