@@ -2,7 +2,13 @@
 
 Types-first (§11.1): the workflow's input and output pydantic models become JSON Schema
 2020-12 through pydantic's own ``models_json_schema``, then are *lowered* to nexgen's
-strict subset (decisions I2):
+strict subset (decisions I2). The contract describes what each side receives (decisions
+I38): the input in pydantic's *validation* mode (what a buyer may send), the output in
+*serialization* mode (what the buyer is delivered: temporalio's pydantic converter, and a
+bound handler's result, write ``model_dump(mode="json", by_alias=True)``) -- computed
+fields present, excluded fields absent, keyed by serialization alias, typed by a
+serializer's return type, and every field required, since the reply always carries it. A
+model whose two schemas differ is two definitions, ``ReportInput`` and ``ReportOutput``.
 
 * ``Optional[T]`` becomes ``oneOf: [T, {type: null}]`` (pydantic writes ``anyOf``);
   ``default: null`` is dropped (it is the absence of a default, and nexgen refuses it);
@@ -10,8 +16,9 @@ strict subset (decisions I2):
   setting -- a seller cannot open the contract (§11.3);
 * ``dict[str, T]`` stays a typed map; ``kontra.types.Artifact`` becomes the reserved
   ``KontraArtifact`` with the body from ``spec/``;
-* auto-generated titles (``"Urls"``) are dropped and ``required`` is sorted, so the hash
-  moves only when the contract does;
+* auto-generated titles (``"Urls"``) and ``readOnly``/``writeOnly`` (annotations nexgen's
+  subset lacks; pydantic marks a computed field ``readOnly``) are dropped and ``required``
+  is sorted, so the hash moves only when the contract does;
 * an enum or a constrained scalar pydantic names in ``$defs`` is written out where it is
   used, its use site's constraints *conjoined* with its own, never overriding them
   (:func:`inline_non_object_defs`);
@@ -34,6 +41,7 @@ from pydantic.json_schema import (
     CoreModeRef,
     DefsRef,
     GenerateJsonSchema,
+    JsonSchemaMode,
     JsonSchemaValue,
     models_json_schema,
 )
@@ -70,11 +78,36 @@ _ARTIFACT_REF_PREFIX = f"{Artifact.__module__}.{Artifact.__qualname__}:"
 _ARTIFACT = "KontraArtifact"
 
 
+#: Kontra's spelling of a definition whose two modes differ: ``ReportInput``, ``ReportOutput``
+#: (pydantic writes ``Report-Input``, and a contract's definition names are identifiers).
+_MODE_SUFFIX = {"validation": "Input", "serialization": "Output"}
+
+
 class _Generator(GenerateJsonSchema):
-    """pydantic's generator, minus the noise and with the reserved names pinned."""
+    """pydantic's generator, minus the noise and with the reserved names pinned. In
+    serialization mode (an output) every field the reply always carries is required and
+    no default is written: a default says what an *absent* member means, and an output's
+    member is never absent."""
 
     def field_title_should_be_set(self, schema: Any) -> bool:
         return False
+
+    def field_is_required(
+        self,
+        field: core_schema.ModelField | core_schema.DataclassField | core_schema.TypedDictField,
+        total: bool,
+    ) -> bool:
+        # pydantic's json_schema_serialization_defaults_required, for every model: a model's
+        # or a dataclass's dump writes every field (an exclude_if field may be left out); a
+        # TypedDict's writes only the keys the value has, so pydantic's rule stands there.
+        if self.mode == "serialization" and field["type"] != "typed-dict-field":
+            return field.get("serialization_exclude_if") is None
+        return super().field_is_required(field, total)
+
+    def default_schema(self, schema: core_schema.WithDefaultSchema) -> JsonSchemaValue:
+        if self.mode == "serialization":
+            return self.generate_inner(schema["schema"])
+        return super().default_schema(schema)
 
     def _drop_class_title(self, js: JsonSchemaValue, cls: type[Any]) -> JsonSchemaValue:
         config = getattr(cls, "model_config", {})
@@ -97,10 +130,21 @@ class _Generator(GenerateJsonSchema):
         return js if cls is None else self._drop_class_title(js, cls)
 
     def get_defs_ref(self, core_mode_ref: CoreModeRef) -> DefsRef:
+        """pydantic's choices of a name, most readable first, with Kontra's spelling of a
+        mode (pydantic falls back to it only where one model's two modes differ) and the
+        reserved ``KontraArtifact`` pinned. Construction only: nothing reads a name back."""
         ref = super().get_defs_ref(core_mode_ref)
-        core_ref, _mode = core_mode_ref
+        core_ref, mode = core_mode_ref
         if core_ref.startswith(_ARTIFACT_REF_PREFIX) and core_ref.endswith(f":{id(Artifact)}"):
             self._prioritized_defsref_choices[ref] = [DefsRef(_ARTIFACT), ref]
+            return ref
+        suffix = _MODE_SUFFIX[mode]
+        choices = self._prioritized_defsref_choices[ref]
+        # pydantic's own (``-Output``) stays last: it never collides, so a choice always exists
+        self._prioritized_defsref_choices[ref] = [
+            *(DefsRef(c.replace(f"-{suffix}", suffix)) for c in choices),
+            ref,
+        ]
         return ref
 
 
@@ -120,7 +164,8 @@ def lower_schema(node: Any, path: str) -> Any:
     if not src:
         raise ContractError(
             path,
-            "accepts anything (Any, or a bare list/dict); give it a type, e.g. list[str] or dict[str, int]",
+            "accepts anything (Any, a bare list/dict, or a serializer with no return "
+            "annotation); give it a type, e.g. list[str] or dict[str, int]",
         )
     out: dict[str, Any] = {}
     for key, value in src.items():
@@ -146,6 +191,8 @@ def lower_schema(node: Any, path: str) -> Any:
             raise ContractError(path, "is a tuple (prefixItems); use a model or list[T]")
         if key == "discriminator":
             continue  # OpenAPI; the branches' const tags select the branch
+        if key in ("readOnly", "writeOnly"):
+            continue  # annotations outside nexgen's subset (a computed field is readOnly)
         if key == "default" and (value is None or isinstance(value, dict | list)):
             # null is no default at all; nexgen materialises only scalar defaults, and an
             # absent optional field already reads back as empty in every target.
@@ -401,13 +448,19 @@ def _service(spec: OfferingSpec, input_name: str, output_name: str) -> dict[str,
 def derive_document(
     spec: OfferingSpec, input_type: type[Any], output_type: type[Any]
 ) -> dict[str, Any]:
-    """Types-first: the sealed contract document for a workflow ``run(input) -> output``.
-    Deterministic: the same models and offering always give the same bytes and hash."""
+    """Types-first: the sealed contract document for a workflow ``run(input) -> output``:
+    the input as pydantic validates it, the output as pydantic serializes it (see the module
+    docstring). Deterministic: the same models and offering always give the same bytes and
+    hash."""
     inp = _model_class(input_type, "input")
     out = _model_class(output_type, "output")
+    sides: tuple[tuple[str, type[BaseModel], JsonSchemaMode], ...] = (
+        ("input", inp, "validation"),
+        ("output", out, "serialization"),
+    )
     try:
         key_map, generated = models_json_schema(
-            [(inp, "validation"), (out, "validation")],
+            [(tp, mode) for _side, tp, mode in sides],
             ref_template="#/$defs/{model}",
             schema_generator=_Generator,
         )
@@ -415,9 +468,10 @@ def derive_document(
         raise ContractError("$defs", f"pydantic cannot describe these types: {exc}") from exc
 
     raw_defs = cast(dict[str, Any], generated.get("$defs", {}))
+    # The name each root got, as the reference pydantic wrote to it: the template is ours.
     names = {
-        side: cast(str, key_map[(tp, "validation")]["$ref"]).rsplit("/", 1)[1]
-        for side, tp in (("input", inp), ("output", out))
+        side: cast(str, key_map[(tp, mode)]["$ref"]).removeprefix("#/$defs/")
+        for side, tp, mode in sides
     }
     defs: dict[str, Any] = {}
     for name in sorted(raw_defs):

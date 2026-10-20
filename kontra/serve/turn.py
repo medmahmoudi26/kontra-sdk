@@ -18,8 +18,9 @@ header all work unchanged), and the wrapper:
    to that message;
 3. signals ``close`` once the reply is in, waits for the agent to finish (its teardown runs
    before the job delivers), and returns the reply -- the job's result, encrypted to the
-   buyer like any job result, and keyed by the output model's aliases, as a workflow
-   entry's result is (the harness publishes it by field name).
+   buyer like any job result: the output model's serialization keyed by its serialization
+   aliases, exactly what a workflow entry's result is and what the contract describes (the
+   harness publishes it keyed by field name; :func:`as_output`).
 
 A worker lost mid-turn -- a deploy, a crash -- costs nothing: the activity is retried on
 another worker, its update id gets the first attempt's admission back, and it reads the
@@ -51,13 +52,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, cast
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowUpdateFailedError
 from temporalio.common import RetryPolicy
@@ -67,6 +67,8 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.contrib.workflow_streams import WorkflowStreamClient
 
     from kontra.contract.names import agent_workflow_id, job_id_from_workflow_id
+    from kontra.contract.serialized import by_alias
+    from kontra.contract.validator import InputValidator
 
 __all__ = [
     "TURN_ACTIVITY",
@@ -238,12 +240,19 @@ class TurnWorkflow:
 class TurnActivities:
     """``kontra.turn.v1.deliver``, bound to the worker's own client (it talks to the agent, a
     child of the job: :class:`~kontra.plugin.KontraPlugin` binds it when it builds a
-    bound-handler offering's worker) and to the handler's output model (the reply is
-    re-keyed by its aliases, :func:`as_output`)."""
+    bound-handler offering's worker), to the handler's output model and to the served
+    contract (the reply is re-keyed by the model's aliases and checked against the
+    contract's output, :func:`as_output`)."""
 
-    def __init__(self, client: Client, output: type[BaseModel] | None = None) -> None:
+    def __init__(
+        self,
+        client: Client,
+        output: type[BaseModel] | None = None,
+        contract: InputValidator | None = None,
+    ) -> None:
         self._client = client
         self._output = output
+        self._contract = contract
 
     @activity.defn(name=TURN_ACTIVITY)
     async def deliver(self, req: TurnRequest) -> dict[str, Any]:
@@ -262,7 +271,7 @@ class TurnActivities:
         except WorkflowUpdateFailedError as e:
             raise _failure(f"the agent refused the message: {e.cause}") from None
         async with _heartbeating():
-            return as_output(self._output, await self._reply(req, reply))
+            return as_output(self._output, await self._reply(req, reply), self._contract)
 
     async def _reply(self, req: TurnRequest, reply: Mapping[str, Any]) -> dict[str, Any]:
         message_id, offset = reply.get("message_id"), reply.get("accepted_offset")
@@ -327,28 +336,27 @@ async def await_reply(
     raise StreamEnded
 
 
-#: ``model_validate``'s ``by_alias``/``by_name`` (pydantic 2.11; kontra-sdk takes 2.9 up).
-_BY_NAME = "by_name" in inspect.signature(BaseModel.model_validate).parameters
-
-
-def as_output(model: type[BaseModel] | None, reply: dict[str, Any]) -> dict[str, Any]:
+def as_output(
+    model: type[BaseModel] | None, reply: dict[str, Any], contract: InputValidator | None = None
+) -> dict[str, Any]:
     """The handler's reply as the job's result. The harness publishes it as
-    ``model_dump(mode="json")``, keyed by field name; a job's result is the output model's
-    JSON keyed by alias -- what temporalio's pydantic converter writes for a workflow
-    entry's result, and what the contract and the buyer's model read. Validated by name (or
-    alias), dumped by alias; a reply that is not the model fails the job."""
+    ``model_dump(mode="json")``: the output model's serialization (computed fields in,
+    excluded fields out, serializers applied), keyed by field name. A job's result is that
+    serialization keyed by serialization alias, ``model_dump(mode="json", by_alias=True)``
+    -- what temporalio's pydantic converter writes for a workflow entry's result, and what
+    the contract describes (decisions I38) -- so the reply is re-keyed
+    (:func:`kontra.contract.serialized.by_alias`), never validated and dumped again (which
+    would refuse a reply without its excluded field). A result that is not the contract's
+    output fails the job, naming where and what, never the value."""
     if model is None:
         return reply
-    try:
-        if _BY_NAME:
-            value = model.model_validate(reply, by_alias=True, by_name=True)
-        else:  # pragma: no cover - pydantic < 2.11 validates by alias only
-            value = model.model_validate(reply)
-    except ValidationError as e:
-        # Where and what, never the value: the reply is the buyer's output.
-        said = "; ".join(f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors())
-        raise _failure(f"the handler's reply is not a {model.__name__} ({said})") from None
-    return value.model_dump(mode="json", by_alias=True)
+    result = cast(dict[str, Any], by_alias(model, reply))
+    if contract is not None:
+        problems = contract.output_problems(result)
+        if problems:
+            said = "; ".join(f"{path}: {what}" for path, what in problems)
+            raise _failure(f"the handler's reply is not a {model.__name__} ({said})")
+    return result
 
 
 def _mapping(value: object) -> Mapping[str, Any]:

@@ -162,17 +162,22 @@ def test_a_handler_another_agent_inherits_is_refused(tmp_path: Path) -> None:
 def test_the_message_and_the_reply_are_keyed_by_alias(tmp_path: Path) -> None:
     """The harness validates the message against the handler's model, by alias; it
     publishes the reply by field name, and the job's result is re-keyed by alias -- what a
-    workflow entry's result is (temporalio's pydantic converter) and what the buyer reads."""
+    workflow entry's result is (temporalio's pydantic converter) and what the buyer reads --
+    then checked against the served contract's output (decisions I38)."""
     bound = offering(_offering_yaml(tmp_path), entry=HopAgent.hop, quote=hop_quote)
     job = bound.job_input(Hop.model_validate({"from": "a"}))
     assert job.payload == {"from": "a"}
     Hop.model_validate(job.payload)  # what the harness does with it
     by_name = Hopped.model_validate({"to": "a+1", "via-hops": 1}).model_dump(mode="json")
     assert by_name == {"to_": "a+1", "via_hops": 1}  # what the harness publishes
-    assert kturn.as_output(Hopped, by_name) == {"to": "a+1", "via-hops": 1}
-    assert kturn.as_output(Hopped, {"to": "a+1", "via-hops": 1}) == {"to": "a+1", "via-hops": 1}
-    with pytest.raises(ApplicationError, match=r"not a Hopped \(via-hops: Field required\)") as bad:
-        kturn.as_output(Hopped, {"to": f"{MARKER}"})
+    contract = bound.validator()
+    assert kturn.as_output(Hopped, by_name, contract) == {"to": "a+1", "via-hops": 1}
+    wanted = {"to": "a+1", "via-hops": 1}
+    assert kturn.as_output(Hopped, wanted, contract) == wanted
+    with pytest.raises(
+        ApplicationError, match=r"not a Hopped \(output\.via-hops: is missing\)"
+    ) as bad:
+        kturn.as_output(Hopped, {"to": f"{MARKER}"}, contract)
     assert MARKER not in bad.value.message  # where and what, never the buyer's value
     assert bad.value.non_retryable
 

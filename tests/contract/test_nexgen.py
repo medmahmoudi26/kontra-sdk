@@ -15,11 +15,22 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from kontra.contract import OfferingSpec, derive_document, merge_document, nexgen_view, to_yaml
 
 from .test_derive import Rich
 from .test_patterns import PORTABLE
+from .zoo import (
+    Computed,
+    Defaults,
+    EnumOverlap,
+    Excluded,
+    Nested,
+    Serialized,
+    SplitAlias,
+    Tagged,
+)
 
 pytestmark = pytest.mark.slow
 
@@ -102,6 +113,30 @@ def test_nexgen_accepts_every_lowering(
     """Optional, enums, tagged unions, typed maps, datetimes, scalar defaults: everything
     the derivation lowers is something nexgen generates for."""
     doc = derive_document(enrich_spec, Rich, Rich)
+    proc, _ = _run(nexgen, tmp_path, lang, doc)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+
+
+class Zoo(BaseModel):
+    """Every way an output serializes otherwise than it validates (decisions I38): the
+    contract has ``ZooInput``/``ZooOutput`` and the like, and output members all required."""
+
+    computed: Computed
+    excluded: Excluded
+    split: SplitAlias
+    serialized: Serialized
+    defaults: Defaults
+    nested: Nested
+    tagged: Tagged
+    color: EnumOverlap
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_nexgen_accepts_outputs_in_serialization_mode(
+    nexgen: Path, tmp_path: Path, enrich_spec: OfferingSpec, lang: str
+) -> None:
+    doc = derive_document(enrich_spec, Zoo, Zoo)
+    assert {"ZooInput", "ZooOutput", "DogInput", "DogOutput"} <= set(doc["$defs"])
     proc, _ = _run(nexgen, tmp_path, lang, doc)
     assert proc.returncode == 0, proc.stderr + proc.stdout
 

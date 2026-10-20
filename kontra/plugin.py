@@ -600,7 +600,7 @@ class KontraPlugin(SimplePlugin):
         config["interceptors"] = [state.interceptor, *config.get("interceptors", ())]
         config["workflow_runner"] = with_kontra_passthrough(config.get("workflow_runner"))
         if bound.kind == "handler":
-            turn = TurnActivities(client, bound.output_type)
+            turn = TurnActivities(client, bound.output_type, bound.validator())
             config["activities"] = [*config.get("activities", ()), turn.deliver]
         return config
 
