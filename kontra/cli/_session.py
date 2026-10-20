@@ -14,12 +14,16 @@ is the stream **offset**, and the wireframe's "seq" is that offset; dedupe is by
 The vocabulary -- every ``AgentEventType`` mapped to a row, a fold or a hidden kind -- lives in
 :mod:`kontra.serve._agent_events` (shared with the turn-job wrapper, checked against the harness
 in one place). An unknown type renders as a generic row carrying its raw type; nothing is
-dropped silently, and the caps (:data:`ROWS_MAX`, :data:`BYTES_MAX`) collapse the overflow into
-one explicit "N more not shown" row.
+dropped silently. Every string the session carries is capped (:data:`SUMMARY_MAX` for what is
+read, :data:`ID_MAX` for an id), and one budget covers all it emits -- turns, rows and the rows
+nested under a handoff, a subagent's included -- by count (:data:`ROWS_MAX`) and by serialized
+size (:data:`BYTES_MAX`): past either, one explicit "N more not shown" row says how much.
 """
 
 from __future__ import annotations
 
+import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
@@ -28,6 +32,7 @@ from kontra.serve import _agent_events as ae
 
 __all__ = [
     "BYTES_MAX",
+    "ID_MAX",
     "ROWS_MAX",
     "SUMMARY_MAX",
     "TOO_LARGE",
@@ -40,12 +45,22 @@ __all__ = [
 
 #: The JSON version the page reads.
 VERSION = 1
-#: A server-derived one-liner never carries a whole body: it is capped here.
+#: A server-derived one-liner never carries a whole body: it is capped here, and so is every
+#: other string read from an event (a label, a tool or handler name, an outcome).
 SUMMARY_MAX = 120
-#: At most this many rows across all turns; the rest is one "N more not shown" row.
+#: An id read from an event (a turn's, a tool call's, a subagent's and its workflow's): Temporal's
+#: own limit for a workflow id, and the longest ``tool_id`` an answer may name.
+ID_MAX = 1000
+#: At most this many turns and rows (nested ones included) in all; the rest is one "N more not
+#: shown" row.
 ROWS_MAX = 5000
-#: At most this many bytes of summaries per snapshot; the rest is that same row.
+#: At most this many bytes of them, serialized; the rest is that same row.
 BYTES_MAX = 4 * 1024 * 1024
+#: An input's field name in a turn's header.
+_KEY_MAX = 40
+#: The latest timestamp read as one (seconds since the epoch, about the year 5138): a later
+#: one, or one that is no finite number, is no time at all.
+_AT_MAX = 1e11
 #: The type of the event :func:`events_in_poll_result` puts in place of an item too large to
 #: show (#52's per-item cap, ``kontra.gate_client.models.STREAM_ITEM_MAX``): a row that says so.
 TOO_LARGE = "kontra.too_large"
@@ -158,21 +173,25 @@ def build(
     *,
     agent: Mapping[str, Any],
     nodes: Mapping[str, Mapping[str, Any]] | None = None,
-    handoffs: Mapping[str, str] | None = None,
+    handoffs: Mapping[str, Mapping[str, Any]] | None = None,
     subagents: Mapping[str, Mapping[str, Any]] | None = None,
+    input_types: Mapping[str, str] | None = None,
     rows_max: int = ROWS_MAX,
     bytes_max: int = BYTES_MAX,
 ) -> dict[str, Any]:
     """The session from ``items`` -- ``(offset, AgentEvent)`` pairs, in any order, deduped by
     offset. ``nodes`` maps a ``tool_id`` to ``{"node", "event_id", "fallback"}``, the graph
     node (and the activity's scheduled event) its rows link to; ``handoffs`` maps a subagent's
-    workflow id to its child node; ``subagents`` maps that workflow id to ``{"rows": [...]}``
-    (:func:`nested_rows` of its own session, nested under the handoff) or ``{"reason": ...}``
-    (a link out, and why). ``rows_max`` and ``bytes_max`` bound the pane; the overflow becomes
-    one "N more not shown" row."""
+    workflow id to ``{"node", "event_id"}``, its child node and the event that started it;
+    ``subagents`` maps that workflow id to ``{"rows": [...]}`` (:func:`nested_rows` of its own
+    session, nested under the handoff) or ``{"reason": ...}`` (a link out, and why).
+    ``input_types`` names each handler's input type (a turn's header). ``rows_max`` and
+    ``bytes_max`` bound all the session emits, turns and nested rows
+    included; the overflow becomes one "N more not shown" row."""
     builder = _Session(
         dict(agent), nodes or {}, handoffs or {}, subagents or {}, rows_max, bytes_max
     )
+    builder.input_types = input_types or {}
     seen: set[int] = set()
     for offset, event in sorted(items, key=lambda it: it[0]):
         if offset in seen:  # a re-polled offset is skipped (dedupe by offset)
@@ -226,6 +245,8 @@ class _Turn:
         self.turn_id = turn_id
         self.turn_number = turn_number
         self.handler: str | None = None
+        #: The handler's input type, when the caller knows it (``build``'s ``input_types``).
+        self.input_type: str | None = None
         self.input_summary: str | None = None
         self.input_keys: list[str] = []
         self.status = "running"
@@ -240,7 +261,7 @@ class _Session:
         self,
         agent: dict[str, Any],
         nodes: Mapping[str, Mapping[str, Any]],
-        handoffs: Mapping[str, str],
+        handoffs: Mapping[str, Mapping[str, Any]],
         subagents: Mapping[str, Mapping[str, Any]],
         rows_max: int,
         bytes_max: int,
@@ -259,11 +280,9 @@ class _Session:
         self.callbacks: dict[str, dict[str, Any]] = {}
         self.handoffs: dict[str, dict[str, Any]] = {}
         self._by_id: dict[str | None, _Turn] = {}
+        self.input_types: Mapping[str, str] = {}
         self._count = 0  # every deduped event, whether it opens a row, folds, or is hidden
-        self._rows = 0
-        self._bytes = 0
         self._last_offset: int | None = None
-        self._dropped = 0
 
     def _turn(self, event: Mapping[str, Any]) -> _Turn:
         turn_id = _str(event.get(ae.EVENT_TURN_ID))
@@ -287,9 +306,8 @@ class _Session:
         spec = ae.VOCAB.get(kind or "")
         if spec is None:  # an unknown event type: a generic row, never dropped
             summary = _too_large(body) if kind == TOO_LARGE else ""
-            self.row(
-                turn, offset, at, ae.GENERIC_GLYPH, kind or "event", summary=summary, generic=True
-            )
+            label = _cap(kind) if kind else "event"
+            self.row(turn, offset, at, ae.GENERIC_GLYPH, label, summary=summary, generic=True)
             return
         _DISPATCH[spec.role](self, turn, offset, at, spec, body)
 
@@ -298,18 +316,8 @@ class _Session:
     def _rel(self, turn: _Turn, at: float | None) -> str | None:
         if at is None or turn.start_at is None:
             return None
-        delta = max(0, round(at - turn.start_at))
+        delta = max(0, round(at - turn.start_at))  # both are finite and bounded (_as_float)
         return f"+{delta // 60:02d}:{delta % 60:02d}"
-
-    def _budget(self, summary: str) -> bool:
-        """True while a new row still fits; once not, each further row is counted."""
-        size = len(summary.encode())
-        if self._dropped or self._rows >= self._rows_max or self._bytes + size > self._bytes_max:
-            self._dropped += 1
-            return False
-        self._rows += 1
-        self._bytes += size
-        return True
 
     def row(
         self,
@@ -325,10 +333,8 @@ class _Session:
         tool_name: str | None = None,
         generic: bool = False,
         extra: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         summary = _cap(summary)
-        if not self._budget(summary):
-            return None
         row: dict[str, Any] = {
             "offset": offset,
             "type": "unknown" if generic else label,
@@ -341,8 +347,12 @@ class _Session:
             "state": state,
         }
         if tool_id is not None:
-            row["tool_id"] = tool_id
-            row["tool_name"] = tool_name
+            # Shown capped; matched in full (the registries below hold the whole id). A row
+            # whose id was cut cannot be answered: no answer could name it.
+            row["tool_id"] = _id(tool_id)
+            if len(tool_id) > ID_MAX:
+                row["id_capped"] = True
+            row["tool_name"] = _cap(tool_name) if tool_name is not None else None
             link = self._nodes.get(tool_id)
             if link is not None and isinstance(link.get("node"), str):
                 row["node"] = link["node"]
@@ -360,9 +370,10 @@ class _Session:
     def result(self) -> dict[str, Any]:
         turns: list[dict[str, Any]] = [
             {
-                "turn_id": t.turn_id,
+                "turn_id": _id(t.turn_id),
                 "turn_number": t.turn_number,
                 "handler": t.handler,
+                "input_type": t.input_type,
                 "input_keys": t.input_keys,
                 "input_summary": t.input_summary,
                 "status": t.status,
@@ -370,17 +381,24 @@ class _Session:
             }
             for t in self._turns
         ]
-        if self._dropped:
+        fit = _Fit(self._rows_max, self._bytes_max)
+        turns = fit.take(turns, "rows")
+        if fit.dropped:
             # Never dropped silently: the overflow is one explicit row on the last turn.
             note: dict[str, Any] = {
                 "offset": self._last_offset,
                 "type": "truncated",
                 "glyph": ae.GENERIC_GLYPH,
                 "label": "truncated",
-                "summary": f"{self._dropped} more not shown",
+                "summary": f"{fit.dropped} more not shown",
                 "node": None,
             }
-            self._turns[-1].rows.append(note)
+            if not turns:
+                turns.append(
+                    {"turn_id": None, "turn_number": None, "handler": None, "input_type": None,
+                     "input_keys": [], "input_summary": None, "status": "running", "rows": []}
+                )  # fmt: skip
+            turns[-1]["rows"].append(note)
         return {
             "version": VERSION,
             "schema": ae.AGENT_EVENTS_SCHEMA,
@@ -392,8 +410,54 @@ class _Session:
                 "dedupe": "offset",
                 "decrypted": "this machine's dev key",
             },
-            "truncated": bool(self._dropped),
+            "stream": ae.TURN_EVENTS_TOPIC,
+            "truncated": bool(fit.dropped),
         }
+
+
+class _Fit:
+    """One budget over all a session emits, in the order the page draws it: each turn, each
+    row and each row nested under it (a subagent's, at any depth) costs one of ``rows`` and
+    its serialized size of ``size``. Once one does not fit, it and everything after it are
+    left out and counted, so what is shown is a prefix and the count says what follows."""
+
+    def __init__(self, rows: int, size: int) -> None:
+        self.rows = rows
+        self.size = size
+        self.dropped = 0
+
+    def take(self, items: list[dict[str, Any]], inner: str) -> list[dict[str, Any]]:
+        kept: list[dict[str, Any]] = []
+        for item in items:
+            if self.dropped or self.rows < 1:
+                self.dropped += _count(item, inner)
+                continue
+            own = {k: v for k, v in item.items() if k != inner}
+            cost = len(json.dumps(own, separators=(",", ":"), default=str))
+            if cost > self.size:
+                self.dropped += _count(item, inner)
+                continue
+            self.rows -= 1
+            self.size -= cost
+            below = item.get(inner)
+            if isinstance(below, list) and below:
+                own[inner] = self.take(cast("list[dict[str, Any]]", below), "children")
+            elif inner in item:
+                own[inner] = below
+            kept.append(own)
+        return kept
+
+
+def _count(item: Mapping[str, Any], inner: str) -> int:
+    """How many entries ``item`` is: itself and everything nested under it."""
+    below = item.get(inner)
+    if not isinstance(below, list):
+        return 1
+    return 1 + sum(
+        _count(cast("Mapping[str, Any]", c), "children")
+        for c in cast("list[object]", below)
+        if isinstance(c, Mapping)
+    )
 
 
 # --------------------------------------------------------------------------- the dispatch
@@ -411,10 +475,13 @@ def _turn_header(
     spec: ae.EventRow,
     body: Mapping[str, Any],
 ) -> None:
-    turn.handler = _str(body.get("handler"))
+    handler = _str(body.get("handler"))
+    turn.handler = _cap(handler) if handler else None
+    named = s.input_types.get(handler or "")
+    turn.input_type = _cap(named) if named else None
     payload = body.get("payload")
     if isinstance(payload, Mapping):
-        turn.input_keys = [str(k) for k in list(payload)[:4]]
+        turn.input_keys = [_cap(str(k), _KEY_MAX) for k in list(payload)[:4]]
     turn.input_summary = _input(payload) or None
 
 
@@ -503,7 +570,7 @@ def _fold_approval(
     elif kind == ae.AUTO_APPROVAL_EVALUATION_ENDED:
         verdict = _str(body.get("verdict"))
         if verdict:
-            row["auto"] = verdict
+            row["auto"] = _cap(verdict)
 
 
 def _fold_callback(
@@ -519,7 +586,7 @@ def _fold_callback(
         return
     outcome = _str(body.get("outcome")) or ("error" if body.get("error") else "ok")
     row["pending"] = False
-    row["resolution"] = outcome
+    row["resolution"] = _cap(outcome)
     row["state"] = "completed" if outcome == "ok" else "failed"
 
 
@@ -535,10 +602,19 @@ def _subagent_nested(
     if row is None or row.get("fetched"):  # its own history's rows say more; keep them
         return
     children = row.setdefault("children", [])
+    # A nested line links where its handoff does: the subagent's child node.
+    node = row.get("node")
     if _str(body.get(ae.EVENT_TYPE)) == ae.SUBAGENT_MESSAGE_SENT:
-        handler = _str(body.get("handler")) or "message"
+        handler = _cap(_str(body.get("handler")) or "message")
         children.append(
-            {"offset": offset, "glyph": "→", "label": handler, "summary": None, "nested": True}
+            {
+                "offset": offset,
+                "glyph": "→",
+                "label": handler,
+                "summary": None,
+                "node": node,
+                "nested": True,
+            }
         )
     else:  # subagent_reply_received: the parent's own record of the reply
         outcome = _str(body.get("outcome")) or "ok"
@@ -547,8 +623,9 @@ def _subagent_nested(
                 "offset": offset,
                 "glyph": spec.glyph,
                 "label": spec.label,
-                "summary": outcome,
+                "summary": _cap(outcome),
                 "state": "completed" if outcome == "ok" else "failed",
+                "node": node,
                 "nested": True,
             }
         )
@@ -671,8 +748,8 @@ def _emit_row(
     elif kind == ae.SUBAGENT_STARTED:
         key = _str(body.get("agent_key")) or _str(body.get("subagent_id")) or "subagent"
         summary = f"→ {key}"
-        extra["subagent_id"] = _str(body.get("subagent_id"))
-        extra["workflow_id"] = _str(body.get("workflow_id"))
+        extra["subagent_id"] = _id(body.get("subagent_id"))
+        extra["workflow_id"] = _id(body.get("workflow_id"))
         state = "working"
     elif kind in (ae.MESSAGE_HANDLER_END, ae.MESSAGE_HANDLER_ERROR):
         if failed:
@@ -695,9 +772,7 @@ def _emit_row(
         tool_name=tool_name,
         extra=extra,
     )
-    if row is None:
-        return
-    # Register the row so later events fold into it.
+    # Register the row (by the whole id) so later events fold into it.
     if kind == ae.TOOL_REQUESTED and tool_id:
         s.tools[tool_id] = row
     elif kind == ae.TOOL_APPROVAL_REQUESTED and tool_id:
@@ -714,15 +789,25 @@ def _handoff(s: _Session, turn: _Turn, row: dict[str, Any], body: Mapping[str, A
     why -- with the parent stream's message/reply summaries nested meanwhile."""
     subagent_id = _str(body.get("subagent_id"))
     workflow_id = _str(body.get("workflow_id"))
-    node = s.handoff_nodes.get(workflow_id or "")
-    if node is not None:
+    link = s.handoff_nodes.get(workflow_id or "")
+    node = link.get("node") if link is not None else None
+    if isinstance(node, str):
         row["node"] = node
+        event_id = link.get("event_id") if link is not None else None
+        if isinstance(event_id, int):
+            row["event_id"] = event_id  # the child's StartChildWorkflowExecutionInitiated
     view = s.subagent_views.get(workflow_id or "")
     rows = view.get("rows") if view is not None else None
     if isinstance(rows, list):
-        row["children"] = [dict(r) for r in rows if isinstance(r, Mapping)]
+        # The subagent's own rows link where the handoff does: its child node (its own
+        # activities are in its own history, not drawn).
+        row["children"] = [
+            {**cast("Mapping[str, Any]", r), "node": row.get("node")}
+            for r in cast("list[object]", rows)
+            if isinstance(r, Mapping)
+        ]
         row["fetched"] = True
-    elif workflow_id:
+    elif workflow_id and len(workflow_id) <= ID_MAX:  # no longer one is a Temporal workflow id
         row["link"] = workflow_id
         reason = view.get("reason") if view is not None else None
         row["link_reason"] = (
@@ -828,6 +913,14 @@ def _str(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _id(value: object) -> str | None:
+    """An id read from an event, as the page is shown it: cut at :data:`ID_MAX` (and not
+    stripped: an id is matched whole)."""
+    if not isinstance(value, str):
+        return None
+    return value if len(value) <= ID_MAX else value[: ID_MAX - 1] + "…"
+
+
 def _as_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -839,8 +932,11 @@ def _as_int(value: object) -> int | None:
 
 
 def _as_float(value: object) -> float | None:
-    if isinstance(value, bool):
+    """A timestamp: a finite number of seconds within :data:`_AT_MAX` of the epoch, else None
+    (JSON as Python reads it carries ``Infinity`` and ``NaN``, which are no time)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
+    if isinstance(value, int) and abs(value) > _AT_MAX:
+        return None  # before float(): a JSON integer may be too large for one
+    at = float(value)
+    return at if math.isfinite(at) and abs(at) <= _AT_MAX else None

@@ -25,7 +25,7 @@
     [21, {"agent_id": "a1b2c3", "event": {"details": {}, "evaluation_id": "e1", "evaluator": "policy", "reason": null, "tool_id": "call-post-0", "tool_name": "post_findings", "type": "auto_approval_evaluation_ended", "verdict": "escalate"}, "message_id": "m-0199f0a1", "timestamp": 1760950007.7, "turn_id": "t-0199f0a1", "turn_number": 1}],
     [22, {"agent_id": "a1b2c3", "event": {"state_id": "progress", "type": "state_snapshot", "value": {"done": 12}, "version": 1}, "message_id": "m-0199f0a1", "timestamp": 1760950007.8, "turn_id": "t-0199f0a1", "turn_number": 1}]
   ],
-  "handoffs": {"cert-checker-subagent-0199f0a1-9d43-7f71-8c55-4e6f8a0b2c34": "ReconHarnessAgent/CertChecker"},
+  "handoffs": {"cert-checker-subagent-0199f0a1-9d43-7f71-8c55-4e6f8a0b2c34": {"event_id": 23, "node": "ReconHarnessAgent/CertChecker"}},
   "nodes": {"call-plan-0": {"event_id": 11, "fallback": false, "node": "ReconHarnessAgent/plan"}, "call-probe-0": {"event_id": 17, "fallback": true, "node": "ReconHarnessAgent/probe"}},
   "subagent_events": [
     [0, {"agent_id": "a1b2c3-d4e5f6", "event": {"disposition": "opened", "handler": "check", "payload": {"hosts": 12}, "type": "message_accepted"}, "message_id": "m-sub", "timestamp": 1760950004.0, "turn_id": "t-sub", "turn_number": 1}],

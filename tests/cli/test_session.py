@@ -3,8 +3,9 @@ server and no codec: every ``AgentEventType`` maps to the row, fold or hidden ki
 vocabulary (``kontra/serve/_agent_events.py``); an unknown type is a generic row, never
 dropped; deltas coalesce; dedupe is by the stream offset; a ``tool_id`` links to its graph
 node and its scheduled event (two parallel same-name tools stay distinct); a handoff links to
-its child node and nests the subagent's own rows; summaries are capped; the row and byte caps
-collapse the overflow into one explicit row; and the canonical recon sequence reproduces the
+its child node and nests the subagent's own rows; every string read from an event is capped;
+one row and byte budget covers turns, rows and nested rows, the overflow one explicit row; a
+timestamp that is no finite time is none; and the canonical recon sequence reproduces the
 golden. Every fixture is one the installed harness's own ``AgentEvent`` model accepts."""
 
 from __future__ import annotations
@@ -282,12 +283,13 @@ def test_a_handoff_links_its_child_node_and_nests_the_subagent_s_history() -> No
     [row] = _rows(
         _build(
             _handoff_items(),
-            handoffs={workflow_id: "Agent/CertChecker"},
+            handoffs={workflow_id: {"node": "Agent/CertChecker", "event_id": 9}},
             subagents={workflow_id: {"rows": nested}},
         )
     )
-    assert row["node"] == "Agent/CertChecker"
-    assert row["children"] == nested  # the subagent's own rows, not the stream's summary lines
+    assert (row["node"], row["event_id"]) == ("Agent/CertChecker", 9)  # the child it started
+    # The subagent's own rows, not the stream's summary lines, linked to its child node.
+    assert row["children"] == [{**nested[0], "node": "Agent/CertChecker"}]
     assert "link" not in row
 
 
@@ -440,7 +442,7 @@ def test_summaries_are_capped() -> None:
 
 def test_the_row_cap_collapses_the_overflow_into_one_explicit_row() -> None:
     items = [(i, _envelope("turn_started")) for i in range(5)]
-    session = _build(items, rows_max=2)
+    session = _build(items, rows_max=3)  # the turn's header is one of them
     assert session["truncated"] is True
     *shown, note = _rows(session)
     assert len(shown) == 2
@@ -448,15 +450,143 @@ def test_the_row_cap_collapses_the_overflow_into_one_explicit_row() -> None:
     assert session["footer"]["count"] == 5  # every event seen, not only the rows shown
 
 
-def test_the_byte_cap_collapses_the_overflow_too() -> None:
+def _size(value: object) -> int:
+    return len(json.dumps(value, separators=(",", ":")))
+
+
+def test_the_byte_cap_counts_what_is_sent_not_only_the_summaries() -> None:
     items = [
         (i, _envelope("tool_end", {"tool_id": f"t{i}", "tool_name": "n", "tool_output": "y" * 100}))
         for i in range(10)
     ]
-    session = _build(items, bytes_max=350)
+    whole = _build(items)
+    budget = _size(whole["turns"]) // 2
+    session = _build(items, bytes_max=budget)
     *shown, note = _rows(session)
-    assert len(shown) == 3
-    assert note["summary"] == "7 more not shown"
+    assert 0 < len(shown) < 10
+    assert note["summary"] == f"{10 - len(shown)} more not shown"
+    turns = [{**t, "rows": t["rows"][:-1]} for t in session["turns"]]
+    assert _size(turns) <= budget + 2 * (len(shown) + 1) + len('"rows":[]')
+
+
+def _entries(rows: list[dict[str, Any]]) -> int:
+    return sum(1 + _entries(r.get("children") or []) for r in rows)
+
+
+def _drawn(session: dict[str, Any]) -> int:
+    """Everything the page draws a line for: each turn, each row, each row nested under one."""
+    return sum(1 + _entries(t["rows"]) for t in session["turns"])
+
+
+def _many_children() -> list[tuple[int, dict[str, Any]]]:
+    started = {"subagent_id": "s", "agent_key": "k", "workflow_id": "w"}
+    sent = {"subagent_id": "s", "handler": "h"}
+    return [(0, _envelope("subagent_started", started))] + [
+        (i, _envelope("subagent_message_sent", sent)) for i in range(1, 50_000)
+    ]
+
+
+def _many_turns() -> list[tuple[int, dict[str, Any]]]:
+    return [(i, _envelope("turn_end", turn_id=f"turn-{i}")) for i in range(50_000)]
+
+
+def _many_nested() -> tuple[list[tuple[int, dict[str, Any]]], dict[str, Any]]:
+    calls = [
+        (i, _envelope("tool_requested", {"tool_id": str(i), "tool_name": f"t{i}"}))
+        for i in range(10_000)
+    ]
+    view = {"rows": _session.nested_rows(_session.build(calls, agent={}))}
+    assert len(view["rows"]) > 4000  # one subagent's view: bounded by its own build alone
+    started = [
+        (k, _envelope("subagent_started", {"subagent_id": f"s{k}", "workflow_id": f"w{k}"}))
+        for k in range(16)
+    ]
+    return started, {f"w{k}": view for k in range(16)}
+
+
+@pytest.mark.parametrize("case", ["children", "turns", "nested"])
+def test_one_budget_bounds_turns_rows_and_nested_rows_alike(case: str) -> None:
+    """A handoff's own lines, a turn per ``turn_id`` and a subagent's nested view are each
+    charged to the one budget: past :data:`ROWS_MAX`, one row says how much more there is."""
+    subagents: dict[str, Any] = {}
+    if case == "children":
+        items = _many_children()
+    elif case == "turns":
+        items = _many_turns()
+    else:
+        items, subagents = _many_nested()
+    whole = _build(items, subagents=subagents, rows_max=10**9, bytes_max=10**12)
+    session = _build(items, subagents=subagents)
+    assert session["truncated"] is True
+    assert _drawn(session) == _session.ROWS_MAX + 1  # what fits, and the one row saying so
+    note = session["turns"][-1]["rows"][-1]
+    assert note["type"] == "truncated"
+    assert note["summary"] == f"{_drawn(whole) - _session.ROWS_MAX} more not shown"
+    assert _size(session) < _session.BYTES_MAX
+
+
+def test_every_string_read_from_an_event_is_capped() -> None:
+    big = "x" * 50_000
+    items = [
+        (0, _envelope("message_accepted", {"handler": big, "payload": {big: 1}}, turn_id=big)),
+        (1, _envelope(big)),  # an unknown type: its raw type is its label
+        (2, _envelope("tool_requested", {"tool_id": "i" * 5000, "tool_name": big})),
+        (3, _envelope("tool_end", {"tool_id": "i" * 5000, "tool_name": "n", "tool_output": 1})),
+        (
+            4,
+            _envelope(
+                "subagent_started", {"subagent_id": big, "agent_key": "k", "workflow_id": big}
+            ),
+        ),
+        (5, _envelope("subagent_message_sent", {"subagent_id": big, "handler": big})),
+        (6, _envelope("subagent_reply_received", {"subagent_id": big, "outcome": big})),
+        (7, _envelope("tool_approval_requested", {"tool_id": "a", "tool_name": "n"})),
+        (8, _envelope("auto_approval_evaluation_ended", {"tool_id": "a", "verdict": big})),
+        (9, _envelope("callback_requested", {"tool_id": "c", "tool_name": "n"})),
+        (10, _envelope("callback_resolved", {"tool_id": "c", "outcome": big})),
+    ]
+    session = _build(items, input_types={big: big})
+
+    ids = {"turn_id", "tool_id", "subagent_id", "workflow_id", "link"}
+
+    def check(value: object, key: str = "") -> None:
+        if isinstance(value, str):
+            assert len(value) <= (_session.ID_MAX if key in ids else _session.SUMMARY_MAX), key
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                check(k)
+                check(v, k)
+        elif isinstance(value, list):
+            for v in value:
+                check(v, key)
+
+    check(session["turns"])
+    header = session["turns"][0]  # the message's own turn_id, cut
+    assert len(header["input_type"]) <= _session.SUMMARY_MAX
+    rows = {r["offset"]: r for r in _rows(session)}
+    # A cut id is shown cut and marked (no answer could name it), and still matched whole.
+    assert (rows[2]["id_capped"], rows[2]["state"]) == (True, "completed")
+    assert "link" not in rows[4]  # no workflow id is that long: nothing to open
+    assert rows[4]["children"][0]["label"].endswith("…")
+
+
+@pytest.mark.parametrize("stamp", ["Infinity", "-Infinity", "NaN", "1e308", "1" * 400])
+def test_a_timestamp_that_is_no_finite_time_is_none(stamp: str) -> None:
+    """``json.loads`` (the converter's) reads ``Infinity`` and ``NaN``: such a stamp, or one
+    past any real time, is no time -- the session still renders, and JSON can carry it."""
+    weird = json.loads(f'{{"timestamp": {stamp}}}')["timestamp"]
+    items = [
+        (0, _envelope("turn_started", timestamp=1.0)),
+        (1, _envelope("model_interaction_started", {"model": "m"}, timestamp=weird)),
+        (2, _envelope("model_interaction_ended", {"model": "m"}, timestamp=-1e300)),
+    ]
+    session = _build(items)
+    assert [(r["at"], r["rt"]) for r in _rows(session)] == [
+        (1.0, "+00:00"),
+        (None, None),
+        (None, None),
+    ]
+    json.dumps(session, allow_nan=False)  # what the console sends
 
 
 def test_rows_carry_offset_and_time_for_client_replay() -> None:
