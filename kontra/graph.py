@@ -87,7 +87,7 @@ Graph = dict[str, Any]
 HistoryJSON = Mapping[str, Any] | Sequence[Any]
 
 _VERSION = 1
-#: ``kontra._parallel.BATCH_WORKFLOW``, written out: that module imports Temporal.
+#: ``kontra.contrib.parallel.BATCH_WORKFLOW``, written out: that module imports Temporal.
 _BATCH_WORKFLOW = "kontra.batch.v1"
 _BATCH_LABEL = "execute_activities_in_parallel"
 #: The marker sdk-core records for a local activity; no other marker is a node.
@@ -103,7 +103,7 @@ _CAUSE_DEPTH = 32
 _PAYLOAD_MAX = 1 << 16
 #: The longest batch child's input (base64) read: Temporal's 2 MiB payload, base64'd.
 _SPEC_MAX = 3 << 20
-#: The fields of ``kontra._parallel._Spec`` that name what a batch runs: its item activity
+#: The fields of ``kontra.contrib.parallel._Spec`` that name what a batch runs: its item activity
 #: and its ``pages=`` activity.
 _SPEC_NAMES = ("activity", "pages")
 #: Grafana Explore's pane key: three of [0-9a-z], one a letter.

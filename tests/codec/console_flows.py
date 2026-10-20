@@ -6,7 +6,11 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
-from kontra import ApplicationError, RetryPolicy, activity, workflow
+from temporalio import activity, workflow
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
+
+from kontra.contrib.parallel import execute_activities_in_parallel
 
 #: How long the first activity holds still once it has heartbeated: the page reads the run
 #: while the heartbeat is pending in DescribeWorkflowExecution.
@@ -40,7 +44,7 @@ class LeakFlow:
             heartbeat_timeout=timedelta(seconds=20),
             retry_policy=RetryPolicy(initial_interval=timedelta(milliseconds=200)),
         )
-        items = await workflow.execute_activities_in_parallel(
+        items = await execute_activities_in_parallel(
             item,
             items=[f"{text} {i}" for i in range(3)],
             start_to_close_timeout=timedelta(seconds=30),

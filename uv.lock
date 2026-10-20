@@ -1067,9 +1067,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-agents = [
-    { name = "temporalio-openai-agents", extra = ["mcp"] },
-]
 mcp = [
     { name = "mcp" },
 ]
@@ -1097,6 +1094,8 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
     { name = "ruff" },
+    { name = "temporal-agent-harness" },
+    { name = "temporalio-openai-agents", extra = ["mcp"] },
     { name = "uvicorn" },
     { name = "webauthn" },
 ]
@@ -1111,18 +1110,17 @@ requires-dist = [
     { name = "jsonschema", specifier = ">=4.23,<5" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.3,<3" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'opentelemetry'", specifier = ">=1.39,<2" },
-    { name = "pydantic", specifier = ">=2.9,<3" },
+    { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9,<3" },
     { name = "pyrage", specifier = ">=1.2,<2" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "rfc8785", specifier = ">=0.1.4,<0.2" },
-    { name = "temporalio", specifier = ">=1.34,<1.35" },
-    { name = "temporalio", extras = ["opentelemetry"], marker = "extra == 'opentelemetry'", specifier = ">=1.34,<1.35" },
-    { name = "temporalio-openai-agents", extras = ["mcp"], marker = "extra == 'agents'", specifier = ">=1.1,<2" },
+    { name = "temporalio", specifier = ">=1.34,<1.38" },
+    { name = "temporalio", extras = ["opentelemetry"], marker = "extra == 'opentelemetry'", specifier = ">=1.34,<1.38" },
     { name = "uvicorn", marker = "extra == 'testing'", specifier = ">=0.30" },
     { name = "webauthn", marker = "extra == 'testing'", specifier = ">=3.0.1,<4" },
 ]
-provides-extras = ["mcp", "agents", "opentelemetry", "testing"]
+provides-extras = ["mcp", "opentelemetry", "testing"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1137,6 +1135,8 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1.0" },
     { name = "pytest-timeout", specifier = ">=2.3" },
     { name = "ruff", specifier = ">=0.6" },
+    { name = "temporal-agent-harness", specifier = "==0.6.0" },
+    { name = "temporalio-openai-agents", extras = ["mcp"], specifier = ">=1.1,<2" },
     { name = "uvicorn", specifier = ">=0.30" },
     { name = "webauthn", specifier = ">=3.0.1,<4" },
 ]
@@ -2046,6 +2046,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/7b/2b/3850dc6bf7ef71b088962eba31dafc6cffd2f96e577ebb0bb316df96da3e/starlette-1.7.0.tar.gz", hash = "sha256:c79f74ea63cff761804fbbfb182f1e0b440c2d07b164d24700c5a1bab5d6ff5d", size = 2736246, upload-time = "2026-09-23T07:30:26.35Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4e/d6/1ec1b290f9e0fb067899b61e1d37a30c923068bad260b216dbe37a7d2967/starlette-1.7.0-py3-none-any.whl", hash = "sha256:67f8e99895493dd2911a03f11314af6ceebeae4e704bb9f43dfc6a9db151c93e", size = 78980, upload-time = "2026-09-23T07:30:24.567Z" },
+]
+
+[[package]]
+name = "temporal-agent-harness"
+version = "0.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "temporalio" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ee/9e/a57cc2d9ff330d3bc4ba7a799e581851a5567dc3a11361a86e5b913015d5/temporal_agent_harness-0.6.0.tar.gz", hash = "sha256:4f7762efe08bb9a9f8bbb20840c73793a93a6946c9dafff7f33d270f63cf755c", size = 624729, upload-time = "2026-10-03T00:51:08.002Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0a/80/6c0e359a9561dc4b313b1fab178d06f411e5dee9b08f8e223d1afe5791e2/temporal_agent_harness-0.6.0-py3-none-any.whl", hash = "sha256:9a6a15bf3804a6ec6754b4dd7108435bbc396d4b986a60bcdcd721c5f475f534", size = 645924, upload-time = "2026-10-03T00:51:06.276Z" },
 ]
 
 [[package]]

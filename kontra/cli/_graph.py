@@ -48,8 +48,10 @@ _STATIC_VERSION = 1
 #: The largest static graph :func:`load_static` reads.
 _STATIC_MAX = 16 * 1024 * 1024
 _START, _END = "start", "end"  # kontra.graph.START, END, without importing it for --help
-#: What a project that runs an agent imports and the ``[agents]`` extra installs.
+#: What a project that runs an OpenAI agent imports: its own dependency
+#: (``temporalio-openai-agents``), which ``kontra graph`` needs to run it.
 _AGENT_MODULES = ("agents", "openai")
+_AGENT_DEPENDENCY = "temporalio-openai-agents"
 
 
 def static_path(home: Path, task_queue: str) -> Path:
@@ -294,7 +296,6 @@ def graph(
 ) -> None:
     """Print the static graph of worker.py's workflows, from mock runs in Temporal's
     time-skipping test server (every activity answered with a sampled value of its type)."""
-    from kontra import _agents
     from kontra.cli._common import run
     from kontra.cli._mock import explore
     from kontra.cli._project import load_worker
@@ -312,14 +313,15 @@ def graph(
             with _stopped_like_ctrl_c():
                 explored = run(lambda: explore(worker, chosen, inputs, seed=seed, deadline=timeout))
     except ModuleNotFoundError as err:
-        # An agent workflow's project imports `agents`: without the extra it cannot even
-        # be imported, so it cannot be run either.
-        if (err.name or "").partition(".")[0] in _AGENT_MODULES:
-            fail(f"{directory} runs an agent, which needs the extra: {_agents.EXTRA} ({err})")
-        raise
-    except TypeError as err:  # `agents` imported, Temporal's integration not installed
-        if _agents.imported() and not _agents.AVAILABLE:
-            fail(str(err))
+        # An agent workflow's project imports `agents` (and worker.py Temporal's
+        # integration): without the seller's dependency installed here it cannot even be
+        # imported, so it cannot be run either.
+        top = (err.name or "").partition(".")[0]
+        if top in _AGENT_MODULES or (err.name or "").startswith("temporalio.openai_agents"):
+            fail(
+                f"{directory} runs an agent: install the project's own dependency here "
+                f"(pip install {_AGENT_DEPENDENCY}) ({err})"
+            )
         raise
 
     if as_json:

@@ -184,13 +184,15 @@ class Market:
 
 def seller_env(home: Path, sites: Sites) -> dict[str, str]:
     """The seller processes' environment: the party's profile, every heartbeat forwarded
-    one by one (acceptance 13 counts them), the test sites' CA trusted for HTTPS, and their
+    one by one (acceptance 13 counts them) with the stream upload budget a loaded test
+    machine needs (Marketplace's 8 s: past 2 s an item is a stub, a gap the counts see), the test sites' CA trusted for HTTPS, and their
     address (127.0.0.1) allowed as a destination. Nothing of OpenAI's: no seller here needs
     an ``OPENAI_API_KEY``."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(("KONTRA_", "OPENAI_"))}
     env.update(
         KONTRA_HOME=str(home),
         KONTRA_PROGRESS_INTERVAL="0",
+        KONTRA_STREAM_UPLOAD_BUDGET="8",
         SSL_CERT_FILE=str(sites.ca_file),
         PYTHONUNBUFFERED="1",
         **ALLOW_LOCAL_SITES,

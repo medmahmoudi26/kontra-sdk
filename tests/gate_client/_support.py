@@ -46,6 +46,8 @@ PATTERNED = {
 #: confirmation (the first literal of ``status``) shows a code.
 CONSISTENT: dict[type[BaseModel], dict[str, Any]] = {
     m.ConfirmStart: {"user_code": "BCDF-GHJK"},
+    # a stream event's kind decides its fields: a history event carries the job's state
+    m.StreamEvent: {"cursor": 1, "kind": "history", "state": "working"},
 }
 
 
@@ -106,11 +108,12 @@ def error(status: int, code: str, message: str = "nope", detail: Any = None) -> 
     return httpx.Response(status, json={"code": code, "message": message, "detail": detail})
 
 
-def event(seq: int, *, extra: str = "") -> str:
-    body = m.ProgressEvent.model_validate(
-        {"seq": seq, "at": NOW, "source": "history", "state": "working"}
-    ).model_dump_json()
-    return f"id: {seq}\n{extra}data: {body}\n\n"
+def event(cursor: int, *, extra: str = "") -> str:
+    """One ``history`` event of ``GET /v1/jobs/{id}/stream`` as the gate frames it."""
+    body = m.StreamEvent.model_validate(
+        {"cursor": cursor, "kind": "history", "at": NOW, "state": "working"}
+    ).model_dump_json(exclude_none=True)
+    return f"id: {cursor}\nevent: history\n{extra}data: {body}\n\n"
 
 
 class Chunks(httpx.AsyncByteStream):
