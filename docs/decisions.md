@@ -1996,6 +1996,9 @@ recipe in a public repository.
 
 ## I31. Streams cross the boundary through the job's own workflow stream, sealed per item (kontra-sdk#52; decisions 5, 6 of #50)
 
+_OD1–OD11 below were decided by the implementer in the owner's place, as kontra-sdk#50 directs
+(no step waits on an answer); each is listed on #52 for the owner to confirm or overturn._
+
 Nexus does not stream. A seller already streams with Temporal's own API
 (`temporalio.contrib.workflow_streams`: a log in workflow state, written by a publish signal,
 read by a poll Update and an offset Query), and a buyer holds no Temporal client. So a job's
@@ -2012,7 +2015,7 @@ with two prototypes whose results are below.
   rule language-neutrally (the same vectors run through both). It is **not an `x-kontra`
   fact**: not in the contract hash, every golden unchanged. It travels as catalog data beside
   the document, as `recipients` does (I7): `PublishRequest.streams`, `CatalogEntry.streams`.
-  It is **fixed per version** (owner, OD5): the gate refuses a republish of a version with
+  It is **fixed per version** (OD5): the gate refuses a republish of a version with
   other streams (409 `streams_fixed`) and `KontraPlugin`'s hash lock refuses to start code
   whose list differs from the catalog's. Per-topic item schemas in the contract are later
   (OD11): `job.stream(type=)` takes the buyer's own model.
@@ -2070,7 +2073,7 @@ with two prototypes whose results are below.
   second and before it returns the reply, and checkpointed in its heartbeat details so a
   retried attempt mirrors from where the last flush got (a lost worker re-publishes at most
   one flush window; the test counts every event once). Unlisted topics are never copied.
-  **Naming rule: identity** (owner, OD3): `streams: [turn_events]` relays the harness's own
+  **Naming rule: identity** (OD3): `streams: [turn_events]` relays the harness's own
   `turn_events`; there is no `agent` alias -- the PRD's and the issue's `streams: [agent]`
   was illustrative. One sentence covers both entry kinds, no alias table couples Kontra to a
   pre-1.0 harness, and #54's renderer reads `turn_events` by one name in dev and prod.
@@ -2087,7 +2090,7 @@ with two prototypes whose results are below.
   `protocol`. **Amends the issue's "FakeGate relays from a real `WorkflowStreamClient`":** the
   stock client uses `PollWorkflowExecutionUpdate` and `DescribeWorkflowExecution`, which
   production denies (I30), and `kontra dev up` runs no Authorizer to show it.
-* **When the relay runs** (owner, OD2, **changed from the design's tail start**): one relay per
+* **When the relay runs** (OD2, **changed from the design's tail start**): one relay per
   job, started once escrow has pinned the chain **and** its first listener attaches, **from
   offset 0, once per job**; nothing polls while nobody ever listened. The gate keeps a
   monotonic per-job cursor and stores what it relays (the caps below), so a later listener
@@ -2096,13 +2099,13 @@ with two prototypes whose results are below.
   kept; a buyer's resume never moves it (a buyer-chosen offset would hand every buyer the
   leaked-token amplification of I30). `kontra._relay` keeps `start="tail"` for a gate that
   wants it, but `start=` has no default: a gate that omits it gets an error, not the tail.
-* **Seam ②** (owner, OD4: a hard cut in this 0.x release). `POST` and `GET
+* **Seam ②** (OD4: a hard cut in this 0.x release). `POST` and `GET
   /v1/jobs/{id}/progress`, `ProgressPost` and `ProgressEvent` are gone. `GET
   /v1/jobs/{id}/stream` (the job's buyer or seller) serves SSE of `StreamEvent{cursor, kind:
   item | gap | history, ...}`: `topic` (repeatable; each in the version's `streams` or
   `kontra.progress`, else 422 `unknown_topic`), `history`, `after` or `Last-Event-ID`; it ends
   once the job is closed and its relay finished. History events are the platform's liveness
-  summary, unchanged in content. Caps (owner, OD7): 256 KiB per relayed item
+  summary, unchanged in content. Caps (OD7): 256 KiB per relayed item
   (`gap{too_large}` with its size), 16 MiB per topic and 64 MiB per job stored -- past one,
   a single `gap{topic_budget|job_budget}` (the first item that did not fit), and the gate
   relays no more of that topic (it restarts the relay without it) or of the job (the relay
@@ -2120,7 +2123,7 @@ with two prototypes whose results are below.
   the delivery semantics below: heartbeats appear only for a job someone listened to before
   it closed (asking for its status while it runs is listening), else history events alone.
   `kontra job <id> --stream TOPIC` prints decrypted items as JSON lines.
-* **History budget** (owner, OD1, OD8). Heartbeats now cost the seller's history: one publish
+* **History budget** (OD1, OD8). Heartbeats now cost the seller's history: one publish
   signal is about four events, a relayed poll about five more (measured: 20 activity publish
   batches cost 95 events, 192 with a relay polling). Against Kontra's pinned
   `limit.historyCount.error` (20,480), yesterday's one-a-second forwarding with a listening
@@ -2188,12 +2191,12 @@ with two prototypes whose results are below.
   items published before a continue-as-new of a Kontra-hosted stream nobody polled are not
   carried). At-least-once transport from the gate, deduplicated by the buyer. An activity
   retry re-publishes (the turn mirror is checkpointed; a seller's own activities are theirs).
-* **Not in v1.** Client publish signals are not sealed per item (owner, OD6): a publish
+* **Not in v1.** Client publish signals are not sealed per item (OD6): a publish
   signal, like a continue-as-new input, stays one payload encrypted to the buyer and the
   seller, so an unlisted topic is private in what is *relayed*, not in what the buyer's key
   could open if it ever read the seller's history (it cannot: the buyer has no Temporal access
   to the seller's namespace). Harness-internal activities' heartbeats are forwarded as any
-  seller activity's are (owner, OD10, asked on #52). Item schemas in the contract (OD11).
+  seller activity's are (OD10, asked on #52). Item schemas in the contract (OD11).
 * **The authorizer: no new cell here.** The relay's two calls are #59's, and so is the request
   cap this change's review asked for (I30, merged in); the forwarder's and the turn mirror's
   publish signal and the seller's own subscriptions are the party allowlist on its own job; the
