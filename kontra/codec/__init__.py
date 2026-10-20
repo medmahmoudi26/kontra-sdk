@@ -118,6 +118,7 @@ from kontra.codec import stream as _stream
 from kontra.codec.stream import (
     OFFSET_MARK,
     POLL_MARK,
+    REPLAYED_MARK,
     STREAM_ENCODING,
     STREAM_MARK,
     STREAM_UPLOAD_BUDGET,
@@ -578,6 +579,8 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
             except EnvelopeError as e:
                 raise CodecError(f"a marked stream offset: {e}") from e
             return p  # plaintext by design: a log length
+        if mark == REPLAYED_MARK:
+            return _stream.replayed_payload()  # a replayed answer: never sent, a constant
         if mark != POLL_MARK:
             raise CodecError("an unknown workflow-stream mark")
         if self._buyer_keys is None:

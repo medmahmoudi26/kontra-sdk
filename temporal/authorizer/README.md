@@ -125,7 +125,7 @@ in the job instead: the polls one workflow task completes answer in the worker's
 and a job root answers at most 1.5 MiB in one task and holds further polls back for a later
 one, so concurrent polls cannot push that reply past the 4 MiB limit (#52's answer budget;
 `docs/security.md`, decisions I30, I31). *Since I39:* answers are references (at most 13,504
-bytes) and a run accepts at most 1,000 polls, so what a token holder's polls add to a run is
+bytes) and a run accepts at most 250 polls, so what a token holder's polls add to a run is
 bounded by a formula, not by the history limit.
 
 Then the request's shape: a poll's one argument with metadata exactly `{encoding: json/plain}`

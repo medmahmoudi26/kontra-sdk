@@ -5,14 +5,18 @@ its pinned dynamic config (``kontra.yaml``) and relay tokens minted as the gate 
   ``RelayRateReason``, waits and reads on. The request's shape and the rate themselves, their
   deny-matrix cells and wire tests, are #59's (decisions I30, Q10 and Q11:
   ``test_streams_and_platform_wire.py``).
-* **The bound.** Token holders re-polling a job's stream from offset 0, ten at once, with
-  fresh update ids, as fast as the Authorizer and the server admit -- at a genuine request's
-  size on job A, padded to exactly ``RelayRequestMax`` on job B -- while each job does its own
-  work, and then on past the guard: at every sample both runs stay under
+* **The bound.** Token holders re-polling a job's stream from offset 0 with fresh update ids,
+  as fast as the Authorizer and the server admit, while the job does its own work, and then
+  on past the guard -- the poll budget's and the bytes guard's terms at their most, and a
+  long stream, one attacked job a test: job A at a genuine request's size (the poll budget
+  binds), then its worker restarted and the run replayed cold within the task timeout; job B
+  padded to ``RelayRequestMax``, with update ids of ``limit.maxIDLength`` and a 64-character
+  listed topic, on a history the seller grew (the bytes guard binds); job D a stream of 5,000
+  small items (a poll costs its answer, never the log). At every sample the runs stay under
   ``limit.historyCount.error`` and ``limit.historySize.error``; what they added, measured
-  against twins doing the same work with nobody polling, is within I39's formula; the runs
-  accept at most ``STREAM_POLLS_MAX`` polls; a legitimate relay read the stream and was then
-  told, explicitly, that the budget was spent; and both jobs complete, and replay.
+  against twins doing the same work with nobody polling, is within the formula; a legitimate
+  relay read the stream and was then told, explicitly, that the budget was spent; and every
+  job completes with no workflow task failed or timed out, and replays.
 
 The jobs survive: these tests show the attack failing. None ends a job."""
 
@@ -24,7 +28,7 @@ import json
 import time
 import uuid
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -77,6 +81,13 @@ ITEMS = s.STREAM_ITEMS_MAX + 1
 RATE = int(relay_bound.authorizer_constant("RelayRate"))
 BURST = int(relay_bound.authorizer_constant("RelayBurst"))
 REQUEST_MAX = int(relay_bound.authorizer_constant("RelayRequestMax"))
+#: The longest topic ``check_topic`` admits, listed: every reference to it at its longest.
+LONG_TOPIC = "t" * 64
+#: ``limit.maxIDLength``: the longest update id the server takes.
+ID_MAX = int(relay_bound.pinned()["limit.maxIDLength"])
+#: Temporal's default workflow task timeout, which nothing in Kontra sets otherwise: a worker
+#: that lost its cache replays a run's accepted polls within it (decisions I39).
+TASK_TIMEOUT = 10.0
 
 
 class _Keys:
@@ -93,10 +104,13 @@ class Seller:
 
 
 @contextlib.asynccontextmanager
-async def seller_worker(cluster: Cluster) -> AsyncIterator[Seller]:
+async def seller_worker(
+    cluster: Cluster, *, blobs: MemoryBlobs | None = None, queue: str | None = None
+) -> AsyncGenerator[Seller]:
     """A seller's worker as ``kontra.serve`` runs one: Kontra's codec (a blob store for the
-    stream's items) and interceptor, on the party's own token, its own task queue."""
-    blobs = MemoryBlobs()
+    stream's items) and interceptor, on the party's own token, its own task queue. Given the
+    ``blobs`` and ``queue`` of one before it: that worker restarted, its caches empty."""
+    blobs = blobs if blobs is not None else MemoryBlobs()
     codec = KontraCodec(
         SELLER_KEY[0], [SELLER_KEY[1]], role="seller", buyer_keys=_Keys(), blobs=blobs
     )
@@ -106,8 +120,8 @@ async def seller_worker(cluster: Cluster) -> AsyncIterator[Seller]:
         api_key=cluster.signer.api_key(SELLER),
         data_converter=seller_data_converter(codec),
     )
-    queue = f"bound-{uuid.uuid4().hex[:8]}"
-    interceptor = KontraInterceptor(None, streams={queue: [LISTED]})
+    queue = queue or f"bound-{uuid.uuid4().hex[:8]}"
+    interceptor = KontraInterceptor(None, streams={queue: [LISTED, LONG_TOPIC]})
     async with Worker(
         client,
         task_queue=queue,
@@ -119,11 +133,13 @@ async def seller_worker(cluster: Cluster) -> AsyncIterator[Seller]:
         yield Seller(client, queue, interceptor, blobs)
 
 
-async def start(seller: Seller, items: int = ITEMS) -> tuple[str, WorkflowHandle[Any, str]]:
+async def start(
+    seller: Seller, items: int = ITEMS, **kw: Any
+) -> tuple[str, WorkflowHandle[Any, str]]:
     job = names.new_job_id()
     handle = await seller.client.start_workflow(
         app.BoundJob.run,
-        app.BoundJobInput(items),
+        app.BoundJobInput(items, **kw),
         id=names.job_workflow_id(job),
         task_queue=seller.queue,
     )
@@ -143,31 +159,50 @@ async def until(check: Callable[[], Awaitable[bool]], within: float = 60.0) -> N
         await asyncio.sleep(0.1)
 
 
-def poll_request(workflow_id: str, *, identity: str = "kontra-relay") -> UpdateWorkflowExecutionRequest:  # fmt: skip
+def poll_request(
+    workflow_id: str,
+    *,
+    identity: str = "kontra-relay",
+    topic: str = LISTED,
+    update_id: str | None = None,
+) -> UpdateWorkflowExecutionRequest:
     """A poll from offset 0 with a fresh update id, shaped as ``kontra._relay`` builds it."""
     return UpdateWorkflowExecutionRequest(
         namespace=SELLER,
         workflow_execution=WorkflowExecution(workflow_id=workflow_id),
         wait_policy=WaitPolicy(lifecycle_stage=COMPLETED),
         request=UpdateRequest(
-            meta=UpdateMeta(update_id=uuid.uuid4().hex, identity=identity),
+            meta=UpdateMeta(update_id=update_id or uuid.uuid4().hex, identity=identity),
             input=UpdateInput(
                 name=names.STREAM_POLL_UPDATE,
                 args=Payloads(
-                    payloads=[_relay.poll_input_payload([LISTED, names.PROGRESS_TOPIC], 0)]
+                    payloads=[_relay.poll_input_payload([topic, names.PROGRESS_TOPIC], 0)]
                 ),
             ),
         ),
     )
 
 
-def padded_identity(workflow_id: str) -> str:
+def long_update_id() -> str:
+    """A fresh update id of ``limit.maxIDLength`` characters: the poll's accepted event
+    writes it three times."""
+    return (uuid.uuid4().hex * 8)[:ID_MAX]
+
+
+def padded_identity(workflow_id: str, *, topic: str = LISTED, long_ids: bool = False) -> str:
     """The identity that makes a poll exactly ``RelayRequestMax`` bytes: the field a poll's
     accepted and completed events both echo, so the most a request can cost the history."""
+    update_id = long_update_id() if long_ids else None
+
+    def size(identity: str) -> int:
+        return poll_request(
+            workflow_id, identity=identity, topic=topic, update_id=update_id
+        ).ByteSize()
+
     identity = "h"
-    while poll_request(workflow_id, identity=identity + "h").ByteSize() <= REQUEST_MAX:
+    while size(identity + "h") <= REQUEST_MAX:
         identity += "h"
-    assert poll_request(workflow_id, identity=identity).ByteSize() in (REQUEST_MAX, REQUEST_MAX - 1)
+    assert size(identity) in (REQUEST_MAX, REQUEST_MAX - 1)
     return identity
 
 
@@ -206,23 +241,36 @@ def largest_task(history: WorkflowHistory) -> int:
     return largest
 
 
-async def replays(seller: Seller, history: WorkflowHistory) -> None:
+async def cold_replay(seller: Seller, history: WorkflowHistory) -> float:
+    """Replays ``history`` as a worker that lost its cache does -- a fresh codec, nothing
+    remembered -- and returns the seconds it took: what one workflow task's timeout must
+    hold after a restart, a deploy or an eviction."""
+    codec = KontraCodec(
+        SELLER_KEY[0], [SELLER_KEY[1]], role="seller", buyer_keys=_Keys(), blobs=seller.blobs
+    )
     replayer = Replayer(
         workflows=[app.BoundJob],
         interceptors=[seller.interceptor],
-        data_converter=seller.client.data_converter,
+        data_converter=seller_data_converter(codec),
     )
+    began = time.monotonic()
     result = await replayer.replay_workflow(history, raise_on_replay_failure=False)
+    took = time.monotonic() - began
     assert result.replay_failure is None, result.replay_failure
+    return took
 
 
-def describe(control: Client, workflow_id: str) -> Callable[[], Awaitable[tuple[int, int, int]]]:
-    """The run's (history length, history size, status), as the gate's observer reads it."""
+def describe(
+    control: Client, workflow_id: str, run_id: str = ""
+) -> Callable[[], Awaitable[tuple[int, int, int]]]:
+    """The run's (history length, history size, status), as the gate's observer reads it:
+    the chain's current run, or ``run_id``."""
 
     async def get() -> tuple[int, int, int]:
         d = await control.workflow_service.describe_workflow_execution(
             DescribeWorkflowExecutionRequest(
-                namespace=SELLER, execution=WorkflowExecution(workflow_id=workflow_id)
+                namespace=SELLER,
+                execution=WorkflowExecution(workflow_id=workflow_id, run_id=run_id),
             )
         )
         info = d.workflow_execution_info
@@ -321,11 +369,13 @@ async def test_the_relay_waits_out_its_rate_and_reads_on(cluster: Cluster) -> No
 
 @dataclass
 class Attack:
-    """Ten token holders on one job, polling from 0 with fresh ids as fast as admitted."""
+    """Token holders on one job, polling from 0 with fresh ids as fast as admitted."""
 
     relay: Client
     workflow_id: str
-    identity: str
+    identity: str = "kontra-relay"
+    topic: str = LISTED
+    long_ids: bool = False
     tally: Counter[str] = field(default_factory=Counter[str])
     full: asyncio.Event = field(default_factory=asyncio.Event)
     stop: asyncio.Event = field(default_factory=asyncio.Event)
@@ -333,7 +383,12 @@ class Attack:
 
     async def holder(self) -> None:
         while not self.stop.is_set():
-            req = poll_request(self.workflow_id, identity=self.identity)
+            req = poll_request(
+                self.workflow_id,
+                identity=self.identity,
+                topic=self.topic,
+                update_id=long_update_id() if self.long_ids else None,
+            )
             try:
                 resp = await self.relay.workflow_service.update_workflow_execution(
                     req, timeout=timedelta(seconds=10)
@@ -356,6 +411,12 @@ class Attack:
                 continue
             self.tally["answered"] += 1
 
+    def run(self, holders: int) -> list[asyncio.Task[None]]:
+        return [asyncio.create_task(self.holder()) for _ in range(holders)]
+
+    def authorized(self) -> int:
+        return sum(n for k, n in self.tally.items() if k != "rate" and not k.startswith("rpc:"))
+
 
 @dataclass
 class Samples:
@@ -376,47 +437,206 @@ async def sample(control: Client, jobs: dict[str, str], into: Samples, stop: asy
         await asyncio.sleep(0.5)
 
 
+class Driver:
+    """The seller's own work on every job, in step: a signal, an activity, an item."""
+
+    def __init__(self, handles: dict[str, WorkflowHandle[Any, str]], items: dict[str, int]):
+        self.handles, self.items, self.cycles = handles, items, 0
+        self.stop = asyncio.Event()
+
+    async def cycle(self) -> None:
+        self.cycles += 1
+        for h in self.handles.values():
+            await h.signal(app.BoundJob.work, self.cycles)
+        for label, h in self.handles.items():
+            await until(lambda h=h, n=self.items[label] + self.cycles: _at(h, n), within=120)
+
+    async def drive(self) -> None:
+        while not self.stop.is_set():
+            await self.cycle()
+            await asyncio.sleep(1.0)
+
+
+def assert_survived(samples: Samples, results: dict[str, str], runs: dict[str, list[Run]]) -> None:  # fmt: skip
+    """At every sample under both limits and running; every run then completed, by itself,
+    and not one workflow task failed or timed out."""
+    pinned = relay_bound.pinned()
+    assert samples.taken > 20
+    for label, (length, size) in samples.worst.items():
+        assert length < pinned["limit.historyCount.error"], (label, length)
+        assert size < pinned["limit.historySize.error"], (label, size)
+        assert samples.statuses[label] == {
+            WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_RUNNING
+        }, label
+    assert set(results.values()) == {"done"}, results
+    for label, chain in runs.items():
+        for run in chain:
+            assert count(run.history, EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED) == 0, label
+            assert count(run.history, EventType.EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT) == 0, label
+
+
+@dataclass
+class Run:
+    """One run's history and its length and size as the server counts them."""
+
+    history: WorkflowHistory
+    length: int
+    size: int
+
+
+def within_formula(attacked: Run, twin: Run, label: str) -> dict[str, int]:
+    """What the polls added to one run (it less its twin's run, which did the same work with
+    nobody polling) against I39's formula for the polls the run accepted, ``W_s`` the twin's
+    workflow tasks, ``w_t`` the largest triple of either run."""
+    pinned = relay_bound.pinned()
+    accepted = accepted_polls(attacked.history)
+    assert accepted_polls(twin.history) == 0
+    assert accepted <= s.STREAM_POLLS_MAX, (label, accepted)
+    tasks = count(twin.history, EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED)
+    triple = max(largest_task(attacked.history), largest_task(twin.history))
+    assert triple <= relay_bound.TASK_BYTES_MAX, (label, triple)  # the precondition on w_t
+    events, size = attacked.length - twin.length, attacked.size - twin.size
+    scaled, bound = relay_bound.bound(polls_max=accepted), relay_bound.bound()
+    assert events <= scaled.events_with(tasks), (label, events, accepted, tasks)
+    assert size <= scaled.bytes_with(tasks, triple), (label, size, accepted, tasks)
+    assert events <= bound.events_with(tasks)
+    assert size <= bound.bytes_with(tasks, triple)
+    assert twin.length + bound.events_with(tasks) < pinned["limit.historyCount.error"]
+    assert twin.size + bound.bytes_with(tasks, triple) < pinned["limit.historySize.error"]
+    return {
+        "accepted": accepted,
+        "events_added": events,
+        "bytes_added": size,
+        "seller_tasks": tasks,
+        "largest_task": triple,
+    }
+
+
+async def runs_of(client: Client, control: Client, workflow_id: str) -> list[Run]:
+    """Every run of the chain, oldest first."""
+    found = [r async for r in client.list_workflows(f"WorkflowId = '{workflow_id}'")]
+    found.sort(key=lambda r: r.start_time)
+    runs: list[Run] = []
+    for r in found:
+        history = await client.get_workflow_handle(workflow_id, run_id=r.run_id).fetch_history()
+        length, size, _ = await describe(control, workflow_id, r.run_id)()
+        runs.append(Run(history, length, size))
+    return runs
+
+
+class Bench:
+    """A seller's worker, an attacked job beside a twin doing the same work with nobody
+    polling, the seller's own work driven on both, and every run sampled as the gate's
+    observer samples it. One attacked job a bench: the worker keeps up with one relay
+    token's rate (decisions I39's precondition), whatever else runs on the machine."""
+
+    def __init__(self, cluster: Cluster, control: Client) -> None:
+        self.cluster, self.control = cluster, control
+        self.samples, self._sampling = Samples(), asyncio.Event()
+        self._worker = contextlib.AsyncExitStack()
+        self.jobs: dict[str, str] = {}
+        self.job_of: dict[str, str] = {}
+        self.handles: dict[str, WorkflowHandle[Any, str]] = {}
+        self.driver = Driver({}, {})
+        self._tasks: list[asyncio.Task[None]] = []
+
+    async def __aenter__(self) -> Bench:
+        self.seller = await self._worker.enter_async_context(seller_worker(self.cluster))
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.driver.stop.set()
+        self._sampling.set()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self._worker.aclose()
+
+    async def start(self, shapes: dict[str, dict[str, Any]]) -> None:
+        """The jobs, each with its stream published, then the seller's work and the sampling
+        under way."""
+        items: dict[str, int] = {}
+        for label, kw in shapes.items():
+            job, handle = await start(self.seller, **kw)
+            self.jobs[label], self.job_of[label], self.handles[label] = handle.id, job, handle
+            items[label] = kw.get("items", ITEMS)
+        for label, h in self.handles.items():
+            await until(lambda h=h, n=items[label]: _at(h, n), within=120)
+        self.driver = Driver(self.handles, items)
+        self._tasks = [
+            asyncio.create_task(self.driver.drive()),
+            asyncio.create_task(sample(self.control, self.jobs, self.samples, self._sampling)),
+        ]
+
+    async def relay(self, label: str) -> Client:
+        """A client on the job's relay token, as the gate mints it."""
+        token = self.cluster.signer.relay(SELLER, self.job_of[label])
+        return await connect_public(self.cluster, SELLER, api_key=token)
+
+    async def stop(self) -> None:
+        """The seller's work and the sampling, stopped."""
+        self.driver.stop.set()
+        self._sampling.set()
+        await asyncio.gather(*self._tasks)
+        self._tasks = []
+
+    async def restart(self) -> None:
+        """The seller's worker restarts: its workflow cache and its codec's are empty."""
+        queue, blobs = self.seller.queue, self.seller.blobs
+        await self._worker.aclose()
+        self._worker = contextlib.AsyncExitStack()
+        self.seller = await self._worker.enter_async_context(
+            seller_worker(self.cluster, blobs=blobs, queue=queue)
+        )
+        self.handles = {
+            label: self.seller.client.get_workflow_handle(wid) for label, wid in self.jobs.items()
+        }
+        self.driver.handles = self.handles
+
+    async def finish(self) -> tuple[dict[str, str], dict[str, list[Run]]]:
+        """Every job finished by its seller; its result, and each run of its chain."""
+        await self.stop()
+        for h in self.handles.values():
+            await h.signal(app.BoundJob.finish)
+        results = {label: await h.result() for label, h in self.handles.items()}
+        runs = {
+            label: await runs_of(self.seller.client, self.control, wid)
+            for label, wid in self.jobs.items()
+        }
+        return results, runs
+
+
+async def attack_until_full(attack: Attack, holders: int, *, past: float = 10.0) -> float:
+    """``holders`` token holders until the run refuses polls (its poll budget, or its bytes
+    guard), and on past it for ``past`` seconds while the seller works: refused polls write
+    nothing but a task beside one of the seller's own, at most. The attack's seconds."""
+    began = time.monotonic()
+    tasks = attack.run(holders)
+    try:
+        await asyncio.wait_for(attack.full.wait(), 240)
+        took = time.monotonic() - began
+        await asyncio.sleep(past)
+    finally:
+        attack.stop.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    assert attack.refused_after_full > 0  # past the guard, refused for as long as it went on
+    assert attack.authorized() <= BURST + RATE * (took + past + 2) * 1.2 + 20
+    return took
+
+
 async def test_a_token_holder_re_polling_from_offset_0_cannot_end_the_job(
     cluster: Cluster, control: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The owner's test on #59 (decisions I39): see the module docstring. Scaled from the
-    formula: each job's stream starts with one more item than an answer lists, so every poll
-    from 0 carries the most references; the polls the run accepts (P) and the bytes guard are
-    the real ones, so the run is pushed as far as any token holder can push it. (The
-    legitimate relay's longest wait after its rate's refusals is shortened, so it gets a
-    request in between the holders' sooner.)"""
+    """The owner's test on #59 (decisions I39): ten token holders re-poll job A's stream from
+    offset 0 with fresh update ids, at a genuine request's size, as fast as the Authorizer
+    admits, while the seller works and a legitimate relay listens; then on past the poll
+    budget. Each poll from 0 carries the most references (the stream starts with one more
+    item than an answer lists), and P is the real one. Then the seller's worker restarts, and
+    A's next task replays its whole history -- every accepted poll -- on a cold worker within
+    the task timeout. (The legitimate relay's longest wait after its rate's refusals is
+    shortened, so it gets a request in between the holders' sooner.)"""
     monkeypatch.setattr(_relay, "_EXHAUSTED_MAX", 2.0)
-    pinned = relay_bound.pinned()
-    events_limit, bytes_limit = (
-        pinned["limit.historyCount.error"],
-        pinned["limit.historySize.error"],
-    )
-    bound = relay_bound.bound()
-    async with seller_worker(cluster) as seller:
-        started = {label: await start(seller) for label in ("A", "B", "A0", "B0")}
-        jobs = {label: handle.id for label, (_, handle) in started.items()}
-        handles = {label: handle for label, (_, handle) in started.items()}
-        for h in handles.values():
-            await until(lambda h=h: _at(h, ITEMS))
-        job_a, job_b = started["A"][0], started["B"][0]
-        relay_a = await connect_public(cluster, SELLER, api_key=cluster.signer.relay(SELLER, job_a))
-        relay_b = await connect_public(cluster, SELLER, api_key=cluster.signer.relay(SELLER, job_b))
-
-        # The seller's own work on all four jobs, in step: a signal, an activity, an item.
-        cycles = 0
-        working = asyncio.Event()
-
-        async def drive() -> None:
-            nonlocal cycles
-            while not working.is_set():
-                cycles += 1
-                for h in handles.values():
-                    await h.signal(app.BoundJob.work, cycles)
-                for h in handles.values():
-                    await until(lambda h=h, n=ITEMS + cycles: _at(h, n))
-                await asyncio.sleep(1.0)
-
-        # A legitimate relay on A, from offset 0: it reads the stream, then the budget's stop.
+    async with Bench(cluster, control) as b:
+        await b.start({"A": {}, "A0": {}})
+        relay = await b.relay("A")
         legit: list[_relay.RelayItem] = []
         legit_stop: list[BaseException] = []
         legit_read = asyncio.Event()
@@ -424,14 +644,14 @@ async def test_a_token_holder_re_polling_from_offset_0_cannot_end_the_job(
         async def listen() -> None:
             try:
                 async for batch in _relay.relay(
-                    relay_a.workflow_service,
+                    relay.workflow_service,
                     namespace=SELLER,
-                    job_id=job_a,
+                    job_id=b.job_of["A"],
                     topics=[LISTED, names.PROGRESS_TOPIC],
                     start=0,
-                    closed=_closed(control, jobs["A"]),
+                    closed=_closed(control, b.jobs["A"]),
                     min_interval=0.5,
-                    blobs=seller.blobs.fetch,
+                    blobs=b.seller.blobs.fetch,
                 ):
                     legit.extend(batch.items)
                     if len(legit) >= ITEMS:
@@ -439,100 +659,25 @@ async def test_a_token_holder_re_polling_from_offset_0_cannot_end_the_job(
             except _relay.RelayStopped as e:
                 legit_stop.append(e)
 
-        samples, sampling = Samples(), asyncio.Event()
-        sampler = asyncio.create_task(sample(control, jobs, samples, sampling))
-        driver = asyncio.create_task(drive())
         listener = asyncio.create_task(listen())
         await asyncio.wait_for(legit_read.wait(), 60)
+        attack = Attack(relay, b.jobs["A"])
+        attack_secs = await attack_until_full(attack, 10)
+        await asyncio.wait_for(listener, 60)  # told the budget is spent, explicitly
+        await b.stop()
+        await b.restart()
+        await b.driver.cycle()  # each job's next task: its whole history, replayed cold
+        results, runs = await b.finish()
+        replay_secs = round(await cold_replay(b.seller, runs["A"][0].history), 2)
+        blobs = b.seller.blobs
 
-        attacks = {
-            "A": Attack(relay_a, jobs["A"], "kontra-relay"),
-            "B": Attack(relay_b, jobs["B"], padded_identity(jobs["B"])),
-        }
-        assert poll_request(jobs["B"], identity=attacks["B"].identity).ByteSize() >= REQUEST_MAX - 1
-        began = time.monotonic()
-        holders = [
-            asyncio.create_task(attack.holder()) for attack in attacks.values() for _ in range(10)
-        ]
-        try:
-            # Until each run refuses polls (its poll budget, or its bytes guard)...
-            await asyncio.wait_for(asyncio.gather(*(a.full.wait() for a in attacks.values())), 240)
-            attack_secs = time.monotonic() - began
-            # ...and on past it, while the seller works: refused polls write nothing but a
-            # task beside one of the seller's own, at most.
-            await asyncio.sleep(10)
-        finally:
-            for attack in attacks.values():
-                attack.stop.set()
-            await asyncio.gather(*holders, return_exceptions=True)
-        try:
-            await asyncio.wait_for(listener, 60)  # told the budget is spent, explicitly
-        finally:
-            working.set()
-            await driver
-        sampling.set()
-        await sampler
-        for h in handles.values():
-            await h.signal(app.BoundJob.finish)
-        results = {label: await h.result() for label, h in handles.items()}
-        histories = {label: await h.fetch_history() for label, h in handles.items()}
-        final = {label: await describe(control, wid)() for label, wid in jobs.items()}
-
-    # Survival: at every sample, under both limits and running; then completed, by itself.
-    assert samples.taken > 20
-    for label, (length, size) in samples.worst.items():
-        assert length < events_limit, (label, length)
-        assert size < bytes_limit, (label, size)
-        assert samples.statuses[label] == {
-            WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_RUNNING
-        }, label
-    assert results == {"A": "done", "B": "done", "A0": "done", "B0": "done"}
-    for label, (_, _, status) in final.items():
-        assert status == WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_COMPLETED, label
-        # No poll ever reached the codec misshapen, nor held a task past its timeout.
-        assert count(histories[label], EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED) == 0, label
-        assert count(histories[label], EventType.EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT) == 0, label
-
-    # The formula: what the polls added (the attacked run less its twin, which did the same
-    # work with nobody polling) is within I39's bound for the polls the run accepted.
-    measured: dict[str, dict[str, int]] = {}
-    for label, twin in (("A", "A0"), ("B", "B0")):
-        accepted = accepted_polls(histories[label])
-        tasks = count(histories[twin], EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED)
-        triple = largest_task(histories[twin])
-        assert triple <= relay_bound.TASK_BYTES_MAX  # the precondition on w_t
-        assert accepted_polls(histories[twin]) == 0
-        events = final[label][0] - final[twin][0]
-        size = final[label][1] - final[twin][1]
-        assert accepted <= s.STREAM_POLLS_MAX, (label, accepted)
-        scaled = relay_bound.bound(polls_max=accepted)
-        assert events <= scaled.events_with(tasks), (label, events, accepted, tasks)
-        assert size <= scaled.bytes_with(tasks, triple), (label, size, accepted, tasks)
-        assert events <= bound.events_with(tasks)
-        assert size <= bound.bytes_with(tasks, triple)
-        assert final[twin][0] + bound.events_with(tasks) < events_limit
-        measured[label] = {
-            "accepted": accepted,
-            "events_added": events,
-            "bytes_added": size,
-            "seller_tasks": tasks,
-            "largest_task": triple,
-            "worst_length": samples.worst[label][0],
-            "worst_size": samples.worst[label][1],
-        }
-    # A, at a genuine request's size: the poll budget binds, exactly.
-    assert measured["A"]["accepted"] == s.STREAM_POLLS_MAX
-    # B, padded to the Authorizer's cap: the bytes guard binds first, under half the limit
-    # plus the polls in flight.
-    assert measured["B"]["accepted"] < s.STREAM_POLLS_MAX
-    assert samples.worst["B"][1] >= relay_bound.interceptors.STREAM_HISTORY_BYTES
-    # Past the guard, polls were refused for as long as the holders went on.
-    for attack in attacks.values():
-        assert attack.refused_after_full > 0
-        assert attack.tally["rate"] > 0  # the Authorizer's rate held them, not the loop
-        authorized = sum(n for k, n in attack.tally.items() if k != "rate" and not k.startswith("rpc:"))  # fmt: skip
-        assert authorized <= BURST + RATE * (attack_secs + 12) * 1.2 + 20
-
+    assert_survived(b.samples, results, runs)
+    measured = within_formula(runs["A"][0], runs["A0"][0], "A")
+    measured["worst_length"], measured["worst_size"] = b.samples.worst["A"]
+    assert measured["accepted"] == s.STREAM_POLLS_MAX  # the poll budget binds, exactly
+    assert attack.tally["rate"] > 0  # the Authorizer's rate held them, not the loop
+    # A worker that lost its cache replays the attacked run well within a task's timeout.
+    assert replay_secs < TASK_TIMEOUT / 2, replay_secs
     # The legitimate relay read the stream from 0, every item its buyer's, in order, and was
     # then told the budget is spent: one explicit stop, no silent loss.
     assert [i.offset for i in legit] == list(range(len(legit)))
@@ -543,14 +688,90 @@ async def test_a_token_holder_re_polling_from_offset_0_cannot_end_the_job(
     assert [e.reason for e in legit_stop if isinstance(e, _relay.RelayStopped)] == [
         "history_budget"
     ]
-    # Re-reads stored nothing new: one blob per item answered, each uploaded once.
-    stored = seller.blobs.of(job_a)
-    assert len(stored) <= ITEMS + cycles
+    # Re-reads stored nothing new: one blob per item answered, each uploaded once -- the
+    # restart's replay included.
+    stored = blobs.of(b.job_of["A"])
+    assert len(stored) <= ITEMS + b.driver.cycles
     assert all(data.startswith(s.AGE_MAGIC) for data in stored.values())
-    # And both runs replay.
-    for label in ("A", "B"):
-        await replays(seller, histories[label])
-    print("relay bound, measured:", json.dumps(measured, sort_keys=True), "cycles", cycles)
+    print(
+        "relay bound A, measured:",
+        json.dumps(measured, sort_keys=True),
+        f"attack {attack_secs:.1f} s, cold replay {replay_secs} s, cycles {b.driver.cycles}",
+    )
+
+
+async def test_the_bytes_guard_binds_for_the_largest_requests_and_answers(
+    cluster: Cluster, control: Client
+) -> None:
+    """The bytes term at its most (decisions I39): ten holders on job B, each request padded
+    to ``RelayRequestMax`` with update ids of ``limit.maxIDLength``, polling a listed topic of
+    64 characters (every reference at its longest), on a history the seller grew first: the
+    bytes guard stops the run before its poll budget, at half the limit plus the polls in
+    flight, and what the polls added is within the formula."""
+    # Under the codec's claim-check threshold (256 KiB), so each stays in the history:
+    # twenty-eight are about 7 MB of it.
+    ballast = "b" * 250_000
+    async with Bench(cluster, control) as b:
+        await b.start({"B": {"topic": LONG_TOPIC}, "B0": {"topic": LONG_TOPIC}})
+        for label in ("B", "B0"):
+            for _ in range(28):
+                await b.handles[label].signal(app.BoundJob.ballast, ballast)
+        identity = padded_identity(b.jobs["B"], topic=LONG_TOPIC, long_ids=True)
+        attack = Attack(await b.relay("B"), b.jobs["B"], identity, topic=LONG_TOPIC, long_ids=True)
+        padded = poll_request(
+            attack.workflow_id, identity=identity, topic=LONG_TOPIC, update_id=long_update_id()
+        )
+        assert padded.ByteSize() >= REQUEST_MAX - 1
+        attack_secs = await attack_until_full(attack, 10)
+        results, runs = await b.finish()
+        await cold_replay(b.seller, runs["B"][0].history)
+
+    assert_survived(b.samples, results, runs)
+    measured = within_formula(runs["B"][0], runs["B0"][0], "B")
+    measured["worst_length"], measured["worst_size"] = b.samples.worst["B"]
+    assert measured["accepted"] < s.STREAM_POLLS_MAX
+    assert b.samples.worst["B"][1] >= relay_bound.interceptors.STREAM_HISTORY_BYTES
+    assert attack.tally["rate"] > 0
+    print(
+        "relay bound B, measured:",
+        json.dumps(measured, sort_keys=True),
+        f"attack {attack_secs:.1f} s",
+    )
+
+
+async def test_a_long_stream_costs_a_poll_its_answer(cluster: Cluster, control: Client) -> None:
+    """A stream of 5,000 small items, polled from 0 by ten holders -- half naming the listed
+    topic, half a topic the log does not hold -- so that a poll would cost the log's length
+    if anything scanned or encoded it (the contrib alone encodes all 5,000 for each poll from
+    0; decisions I39): job D accepts its budget, runs on, and its history replays on a cold
+    worker well within a task's timeout -- what the polls add to that replay, against its
+    twin's, a small part of it."""
+    big = 5_000
+    async with Bench(cluster, control) as b:
+        await b.start({"D": {"items": big, "pad": 0}, "D0": {"items": big, "pad": 0}})
+        relay = await b.relay("D")
+        listed, absent = Attack(relay, b.jobs["D"]), Attack(relay, b.jobs["D"], topic="absent")
+        absent_tasks = absent.run(5)
+        try:
+            attack_secs = await attack_until_full(listed, 5)
+        finally:
+            absent.stop.set()
+            await asyncio.gather(*absent_tasks, return_exceptions=True)
+        results, runs = await b.finish()
+        twin_secs = round(await cold_replay(b.seller, runs["D0"][0].history), 2)
+        replay_secs = round(await cold_replay(b.seller, runs["D"][0].history), 2)
+
+    assert_survived(b.samples, results, runs)
+    measured = within_formula(runs["D"][0], runs["D0"][0], "D")
+    assert measured["accepted"] == s.STREAM_POLLS_MAX
+    assert absent.tally["answered"] > 0  # answered: bounded scans, nothing in them
+    assert replay_secs < TASK_TIMEOUT / 2, replay_secs
+    assert replay_secs - twin_secs < TASK_TIMEOUT / 4, (replay_secs, twin_secs)
+    print(
+        "relay bound D, measured:",
+        json.dumps(measured, sort_keys=True),
+        f"attack {attack_secs:.1f} s, cold replay {replay_secs} s (its twin {twin_secs} s)",
+    )
 
 
 async def _at(handle: WorkflowHandle[Any, str], n: int) -> bool:

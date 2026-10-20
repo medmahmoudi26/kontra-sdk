@@ -43,18 +43,28 @@ nothing else, so the root hosts the stream (``temporalio.contrib.workflow_stream
   ``next_offset`` at the first item left out, ``more_ready``), so every answer has a fixed
   upper size, the codec never trims it, and what this run counts as read is what the poller
   is sent.
+* **Bounded work** (decisions I39). When the run's poll handler is the contrib's own (of the
+  stream Kontra hosts, or of the seller's), Kontra answers its polls (:func:`_answer`): the
+  contrib's protocol, looking at most :data:`STREAM_SCAN_MAX` entries of the log and encoding
+  only the items it answers, so a poll costs the same whatever the log's length. A worker
+  replays every accepted poll of a run after a cache miss, within one workflow task's
+  timeout: on replay a poll's answer -- already in the history, never sent again -- is a
+  constant (:func:`~kontra.codec.stream.replayed_payload`), nothing encoded, sealed or stored.
 * **The poll guard** (decisions I31, I39). A poll is refused at validation -- a rejected
   update is not written to history and spends none of the run's updates -- with
   ``KontraStreamFull`` once this run accepted :data:`~kontra.codec.stream.STREAM_POLLS_MAX`
-  polls (half of Kontra's pinned ``history.maxTotalUpdates``) or its history is past half of
-  Kontra's pinned limits (:data:`STREAM_HISTORY_EVENTS`, :data:`STREAM_HISTORY_BYTES`); and
+  polls (an eighth of Kontra's pinned ``history.maxTotalUpdates``) or its history is past half
+  of Kontra's pinned limits (:data:`STREAM_HISTORY_EVENTS`, :data:`STREAM_HISTORY_BYTES`); and
   with ``KontraStreamBusy`` (retryable) while :data:`STREAM_PARKED_MAX` polls are in flight,
   so the seller always keeps update slots of its own, or, once the run's code is under way,
   for an offset past the stream's end, which would wait past the next publish. The count is workflow state, incremented first in the
   handler, before any ``await``: at most ``STREAM_POLLS_MAX`` polls are accepted in a run,
   exactly. With the Authorizer's rules for a relay token (a request at most 4 KiB, shaped as
   ``kontra._relay`` builds it, at most ten a second: decisions I30, I39), that bounds what any
-  token holder's polls add to a run: I39 states the formula. A poll's failure is a
+  token holder's polls add to a run: I39 states the formula. temporalio runs validators only
+  for a handler registered with one: a job whose code registers its own poll handler without
+  one is outside the bound (each poll is written before anything could refuse it), and is
+  told so in a warning, once a run. A poll's failure is a
   :class:`~kontra.codec.stream.PollFailure`: a fixed message, no traceback.
 * **Answer budget.** The polls one workflow task completes answer together, in the worker's
   reply to that task, which must fit gRPC's 4 MiB message or Temporal ends the run. A root
@@ -90,7 +100,7 @@ import contextlib
 import json
 import logging
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import timedelta
 from typing import Any, NoReturn, Protocol
 
@@ -101,7 +111,17 @@ from temporalio.contrib.workflow_streams import (
     PollInput,
     PollResult,
     WorkflowStream,
+    WorkflowStreamItem,
     WorkflowStreamState,
+)
+from temporalio.contrib.workflow_streams._stream import (  # the contrib's own answer protocol
+    _MAX_POLL_RESPONSE_BYTES,  # pyright: ignore[reportPrivateUsage]
+    _payload_wire_size,  # pyright: ignore[reportPrivateUsage]
+)
+from temporalio.contrib.workflow_streams._types import (
+    TRUNCATED_OFFSET_ERROR_TYPE,
+    _encode_payload,  # pyright: ignore[reportPrivateUsage]
+    _WorkflowStreamWireItem,  # pyright: ignore[reportPrivateUsage]
 )
 from temporalio.exceptions import ApplicationError, FailureError
 from temporalio.worker import (
@@ -134,6 +154,7 @@ from kontra.codec.stream import (
     PollFailure,
     buyer_topics,
     envelope_bound,
+    replayed_payload,
 )
 from kontra.codec.stream import offset_payload as _offset_payload
 from kontra.contract.names import (
@@ -157,6 +178,7 @@ __all__ = [
     "STREAM_PARKED_MAX",
     "STREAM_POLLED_HEADER",
     "STREAM_POLLS_MAX",
+    "STREAM_SCAN_MAX",
     "KontraInterceptor",
     "ProgressSink",
     "job_from_headers",
@@ -194,6 +216,12 @@ STREAM_PARKED_MAX = 6
 #: ``limit.blobSize.error`` (2 MiB) included. Answers are references now (at most 13.5 KiB):
 #: ten in flight are under a tenth of it.
 STREAM_ANSWER_BUDGET = 1536 * 1024
+#: The most log entries one poll of the contrib's stream looks at (Kontra answers it,
+#: :meth:`_WorkflowInbound._poll`): past them, the answer stops with ``more_ready`` and
+#: ``next_offset`` at the first entry not looked at, so a poll naming topics the log hardly
+#: holds costs a bounded scan, never the log's length (decisions I39). Sixteen answers' worth:
+#: a relay reads a 64,000-entry log of other topics in 63 polls.
+STREAM_SCAN_MAX = 16 * STREAM_ITEMS_MAX
 _JSON_PLAIN = b"json/plain"
 _INT = re.compile(rb"0|[1-9][0-9]{0,18}", re.ASCII)
 
@@ -243,6 +271,44 @@ def _int_payload(n: int) -> Payload:
 # --------------------------------------------------------------------------- workflows
 
 
+def _answer(
+    log: Sequence[WorkflowStreamItem[Any]], base: int, poll: PollInput, *, encode: bool
+) -> PollResult:
+    """What the contrib's ``WorkflowStream._on_poll`` answers once its wait is over -- its
+    truncated offsets, its ~1 MB cap, its truncation protocol (``next_offset`` at the first
+    item left out, ``more_ready``) -- cut at :data:`~kontra.codec.stream.STREAM_ITEMS_MAX`
+    items, and doing work in proportion to that, never to the log (decisions I39): it looks at
+    no more than :data:`STREAM_SCAN_MAX` entries and encodes only the items it answers, where
+    the contrib encodes up to 1 MB of the log before Kontra could cut it. ``encode`` False (a
+    replay): nothing is encoded at all, the items' data left empty. A count and the items'
+    sizes decide the answer: the same on every worker and on replay."""
+    at = poll.from_offset - base
+    if at < 0:
+        if poll.from_offset != 0:
+            raise ApplicationError("truncated", type=TRUNCATED_OFFSET_ERROR_TYPE)
+        at = 0  # "from the beginning": whatever is there
+    topics = frozenset(poll.topics) if poll.topics else None
+    end = len(log)
+    scanned = min(end, at + STREAM_SCAN_MAX)
+    items: list[_WorkflowStreamWireItem] = []
+    size = 0
+    for index in range(at, scanned):
+        item = log[index]
+        if topics is not None and item.topic not in topics:
+            continue
+        item_size = _payload_wire_size(item.data, item.topic)
+        if len(items) == STREAM_ITEMS_MAX or (
+            items and size + item_size > _MAX_POLL_RESPONSE_BYTES
+        ):
+            return PollResult(items=items, next_offset=base + index, more_ready=True)
+        size += item_size
+        data = _encode_payload(item.data) if encode else ""
+        items.append(_WorkflowStreamWireItem(topic=item.topic, data=data, offset=base + index))
+    if scanned < end:
+        return PollResult(items=items, next_offset=base + scanned, more_ready=True)
+    return PollResult(items=items, next_offset=base + end, more_ready=False)
+
+
 class _HostedStream(WorkflowStream):
     """The stream Kontra hosts on a root whose code hosts none: the contrib's own
     implementation. ``WorkflowStream`` insists on being built from a function named
@@ -264,6 +330,9 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
     _root: bool = False
     #: The stream Kontra hosts on this run, if it hosts one.
     _hosted: _HostedStream | None = None
+    #: The contrib's stream whose polls Kontra answers (:meth:`_poll`): the hosted one, or the
+    #: seller's own when its poll handler is the contrib's.
+    _stream: WorkflowStream | None = None
     #: The run's stream exists (hosted, or the seller's): early polls may go on.
     _ready: bool = False
     #: A poll was seen in this chain (this run, or a run before it: the polled header).
@@ -271,6 +340,10 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
     _in_flight: int = 0
     #: The polls this run accepted (the guard's count, :data:`STREAM_POLLS_MAX`).
     _accepted: int = 0
+    #: The update id the guard last validated: a poll whose handler runs without it ran no
+    #: validator; and whether the seller was told so in this run.
+    _validated: str | None = None
+    _unguarded: bool = False
     #: The largest ``next_offset`` of a poll answered with ``more_ready`` false.
     _answered_to: int = 0
     #: The workflow task whose answers :attr:`_task_answered` counts (its history length, see
@@ -322,6 +395,7 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
             # The seller's __init__ has run: a stream it built is registered by now.
             base = _int_header(input.headers, STREAM_BASE_HEADER) or 0
             self._hosted = _HostedStream(WorkflowStreamState(base_offset=base) if base else None)
+        self._adopt()
         if _int_header(input.headers, STREAM_POLLED_HEADER) == 1:
             self._polled = True
         self._ready = True
@@ -335,6 +409,44 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
             raise
         await self._drain()
         return result
+
+    def _adopt(self) -> None:
+        """When the run's poll handler is the contrib's own (``WorkflowStream._on_poll``, of the
+        stream Kontra hosts or of the seller's), answer its polls with :meth:`_poll` instead,
+        the contrib's validator kept. A handler of the seller's own is left as it is."""
+        handler = workflow.get_update_handler(STREAM_POLL_UPDATE)
+        stream = getattr(handler, "__self__", None)
+        if not isinstance(stream, WorkflowStream):
+            return
+        if getattr(handler, "__func__", None) is not WorkflowStream._on_poll:  # pyright: ignore[reportPrivateUsage]
+            return
+        self._stream = stream
+        workflow.set_update_handler(
+            STREAM_POLL_UPDATE,
+            self._poll,
+            validator=stream._validate_poll,  # pyright: ignore[reportPrivateUsage]
+        )
+
+    async def _poll(self, payload: PollInput) -> PollResult:
+        """The contrib's poll handler (``WorkflowStream._on_poll``): its wait, then
+        :func:`_answer`. A replay runs every accepted poll of the run again; on replay nothing
+        is encoded (:meth:`handle_update_handler` answers a constant)."""
+        stream = self._stream
+        if stream is None:
+            raise PollFailure(STREAM_ERROR)
+        await workflow.wait_condition(
+            lambda: (
+                payload.from_offset < stream._base_offset  # pyright: ignore[reportPrivateUsage]
+                or len(stream._log) > payload.from_offset - stream._base_offset  # pyright: ignore[reportPrivateUsage]
+                or stream._detaching  # pyright: ignore[reportPrivateUsage]
+            )
+        )
+        return _answer(
+            stream._log,  # pyright: ignore[reportPrivateUsage]
+            stream._base_offset,  # pyright: ignore[reportPrivateUsage]
+            payload,
+            encode=not workflow.unsafe.is_replaying_history_events(),
+        )
 
     def _end(self) -> int | None:
         end_of = workflow.get_query_handler(STREAM_OFFSET_QUERY)
@@ -366,7 +478,7 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
         ending: detaching a stream the seller hosts changes nothing it could still read."""
         if self._in_flight == 0:
             return
-        stream: WorkflowStream | None = self._hosted
+        stream: WorkflowStream | None = self._stream or self._hosted
         if stream is None:
             owner = getattr(workflow.get_update_handler(STREAM_POLL_UPDATE), "__self__", None)
             stream = owner if isinstance(owner, WorkflowStream) else None
@@ -408,6 +520,7 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
 
     def handle_update_validator(self, input: HandleUpdateInput) -> None:
         if self._root and input.update == STREAM_POLL_UPDATE:
+            self._validated = input.id
             # Each refusal is a rejection: not written to history, no update spent.
             info = workflow.info()
             if (
@@ -432,6 +545,23 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
     async def handle_update_handler(self, input: HandleUpdateInput) -> Any:
         if not (self._root and input.update == STREAM_POLL_UPDATE):
             return await super().handle_update_handler(input)
+        # temporalio ran no validator for it: the run's poll handler was registered without
+        # one. Every such poll is accepted, and written, before Kontra could refuse it.
+        # Refusing it here would only fail an update already written (and would replay
+        # differently once the budget changed), so the seller is told, once a run. A replay
+        # runs no validator: not a sign of anything.
+        if (
+            self._validated != input.id
+            and not self._unguarded
+            and not workflow.unsafe.is_replaying_history_events()
+        ):
+            self._unguarded = True
+            workflow.logger.warning(
+                "this job's stream poll handler has no validator: Kontra cannot refuse a "
+                "poll before it is written, and the job is outside the relay's bound "
+                "(decisions I39); register the handler with a validator, or leave the "
+                "stream's own"
+            )
         self._accepted += 1  # first, before any await: the next validator sees it
         self._polled = True
         self._in_flight += 1
@@ -453,6 +583,12 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
         result = self._budget(self._trim(result))
         if not result.more_ready:
             self._answered_to = max(self._answered_to, result.next_offset)
+        if workflow.unsafe.is_replaying_history_events():
+            # The answer is in the history already, and Temporal matches a replayed update's
+            # response by its protocol instance, never its payload, which goes nowhere: a
+            # constant the codec passes as it is -- nothing encoded, sealed or stored again,
+            # so a replay of a run's accepted polls costs their count, not their answers.
+            return RawValue(replayed_payload())
         [p] = workflow.payload_converter().to_payloads([result])
         p.metadata[STREAM_MARK] = POLL_MARK
         p.metadata[BUYER_TOPICS_KEY] = buyer_topics(sorted(listed))
@@ -462,7 +598,8 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
         """The answer as the codec will send it: cut, with the contrib's own truncation
         protocol, at :data:`~kontra.codec.stream.STREAM_ITEMS_MAX` items, so every answer is
         at most ``ENVELOPE_MAX``, the codec never trims it, and the drain counts only what the
-        poller is sent. A count: the same on every worker and on replay."""
+        poller is sent. A count: the same on every worker and on replay. :func:`_answer` cuts
+        there already; this is for a seller's own handler that returns a ``PollResult``."""
         items = result.items
         if len(items) <= STREAM_ITEMS_MAX:
             return result

@@ -12,6 +12,7 @@ timeout; every history replays."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -47,6 +48,7 @@ from kontra.testing.devserver import DevServer
 from .streamflows import (
     LISTED,
     UNLISTED,
+    BareHandlerJob,
     Burst,
     ChainJob,
     FilledJob,
@@ -127,7 +129,7 @@ async def rig(dev_server: DevServer) -> AsyncIterator[Rig]:
     async with Worker(
         seller,
         task_queue=queue,
-        workflows=[HostedJob, OwnStreamJob, ChainJob, FilledJob],
+        workflows=[HostedJob, OwnStreamJob, ChainJob, FilledJob, BareHandlerJob],
         activities=[burst],
         interceptors=[interceptor],
     ):
@@ -613,17 +615,60 @@ async def test_the_history_guard_refuses_polls_and_stops_the_relay(
     assert await handle.result() == "ok"
 
 
-async def test_every_history_replays(rig: Rig) -> None:
+async def test_a_poll_handler_without_a_validator_is_outside_the_guard_and_said_so(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """temporalio runs a poll's validators only for a handler registered with one. A seller
+    that registers its own poll handler without one gets every poll accepted -- written
+    before anything could refuse it, past the run's budget too: such a job is outside I39's
+    bound -- and is told so, once a run, in a warning."""
+    monkeypatch.setattr(interceptors, "STREAM_POLLS_MAX", 2)
+    job, handle = await rig.start(BareHandlerJob.run)
+    with caplog.at_level(logging.WARNING):
+        for _ in range(5):
+            await raw_poll(rig, job, 0)
+    history = await history_of(rig, job)
+    assert count(history, EventType.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ACCEPTED) == 5
+    warned = [r for r in caplog.records if "has no validator" in r.getMessage()]
+    assert len(warned) == 1
+    monkeypatch.undo()
+    await handle.signal(BareHandlerJob.finish)
+    assert await handle.result() == 5
+
+
+async def test_every_history_replays(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every history replays; and a replay encodes, seals and stores nothing of the stream:
+    each accepted poll's answer is the replayed constant (decisions I39)."""
+    sealed: list[int] = []
+    encoded: list[int] = []
+    real_seal, real_encode = s.seal_poll, interceptors._encode_payload  # pyright: ignore[reportPrivateUsage]
+
+    async def seal(*a: Any, **kw: Any) -> Any:
+        sealed.append(1)
+        return await real_seal(*a, **kw)
+
+    def encode(p: Any) -> str:
+        encoded.append(1)
+        return real_encode(p)
+
     replayer = Replayer(
-        workflows=[HostedJob, OwnStreamJob, ChainJob, FilledJob],
+        workflows=[HostedJob, OwnStreamJob, ChainJob, FilledJob, BareHandlerJob],
         interceptors=[rig.interceptor],
         data_converter=rig.seller.data_converter,
     )
-    checked = 0
+    stored = dict(rig.blobs.data)
+    checked = polls = 0
     for wf_id in rig.started:
         async for run in rig.seller.list_workflows(f"WorkflowId = '{wf_id}'"):
             history = await rig.seller.get_workflow_handle(wf_id, run_id=run.run_id).fetch_history()
+            polls += count(history, EventType.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_COMPLETED)
+            monkeypatch.setattr(s, "seal_poll", seal)
+            monkeypatch.setattr(interceptors, "_encode_payload", encode)
             result = await replayer.replay_workflow(history, raise_on_replay_failure=False)
+            monkeypatch.undo()
             assert result.replay_failure is None, (wf_id, result.replay_failure)
             checked += 1
     assert checked >= len(rig.started)
+    assert polls > 50  # the case is not vacuous
+    assert (sealed, encoded) == ([], [])
+    assert rig.blobs.data == stored

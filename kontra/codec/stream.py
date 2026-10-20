@@ -45,7 +45,7 @@ reference, so a stock ``WorkflowStreamClient`` keeps working. :func:`parse_envel
 relay's reader: no key, strict; :func:`verified_item` is what the relay keeps of a fetched
 blob (its size and digest checked, an age file), so plaintext never reaches a gate's storage.
 The offset query's answer is marked too (:data:`OFFSET_MARK`) and passes the codec in
-plaintext: a log length.
+plaintext: a log length; so does a poll's answer on replay (:data:`REPLAYED_MARK`), a constant.
 
 Imports only the standard library, protobuf, ``temporalio.api``/``temporalio.exceptions``,
 :mod:`kontra.codec.age` and :mod:`kontra.contract`: the gate's relay (:mod:`kontra._relay`)
@@ -83,6 +83,7 @@ __all__ = [
     "OFFSET_MARK",
     "POLL_MARK",
     "REF_ENTRY_MAX",
+    "REPLAYED_MARK",
     "SEALED_OFFSET_KEY",
     "SEALED_TOPIC_KEY",
     "STREAM_BUSY",
@@ -108,6 +109,7 @@ __all__ = [
     "open_poll",
     "parse_envelope",
     "parse_offset",
+    "replayed_payload",
     "seal_poll",
     "verified_item",
 ]
@@ -120,6 +122,8 @@ STREAM_ENCODING = b"binary/kontra-stream"
 STREAM_MARK = "kontra-stream"
 POLL_MARK = b"poll/v1"
 OFFSET_MARK = b"offset/v1"
+#: A poll's answer on replay (:func:`replayed_payload`): already in the history, never sent.
+REPLAYED_MARK = b"replayed/v1"
 #: On a marked poll result: the JSON list of topics the buyer may read.
 BUYER_TOPICS_KEY = "kontra-stream-buyer"
 #: Inside a sealed item: its topic and its offset (ASCII decimal).
@@ -139,11 +143,14 @@ _ENVELOPE_FRAME = 128
 #: The largest envelope: :data:`STREAM_ITEMS_MAX` of the largest entries in the frame
 #: (13,504 bytes). It is never claim-checked or stored externally: the relay must read it.
 ENVELOPE_MAX = _ENVELOPE_FRAME + STREAM_ITEMS_MAX * REF_ENTRY_MAX
-#: The most polls a job root accepts in one run: half of Kontra's pinned
-#: ``history.maxTotalUpdates`` (2,000), so the other half stays the seller's own updates'
-#: (decisions I39; a test pins it). Past it a poll is refused (:data:`STREAM_FULL`).
-STREAM_POLLS_MAX = 1_000
-#: The stored items a codec remembers (:class:`BlobRefs`): more than one run's polls can list
+#: The most polls a job root accepts in one run: an eighth of Kontra's pinned
+#: ``history.maxTotalUpdates`` (2,000), so the other 1,750 stay the seller's own updates'
+#: (decisions I39; a test pins it). Past it a poll is refused (:data:`STREAM_FULL`). It is
+#: also what a worker replays of a run's polls after a cache miss, each one again, within one
+#: workflow task's timeout: 250 replay in under 2.5 s on a two-core worker at a load of
+#: nine, a quarter of the 10 s default.
+STREAM_POLLS_MAX = 250
+#: The stored items a codec remembers (:class:`BlobRefs`): more than four runs' polls can list
 #: (``STREAM_POLLS_MAX * STREAM_ITEMS_MAX``), about 16 MB. A cache: what it forgets is sealed
 #: to the same bytes again (per-worker sealing) and found stored.
 STREAM_REFS_MAX = 65_536
@@ -298,6 +305,14 @@ def offset_payload(n: int) -> Payload:
     return Payload(
         metadata={"encoding": _JSON_PLAIN, STREAM_MARK: OFFSET_MARK}, data=str(n).encode()
     )
+
+
+def replayed_payload() -> Payload:
+    """What Kontra's workflow interceptor answers a poll with on replay: its answer is in the
+    history already and the replayed response is never sent (Temporal matches it by its
+    protocol instance), so nothing of the stream is encoded, sealed or stored again. Plaintext
+    ``null``: were it ever sent, a poller reads no item and the relay stops at ``protocol``."""
+    return Payload(metadata={"encoding": _JSON_PLAIN, STREAM_MARK: REPLAYED_MARK}, data=b"null")
 
 
 def parse_offset(payload: Payload) -> int:

@@ -373,6 +373,19 @@ async def test_the_offset_is_plaintext_and_validated() -> None:
         s.parse_offset(Payload(metadata={"encoding": b"json/plain"}, data=b"15"))
 
 
+async def test_a_replayed_answer_passes_as_the_constant() -> None:
+    """On replay Kontra's interceptor answers a poll with a marked constant (its answer is in
+    the history already, never sent again): the codec passes the constant whatever bytes the
+    marked payload carries, and seals, stores and looks up nothing -- no buyer key, no
+    bucket."""
+    blobs = Blobs()
+    replayed = s.replayed_payload()
+    forged = Payload(metadata=dict(replayed.metadata), data=b'{"items": "anything"}')
+    c = codec(blobs=blobs, buyer_keys=None)
+    assert await c.encode([replayed, forged]) == [replayed, replayed]
+    assert blobs.data == {}
+
+
 @pytest.mark.parametrize(
     "context",
     [

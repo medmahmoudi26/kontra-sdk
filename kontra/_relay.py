@@ -217,8 +217,9 @@ def own_pace(polls: int, min_interval: float = MIN_INTERVAL) -> float:
     """The least wait before a poll that is not ``more_ready``, after ``polls`` answers of the
     job's current run: ``min_interval`` for the first half of the run's poll budget
     (:data:`~kontra.codec.stream.STREAM_POLLS_MAX`), 10 s to three quarters, 60 s after -- so a
-    run a buyer listens to all along lasts about five hours of polling at the default
-    interval before the budget, and the gate stops with ``history_budget`` only then."""
+    run a buyer listens to all along, an item ready at every poll, lasts about an hour and a
+    quarter of polling at the default interval before the budget, and the gate stops with
+    ``history_budget`` only then (a longer stream continues as new)."""
     if polls < STREAM_POLLS_MAX // 2:
         return min_interval
     if polls < STREAM_POLLS_MAX * 3 // 4:

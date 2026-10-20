@@ -6,11 +6,13 @@ holder's polls can add to one run of a job, whatever offsets it polls from.
 
 P the run's poll budget, F the updates in flight, G_b the poll guard's bytes, b_max the most
 one accepted poll writes (its workflow task's events, the request echoed twice, the answer),
-C_e/C_b the drain at the run's end; W_s the seller's own workflow tasks in the run and w_t one
-of their triples (a refused poll's speculative task kept beside one of them). The job survives
-when its own history and the relay's share stay under ``limit.historyCount.error`` and
-``limit.historySize.error``. Shared by ``tests/serve/test_interceptors.py`` (the numbers) and
-``tests/temporal/test_relay_bound_wire.py`` (measured against them)."""
+C_e/C_b the drain at the run's end (a timer and two workflow tasks); W_s the seller's own
+workflow tasks in the run and w_t one of their triples (a refused poll's speculative task kept
+beside one of them). The job survives when its own history and the relay's share stay under
+``limit.historyCount.error`` and ``limit.historySize.error``, on a worker that completes its
+workflow tasks in time (a task that times out writes up to :data:`TIMEOUT_EVENTS` more events
+and two triples: decisions I39). Shared by ``tests/serve/test_interceptors.py`` (the numbers)
+and ``tests/temporal/test_relay_bound_wire.py`` (measured against them)."""
 
 from __future__ import annotations
 
@@ -31,9 +33,14 @@ AUTHORIZER = Path(__file__).resolve().parents[1] / "temporal/authorizer"
 #: every string in them is the seller's worker's (its task queue, identity, build id), each at
 #: most ``limit.maxIDLength``.
 TASK_BYTES_MAX = 4096
-#: The drain at a run's end, once per run when anyone polled: a timer and its task for the
-#: wait, one for releasing the pollers.
-DRAIN_EVENTS, DRAIN_BYTES = 10, 2048
+#: The drain at a run's end, once per run when anyone polled: a timer (started, fired or
+#: cancelled) and its task for the wait, one for releasing the pollers -- two triples of at
+#: most ``TASK_BYTES_MAX`` and the timer's events.
+DRAIN_EVENTS, DRAIN_BYTES = 10, 2 * TASK_BYTES_MAX + 256
+#: What one workflow task that timed out writes, beyond the triple that replaces it: a
+#: speculative task's scheduled, started and timed-out events kept (``server@v1.32.1``
+#: ``workflow_task_state_machine.go``), and its retry's triple.
+TIMEOUT_EVENTS = 6
 #: The events one accepted poll writes, at most: ``UpdateAccepted``, ``UpdateCompleted`` and
 #: the workflow task that accepted it.
 EVENTS_PER_POLL = 5

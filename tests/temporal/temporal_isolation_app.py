@@ -14,7 +14,7 @@ from datetime import timedelta
 import nexusrpc
 import nexusrpc.handler
 from temporalio import activity, nexus, workflow
-from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.contrib.workflow_streams import WorkflowStream, WorkflowStreamState
 
 SELLER_NAMESPACE = "acme"
 SELLER_TASK_QUEUE = "acme/enrich@1.2.0"  # OfferingId(acme, enrich, 1.2.0).task_queue
@@ -234,8 +234,10 @@ class PlatformPing:
 
 @dataclass
 class BoundJobInput:
-    items: int  # published as the run starts, on the listed topic
+    items: int  # published as the run starts, on ``topic``
     pad: int = 64  # bytes of filler in each
+    topic: str = "events"
+    state: WorkflowStreamState | None = None  # the stream, carried across continue-as-new
 
 
 @activity.defn
@@ -247,22 +249,32 @@ async def bound_step(n: int) -> int:
 @workflow.defn
 class BoundJob:
     """A seller's handler workflow (`job-<id>`) doing its own work while someone reads its
-    stream: it publishes ``items`` items as it starts; each ``work`` signal runs one activity
-    and publishes one more item (the seller's own workflow tasks); ``finish`` completes it."""
+    stream: it publishes ``items`` items as its chain starts; each ``work`` signal runs one
+    activity and publishes one more item (the seller's own workflow tasks); ``ballast``
+    carries bytes into its history and nothing else; ``roll`` continues it as new (the
+    contrib's recipe, its stream carried); ``finish`` completes it."""
 
     @workflow.init
     def __init__(self, job: BoundJobInput) -> None:
-        self.stream = WorkflowStream()
+        self.stream = WorkflowStream(job.state)
         self._queue: list[int] = []
         self._done = False
+        self._roll = False
 
     @workflow.run
     async def run(self, job: BoundJobInput) -> str:
-        events = self.stream.topic("events", type=str)
-        for i in range(job.items):
-            events.publish(f"item-{i}-" + "p" * job.pad)
+        events = self.stream.topic(job.topic, type=str)
+        if job.state is None:
+            for i in range(job.items):
+                events.publish(f"item-{i}-" + "p" * job.pad)
+                if i % 2_000 == 1_999:  # a long stream: published over several tasks
+                    await workflow.sleep(timedelta(milliseconds=1))
         while True:
-            await workflow.wait_condition(lambda: bool(self._queue) or self._done)
+            await workflow.wait_condition(lambda: bool(self._queue) or self._done or self._roll)
+            if self._roll and not self._queue:
+                await self.stream.continue_as_new(
+                    lambda state: [BoundJobInput(job.items, job.pad, job.topic, state)]
+                )
             if not self._queue:
                 return "done"
             n = self._queue.pop(0)
@@ -274,6 +286,14 @@ class BoundJob:
     @workflow.signal
     def work(self, n: int) -> None:
         self._queue.append(n)
+
+    @workflow.signal
+    def ballast(self, data: str) -> None:
+        """Bytes in the history, nothing else: the seller's own history, grown."""
+
+    @workflow.signal
+    def roll(self) -> None:
+        self._roll = True
 
     @workflow.signal
     def finish(self) -> None:

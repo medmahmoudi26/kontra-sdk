@@ -12,6 +12,8 @@ from temporalio import activity, workflow
 
 with workflow.unsafe.imports_passed_through():
     from temporalio.contrib.workflow_streams import (
+        PollInput,
+        PollResult,
         WorkflowStream,
         WorkflowStreamClient,
         WorkflowStreamState,
@@ -146,6 +148,31 @@ class FilledJob:
     def ping(self) -> str:
         """One of the seller's own updates (an approval, say)."""
         return "pong"
+
+
+@workflow.defn
+class BareHandlerJob:
+    """Replaces its stream's poll handler with one of its own, registered without a
+    validator, so temporalio runs no validator for a poll: every poll is accepted (written)
+    before anything can refuse it."""
+
+    def __init__(self) -> None:
+        self.done = False
+        self.answered = 0
+
+    @workflow.run
+    async def run(self) -> int:
+        workflow.set_update_handler("__temporal_workflow_stream_poll", self.poll)
+        await workflow.wait_condition(lambda: self.done)
+        return self.answered
+
+    async def poll(self, payload: PollInput) -> PollResult:
+        self.answered += 1
+        return PollResult(items=[], next_offset=0)
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.done = True
 
 
 @workflow.defn

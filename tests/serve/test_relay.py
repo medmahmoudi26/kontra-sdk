@@ -527,7 +527,7 @@ async def test_the_runs_own_poll_budget_paces_the_relay(waits: list[float]) -> N
     new_run = success(envelope([], 1))
     new_run.update_ref.workflow_execution.run_id = "run-2"
     await run(Scripted([*script, new_run, success(envelope([], 1))]), min_interval=2.0)
-    # The wait after answer k of a run is own_pace(k): the 500th and 501st of run-1 wait
+    # The wait after answer k of a run is own_pace(k): the 125th and 126th of run-1 wait
     # 10 s; run-2's first answers count from 1 again.
     assert all(1.9 < w <= 2.0 for w in waits[: half - 1])
     assert waits[half - 1] == pytest.approx(10.0, abs=0.1)
