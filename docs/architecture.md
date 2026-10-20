@@ -98,7 +98,7 @@ the same pull request.**
 
 | # | Seam | What crosses | Contract | Test | CI job |
 |---|---|---|---|---|---|
-| ① | Temporal frontend | Nexus calls, task polls, the hold-token header, `DescribeTaskQueue` in the token's own namespace (a seller's backlog) | Temporal's protocol + the policy in `temporal/authorizer` | the Go deny matrix + `tests/temporal` over the wire | `deny-matrix` (required) |
+| ① | Temporal frontend | Nexus calls, task polls, the hold-token header, `DescribeTaskQueue` in the token's own namespace (a seller's backlog), a party's updates, queries and signals to its own workflows, the stream relay's poll Update and offset Query on one job, the worker controller's deployment calls in `kontra-system` | Temporal's protocol + the policy in `temporal/authorizer` | the Go deny matrix + `tests/temporal` over the wire | `deny-matrix` (required) |
 | ② | Gate HTTP API | quote, hire (with the job's own key), jobs, progress, artifacts, disputes, catalog, publish, a party's recipients and devices, job-key wraps, the Workers view | `kontra/gate_client/models.py` + `routes.py` | `tests/gate_client/test_routes.py`; the gate's OpenAPI snapshot in `kontra-cloud` | `seams` |
 | ③ | Contract document | the offering, seller to buyer: its types and facts (spec v2: `uses_hosted_model` when true, and no key) | `kontra/contract` + `spec/` | `tests/contract`; the golden `examples/*/contract.yaml`, reproduced byte for byte | `seams` |
 | ④ | Ledger | money state | the `Ledger` Protocol (`kontra/ledger.py`) | `kontra.testing.ledger_contract` (the §9.3 invariants, 10,000 random interleavings) against every adapter | `seams` |
@@ -149,13 +149,18 @@ a trailing newline. So every Temporal identifier is built in one place,
 | nexgen service key | `AcmeEnrich`, with `fqn: acme.enrich` | constructed |
 | Task queue | `acme/enrich@1.2.0` | constructed |
 | Seller namespace | `acme` | a party's namespace is its handle |
+| Platform namespace | `kontra-system` | a constant (`PLATFORM_NAMESPACE`), a reserved handle no party can take |
+| Stream relay's Temporal subject | `relay/acme/job-<32 hex>` | constructed from the seller's namespace and the job id (`relay_subject`); the Authorizer rebuilds it from a request and compares it whole |
+| Worker controller's Temporal subject | `platform/worker-controller` | a constant (`WORKER_CONTROLLER_SUBJECT`); like the relay's, it contains `/`, which no handle can |
 | Handler workflow id | `job-<32 hex>` | constructed from the job id (for a bound agent handler, the job is Kontra's `kontra.turn.v1` wrapper) |
 | Agent child workflow id | `job-<32 hex>/agent` | constructed from the job id, for the agent a bound handler's wrapper starts; not job-shaped, so the codec encrypts its payloads to the seller alone |
 | Batch child workflow id | `<parent workflow id>/batch/<activity>/<uuid4>` (`job-<32 hex>/batch/...` under a handler) | constructed from the parent's id, the activity's Temporal name and a `workflow.uuid4()` of the parent's, for the `kontra.batch.v1` child; reads back as no job id |
 
 - No code splits a task queue, service name or endpoint to recover an offering, and no
   authorization decision reads one. The Authorizer decides by exact equality and set
-  membership on the token's claims and the request's namespace.
+  membership on the token's claims and the request's namespace, and for the gate's stream
+  relay alone on the request's workflow id and handler name, compared whole with values it
+  constructs (decisions I30).
 - The catalog is the only map between an endpoint and an offering, in both directions
   (`CatalogEntry.endpoint`, `GET /v1/endpoints/{endpoint}`). A contract document does not
   contain its endpoint: the endpoint is assigned after the document is sealed. Nor does it
