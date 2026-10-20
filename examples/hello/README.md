@@ -103,7 +103,7 @@ asyncio.run(main())
 
 ## Without an invitation
 
-`kontra dev` runs a local Kontra in Docker, with play money, and logs you in to it. Log in as
+`kontra dev` runs a local Kontra with no containers, with play money, and logs you in to it. Log in as
 `acme` and this directory runs unchanged: on a dev profile, `kontra serve` publishes the
 offering itself.
 

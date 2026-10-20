@@ -54,18 +54,15 @@ pip install "kontra-sdk[testing]"      # + the in-process marketplace for your t
 > bare `kontra` dependency in a requirements file or a `pyproject.toml`: it installs someone
 > else's code. The import name is `kontra`.
 
-`kontra dev` also needs Docker with the compose plugin. It runs the images
-`ghcr.io/medmahmoudi26/kontra-temporal:dev` and `ghcr.io/medmahmoudi26/kontra-gate:dev`;
-`KONTRA_TEMPORAL_IMAGE` and `KONTRA_GATE_IMAGE` name others (in a checkout, `make temporal`
-builds `kontra-temporal:dev` from [`temporal/authorizer`](temporal/authorizer)). The published
-Temporal image is `linux/amd64` only: on an arm64 machine Docker has to emulate it, or build a
-native one with `make temporal`.
+`kontra dev` runs a local Kontra on this machine with no containers (the dev gate and a Temporal
+dev server in one background process); it needs `pip install "kontra-sdk[dev]"` (`[testing]`
+includes it) and downloads a checksum-pinned Temporal CLI once. `kontra dev up --observability`
+is the one part that uses Docker.
 
 ## Sell a job
 
 ```sh
-kontra dev                    # a local Kontra in Docker (Temporal, gate, Postgres, bucket);
-                              # logs you in as a dev party with play money
+kontra dev                    # a local Kontra, no containers; logs you in as a dev party with play money
 kontra init wordcount         # ./wordcount: offering.yaml, models, workflow, quote, worker, a test
 cd wordcount
 pytest                        # the whole lifecycle -- quote, hire, deliver, accept, refund --

@@ -16,7 +16,8 @@ Security problems do not go in pull requests or issues: see [SECURITY.md](SECURI
 ## Set up
 
 You need [uv](https://docs.astral.sh/uv/), Go (the version in `temporal/authorizer/go.mod`;
-`GOTOOLCHAIN=auto` fetches it), and Docker for `kontra dev` and the images.
+`GOTOOLCHAIN=auto` fetches it), and Docker for the e2e stack and the images (`kontra dev` runs
+no containers).
 
 ```sh
 make sync      # .venv from uv.lock: Python 3.12, every extra, the dev group (which carries
@@ -63,16 +64,15 @@ Notes:
 ```sh
 make temporal          # bin/kontra-temporal and the image kontra-temporal:dev (off Linux,
                        # the image compiles its own server: the multi-stage Dockerfile)
-make e2e               # `kontra dev up` with that image, then tests/e2e
-kontra dev down        # when you are done (--volumes also drops the data)
+make e2e               # make stack-up with that image, then tests/e2e
+make stack-down        # when you are done (deletes the stack's data and credentials)
 ```
 
-`make e2e` uses `KONTRA_TEMPORAL_IMAGE` (default `kontra-temporal:dev`) and
-`KONTRA_GATE_IMAGE` (default: compose's, `ghcr.io/medmahmoudi26/kontra-gate:dev`). If your
-`KONTRA_HOME` holds a real login, `kontra dev` refuses to replace it: run with
-`KONTRA_HOME=~/.kontra-dev`. The suite ends with `kontra dev down --volumes`, which deletes
-the data of this machine's one dev stack (the compose project is `kontra-dev` whatever the
-home): do not run it next to a dev stack whose data you want to keep.
+`make e2e` uses `KONTRA_TEMPORAL_IMAGE` (default `kontra-temporal:dev`) and `KONTRA_GATE_IMAGE`
+(default: compose's, `ghcr.io/medmahmoudi26/kontra-gate:dev`). The e2e stack is the compose
+project `kontra-e2e` on 18080/17233/18333/15432 (`KONTRA_DEV_*_PORT`), separate from `kontra dev`
+(which runs no containers). The suite ends with `make stack-down`, which deletes its data. The
+no-container `kontra dev` path is covered on every pull request by `make test`.
 [docs/acceptance.md](docs/acceptance.md) maps each PRD §16 criterion to the tests that prove
 it, end to end and below, with the last full run.
 

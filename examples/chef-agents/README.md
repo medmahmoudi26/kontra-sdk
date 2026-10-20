@@ -69,7 +69,7 @@ encrypted in Temporal like the rest of the job.
 
 ## Run it
 
-`kontra dev` runs a local Kontra in Docker with play money and logs you in to it, as `acme`;
+`kontra dev` runs a local Kontra with no containers and play money and logs you in to it, as `acme`;
 this directory then runs unchanged, and `kontra serve` publishes the offering itself.
 
 ```sh

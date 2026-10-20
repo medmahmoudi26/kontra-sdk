@@ -13,7 +13,7 @@ PRD (`kontra-cloud/PRD.md`); where implementing it required a choice, the choice
 - [The six seams](#the-six-seams)
 - [Names: constructed, never parsed](#names-constructed-never-parsed)
 - [A job, end to end](#a-job-end-to-end)
-- [One environment definition](#one-environment-definition)
+- [Two gates, one per environment](#two-gates-one-per-environment)
 - [CI and releases](#ci-and-releases)
 
 ## What runs where
@@ -90,7 +90,8 @@ is what lets a ledger adapter be swapped and keeps a future split into services 
 | `kontra.graph` | a run's history read back as a graph (decisions I26): nodes, causal edges and status, the union of mock runs and a live run painted on it, Temporal UI and Grafana links, Mermaid; no payload without a codec, and the standard library only at import |
 | `kontra._relay` | the gate's stream relay (decisions I31): a job's workflow stream read with the poll Update and the offset Query only, on a relay token; the fake gate and the platform gate both use it, and it imports no `temporalio.contrib` |
 | `kontra._control` | the Temporal adapter's calls on the internal frontend (the Workers view's `DescribeTaskQueue` and `ListWorkers` among them), shared by the real and the fake gate |
-| `kontra.testing` | a fake for every seam: `fake_ledger`, `fake_gate`, `fake_engine` (`FakeEngine`), a dev server with standalone Nexus, `Marketplace`; and the contracts every adapter passes: `ledger_contract`, `engine_contract` |
+| `kontra.devgate` | the public dev gate (decisions I34): `DevGate`, seam ② in memory, and the host process of `kontra dev` -- the gate under uvicorn and a pinned, checksum-verified Temporal CLI dev server, loopback only, `--persist` as tagged JSON with a class allowlist |
+| `kontra.testing` | a fake for every seam: `fake_ledger`, `fake_gate` (`FakeGate` is `kontra.devgate.DevGate`), `fake_engine` (`FakeEngine`), a dev server with standalone Nexus, `Marketplace`; and the contracts every adapter passes: `ledger_contract`, `engine_contract` |
 
 ## The six seams
 
@@ -230,16 +231,31 @@ a trailing newline. So every Temporal identifier is built in one place,
 The gate never starts the seller's workflow and never reads a payload: everything it decides
 from is a workflow state, a timestamp or a buyer's call.
 
-## One environment definition
+## Two gates, one per environment
 
-`compose.yaml` at the root is the stack: Postgres, the bucket, Kontra's Temporal server and the
-gate. `kontra dev` runs it on a laptop (it ships in the wheel as `kontra/_dev/compose.yaml`),
-CI's e2e job runs it, and v1 production runs it, with different env files. It carries no
-default secret; `kontra dev` writes random credentials and `KONTRA_DEV=1` (dev login, play
-money) into `$KONTRA_HOME/dev.env`, and `kontra dev up` adds the host ports it ran with
-(`KONTRA_DEV_*_PORT`), so `status`, `logs` and `down` find the stack where `up` put it. It never
-remembers a bind address (`KONTRA_DEV_BIND`, `KONTRA_DEV_PG_BIND`): publishing a dev gate (dev
-login, play money) beyond loopback is asked for on each `up`, not inherited from an earlier one.
+The gate has two implementations of seam ②, one per environment ([decisions](decisions.md) I34),
+and the prod gate is never imported here:
+
+| Environment | Gate | Temporal | Run by |
+|---|---|---|---|
+| dev | `kontra.devgate.DevGate` (the class `kontra.testing.FakeGate` names), in memory, play money | a Temporal CLI 1.9.1 dev server, pinned and checksum-verified, **no Authorizer** | `kontra dev up`: one host process, loopback only, no containers |
+| e2e | the prod gate image (`kontra-gate`), `KONTRA_DEV=1` | Kontra's Temporal server with the Authorizer (`kontra-temporal`) | `compose.yaml` through the Makefile (`make stack-up`, `make e2e`); kontra-cloud's laptop stack overlays it |
+| production | the prod gate | Kontra's Temporal server | kontra-cloud's cluster |
+
+`kontra dev` proves the gate's API and escrow rules, never the Authorizer (seam ①: `make
+deny-matrix` and the wire suite), JWKS polling, presigned bucket URLs or the Postgres ledger:
+those are the e2e stack's. Drift between the two gates is policed by seam ② (`tests/gate_client/
+test_routes.py` against `DevGate`) and the prod gate's OpenAPI snapshot in kontra-cloud.
+`kontra dev up --observability` runs its own compose file (`observability/compose.yaml`, shipped
+as `kontra/_dev/observability/compose.yaml`): Prometheus and its agent, Grafana, an OpenTelemetry
+Collector, Loki and Tempo, on networks of their own, and nothing of the gate or of Temporal.
+
+`compose.yaml` at the root is the e2e stack: Postgres, the bucket, Kontra's Temporal server and
+the prod gate image. It is never shipped in the wheel and never a mode of `kontra dev`. It
+carries no default secret; `tests/e2e/stack.py` writes random credentials and `KONTRA_DEV=1`
+(dev login, play money) into `.stack/stack.env` (0600) and passes it as the env file. The
+Makefile runs it on 18080/17233/18333/15432 (`KONTRA_DEV_*_PORT`, which `kontra dev` never
+reads), so `make e2e` and `kontra dev up` coexist on one machine.
 
 Temporal's internal frontend has no authentication: reaching it is control of every
 namespace. It is never published, and it listens on one address only: Temporal's fixed
@@ -257,27 +273,11 @@ networks whose other members may reach its other ports:
 | `temporal-db` | temporal, postgres-relay | Temporal's own database connections (the internal frontend does not listen here; a peer that could route Temporal's `control` address through it would still reach it, which takes a capability the relay does not have) |
 | `database` | postgres, postgres-relay, gate, migrate | the gate's and the migrations' database connections |
 | `bucket` | s3, gate | SeaweedFS's S3 port and its unauthenticated master, volume and filer ports |
-| `observability` | prometheus, grafana (the `observability` profile) | Grafana's queries to Prometheus |
-| `telemetry` | otelcol, loki, tempo, grafana (the `observability` profile) | the collector's writes to Loki and Tempo; Grafana's queries to them |
 
-Two compose profiles add dev tools that production never enables (`kontra dev up --ui`,
-`--observability`; [sellers.md](sellers.md#the-ui-and-the-dashboards)). The `ui` profile puts
-Temporal's UI on `control`: it reads every namespace through the internal frontend, which is
-the point of it locally and why it is published on 127.0.0.1 only. The `observability`
-profile puts Prometheus on `temporal-db`, to scrape the metrics listener Temporal opens there
-when asked (`KONTRA_TEMPORAL_METRICS_ADDR`), held to the relay's terms there (no
-capabilities, not root, no forwarding), and Grafana on `observability` and `telemetry`, with
-forwarding off. The OpenTelemetry Collector (`otelcol`), which takes whatever reaches its
-port published on 127.0.0.1 (what `kontra serve --otlp` exports), shares `telemetry` with
-the two stores it writes, Loki and Tempo, and with Grafana, and no network with Prometheus or
-Temporal. Prometheus's agent (`prometheus-agent`) is on no network of the stack's: it runs in
-the host's network namespace, because a worker's `kontra serve --metrics 127.0.0.1:PORT` is
-on the host's loopback and a container on a bridge network reaches the host only through
-Docker's gateway, which a host firewall may drop (ufw's default does, measured). It scrapes
-those ports and writes the samples to Prometheus's published port; it keeps no database,
-answers no query, and has no capabilities, a read-only root and an unprivileged user. Like
-any process of the host's it can reach the stack's networks, the internal frontend among
-them: it is a dev tool, on a machine that is yours.
+One profile adds a debugging tool that production never enables (`make stack-up UI=1`; `kontra
+dev up --ui` is the dev server's own UI instead, [sellers.md](sellers.md#the-ui-and-the-dashboards)):
+the `ui` profile puts Temporal's UI on `control`: it reads every namespace through the internal
+frontend, which is the point of it and why it is published on 127.0.0.1 only.
 
 `postgres-relay` is busybox `nc` from the pinned Postgres image itself: it accepts Temporal's
 connections and opens one to Postgres for each, copying bytes, and never connects to Temporal
@@ -321,7 +321,7 @@ and the Temporal server is built with the Go toolchain `go.mod` names.
 
 | Workflow | When | What |
 |---|---|---|
-| `ci.yml` | every pull request; pushes to `dev` | `lint`, `typecheck`, `test` and `seams` (each on Python 3.11 and 3.12), `deny-matrix` (each one `make` target; `make check` is their union), then `e2e` against `kontra dev` when the gate image is readable (not a fork's pull request while that image is private: decisions I14) |
+| `ci.yml` | every pull request; pushes to `dev` | `lint`, `typecheck`, `test` and `seams` (each on Python 3.11 and 3.12), `deny-matrix` (each one `make` target; `make check` is their union), then `e2e` against the e2e stack (`make e2e`: `compose.yaml`, the prod gate image) when the gate image is readable (not a fork's pull request while that image is private: decisions I14) |
 | `security.yml` | every push and pull request; weekly | gitleaks, pip-audit, Trivy on the built Temporal image, an SBOM, zizmor |
 | `temporal-image.yml` | a change under `temporal/authorizer/` (which pins the Temporal server version in `go.mod`) | build; on `dev`, push `ghcr.io/medmahmoudi26/kontra-temporal` tagged by commit SHA and `:dev` |
 | `release.yml` | a tag `v*` on `dev` or `main` | build the sdist and wheel, publish `kontra-sdk` to PyPI by trusted publishing (OIDC), attach the SBOM to the GitHub release |

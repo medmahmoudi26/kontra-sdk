@@ -4,9 +4,10 @@ What proves each of the nineteen acceptance criteria of PRD §16 (rows 1-19), an
 added since (row 20, the workflow stream of kontra-sdk#52), how to run it, and what the last
 full run gave. A criterion is proved one of two ways, often both:
 
-* **End to end** (`tests/e2e`, run by `make e2e`): against the real stack `kontra dev` brings
-  up -- Kontra's Temporal server with the Authorizer, the gate image, Postgres and SeaweedFS
-  -- with sellers as `kontra serve` processes (their own `KONTRA_HOME` each, and the
+* **End to end** (`tests/e2e`, run by `make e2e`): against the e2e stack `make stack-up` brings
+  up (`compose.yaml` -- Kontra's Temporal server with the Authorizer, the gate image, Postgres
+  and SeaweedFS), with parties logged in by dev login against that prod gate, sellers as
+  `kontra serve` processes (their own `KONTRA_HOME` each, and the
   settings a seller ships with: no `KONTRA_*` of the test run reaches them), buyers as
   `kontra.hire.Kontra`, the `kontra` CLI or `kontra mcp`, and every party logged in with the
   dev login. One test per criterion that needs the stack, named after it
@@ -27,25 +28,24 @@ make temporal                # kontra-temporal:dev (temporal/authorizer)
 # in kontra-cloud: make image  -- kontra-gate:dev, from that tree and the ../kontra-sdk checkout
 ```
 
-The end-to-end suite. `make e2e` runs `kontra dev up` (timed: acceptance 1 counts the
-stack's start, handed to the session as `KONTRA_E2E_UP_SECONDS`), then the tests; the
-session's fixture runs `kontra dev down --volumes` at the end, so a session starts from an
-empty catalog and ledger. That is the machine's one dev stack (compose project
-`kontra-dev`, whatever the home): run it where no dev stack holds data you want, with a
-`KONTRA_HOME` that holds no real login (the stack's credentials go into its `dev.env`) and
-host ports that are free:
+The end-to-end suite. `make e2e` runs `make stack-up` (timed: acceptance 1 counts the stack's
+start, handed to the session as `KONTRA_E2E_UP_SECONDS`), then the tests; the session's fixture
+runs `make stack-down` at the end, so a session starts from an empty catalog and ledger. The e2e
+stack is compose project `kontra-e2e` on 127.0.0.1:18080/17233/18333/15432 (`KONTRA_DEV_*_PORT`,
+which `kontra dev` does not read), never `kontra dev`'s 8080/7233, and needs no `KONTRA_HOME`
+(parties have their own homes):
 
 ```sh
-export KONTRA_HOME=/tmp/kontra-e2e
 export KONTRA_GATE_IMAGE=kontra-gate:dev KONTRA_TEMPORAL_IMAGE=kontra-temporal:dev
-export KONTRA_DEV_GATE_PORT=18080 KONTRA_DEV_TEMPORAL_PORT=17233
-export KONTRA_DEV_S3_PORT=18333 KONTRA_DEV_PG_PORT=15432
-kontra dev down --volumes                         # from nothing
+make stack-down                                   # from nothing
 make e2e PYTEST_FLAGS="-q -ra -s --durations=0"   # -s prints each test's [acceptance N] line
 KONTRA_LEDGER=fake make e2e PYTEST_FLAGS="-q -ra -s --durations=0"   # acceptance 9
+make stack-down
 ```
 
-Without Docker or either image the tests are skipped, saying which. Acceptance 14 needs about
+`kontra dev`'s own no-container path is proved separately, on every pull request, by
+`tests/cli/test_dev_stack.py::test_ac01_init_dev_up_serve_hire_with_no_containers` in `make test`.
+Without Docker or either image the end-to-end tests are skipped, saying which. Acceptance 14 needs about
 9 GiB of free disk (a 3 GiB file, its ciphertext in the bucket, the download) and skips
 without it.
 
@@ -73,7 +73,7 @@ repository. The result column is the run recorded below.
 
 | # | Criterion | Proved by | Result |
 |---|---|---|---|
-| 1 | `kontra init && kontra dev && kontra serve` yields a hireable offering in under an hour; `workflows.py`/`activities.py` are vanilla Temporal: they import `temporalio` and nothing from `kontra` (decisions I29); no Python symbol in `offering.yaml` | e2e `test_seller.py::test_ac01_init_dev_serve_yields_a_hireable_offering`; `tests/cli/test_cli.py::test_init_scaffolds_the_project_layout`; `tests/cli/test_scaffold.py::test_the_scaffold_passes_its_own_test` | passed; 55.0 s from nothing to an accepted delivery: the stack's start 30.0 s (`kontra dev up`, no stack before), then `kontra dev` 6.5 s, `kontra init` 0.7 s, the scaffold's own `pytest` 12.8 s, `kontra serve` 1.5 s, `kontra hire --accept` 3.1 s |
+| 1 | `kontra init && kontra dev && kontra serve` yields a hireable offering in under an hour; `workflows.py`/`activities.py` are vanilla Temporal: they import `temporalio` and nothing from `kontra` (decisions I29); no Python symbol in `offering.yaml` | `tests/cli/test_dev_stack.py::test_ac01_init_dev_up_serve_hire_with_no_containers` (no containers, in `make test`); e2e `test_seller.py::test_ac01_init_login_serve_hire_against_the_platform_gate`; `tests/cli/test_cli.py::test_init_scaffolds_the_project_layout`; `tests/cli/test_scaffold.py::test_the_scaffold_passes_its_own_test` | passed; 55.0 s from nothing to an accepted delivery: the stack's start 30.0 s (`kontra dev up`, no stack before), then `kontra dev` 6.5 s, `kontra init` 0.7 s, the scaffold's own `pytest` 12.8 s, `kontra serve` 1.5 s, `kontra hire --accept` 3.1 s |
 | 2 | Every §10.4 deny-matrix cell has a failing-by-default test that passes with the Authorizer | `temporal/authorizer`: `TestDenyMatrix`, `TestDenyCellsFailByDefault`, `TestSweep` (`go test ./...`); `tests/temporal/test_isolation_wire.py`, `tests/temporal/test_streams_and_platform_wire.py` (the cells over the wire, against the built server) | passed (2026-10-20, kontra-sdk#59, decisions I30): 1,047 checks (349 matrix cells, 276 of them denials, against 3 authorizers), a sweep of 124,150 decisions over 191 APIs, 61 wire tests |
 | 3 | `grep -rE '^\s*(from\|import)\s+kontra\b' examples/*/workflows.py examples/*/activities.py` prints nothing (decisions I29: any import of `kontra`, where the PRD's grep saw only `import kontra`) | `tests/examples/test_imports.py` (`::test_the_acceptance_grep_prints_nothing`; the checks that seller code imports `temporalio` and no `kontra` by any spelling, `models.py` only `kontra.types`, `quote.py` only `kontra.serve.Quote`, and that loading it loads at most `kontra.types`; and `::test_without_worker_py_the_code_runs_on_any_temporal`, `examples/hello` without `worker.py` on a plain Temporal worker with `kontra` unimportable) | passed |
 | 4 | An offline seller's job refunds within `max_duration` + 1 minute, no human action | e2e `test_escrow.py::test_ac04_an_offline_seller_refunds_within_max_duration_plus_a_minute`; `tests/hire/test_buyer.py::test_an_offline_seller_refunds_by_the_deadline`; cloud: `tests/jobs/test_sweeper.py::test_offline_seller_refunds_by_the_deadline` | passed; refunded 151.1 s after the hire (bound: 180 s, and not before 120 s), never started |
@@ -84,7 +84,7 @@ repository. The result column is the run recorded below.
 | 9 | Switching the ledger adapter from `postgres` to `fake` changes no SDK test outcome | `make e2e` twice, with `KONTRA_LEDGER=postgres` (the default) and `KONTRA_LEDGER=fake` (the gate's own switch); `tests/hire/test_script.py` (every test on two ledger adapters behind the fake gate); cloud: `tests/jobs/test_market_pg.py`, `tests/test_core_settings.py` | passed; the same 14 outcomes with the gate on either adapter (every balance the tests assert included: the seller's 0.19, the buyers' 99.99 and 100.00); the Postgres ledger's tables stayed empty in the `fake` run |
 | 10 | Every `temporalio.worker.Worker` kwarg reaches the inner worker unchanged (decisions I29, two exceptions: `plugins` routed -- a client plugin goes on the client before Kontra's and temporalio carries it onto the inner worker, a worker-only one goes to the inner worker; either way it is among the inner worker's effective plugins --, and a `workflow_runner` that is Temporal's `SandboxedWorkflowRunner` arrives as a copy with `kontra` added to its passthrough modules; any other runner is untouched) | `tests/serve/test_worker.py::test_every_temporalio_keyword_has_a_sentinel`, `::test_every_keyword_reaches_the_inner_worker_unchanged` | passed |
 | 11 | `recon` composes two offerings in one buyer workflow and refunds the second when the first fails | e2e `test_escrow.py::test_ac11_recon_refunds_the_second_offering_when_the_first_fails`; `tests/examples/test_recon.py::test_recon_refunds_the_enrichment_when_the_probe_fails`; `tests/hire/test_workflow.py::test_recon_refunds_the_second_job_when_the_first_fails` | passed; probe failed, enrichment cancelled (its run terminated), both refunded |
-| 12 | MCP search, quote, hire, result, accept completes against `kontra dev` | e2e `test_agents.py::test_ac12_mcp_search_quote_hire_result_accept_against_kontra_dev` (`kontra mcp` over stdio); `tests/mcp/test_mcp_server.py::test_search_quote_hire_result_accept_completes_and_moves_money`, `::test_kontra_mcp_over_stdio` | passed; released, 0.01 paid |
+| 12 | MCP search, quote, hire, result, accept completes against `kontra dev` | e2e `test_agents.py::test_ac12_mcp_search_quote_hire_result_accept_against_the_platform_gate` (`kontra mcp` over stdio); `tests/mcp/test_mcp_server.py::test_search_quote_hire_result_accept_completes_and_moves_money`, `::test_kontra_mcp_over_stdio` | passed; released, 0.01 paid |
 | 13 | Heartbeats `{percent, message}` reach a listening buyer via `job.progress()` in order, the latest within the forwarding interval and the last one always (decisions I31: heartbeats are items of the job stream's `kontra.progress` topic, budgeted -- one every 5 s by default, at most 1,000 a job); with `KONTRA_PROGRESS_INTERVAL=0`, all 100 in order; no Kontra import in `activities.py`, no plaintext at the gate; a job without heartbeat details still shows liveness and activity names | e2e `test_privacy.py::test_ac13_heartbeats_reach_the_buyer_in_order_and_the_gate_keeps_ciphertext`; `tests/hire/test_buyer.py::test_progress_shows_100_heartbeats_in_order_decrypted` (interval 0); `tests/serve/test_serve.py::test_heartbeats_reach_the_buyer_in_order_and_only_as_ciphertext` (interval 0); `tests/serve/test_progress.py::test_settle_publishes_the_latest_before_the_activity_returns`, `::test_the_interval_backs_off`, `::test_the_budget_ends_forwarding`; cloud: the stream route's store holds ciphertext only (kontra-cloud#44) | to rerun for #52 (was: 100 of 100 in order through the removed `POST /progress`, one event a second); in-process: 100 of 100 at interval 0, 103 with the sync activity's |
 | 14 | A 3 GB `Artifact` output uploads with worker RSS under 256 MB above baseline, downloads with matching sha256, and is gone after `artifact_retention` | e2e `test_privacy.py::test_ac14_a_3gb_artifact_in_flat_memory_verified_and_gone_after_retention` (also marked `slow`); `tests/artifacts/test_artifact_memory.py` (64 MiB by default); cloud: `tests/artifacts/test_artifacts_retention.py` | passed; 3 GiB: the seller's worker +19.2 MiB, the buyer's download +22.6 MiB, sha256 equal, deleted 71 s after accept |
 | 15 | An upload over `max_output_bytes` is refused by the gate before any bytes are stored | e2e `test_privacy.py::test_ac15_an_upload_beyond_max_output_bytes_is_refused_before_storing` and `::test_ac15_a_body_beyond_its_declared_size_is_refused_before_storing`; `tests/testing/test_artifacts.py::test_outputs_above_max_output_bytes_are_refused_before_storing`; cloud: `tests/artifacts/test_artifacts.py::test_an_output_above_max_output_bytes_is_refused_before_anything_is_stored`, `tests/artifacts/test_artifacts_s3.py::test_an_output_over_budget_leaves_the_bucket_empty` | passed; a declared 2 MB over 1 MB: 413 `too_large` naming `max_output_bytes`, bucket and gate unchanged; 1,000 bytes declared and 2,000,000 sent: the bucket answered 403 `SignatureDoesNotMatch` and stored nothing (the same URL then took the 1,000 bytes) |
@@ -96,12 +96,14 @@ repository. The result column is the run recorded below.
 
 ### What the end-to-end tests look at
 
-* **1** starts from a new home (only the stack's `dev.env`, so `kontra dev` finds the running
-  stack instead of starting a second one), times `kontra dev`, `kontra init`, the scaffold's
-  own `pytest`, `kontra serve` (a dev profile publishes) and a buyer's
-  `kontra hire --accept` through the CLI, adds the session's `kontra dev up` (the stack's
-  start, which `kontra dev` does on a fresh machine), and checks the two files and
-  `offering.yaml`. Pulling the images is not counted.
+* **1** starts from a new home that logs in to the e2e stack's prod gate with `kontra login
+  --dev --gate`, times that, `kontra init`, the scaffold's own `pytest`, `kontra serve` (a dev
+  profile publishes) and a buyer's `kontra hire --accept` through the CLI, adds the stack's
+  start (`make stack-up`, `KONTRA_E2E_UP_SECONDS`), and checks the two files and
+  `offering.yaml`. Pulling the images is not counted. `kontra dev`'s own path (no containers:
+  `kontra dev up`, `kontra serve` of `examples/hello`, `kontra hire --accept`, `status`, `logs`,
+  `down`, with a `docker` that fails the test if called; `--ui`, `--persist`, a joined home and a
+  killed host beside it) is `tests/cli/test_dev_stack.py`, in `make test`.
 * **4** quotes while the seller serves, stops the seller, hires, and polls the job (a read:
   `GET /v1/jobs/{id}` changes nothing, the gate's sweeper alone moves the escrow): refunded,
   never started, no earlier than `max_duration`, no later than `max_duration` + 60 s.

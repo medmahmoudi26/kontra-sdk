@@ -511,18 +511,30 @@ adapter (`kontra.engine.temporal`); a second one ships only once it proves, with
 
 ## Known limits
 
+- **`kontra dev` runs no Authorizer.** Its Temporal is the CLI's dev server (pinned and
+  checksum-verified, decisions I34): every API of every namespace is open to whoever reaches its
+  frontend, its HTTP API or (with `--ui`) its UI on 127.0.0.1 -- other local users, and a web
+  page whose name rebinds to 127.0.0.1 for the HTTP API and the UI, which check no `Host`. The
+  dev gate and the codec server do check `Host` and take JSON bodies only, the dev gate's
+  control routes need a token that only ever travels on standard input, and payloads stay
+  sealed to the parties' keys, which never leave the machine. So `kontra dev` proves the gate's
+  API and escrow, never seam ①: a workflow the Authorizer refuses (a schedule, outward Nexus, a
+  query of another namespace) works there and fails on the platform. Seam ① is proved by `make
+  deny-matrix`, the wire suite and `make e2e` (the prod gate image with Kontra's Temporal
+  server). Run `kontra dev` on a machine whose loopback is yours.
 - **The internal frontend has no authentication.** Reaching it is full control of every
   namespace; its isolation is the network alone: loopback by default, and in `compose.yaml`
   Temporal's fixed address on the `control` network (a pinned subnet, `KONTRA_CONTROL_NET`),
   shared only with the gate. It does not listen on `temporal-db`, whose only other member is
-  the Postgres relay (and, with `kontra dev up --observability`, Prometheus, held to the
-  same terms); Postgres and the gate's migration job reach the database through that
+  the Postgres relay; Postgres and the gate's migration job reach the database through that
   relay and cannot reach Temporal at all; the bucket's network and the published ports never
   carry it. A deployment that adds a container to `control` gives that container the
-  internal frontend; `kontra dev up --ui` does so on purpose with Temporal's UI, a dev tool
-  published on 127.0.0.1 only that production never runs (as is the codec server it starts,
-  which decrypts with the machine's key for whoever reaches its loopback port, and serves the
-  graph page, reading the dev party's runs with its worker token). The bind is
+  internal frontend; the e2e stack's `ui` profile (`make stack-up UI=1`) does so on purpose
+  with Temporal's UI, a debugging tool published on 127.0.0.1 only that production never runs,
+  and that starts no codec server: it shows payloads as ciphertext unless one is run by hand.
+  (`kontra dev up --ui` runs no container: it is the dev server's own UI, and the codec server
+  it starts decrypts with the machine's key for whoever reaches its loopback port, and serves
+  the graph page, reading the dev party's runs with its worker token.) The bind is
   not the whole wall on `temporal-db`: Linux accepts a packet
   for any of its addresses on any interface, so a peer there that routes Temporal's `control`
   address through Temporal's `temporal-db` address reaches it (measured); that takes

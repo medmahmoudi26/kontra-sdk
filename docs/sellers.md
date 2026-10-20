@@ -971,70 +971,77 @@ anywhere: `kontra publish` does not carry it.
 ```sh
 kontra dev                    # = kontra dev up
 kontra dev up --ui            # + Temporal's UI, reading your payloads, and the graph page (below)
-kontra dev up --observability # + Prometheus, Grafana, and Loki and Tempo for `kontra serve --otlp` (below)
-kontra dev status             # containers, the gate's health, the codec server, the profile
-kontra dev logs [gate|temporal|postgres|postgres-relay|s3|migrate|ui|prometheus|prometheus-agent|grafana|otelcol|loki|tempo] [-f] [--tail N]
-kontra dev down [--volumes]   # --volumes also deletes the stack's data
+kontra dev up --observability # + Prometheus, Grafana, and Loki and Tempo for `kontra serve --otlp` (Docker)
+kontra dev up --persist       # keep the stack's state across `down` and reboots (remembered)
+kontra dev status             # the gate, Temporal, the codec server, the profile
+kontra dev logs [gate|temporal|codec|grafana|...] [-f] [--tail N]
+kontra dev down [--reset]     # --reset also deletes kept state and the logs
 ```
 
-`kontra dev` runs the same `compose.yaml` that CI and production run: Kontra's Temporal server
-(with the Authorizer), the gate, Postgres and an S3 bucket. It writes random credentials to
-`$KONTRA_HOME/dev.env` on first use, waits for the gate, logs you in as a dev party with play
-money, and waits until Temporal accepts your worker token. It refuses to replace a real login
-in the same `KONTRA_HOME`; use another home (`KONTRA_HOME=~/.kontra-dev kontra dev`) or run
-`kontra dev up --replace-profile`.
+`kontra dev up` runs Kontra on this machine with no containers and nothing to pull: the dev gate
+(the gate's whole API, escrow by the platform's own rules, play money) and a Temporal dev server,
+in one background process. It needs `pip install "kontra-sdk[dev]"` (`[testing]` includes it),
+downloads the Temporal CLI once (checked against the checksums kontra-sdk pins; `KONTRA_TEMPORAL_CLI`
+names one on disk instead), and logs you in as a dev party named after your user name (`--handle`
+picks another) with 100.00 of play money. There is no login step: the profile it writes is what
+`kontra serve`, `kontra hire` and `kontra mcp` use. It refuses to replace a real login in the same
+`KONTRA_HOME` (`KONTRA_HOME=~/.kontra-dev kontra dev`, or `--replace-profile`).
 
-Everything is published on 127.0.0.1 only: the gate on 8080, Temporal on 7233, the bucket on
-8333, Postgres on 5432. When a port is taken, set `KONTRA_DEV_GATE_PORT`,
-`KONTRA_DEV_TEMPORAL_PORT`, `KONTRA_DEV_S3_PORT` or `KONTRA_DEV_PG_PORT` (the header of
-[`compose.yaml`](../compose.yaml) lists every variable). `kontra dev up` remembers these four
-ports in `$KONTRA_HOME/dev.env`, so `kontra dev status`, `logs`, `down` and the next `up` use
-them without being told again; set one in the environment to change it, or set it empty for
-one `up` (`KONTRA_DEV_GATE_PORT= kontra dev up`) to go back to the default. The bind addresses
-(`KONTRA_DEV_BIND`, `KONTRA_DEV_PG_BIND`) are never remembered: a stack published beyond
-loopback (dev login, play money) is one you ask for on that `up`.
-The images are
-`ghcr.io/medmahmoudi26/kontra-temporal:dev` and `ghcr.io/medmahmoudi26/kontra-gate:dev`;
-`KONTRA_TEMPORAL_IMAGE` and `KONTRA_GATE_IMAGE` name others, and `--env-file` adds variables
-from a file. The published Temporal image is `linux/amd64` only; on an arm64 machine, build a
-native one in a checkout (`make temporal`, then `KONTRA_TEMPORAL_IMAGE=kontra-temporal:dev`).
-Temporal's internal frontend, which has no authentication, is never published, and Temporal
-shares a network only with the gate and `postgres-relay`, which carries its database
-connections (see [architecture](architecture.md#one-environment-definition)).
+Everything listens on 127.0.0.1 only: the gate on 8080, Temporal on 7233. `kontra dev up
+--gate-port` and `--temporal-port` move them, and `up` remembers them in `$KONTRA_HOME/dev/`. The
+`KONTRA_DEV_*_PORT` variables belong to the e2e stack (`make e2e`), not to `kontra dev`, so setting
+one does not move its gate. The stack's state is in memory: `kontra dev down` (or a reboot) forgets
+parties, the catalog, jobs and balances, and a `kontra serve` started before has to be restarted.
+`--persist` keeps it all in `$KONTRA_HOME/dev/data/`, and a restarted stack is then the same one,
+the tokens of a running `kontra serve` included. On a dev profile `kontra serve` publishes an
+unpublished version itself, so `kontra dev && kontra serve` is a hireable offering.
 
-On a dev profile, `kontra serve` publishes an unpublished version itself, so
-`kontra dev && kontra serve` is a hireable offering.
+A second party (a buyer, say) is another home: `KONTRA_HOME=~/.kontra-buyer kontra dev up --handle
+bob` finds the stack your user already runs on that gate port and joins it instead of starting
+one (nothing else starts; its own `--ui` starts only its own codec server). `kontra dev down` in
+the joining home says to run it in the home that started the stack. A home that joins as the same
+handle is a second machine of the same party: pass `--handle` to be someone else.
+
+What the dev stack is not: the Temporal dev server runs **no Authorizer**, the gate keeps blobs in
+memory rather than in a bucket, and the money is a ledger in memory. A workflow that does something
+the platform's Authorizer refuses works here and fails there (see [security](security.md)); Kontra's
+own end-to-end suite covers that half (`make e2e`, against the prod gate image). The dev server's
+frontend, its HTTP API and (with `--ui`) its UI take no credentials: anyone on this machine's
+loopback can act on its namespaces, and a web page whose name rebinds to 127.0.0.1 can reach the
+HTTP API and the UI. Your payloads stay sealed (they are encrypted to your key, and the gate and
+the codec server check `Host`). Run it on a machine whose loopback is yours.
 
 ### The UI and the dashboards
 
-`--ui` and `--observability` are the two compose profiles of the same `compose.yaml` (`ui`,
-`observability`); production never enables them. `kontra dev up` runs exactly the profiles
-its flags name: alone it is the stack above and nothing more, and it stops what an earlier
-`--ui` or `--observability` started. `kontra dev status`, `logs` and `down` cover every
-profile. Each tool is published on 127.0.0.1 only, whatever `KONTRA_DEV_BIND` says:
+`--ui` is the dev server's own UI; turning it on or off restarts the Temporal child in a second or
+two and keeps every run. `--observability` is the one part that runs containers (Docker with the
+compose plugin): a shipped compose file with Prometheus, Grafana, Loki and Tempo and nothing of
+Kontra's. `kontra dev up` runs exactly what its flags name and stops the rest. Each listens on
+127.0.0.1 only:
 
-| Flag | Service | Address | Port setting |
+| Flag | Service | Address | Moved by |
 |---|---|---|---|
-| `--ui` | Temporal's UI (`temporalio/ui`) | http://localhost:8233 | `KONTRA_DEV_UI_PORT` |
-| `--ui` | the codec server, a process of `kontra dev` on the host, and the [graph page](#the-graph-page) it serves | http://127.0.0.1:8081 | `KONTRA_DEV_CODEC_PORT` |
-| `--observability` | Prometheus | http://localhost:9090 | `KONTRA_DEV_PROMETHEUS_PORT` |
-| `--observability` | Grafana: Temporal's dashboards; Prometheus, Loki and Tempo to explore; no sign-in | http://localhost:3000 | `KONTRA_DEV_GRAFANA_PORT` |
-| `--observability` | an OpenTelemetry Collector, OTLP over gRPC, for `kontra serve --otlp` | http://127.0.0.1:4317 | `KONTRA_DEV_OTLP_PORT` |
+| `--ui` | Temporal's UI (the dev server's own, Temporal UI 2.54) | http://127.0.0.1:8233 | `--ui-port` |
+| `--ui` | the codec server, a process of `kontra dev` on the host, and the [graph page](#the-graph-page) it serves | http://127.0.0.1:8081 | `--codec-port` |
+| `--observability` | the dev server's metrics, for Prometheus | http://127.0.0.1:9463 | `--metrics-port` |
+| `--observability` | Prometheus | http://localhost:9090 | `--prometheus-port` |
+| `--observability` | Grafana: Temporal's dashboards; Prometheus, Loki and Tempo to explore; no sign-in | http://localhost:3000 | `--grafana-port` |
+| `--observability` | an OpenTelemetry Collector, OTLP over gRPC, for `kontra serve --otlp` | http://127.0.0.1:4317 | `--otlp-port` |
 
-The five ports are remembered in `$KONTRA_HOME/dev.env` like the stack's. Loki and Tempo
+The flags are `kontra dev up`'s, remembered in `$KONTRA_HOME/dev/` like the gate's port (the
+`KONTRA_DEV_*_PORT` variables are the e2e stack's and move nothing here). Loki and Tempo
 publish nothing: the collector writes to them and Grafana reads them.
 
 `--ui` is Temporal's own UI, not a Kontra one; after the login, `kontra dev up --ui` prints
 the link to your namespace's workflows. Payloads in Kontra's Temporal are age ciphertext, so
 `kontra dev up --ui` also starts a codec server in the background: Temporal's codec-server
 protocol (`POST /decode` and `/encode`) answered with this machine's key and the job keys
-under `$KONTRA_HOME`. The UI is configured to call it (`TEMPORAL_CODEC_ENDPOINT`), so you read
+under `$KONTRA_HOME`. The UI is configured to call it (the dev server's `--ui-codec-endpoint`), so you read
 your own inputs, results and failures in the UI; a payload encrypted to another party, or one
 claim-checked to the bucket, is shown as stored. `kontra dev down` stops the codec server; it
 writes to `$KONTRA_HOME/codec.log`. It starts only when `$KONTRA_HOME` holds a dev profile
-(the one `kontra dev up` logs in to): with a real login there (`--no-login`, or
-`--replace-profile` against a gate that is not a dev gate) the UI shows payloads as
-ciphertext, and `up` says why. The UI talks to Temporal's internal frontend, which has no
+(the one `kontra dev up` logs in to): with a real login there (a home used with
+`--replace-profile`) the UI shows payloads as ciphertext, and `up` says why. The UI talks to the dev server, which has no
 authentication: it sees and controls every namespace of the local stack, and so does anyone
 who reaches its port, as anyone who reaches the codec server's can have your key decrypt what
 was encrypted to it. Both answer on 127.0.0.1 alone, and the codec server to no web origin but
@@ -1044,11 +1051,11 @@ which (as upstream) check no `Host` and ask no sign-in, so it can use the UI's a
 start, signal, terminate a workflow in any namespace -- read the metrics, and read your
 workers' logs and traces and edit dashboards through Grafana. The codec server checks `Host`
 and refuses it, so your payloads stay sealed. `kontra dev up` alone stops
-the profiles when you are not using them.
+the UI and the observability containers when you are not using them.
 
-`--observability` runs Prometheus, Prometheus's agent and Grafana. Prometheus scrapes Kontra's
-Temporal server (`kontra dev up --observability` turns its metrics listener on,
-`KONTRA_TEMPORAL_METRICS_ADDR`), and receives the metrics of every `kontra serve --metrics` on
+`--observability` runs Prometheus, Prometheus's agent and Grafana. Prometheus scrapes the dev
+server (`kontra dev up --observability` turns its metrics listener on, on 127.0.0.1:9463), and
+receives the metrics of every `kontra serve --metrics` on
 this machine on ports 9464 to 9473. Grafana opens on Temporal's SDK dashboard, with its server
 dashboard beside it (see [Dashboards](#dashboards)). Serve the metrics on loopback, one port
 per worker:
@@ -1087,8 +1094,8 @@ for example one activity of one run:
 
 A line's `trace_id` links to its trace in Tempo, and a span to its trace's lines in Loki.
 `kontra-worker` is the service name when `OTEL_SERVICE_NAME` sets none. Loki keeps 7 days of
-logs and Tempo 14 days of traces, on volumes of their own (`kontra dev down --volumes`
-deletes them with the rest). From Loki 3.7, Loki refuses every line while the disk its data
+logs and Tempo 14 days of traces, on volumes of their own (`kontra dev down` stops the
+observability containers and keeps their volumes; `kontra dev down --reset` deletes them too). From Loki 3.7, Loki refuses every line while the disk its data
 is on is fuller than a threshold; it is 98% here, not Loki's 90%, at which many a laptop's disk
 already is. Grafana's anonymous user is an Editor here, because Explore needs one in Grafana
 13: an Editor also changes dashboards (the vendored ones are read-only), but adds no data
@@ -1100,7 +1107,7 @@ anything out.
 `kontra dev up --ui` also prints the graph page, which the codec server serves:
 
 ```text
-  workflows http://localhost:8233/namespaces/acme/workflows
+  ui        http://127.0.0.1:8233/namespaces/acme/workflows
   graph     http://127.0.0.1:8081/graph
 ```
 

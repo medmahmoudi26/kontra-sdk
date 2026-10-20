@@ -259,7 +259,9 @@ The end-to-end job needs the gate, which is private (`kontra-cloud`) and reaches
 repository only as an image. A `gate-image` job checks the image can be read first; when it
 cannot, the run carries a warning and a summary line and `e2e` shows as skipped, never as a
 silent pass. `e2e` is therefore not a required check until the gate image is readable from
-this repository's CI.
+this repository's CI. (Amended by I34: `e2e` is `make e2e` against the e2e stack, `compose.yaml`
+through `make stack-up`; `kontra dev` runs no containers, and acceptance 1's no-container half
+runs in the required `test` job.)
 
 The Temporal image is pushed only from `dev` (full-SHA tag, plus `:dev`), built without a
 layer cache, for `linux/amd64`, with a BuildKit SBOM and provenance. A release is a tag that
@@ -271,12 +273,13 @@ commit SHA; Trivy's action is pinned to a release made after its March 2026 tag 
 ## I14. Fork code never runs next to a private gate image
 
 The gate is private, and its image is Python: whoever can pull it can read it. CI's `e2e` job
-pulls it and then runs the pull request's own code on the same runner (`make sync`, `kontra
-dev up`, `tests/e2e`), which could `docker save` it, or read the registry login. So while the
+pulls it and then runs the pull request's own code on the same runner (`make sync`, `make
+stack-up`, `tests/e2e`), which could `docker save` it, or read the registry login. So while the
 image is private (CI first tries to read it anonymously), `e2e` runs for pushes to `dev` and
 for pull requests from branches of this repository only; a pull request from a fork is skipped
 with a warning that says so, as an unreadable gate image is (I13). Once the image is public,
-which `kontra dev` needs anyway, there is nothing to protect and forks run `e2e` too. The job
+there is nothing to protect and forks run `e2e` too. (Amended by I34: `kontra dev` no longer
+pulls the image, so nothing but the e2e stack needs it public.) The job
 logs out of the registry as soon as the image is pulled, so no later step can read the
 credential.
 
@@ -1407,9 +1410,11 @@ server, Temporal's UI 2.55.0, Grafana 13.2.3, Loki 3.7.8, Tempo 3.1.0, collector
 --observability` with `examples/sweep` served and hired. Where the issue and the code part
 ways:
 
-- **The codec server serves the page, not "the fake gate".** `kontra dev` runs the real
-  kontra-gate image (the fake gate exists only in pytest), and the SDK cannot add routes to
-  it. The codec server is already SDK code, loopback-only, dev-profile-only and
+- **The codec server serves the page, not "the fake gate".** `kontra dev` ran the real
+  kontra-gate image (the fake gate existed only in pytest), and the SDK cannot add routes to
+  it. (Amended by I34: `kontra dev` now runs the dev gate in process, `kontra.devgate`; the
+  page stays on the codec server, because the gate stands in for the platform and never holds
+  a party's key.) The codec server is already SDK code, loopback-only, dev-profile-only and
   Host-checked, and holds this machine's key; it gains a dev session (`Session.load` of its
   home, `connect_temporal("worker")`, which keeps the token fresh) to read history in the
   party's own namespace. The Authorizer already allows a worker token
@@ -1449,8 +1454,8 @@ ways:
   no style or handler attribute, loads nothing from elsewhere, and puts every string from the
   server in with `textContent` or `setAttribute`, never as HTML.
 - **No `kontra.yaml`.** The issue's `console:` keys exist nowhere. `kontra dev up` resolves the
-  UI's and Grafana's URLs from the compose configuration it ran (`_published()`) and hands them
-  to the codec server (`--temporal-ui`, and `--grafana` with `--observability` only); the data
+  UI's and Grafana's URLs from the ports it ran with (its settings since I34, the compose
+  configuration before) and hands them to the codec server (`--temporal-ui`, and `--grafana` with `--observability` only); the data
   source uids are the provisioned ones (`loki`, `tempo`); the LogQL selector is
   `{service_name="kontra-worker"}`, or `OTEL_SERVICE_NAME` as `kontra dev up` saw it.
   The production console's per-fleet Grafana (the issue's note on the recipients fleet entry) is
@@ -2668,3 +2673,118 @@ limit); C wrote 5.07 events a poll; D accepted 250, and its history replayed col
 twin's in 0.45 s; E accepted 250 polls in each run, growing 1,094 and 1,147 events; the
 seller's own tasks were 36 to 57 a run, their triples at most 335 bytes; the legitimate relay
 read A's stream from 0 and was told the budget was spent; about four and a half minutes in all.
+
+## I34. Two gates, one per environment: `kontra dev` runs the public dev gate in process; the compose stack is e2e tooling (kontra-sdk#57; decision 11 of #50)
+
+1. **The problem.** `kontra dev` ran the prod gate image (`ghcr.io/…/kontra-gate:dev`, private,
+   amd64 only: #49) flipped by `KONTRA_DEV=1`, so the public SDK's dev experience needed a private
+   image and the full account machinery, took tens of seconds to start, and could punt to `kontra
+   login` (the reported email prompt, §11 of the design).
+
+2. **Two gate packages.** The prod gate stays in `kontra-cloud` and is never imported here. The dev
+   gate is `kontra.devgate`, in this repository and wheel: `DevGate` (the old `FakeGate`, moved with
+   `git mv`; `kontra.testing.FakeGate` and `kontra.testing.fake_gate` re-export it, so it is one
+   class) serves every seam ② row. A module, not a distribution: it is built from `kontra.escrow`,
+   `kontra.ledger`, `kontra._control`, `kontra.contract`, `kontra.gate_client` and `kontra.engine`,
+   so a second distribution would ship in lockstep anyway, and FastAPI stays out of a worker's
+   install through a `[dev]` extra instead (`[testing]` includes it). Drift between the two gates is
+   policed by seam ② (`tests/gate_client/test_routes.py`) and the gate's OpenAPI snapshot in
+   `kontra-cloud`.
+
+3. **One host process.** `python -m kontra.devgate` runs `DevGate` under uvicorn on its main event
+   loop and a Temporal CLI dev server as its child (pinned and checksum-verified, a `--db-filename`,
+   loopback only, in the host's process group). `kontra dev up` starts it detached and returns
+   (`--foreground` to watch it). The codec server stays its own process: the gate stands in for the
+   platform and never holds a party's key (I7, I28).
+
+4. **No login verb.** `up` mints the dev party from the OS user (`--handle` overrides, else the
+   existing dev party, else `default_handle()`); the host has no `KONTRA_DEV` mode switch, and `up`
+   exits 0 only when a dev profile is written. The punt is gone structurally, and a dev profile is
+   told `kontra dev up`, never `kontra login` (`auth`, `profile`, the CLI hints, the MCP errors);
+   a test greps the dev CLI and the host for both. `--env-file` and `--no-login` are gone.
+
+5. **State.** In memory by default (dies with `down`, a crash or a reboot); `--persist` (remembered)
+   keeps a versioned tagged-JSON snapshot decoded only into a class allowlist — never pickle, so a
+   state file naming a callable is refused before any import — plus the Temporal db, restored
+   transparently to a running worker and buyer session.
+
+6. **What `kontra dev` does not prove.** No Authorizer (seam ① is `make deny-matrix` and e2e), no S3,
+   no Postgres ledger, no JWKS polling. Accepted; documented in `docs/sellers.md` and
+   `docs/security.md`.
+
+7. **`--ui`** is the dev server's own Temporal UI (its codec endpoint the codec server's port);
+   toggling it restarts only the Temporal child on its db file, lossless. The graph page (I28) and
+   the session pane (#54) read history as the dev party, unchanged.
+
+8. **`--observability`** stays compose, from a shipped observability-only file
+   (`observability/compose.yaml`, `kontra/_dev/observability/compose.yaml` in the wheel) that names
+   no gate, no Temporal image and no image of ours, run with `-p`/`-f` only. A packaging test and
+   `check_dist.py` hold it there (no `compose*.yaml` ships but that one; no shipped YAML names
+   `kontra-gate`). The only part that needs Docker; `up`/`down` touch Docker only when a previous
+   `up --observability` left a project.
+
+9. **The compose stack** (`compose.yaml`, the prod gate image, the Authorizer, Postgres, SeaweedFS)
+   is repository tooling: `make stack-up`/`stack-down`/`stack-logs`/`e2e` through
+   `tests/e2e/stack.py`, not shipped (it leaves the wheel and the sdist), never a `kontra dev` mode.
+   Sellers never see a choice.
+
+10. **Ports (OD8, a change from the design).** The base compose's `KONTRA_DEV_*` variables are
+    **not** renamed to `KONTRA_STACK_*`: kontra-cloud's laptop stack overlays this file, so a rename
+    would be a lockstep change in a repository #57 does not touch. Instead the in-process dev gate
+    never reads the environment for its ports — they come from `$KONTRA_HOME/dev/settings.json` and
+    `kontra dev up`'s `--*-port` flags — so `make e2e` runs the stack on 18080/17233/18333/15432/18233
+    through the existing `KONTRA_DEV_*_PORT` and `kontra dev up` stays on 8080/7233 beside it. A test
+    proves exporting `KONTRA_DEV_GATE_PORT=18080` does not move `kontra dev`'s gate.
+
+11. **Acceptance 1** is proved without containers in `make test` (a required check, a `docker` shim
+    that fails the test if it is called); e2e keeps the prod-gate half (`kontra login --dev --gate`).
+    One Temporal CLI pin and downloader (`kontra.devgate.temporal_cli`), which the Makefile's
+    `$(TEMPORAL_CLI)` rule and `kontra.testing.devserver` both use. Supersedes PRD §19.3's "single
+    environment definition" and the compose default on `kontra-gate:dev`; amends I13 and I14 (`make
+    stack-up` where they said `kontra dev up`) and I28 (the dev gate is in process now; the graph
+    page stays on the codec server because the gate never holds a key).
+
+12. **A second home joins (OD7).** A per-user registry (`$XDG_STATE_HOME/kontra-sdk/dev-gates/
+    <gate port>`, 0600) names the home that runs the stack on a port; another home of the same
+    user whose `up` finds that stack answering its own token there joins it (`dev/joined.json`),
+    starts nothing, and is told to run `down` in the owner's home. The stack's settings
+    (`--ui`'s Temporal UI, `--observability`, `--persist`) stay the owner's.
+
+13. **Orphans are signalled only when provably ours.** A recorded pid outlives its process (a
+    crash, a reboot) and may then be anyone's, a group leader included. `down` and a stale `up`
+    signal the recorded group only when the host led it (pgid == pid), it is not the command's
+    own group, and a member's command line names this home: the host's `--home` label (a label
+    on argv, never the token) or the Temporal child's `--db-filename` under this home. A forged
+    or recycled record is forgotten, never signalled (`tests/cli/test_dev.py`).
+
+14. **The `[dev]` extra is checked at once.** Without FastAPI or uvicorn, `up` exits 1 before
+    anything else with `pip install "kontra-sdk[dev]"`; `down`, `status` and `logs` never import
+    them (a test runs them with both imports blocked).
+
+15. **What `--persist` keeps** is the census of what the gate's kept stores can hold:
+    `store.ALLOWED` must equal the classes reachable from them (a test walks the field types),
+    and every store of state on the gate is either kept or named transient. A job's stored
+    stream and its relay's offset and budgets are kept, so cursors still line up with the offset
+    a resumed relay polls from; the relay's task, timer and listener count are not. `gate.json`
+    is read only when it is the user's and no one else may write it; a restore decodes
+    everything before it touches the gate.
+
+16. **The e2e stack lost what `kontra dev` used.** `compose.yaml`'s `observability` profile,
+    `observability/prometheus.yml` and `x-kontra-dev-settings` are gone (nothing here or in
+    kontra-cloud's laptop stack used them); its `ui` profile stays for `make stack-up UI=1`.
+    Dependabot bumps `observability/compose.yaml`'s digests too.
+
+17. **The email prompt, for the record.** Two paths led a dev user to an email sign-in, both
+    through `kontra login` defaulting to `https://api.kontra.run`: (a) `up` punted when compose
+    resolved the gate's `KONTRA_DEV` to anything but `1`/`true` (an exported `KONTRA_DEV=0`, as
+    kontra-cloud's `env.example` documents for production, wins over `dev.env`), printed "log in
+    with `kontra login`", wrote no profile and exited 0; (b) a dev profile whose gate forgot its
+    session (a reset stack) was told "Run `kontra login`". Which one the reported prompt was
+    cannot be recovered from the code. (a) cannot exist now (no mode switch, `up` exits 0 only
+    with a dev profile, the grep test); (b) says `kontra dev up` (OD14).
+
+18. **Costs accepted**: dev ≠ prod at the Authorizer and storage; loopback Temporal is
+    unauthenticated (payloads stay sealed, the HTTP API's port is kernel-chosen, the UI is opt-in);
+    in-memory blobs; the FakeGate move (`git mv` keeps history, the alias keeps every import);
+    `kontra-cloud#47` is a no-code-change follow-up (keep `KONTRA_DEV=1` in the prod image for the
+    e2e stack, optionally guarded to a loopback URL).

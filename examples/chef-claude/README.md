@@ -65,7 +65,7 @@ Anthropic.
 ## Run it
 
 `claude` must be on the worker's PATH (else `/usr/local/bin/claude` is used). With `kontra dev`
-(a local Kontra in Docker, play money, logged in as `acme`), this directory runs unchanged:
+(a local Kontra with no containers, play money, logged in as `acme`), this directory runs unchanged:
 
 ```sh
 kontra dev up --handle acme      # KONTRA_HOME=~/.kontra-dev keeps it apart from a real login
