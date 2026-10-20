@@ -5,7 +5,7 @@ from workflows import VaultFlow
 from kontra.serve import Worker, offering
 
 worker = Worker(
-    offerings=[offering("offering.yaml", workflow=VaultFlow, quote=quote)],
+    offerings=[offering("offering.yaml", entry=VaultFlow, quote=quote)],
     activities=[reseal],
 )
 
