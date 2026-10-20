@@ -86,3 +86,29 @@ class EnrichOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     domains: list[str]
+
+
+class FeedJob(BaseModel):
+    """``acme/feed`` (``streams: [events]``): ``count`` events on the job's stream, under
+    ``events``, from an activity -- and as many on ``secret``, a topic it never lists."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    count: int = Field(ge=0, le=100)
+    note: str = Field(default="", max_length=200)
+
+
+class FeedOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    published: int
+
+
+class FeedEvent(BaseModel):
+    """An item of ``events``: the seller's, never in the contract (decisions I31, OD11); the
+    buyer reads it with its own copy of the model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    n: int
+    note: str
