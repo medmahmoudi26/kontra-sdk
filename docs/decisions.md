@@ -1699,5 +1699,7 @@ two authorizers (319 cells, 253 of them denials that Temporal's no-op authorizer
 checks); a sweep of all 191 surfaces against 26 kinds of caller, five namespaces and a
 favourable, a hostile and no request (99,320 decisions, the expected rule restated in the
 test); Temporal's own authorization interceptor handing the relay rule the decoded request;
-and `tests/temporal` over the wire against the real binary (59 tests), the relay, controller,
-self-access and escrow cells included, and a relay ending its job by history size alone.
+and `tests/temporal` over the wire against the real binary (58 tests), the relay, controller,
+self-access and escrow cells included. What a relay's polls cost a job's history is stated
+above and in `docs/security.md`, not pinned by a wire test: that test would be a ready-made
+recipe in a public repository.
