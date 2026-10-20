@@ -14,22 +14,34 @@
 // Three kinds of token mean anything, told apart by the claims the mapper produces, in
 // this order:
 //
-//   - A party token carries a permission. The one that grants anything is
-//     "<namespace>:worker": the WorkflowService calls in AllowedAPIs, in that namespace
-//     only. A seller's worker token, a seller's API-key session, a buyer (a worker of its
-//     own namespace, because any party can sell and buy) and the dev party all hold this
-//     token and are identical on the wire. Every other role ("admin", "write", "read", an
-//     unknown role, any "temporal-system:..." role) grants nothing. A token with any
-//     permission at all is judged by this rule alone, whatever its subject says.
+//   - A party token carries a permission: a permission string the mapper turns into a
+//     namespace key (any "<namespace>:<role>", even a role it does not know) or into a
+//     system role it knows ("temporal-system:" with "read", "write", "admin" or
+//     "worker"). The one that grants anything is "<namespace>:worker": the WorkflowService
+//     calls in AllowedAPIs, in that namespace only. A seller's worker token, a seller's
+//     API-key session, a buyer (a worker of its own namespace, because any party can sell
+//     and buy) and the dev party all hold this token and are identical on the wire. Every
+//     other role ("admin", "write", "read", an unknown role in a namespace, a
+//     "temporal-system:" role the mapper knows) grants nothing. A token with a permission
+//     is judged by this rule alone, whatever its subject says.
 //   - The worker controller (KON-15) carries no permission and the subject
 //     ControllerSubject: the worker-deployment calls in ControllerAPIs, in
 //     PlatformNamespace only.
 //   - The gate's stream relay carries no permission and the subject RelaySubject(namespace,
 //     job workflow id): the stream's poll Update and offset Query on that one workflow.
 //
-// Party tokens and the other two are disjoint twice over: a party token always carries a
-// permission and the others never do, and a party's subject is a handle, which can never
-// contain the "/" both other subjects contain.
+// A permission string the mapper drops is no permission: "temporal-system:" with a role it
+// does not know (it maps to no role and creates no namespace key), an entry with no ":", an
+// entry that is not a string, a "permissions" claim that is not a list. A token carrying
+// only those is judged by its subject like one that carries none, so the controller's or
+// a relay's subject with such an entry gets that principal's calls.
+//
+// Party tokens and the other two are told apart twice: the gate mints a party token with
+// a permission and the other two with none, and a party's subject is a handle, which can
+// never contain the "/" both other subjects contain. The second holds whatever the mapper
+// does with a token's permissions; the first holds as long as the gate writes only
+// permissions the mapper keeps, which is why decisions I30 has the gate mint each
+// principal's token with its own function and no role parameter.
 //
 // Decisions compare whole strings for equality or set membership; nothing here splits an
 // API name, a namespace, an endpoint name or a subject. One rule reads the request: a
@@ -63,7 +75,8 @@ const (
 	// StreamPollUpdate and StreamOffsetQuery are the two workflow-stream handlers a relay
 	// may use (temporalio.contrib.workflow_streams _POLL_UPDATE and _OFFSET_QUERY, pinned
 	// by tests/contract/test_names.py). The stream's publish signal is deliberately not
-	// one of them: a relay reads a stream and never writes to it.
+	// one of them: a relay reads a stream and never publishes to it. Each poll's outcome is
+	// still written to the job's history, which this policy cannot bound (decisions I30).
 	StreamPollUpdate  = "__temporal_workflow_stream_poll"
 	StreamOffsetQuery = "__temporal_workflow_stream_offset"
 )
@@ -291,7 +304,10 @@ func (Authorizer) Authorize(
 // claim mapper creates a namespace's key even for a role it does not know
 // (default_jwt_claim_mapper.go: an unknown role is RoleUndefined, but the key is set), so
 // the test is "any namespace key or any system role", not "any role bit": a token that
-// says "acme:relay" is a party token with no role, never a relay.
+// says "acme:relay" is a party token with no role, never a relay. The system clause keeps
+// "temporal-system:admin" next to the controller's or a relay's subject in the party rule.
+// What the mapper drops, "temporal-system:" with a role it does not know included, sets
+// neither, and is no permission.
 func hasPermissions(claims *authorization.Claims) bool {
 	return claims.System != authorization.RoleUndefined || len(claims.Namespaces) > 0
 }

@@ -187,6 +187,23 @@ var (
 	controllerAdmin  = mustJWT(kontra.ControllerSubject, kontra.PlatformNamespace+":admin")
 	// One of Kontra's own workers: a party token for the platform namespace (decisions I30 Q4).
 	platformWorker = mustJWT("kontra-system-worker", kontra.PlatformNamespace+":worker")
+
+	// A system role is a permission too: next to the controller's or the relay's subject it
+	// makes a party token, which no system role helps (hasPermissions reads claims.System as
+	// well as the namespace keys).
+	controllerSysAdmin = mustJWT(kontra.ControllerSubject, "temporal-system:admin")
+	relaySysRead       = mustJWT(kontra.RelaySubject("acme", jobJ), "temporal-system:read")
+	// Permission strings the default claim mapper drops are no permission at all: a
+	// "temporal-system:" role it does not know (RoleUndefined, and no namespace key), an
+	// entry with no ":", an entry that is not a string, a claim that is not a list. Such a
+	// token is judged by its subject alone, like one that carries none. Only the gate mints
+	// these subjects, and it writes no permission into them (decisions I30).
+	controllerSysUnknown = mustJWT(kontra.ControllerSubject, "temporal-system:bogus")
+	controllerNoColon    = mustJWT(kontra.ControllerSubject, "kontra-system")
+	controllerNotString  = mustJWTPermissionsClaim(kontra.ControllerSubject, []any{1})
+	controllerNotList    = mustJWTPermissionsClaim(kontra.ControllerSubject, "kontra-system:admin")
+	relaySysUnknown      = mustJWT(kontra.RelaySubject("acme", jobJ), "temporal-system:relay")
+	relayNoColon         = mustJWT(kontra.RelaySubject("acme", jobJ), "relay")
 )
 
 // Job J is the relay's; job K is another job of the same seller.
@@ -549,6 +566,16 @@ var matrix = []cell{
 	{"relay-J", "relay subject + acme:read", relayRead, query, "acme", nil, deny, allow, allow},
 	{"relay-J", "relay subject + acme:relay", relayUnknownRole, updateWF, "acme", nil, deny, allow, deny},
 	{"relay-J", "relay subject + acme:relay", relayUnknownRole, query, "acme", nil, deny, allow, deny},
+	// A system role is a permission too: a party token, which no system role helps.
+	{"relay-J", "relay subject + temporal-system:read", relaySysRead, updateWF, "acme", nil, deny, allow, deny},
+	{"relay-J", "relay subject + temporal-system:read", relaySysRead, query, "acme", nil, deny, allow, allow},
+	// A permission string the default claim mapper drops is no permission: the token is
+	// judged by its subject, here the relay's, and gets the relay's two calls on job J and
+	// nothing more. Only the gate mints this subject, and never with a permission.
+	{"relay-J", "relay subject + temporal-system:relay (dropped)", relaySysUnknown, updateWF, "acme", nil, allow, allow, deny},
+	{"relay-J", "relay subject + relay (dropped)", relayNoColon, query, "acme", nil, allow, allow, deny},
+	{"relay-J", "relay subject + temporal-system:relay (dropped) job K", relaySysUnknown, updateWF, "acme", upd("acme", jobK, kontra.StreamPollUpdate), deny, allow, deny},
+	{"relay-J", "relay subject + temporal-system:relay (dropped)", relaySysUnknown, describe, "acme", nil, deny, allow, deny},
 	// Relay subjects the gate never mints (relay_subject refuses a reserved or empty
 	// namespace) are refused here too: a relay acts in a party's namespace only.
 	{"relay-J", "relay(kontra-system,J)", relayPlatform, updateWF, platform, nil, deny, allow, deny},
@@ -618,6 +645,19 @@ var matrix = []cell{
 	{"controller", "controller + kontra-system:worker", controllerWorker, poll, platform, nil, allow, allow, deny},
 	{"controller", "controller + kontra-system:admin", controllerAdmin, setCurrent, platform, nil, deny, allow, allow},
 	{"controller", "controller + kontra-system:admin", controllerAdmin, describeDeployment, platform, nil, deny, allow, allow},
+	// A system role is a permission too: a party token, which no system role helps.
+	{"controller", "controller + temporal-system:admin", controllerSysAdmin, setCurrent, platform, nil, deny, allow, allow},
+	{"controller", "controller + temporal-system:admin", controllerSysAdmin, describeDeployment, platform, nil, deny, allow, allow},
+	// A permission string the default claim mapper drops is no permission: the token is
+	// judged by its subject, here the controller's, and gets the controller's ten calls in
+	// the platform namespace and nothing more. Only the gate mints this subject, and never
+	// with a permission.
+	{"controller", "controller + temporal-system:bogus (dropped)", controllerSysUnknown, setCurrent, platform, nil, allow, allow, deny},
+	{"controller", "controller + kontra-system (dropped)", controllerNoColon, setCurrent, platform, nil, allow, allow, deny},
+	{"controller", "controller + [1] (dropped)", controllerNotString, setCurrent, platform, nil, allow, allow, deny},
+	{"controller", "controller + \"kontra-system:admin\" not a list (dropped)", controllerNotList, setCurrent, platform, nil, allow, allow, deny},
+	{"controller", "controller + temporal-system:bogus (dropped)", controllerSysUnknown, start, platform, nil, deny, allow, deny},
+	{"controller", "controller + temporal-system:bogus (dropped)", controllerSysUnknown, setCurrent, "acme", nil, deny, allow, deny},
 	// A party token on the deployment calls, anywhere.
 	{"controller", "acme:worker", acmeWorker, describeDeployment, "acme", nil, deny, allow, deny},
 	{"controller", "acme:worker", acmeWorker, setRamping, "acme", nil, deny, allow, deny},
@@ -662,7 +702,7 @@ func TestDenyCellsFailByDefault(t *testing.T) {
 			t.Errorf("%s: the no-op authorizer said %s", c.name(), show(got))
 		}
 	}
-	if denied < 230 {
+	if denied < 250 {
 		t.Fatalf("only %d deny cells: the matrix lost rows", denied)
 	}
 	t.Logf("%d deny cells, %d allow cells", denied, len(matrix)-denied)
@@ -708,9 +748,15 @@ func TestSweep(t *testing.T) {
 		{"relay subject + acme:relay", relayUnknownRole, "party", "", ""},
 		{"controller + kontra-system:worker", controllerWorker, "party", "", ""},
 		{"controller + kontra-system:admin", controllerAdmin, "party", "", ""},
+		{"controller + temporal-system:admin", controllerSysAdmin, "party", "", ""},
+		{"relay subject + temporal-system:read", relaySysRead, "party", "", ""},
 		{"controller", controller, "controller", "", ""},
+		// Permissions the claim mapper drops: no permission, judged by subject.
+		{"controller + temporal-system:bogus", controllerSysUnknown, "controller", "", ""},
+		{"controller + \"kontra-system:admin\" not a list", controllerNotList, "controller", "", ""},
 		{"relay(acme,J)", relayJ, "relay", "acme", jobJ},
 		{"relay(acme,J) permissions:[]", relayEmpty, "relay", "acme", jobJ},
+		{"relay subject + temporal-system:relay", relaySysUnknown, "relay", "acme", jobJ},
 		{"empty jwt", emptyJWT, "nobody", "", ""},
 	}
 	namespaces := []string{"acme", "buyer", "", "temporal-system", "kontra-system"}
@@ -1069,6 +1115,44 @@ func TestNonPartySubjectsAreNotHandles(t *testing.T) {
 	}
 }
 
+// TestWhatTheClaimMapperCountsAsAPermission pins the line the dispatch draws (decisions
+// I30): a permission is what Temporal's default claim mapper turns into a namespace key or
+// a system role it knows. A role it does not know still sets a namespace's key, but
+// "temporal-system:" with such a role, an entry with no ":", one that is not a string and a
+// claim that is not a list map to nothing, so a token carrying only those carries no
+// permission and is judged by its subject.
+func TestWhatTheClaimMapperCountsAsAPermission(t *testing.T) {
+	permission := func(c *authorization.Claims) bool {
+		return c.System != authorization.RoleUndefined || len(c.Namespaces) > 0
+	}
+	for who, c := range map[string]*authorization.Claims{
+		"acme:worker":           mustJWT("x", "acme:worker"),
+		"acme:relay":            mustJWT("x", "acme:relay"),
+		"acme:":                 mustJWT("x", "acme:"),
+		"temporal-system:read":  mustJWT("x", "temporal-system:read"),
+		"temporal-system:admin": mustJWT("x", "temporal-system:admin"),
+	} {
+		if !permission(c) {
+			t.Errorf("%s: the mapper no longer makes it a permission", who)
+		}
+	}
+	for who, c := range map[string]*authorization.Claims{
+		"no claim":                           mustJWT("x"),
+		"[]":                                 mustJWTEmptyPermissions("x"),
+		"temporal-system:bogus":              mustJWT("x", "temporal-system:bogus"),
+		"temporal-system:":                   mustJWT("x", "temporal-system:"),
+		"temporal-system:relay":              mustJWT("x", "temporal-system:relay"),
+		"kontra-system":                      mustJWT("x", "kontra-system"),
+		"[1]":                                mustJWTPermissionsClaim("x", []any{1}),
+		"{}":                                 mustJWTPermissionsClaim("x", []any{map[string]any{}}),
+		"\"kontra-system:admin\" not a list": mustJWTPermissionsClaim("x", "kontra-system:admin"),
+	} {
+		if permission(c) {
+			t.Errorf("%s: the mapper now makes it a permission (%+v): update the docs", who, c)
+		}
+	}
+}
+
 // TestRelayDoesNotMutateRequest: the request the authorizer reads is the one the handler
 // then receives (interceptor.go hands the same object), so reading it must change nothing.
 func TestRelayDoesNotMutateRequest(t *testing.T) {
@@ -1310,7 +1394,13 @@ func mustJWT(subject string, permissions ...string) *authorization.Claims {
 
 // mustJWTEmptyPermissions is mustJWT with the claim present and empty: "permissions": [].
 func mustJWTEmptyPermissions(subject string) *authorization.Claims {
-	return mapJWT(signJWT(jwt.MapClaims{"sub": subject, "permissions": []string{}}))
+	return mustJWTPermissionsClaim(subject, []string{})
+}
+
+// mustJWTPermissionsClaim is mustJWT with the "permissions" claim set to this value as it
+// is, for the shapes the default claim mapper ignores: not a list, entries not strings.
+func mustJWTPermissionsClaim(subject string, permissions any) *authorization.Claims {
+	return mapJWT(signJWT(jwt.MapClaims{"sub": subject, "permissions": permissions}))
 }
 
 func signJWT(claims jwt.MapClaims) string {
