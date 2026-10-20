@@ -344,9 +344,10 @@ a pinned Ubuntu image with Docker, without network).
 
 Generate from the published contract only. A seller whose offering is a handler of an agent
 written with Temporal's agent harness may also have the harness's own schema of it (for their
-own UI); it is never published or hashed, and it comes from the seller's code, which is
-exactly what you cannot see. The contract's hash is the one the catalog, your hold and the
-seller's worker agree on (decisions I33).
+own UI). The two describe the same models alike, and the seller is warned where they do not
+(decisions I33); but the harness's schema is never published or hashed, and it comes from the
+seller's code, which is exactly what you cannot see. The contract's hash is the one the
+catalog, your hold and the seller's worker agree on.
 
 ## What happens to your money
 

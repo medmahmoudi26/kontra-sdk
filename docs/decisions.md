@@ -1965,7 +1965,10 @@ pydantic models (`serve(ReconAgent.sweep)`, I29) are walked by two emitters:
 a buyer buys, and what `kontra pull` generates from -- and temporal-agent-harness's
 `agent_schema`, which its codegen turns into the seller's own TypeScript and which is never
 published. `kontra.contract.harness` compares the two for the handler sold; `kontra publish`
-and `kontra contract` warn where they differ, and seam ③ asserts the verdict.
+and `kontra contract` warn where they differ, and seam ③ asserts them equal. Both describe an
+input in pydantic's validation mode and an output in its serialization mode (I38; the
+harness's `_WireJsonSchema` also requires every output field), so once both are in one
+canonical form the only difference left is one the seller chose, `extra="allow"`.
 
 - **What is compared.** The contract's `execute` input and output against the handler's
   `input` and `output` in the harness's document, each with everything it references. Nothing
@@ -1973,11 +1976,7 @@ and `kontra contract` warn where they differ, and seam ③ asserts the verdict.
   states are the agent's envelope, never the operation, and a difference there is none of the
   contract's. Both sides are walked together, references followed on both, a pair of
   definitions compared once (a recursive model terminates); a difference is reported at its
-  path in the contract's terms (`$defs.Report.required`), with both values, per side.
-  Following a reference never drops an assertion: JSON Schema 2020-12 asserts a `$ref`'s
-  definition and the members beside it both (`{$ref: X, k: v}` is `{allOf: [X, {k: v}]}`), so
-  a use site is folded into its definition only where that is the same schema (below), and
-  otherwise compared as that `allOf`.
+  path in the contract's terms (`$defs.ReportOutput.required`), with both values, per side.
 - **Where the harness's schema comes from: its own CLI**, `temporal-agent-harness schema
   module:Class -o <file>`, run as a subprocess by the interpreter running Kontra, with that
   process's `sys.path` as `PYTHONPATH` and the offering directory as the working directory, so
@@ -1997,144 +1996,141 @@ and `kontra contract` warn where they differ, and seam ③ asserts the verdict.
   quotes the last line), never buffered whole in memory or on disk; the document is read up to
   16 MiB and refused past it. "The harness is installed" means its console script is in this
   environment's metadata; nothing is imported to find out.
-- **Measured** (harness 0.6.0, whose `agent_schema` and CLI are identical in 0.7.0; pydantic
-  2.14), over the test agents and a zoo of one handler per case, each taking and returning
-  the same model. The harness generates an input in validation mode, an output in
-  serialization mode with every field required (`_WireJsonSchema`), and keeps pydantic's
-  output otherwise; Kontra generates both in validation mode and lowers them to nexgen's
-  subset (I2). What differed, and what it is:
+- **The canonical form** removes what changes no valid value, each rule tested on its own:
+  - references followed, and a definition matched by its use, not its name (`ReportOutput`
+    against `Report-Output`, `KontraArtifact` against `Artifact`, an enum or constrained
+    scalar Kontra writes inline against the harness's `$ref`), through chains of aliases
+    (`{$ref: Documented, maxLength: 10}`, `Documented` itself `{$ref: Short,
+    description}`);
+  - a `$ref`'s use site joined to its definition as their conjunction, since JSON Schema
+    2020-12 asserts both: the use site's annotations (`title`, `description`, `examples`,
+    `default`, `$comment`, `deprecated`, `readOnly`, `writeOnly`, `discriminator`) replace
+    the definition's; an assertion the definition does not make joins it; one both make is
+    the one value that says what the two do -- the tighter bound (`maximum`,
+    `exclusiveMaximum`, `maxLength`, `maxItems`, `maxProperties` and the `min*`), the `enum`
+    values both list in the definition's order, `integer` within `number`, the least common
+    multiple of two integer `multipleOf`s, `uniqueItems` if either says so. Keywords that
+    read each other (`properties`/`patternProperties`/`additionalProperties`,
+    `prefixItems`/`items`, `contains`/`minContains`/`maxContains`, `if`/`then`/`else`) join
+    only a definition that writes none of their group or the group alike, and nothing joins
+    beside an `unevaluated*`. Anything else (two `pattern`s, two `const`s, no common `enum`
+    value) stays `allOf: [definition, use site]`, which the contract never writes
+    (derivation refuses such a field, I38), so it is reported; an `anyOf` with `null` over
+    it still reads as `oneOf` when a branch of it cannot be null. The comparison's
+    conjunction is its own, not derivation's `_conjoin`, so a derivation that conjoins
+    wrongly differs here;
+  - `title`, `description`, `examples`, `$comment`, `deprecated`, `readOnly`, `writeOnly`
+    and the OpenAPI `discriminator` dropped (the branches' `const` tags select the branch);
+  - `required` a set (sorted; empty is absent), and values compared as RFC 8785 canonical
+    JSON (key order, `1` and `1.0`);
+  - `anyOf: [T, {type: null}]` read as `oneOf` when `T` cannot be null (a `type` without
+    `null`, a non-null `const`, an `enum` without `null`, a reference to such, an `allOf`
+    with such a branch, or a union of such; unsure is no);
+  - a `null`, list or object `default` dropped (I2: null is the absence of one, and nexgen
+    materialises only scalar defaults), and so is a default on a member its object
+    requires, which never applies: in serialization mode the harness keeps each field's
+    default beside the `required` that lists it, and the contract writes none there (I38).
+    Any other scalar default is compared, although JSON Schema calls it an annotation: a
+    buyer's generated code fills it in, so a different one changes what an absent field
+    means;
+  - the contract's `additionalProperties: false` against the harness's none: no difference,
+    Kontra's closing policy (below); `additionalProperties: true` is its absence on either
+    side, except against the contract's `false`.
 
-  | Case | Difference | Class |
-  |---|---|---|
-  | every model | `$defs` names (`Report` / `Report-Output`, `KontraArtifact` / `Artifact`) | representational: references followed, definitions matched by use |
-  | every model | `title` (auto and explicit), `description` (the reserved `KontraArtifact` text against `Artifact`'s docstring), `examples` | representational: annotations dropped |
-  | every model | order of `required`, of keys | representational: `required` a set, values RFC 8785 canonical JSON |
-  | enums | inline (Kontra) against `$ref` to a named enum | representational: references followed |
-  | optionals | `oneOf: [T, null]` against `anyOf: [T, null]`; `default: null` | representational when `T` cannot be null; null is no default (I2) |
-  | list and dict defaults | dropped by Kontra, kept by the harness | representational: annotation-only, and nexgen materialises only scalar defaults (I2) |
-  | tagged unions | OpenAPI `discriminator` kept by the harness | representational: not a 2020-12 assertion; the `const` tags select the branch |
-  | every model with pydantic's default `extra="ignore"` | contract `additionalProperties: false`, harness none | **policy, not reported** (decided in the owner's place, below): the contract closes every model (§11.3); pydantic drops other keys on input and never emits one, so no value exchanged differs |
-  | `extra="allow"` | contract `additionalProperties: false`, harness `true` | **semantic, `open`**: the model accepts keys the contract forbids, and serializes them into its reply |
-  | a constraint on a named type and again where it is used (`Annotated[Code, Field(max_length=10)]` over `class Code(RootModel[Annotated[str, StringConstraints(max_length=5)]])`; `Field(json_schema_extra={"enum": ["a", "z"]})` over an enum of `a`, `b`) | harness `{$ref: Code, maxLength: 10}`, both asserted (at most 5, as pydantic validates); contract `{maxLength: 10, type: string}`, the use site's value only | **semantic, `drift` on both sides**: the contract accepts `"abcdefg"`, and `"z"`, which the model refuses (for the owner, below) |
-  | output fields with a default (scalar, factory, `= None`, nested) | harness `required` lists them, the contract does not | **semantic, `defaults`**: the reply always carries them; the contract lets them be absent |
-  | output `@computed_field` | harness has the property (and requires it), the contract does not | **semantic, `serialization`** |
-  | output `Field(exclude=True)` | the contract has (and requires) the field, the harness does not | **semantic, `serialization`** |
-  | output `serialization_alias` unlike the validation alias | harness keys by `out_a`, the contract by `in_a` | **semantic, `serialization`** |
-  | output `@field_serializer` returning another type | harness `integer`, the contract `string`/`date-time` | **semantic, `serialization`** |
-  | aliases, alias generators, `AliasChoices`, constrained strings and numbers, lists, maps, `datetime`/`date`/`timedelta`/`UUID`, `Literal`, int and str enums, nested and recursive models, `Artifact`, explicit titles | nothing beyond the rows above | -- |
-
-  So the canonical form is: references followed and definitions matched by use, a `$ref`'s use
-  site folded into its definition only where the result asserts what the two did -- its
-  annotations (`title`, `description`, `examples`, `default`, `$comment`, `deprecated`,
-  `readOnly`, `writeOnly`, `discriminator`) replace the definition's, and each other member
-  joins it if the definition writes none or the same value, with keywords that read each other
-  (`properties`/`patternProperties`/`additionalProperties`, `prefixItems`/`items`,
-  `contains`/`minContains`/`maxContains`, `if`/`then`/`else`) folded only when the two write
-  that group alike, and nothing folded beside an `unevaluated*` -- and otherwise left as `allOf:
-  [definition, use site]`, which an `anyOf` with `null` still reads as `oneOf` when a branch of
-  it cannot be null; `title`,
-  `description`, `examples`, `$comment`, `deprecated`, `readOnly`, `writeOnly` and
-  `discriminator` dropped; `required` sorted, and empty `required` absent; the contract's
-  `additionalProperties: false` against the harness's none no difference (the contract
-  closes models by policy, below), and `additionalProperties: true` absent on either side,
-  except against the contract's `false`, where it is kept and reported `open`;
-  `anyOf: [T, {type: null}]` read as `oneOf` when `T` cannot be null (a `type`
-  without `null`, a non-null `const`, an `enum` without `null`, a reference to such, or a
-  union of such; unsure is no); a `null`, list or object `default` dropped; values compared as
-  RFC 8785 canonical JSON. A **scalar default is compared**, although JSON Schema calls it an
-  annotation: a buyer's generated code fills it in, so a different one would change what an
-  absent field means. `enum` and union branches are compared in order: both emitters write
-  declaration order, and a reorder would be reported, which over-reports and never hides.
-- **What is reported**, each difference with a kind: `open` (an `additionalProperties: true`,
-  `extra="allow"`, where the contract says `false`), `defaults` (an output `required` the
-  harness extends with declared fields only), `serialization` (any other output difference)
-  and `drift` (any other input difference: unexplained; and, on either side, every difference
-  at a use site left beside its definition, which is the emitters disagreeing, not the
-  serialization). `open` and `defaults` are semantic -- they change which values are valid --
-  and reported, not normalised: the warning is the seller's to act on (dropping
-  `extra="allow"` silences `open`), and the zoo's `allow` and `outer` handlers show `open` at
-  a model's root and nested. The test agents in `tests/serve/harness_agents.py` keep
-  pydantic's default `extra="ignore"` and show no difference at all.
+  `enum` and union branches are compared in order: both emitters write declaration order,
+  and a reorder would be reported, which over-reports and never hides.
+- **What is reported: `open`, and anything else as it is.** `open` is the harness's
+  `additionalProperties: true` (`extra="allow"`) where the contract says `false`: the model
+  accepts keys the contract and the gate refuse, and serializes them into its reply, which
+  the served contract refuses (`as_output`, I38), so a reply that carries one fails the job.
+  It is the seller's to act on (pydantic's default or `extra="forbid"` makes the two agree),
+  so it is reported, not normalised; the zoo's `allow` and `outer` handlers show it at a
+  model's root and nested. An `additionalProperties` with a schema (typed extras,
+  `__pydantic_extra__: dict[str, int]`) is no `true` and is compared as any other member.
+  Any other difference is the two emitters describing the same model differently, a bug in
+  one of them: it has no kind of its own, the warning asks the seller to report it at
+  kontra-sdk's issues, and seam ③ fails on it.
 - **The contract closes models by policy: no difference (decided in the owner's place; on #53
-  for the owner to confirm or overturn).** As first
-  built, `open` was also the contract's `additionalProperties: false` against the harness's
-  absence of it, so it fired on nearly every handler: Kontra closes every model (I2, §11.3)
-  whatever its `extra`, and pydantic's default, `extra="ignore"`, writes nothing. A warning
-  that fires on every handler teaches sellers to ignore it, and with it the rows it exists for,
-  so it must not. For an `extra="ignore"` model the difference changes no
-  value actually exchanged -- pydantic drops other keys on input and never emits one on
-  output -- so it is Kontra's closing policy, not drift, and the canonical form sets it aside
-  (`kontra.contract.harness._closed_alike`, tested pair by pair). `extra="allow"` is still
-  `open`: the harness's schema says `additionalProperties: true` there, the model accepts keys
-  the contract forbids and serializes them into its reply, so that `true` is kept against the
-  contract's `false` (anywhere else `true` is its absence, as JSON Schema has it). An
-  `additionalProperties` with a schema (typed extras, `__pydantic_extra__: dict[str, int]`)
-  is no `true` and is compared as any other member. Nothing asks a seller for
+  for the owner to confirm or overturn).** As first built, `open` was also the contract's
+  `additionalProperties: false` against the harness's absence of it, so it fired on nearly
+  every handler: Kontra closes every model (I2, §11.3) whatever its `extra`, and pydantic's
+  default, `extra="ignore"`, writes nothing. A warning that fires on every handler teaches
+  sellers to ignore it, and with it the rows it exists for, so it must not. For an
+  `extra="ignore"` model the difference changes no value actually exchanged -- pydantic drops
+  other keys on input and never emits one on output -- so it is Kontra's closing policy, not
+  drift, and the canonical form sets it aside (`kontra.contract.harness._closed_alike`,
+  tested pair by pair). `extra="allow"` is still `open`. Nothing asks a seller for
   `extra="forbid"`.
 - **The publish-time warning.** `kontra publish` (before contacting the gate) and `kontra
   contract` print, on stderr, one warning per bound-handler offering whose two schemas differ:
-  the offering and handler, one line per difference, and a sentence per kind present. Nothing
-  for a workflow entry, nothing when the harness is not installed (its console script absent
-  from the environment; no subprocess), nothing when the two agree. A harness that cannot
-  answer is one warning line with its last line of stderr, control characters removed; the
-  command goes on. It is a warning and never a refusal: the contract is what is published and
-  hashed, and the harness's schema is dev tooling the buyer never sees. One subprocess per
-  agent class, however many of its handlers a worker binds (about a second, plus the seller's
-  module import).
-- **For the owner: Kontra derives an output in validation mode, and the job's result is its
-  serialization.** The `serialization` rows are not harness drift. A workflow entry's result is
-  what temporalio's pydantic converter writes (`to_json`: computed fields in, excluded fields
-  out, serialization aliases, serializers applied), and a handler's is `as_output`'s
-  `model_dump(mode="json", by_alias=True)`, the same. So for an output model with a computed
-  field (the result carries `area`, which the closed contract refuses), an excluded field (the
-  contract requires `secret`, the result never has it), a serialization alias unlike its
-  validation alias (`out_a` against the contract's `in_a`) or a type-changing serializer (an
-  integer where the contract says `date-time`), **the published contract does not describe
-  what buyers receive**, for workflow entries too. `extra="allow"` on an output is the same
-  class: its extra keys are serialized into a result the contract closes. A handler whose
-  output excludes a required field fails every job besides: `as_output` validates the reply,
-  which lacks it. This issue changes no derivation and no golden (`examples/*/contract.yaml`
-  are byte-identical); the fix -- derive the output in serialization mode, or refuse these at
-  binding -- changes contract hashes and is a decision for the owner: kontra-sdk#63. Separately, the harness's
-  own schema keys an aliased output by alias while the harness publishes the reply by field
-  name; Kontra re-keys it by alias (I29), so the contract and the job agree, and the harness's
-  TypeScript for such a reply does not match what its own stream carries.
-- **For the owner: Kontra's derivation drops a constraint a type and its use site both write.**
-  `inline_non_object_defs` (`kontra/contract/derive.py`, `_substitute`: "Siblings at the use
-  site win") writes a named non-object type out where it is used with the use site's members
-  over the definition's, so for the models in the `drift` row above the published contract
-  says `maxLength: 10` (or `enum: [a, z]`) where pydantic and the harness's schema enforce both
-  constraints: a buyer can send input the contract and the gate accept and the seller's agent
-  refuses. Correct for annotations (a field's own `description` or `default`), wrong for
-  assertions. This issue changes no derivation and no golden; the fix (fold only annotations,
-  and write an overlapping assertion as `allOf` or refuse it, which nexgen's subset may not
-  take) changes contract hashes for such models and is the owner's decision: kontra-sdk#64. Until then this
-  check reports every such field, at `kontra publish` and in the zoo's `overlap` handler.
+  the offering and handler, one line per difference, then what they mean (`open`'s fix-it;
+  for any other, where to report it). Nothing for a workflow entry, nothing when the harness
+  is not installed (its console script absent from the environment; no subprocess), nothing
+  when the two agree. A harness that cannot answer is one warning line with its last line of
+  stderr, control characters removed; the command goes on. It is a warning and never a
+  refusal: the contract is what is published and hashed, and the harness's schema is dev
+  tooling the buyer never sees. One subprocess per agent class, however many of its handlers
+  a worker binds (about a second, plus the seller's module import).
+- **Measured, and what I38 resolved.** First measured with harness 0.6.0 (its `agent_schema`
+  and CLI are identical in 0.7.0) and pydantic 2.14, over the test agents and a zoo of 23
+  models, each one handler taking and returning its model. Beyond the representational
+  differences above, two were Kontra's, not the harness's: the contract described outputs in
+  validation mode while a job's result is the serialization (defaulted fields optional,
+  computed fields absent, excluded fields required, serialization aliases and type-changing
+  serializers ignored), and `inline_non_object_defs` let a use site's assertion replace its
+  definition's (`Annotated[Code, Field(max_length=10)]` over a `RootModel` of at most 5, and
+  `json_schema_extra` re-listing an enum's values: the contract accepted `"abcdefg"` and
+  `"z"`). The check reported them as three kinds of their own, `defaults`, `serialization`
+  and `drift` at a use site, and they went to the owner, who had both fixed before prod
+  (#63, #64): I38. Those kinds are gone with the defects they described, and the assert is
+  exact: rerun over the same models (now `tests/contract/zoo.py`'s, which I38 checks
+  delivery by delivery, plus `Bounded`), the test agents and every zoo handler are equal but
+  `allow` and `outer`, which are exactly their two `open` lines. Three cases changed shape
+  with I38: `Times` writes its durations as seconds (`ser_json_timedelta="float"`), since an
+  ISO `timedelta` output is now refused at derivation; I33's `Overlap` is refused at
+  derivation too (pydantic applies the use site's bound to the `Code` instance and refuses
+  every value), so `Bounded` takes its place -- a bound on a PEP 695 alias of a constrained
+  alias and again where it is used, which pydantic measures as the string and enforces both,
+  and the harness writes `{$ref: Documented, maxLength: 10}`. (On a direct alias of a
+  constrained scalar pydantic replaces the alias's bound with the field's, in its schema and
+  its validation alike, so the contract's `maxLength: 10` there is exact too.) One
+  observation stands, the harness's own: its schema keys an aliased output by alias, while
+  the harness publishes the reply by field name; Kontra re-keys it (I38), so the contract and
+  the job agree, and the harness's TypeScript for such a reply does not match what its own
+  stream carries.
 - **Rejected.** Calling `agent_schema` in-process (`sys.modules` or an import): Kontra would
   depend on a Python API of the harness and break I29's rule, for the same document the CLI
   prints. Canonicalising the harness's document with Kontra's lowering (`lower_schema`): the
   lowering is Kontra's derivation, not a canonical form -- it closes every model, so
   `extra="allow"`'s `open` would vanish, and it would refuse what it cannot lower instead of
   reporting it. Reporting `open` for every model not `extra="forbid"` (as first built): a
-  warning on nearly every handler, for a difference no value exchanged shows. Refusing to
-  publish on a difference: the harness's schema is not what is sold. Finding the console script
-  on `PATH`. Comparing descriptions: the reserved `KontraArtifact` text differs from
+  warning on nearly every handler, for a difference no value exchanged shows. Keeping
+  `defaults`, `serialization` and use-site `drift` once I38 fixed their causes: a kind that
+  explains a difference away would hide the regression it once described. Using derivation's
+  own conjunction in the comparison: the two would agree by construction. Refusing to
+  publish on a difference: the harness's schema is not what is sold. Finding the console
+  script on `PATH`. Comparing descriptions: the reserved `KontraArtifact` text differs from
   `Artifact`'s docstring by design, and a description changes no valid value.
 - **Kontra's examples.** No example sells a handler yet. kontra-sdk#58 adds
   `examples/recon-harness`: `tests/contract/test_harness.py` finds every example whose
   `worker.py` uses the harness and asserts that its golden `contract.yaml` is what the binding
   derives and equals the harness's schema for its handler with no difference at all, so that
-  example must not declare `extra="allow"` (pydantic's default or `"forbid"` both agree) and
-  should keep defaults off its output.
-- **Checked by** `tests/contract/test_harness_rules.py` (each rule of the canonical form, each
-  kind, the contract's closing policy and `additionalProperties` pair by pair, a use site
-  folded into its definition or left beside it, the envelope left out, the
-  errors, and the subprocess's own refusal, its timeout, its flooded standard error read from
-  the end and its oversized document refused; no harness needed)
-  and `tests/contract/test_harness.py` (seam ③: the harness's CLI, name and members against the
-  harness itself, its output equal to `agent_schema`'s; the test agents and the zoo's exact
-  verdicts; a bound handler's document; `kontra contract`'s warning, its silence when the two
-  agree, for a workflow entry and without the harness, and a harness that fails; the examples'
-  hook), `tests/cli/test_marketplace.py` (`kontra publish` of a handler against the fake gate
+  example must not declare `extra="allow"` (pydantic's default or `"forbid"` both agree).
+- **Checked by** `tests/contract/test_harness_rules.py` (each rule of the canonical form on
+  hand-written harness documents: names, annotations, an inline enum, optionals, composite
+  defaults, a scalar default compared and one on a required member not, the discriminator, a
+  recursive model, canonical JSON values; a use site conjoined keyword by keyword, through an
+  alias chain, and left `allOf` where no one value does or a group would split, inside an
+  optional too; the closing policy and `additionalProperties` pair by pair; any other
+  difference reported as it is; the envelope left out, the errors, `describe`'s lines and
+  notes, and the subprocess's own refusal, its timeout, its flooded standard error read from
+  the end and its oversized document refused; no harness needed) and
+  `tests/contract/test_harness.py` (seam ③: the harness's CLI, name and members against the
+  harness itself, its output equal to `agent_schema`'s; the test agents and every zoo handler
+  asserted equal, `allow` and `outer` to exactly their `open` differences; what the harness
+  writes that the canonical form makes equal, so the zoo is equal by the rules; a bound
+  handler's document; `kontra contract`'s warning, its silence when the two agree, for a
+  workflow entry and without the harness, and a harness that fails; the examples' hook),
+  `tests/cli/test_marketplace.py` (`kontra publish` of a handler against the fake gate
   publishes after the warning; a workflow entry's says nothing) and
   `tests/serve/test_turn.py`'s rule that no module of `kontra` imports the harness.

@@ -43,9 +43,12 @@ def _pick(bound: tuple[Any, ...], only: str | None) -> list[Any]:
 def _check_harness(chosen: list[Any]) -> None:
     """Warn, on stderr, where a bound handler's contract and temporal-agent-harness's schema
     for the same handler differ (decisions I33): the contract is what buyers get, the harness's
-    schema what the seller's harness-codegen types come from. Silent for a workflow entry, when
-    the harness is not installed, and when the two agree. Run inside ``load_worker``, so the
-    harness imports the agent's module where worker.py found it."""
+    schema what the seller's harness-codegen types come from. Both describe the input as
+    validated and the output as serialized (I38), so they agree but for an ``extra="allow"``
+    model (``open``: the seller's to change) and a bug in one emitter (to report), as the
+    notes after the lines say. Silent for a workflow entry, when the harness is not installed, and when the
+    two agree. Run inside ``load_worker``, so the harness imports the agent's module where
+    worker.py found it."""
     from kontra.contract import harness
 
     handlers = [b for b in chosen if b.agent is not None and b.handler is not None]

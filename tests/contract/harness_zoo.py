@@ -1,35 +1,25 @@
-"""The model zoo of the harness check (decisions I33): one handler per kind of field a seller
-writes, each taking and returning the same model, so one agent shows how Kontra's derivation
-(validation mode, lowered to nexgen's subset) and temporal-agent-harness's ``agent_schema``
-(validation mode for an input, serialization mode for an output) describe it.
+"""The model zoo of the harness check (decisions I33), as an agent: one handler per model of
+the output zoo (``tests/contract/zoo.py``, decisions I38), each taking and returning its
+model, so one agent shows how Kontra's derivation and temporal-agent-harness's
+``agent_schema`` describe it -- the input in validation mode and the output in serialization
+mode, on both sides.
+
+``Overlap`` is not here: derivation refuses it (I38), so there is no contract to compare.
+``Bounded`` is this module's own: a bound on a named type (a PEP 695 alias of a constrained
+alias, which pydantic measures as its value) and again where it is used, which both emitters
+write as a ``$ref`` with siblings and the contract conjoins.
 
 An importable module, as the harness's ``schema`` command and Temporal's sandbox require:
-vanilla temporalio and the harness, and ``kontra.types.Artifact``, as a seller's models.py
-may use it. ``Forbid`` is a model both describe identically: closed, no defaults. A model
-with pydantic's default ``extra="ignore"`` is closed only by the contract, which is Kontra's
-policy and no difference; ``Allow`` (``extra="allow"``), alone or nested in ``Outer``, is the
-one the harness's schema leaves open."""
+vanilla temporalio and the harness, and the zoo's models, as a seller's models.py."""
 
 from __future__ import annotations
 
-import enum
-from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Annotated, Literal
-from uuid import UUID
+from typing import Annotated
 
-from pydantic import (
-    AliasChoices,
-    BaseModel,
-    ConfigDict,
-    Field,
-    RootModel,
-    StringConstraints,
-    computed_field,
-    field_serializer,
-)
-from pydantic.alias_generators import to_camel
+from pydantic import BaseModel, Field, StringConstraints
 from temporalio import workflow
+from typing_extensions import TypeAliasType
 
 with workflow.unsafe.imports_passed_through():
     from temporal_agent_harness.harness import AgentWorkflowRunner, agent
@@ -37,248 +27,49 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.contrib.workflow_streams import WorkflowStream
 
     from kontra.serve import Quote
-    from kontra.types import Artifact
-
-
-class Defaults(BaseModel):
-    """Scalar defaults."""
-
-    n: int = 3
-    s: str = "x"
-    b: bool = False
-    f: float = 1.5
-    req: int
-
-
-class Optionals(BaseModel):
-    """Optional fields: defaulted to None, required but nullable, defaulted to a value."""
-
-    note: str | None = None
-    must: int | None
-    later: int | None = 4
-
-
-class Aliases(BaseModel):
-    """Aliases, one of them a Python keyword."""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    from_: str = Field(alias="from")
-    via_hops: int = Field(alias="via-hops")
-
-
-class SplitAlias(BaseModel):
-    """A field read under one name and written under another."""
-
-    a: str = Field(validation_alias="in_a", serialization_alias="out_a")
-
-
-class Camel(BaseModel):
-    """An alias generator."""
-
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-    first_name: str
-    last_seen: int = 0
-
-
-class Choices(BaseModel):
-    """Several names accepted for one field (the schema names the first)."""
-
-    a: str = Field(validation_alias=AliasChoices("a", "alpha"))
-
-
-class Leaf(BaseModel):
-    """A nested model."""
-
-    v: int = 0
-
-
-class Nested(BaseModel):
-    """Nested models: required, optional, in a list."""
-
-    leaf: Leaf
-    maybe: Leaf | None = None
-    many: list[Leaf] = []
-
-
-class Color(enum.Enum):
-    RED = "red"
-    BLUE = "blue"
-
-
-class Level(enum.IntEnum):
-    LOW = 1
-    HIGH = 2
-
-
-class Enums(BaseModel):
-    """A string enum with a default, an int enum, an optional enum."""
-
-    color: Color = Color.RED
-    level: Level
-    maybe: Color | None = None
-
-
-class Literals(BaseModel):
-    """Literals: one value, two with a default, numbers."""
-
-    kind: Literal["one"]
-    mode: Literal["a", "b"] = "a"
-    num: Literal[1, 2]
-
-
-class Constrained(BaseModel):
-    """Constrained strings, numbers and lists."""
-
-    code: str = Field(min_length=2, max_length=8, pattern=r"^[a-z]+$")
-    n: int = Field(ge=0, le=100, multiple_of=5)
-    x: float = Field(gt=0, lt=1)
-    tags: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=5)
-
-
-class Collections(BaseModel):
-    """Lists and maps, with and without defaults."""
-
-    xs: list[int]
-    ys: list[str] = Field(default_factory=list)
-    m: dict[str, int]
-    mm: dict[str, list[float]] = {}
-
-
-class Times(BaseModel):
-    """Dates, times, durations and UUIDs."""
-
-    at: datetime
-    day: date
-    took: timedelta
-    uid: UUID
-
-
-class Files(BaseModel):
-    """Artifacts: required, in a list, optional."""
-
-    doc: Artifact
-    more: list[Artifact] = []
-    opt: Artifact | None = None
-
-
-class Cat(BaseModel):
-    """One branch of a tagged union."""
-
-    kind: Literal["cat"]
-    lives: int = Field(ge=0, le=9)
-
-
-class Dog(BaseModel):
-    """The other branch, with a default."""
-
-    kind: Literal["dog"]
-    good: bool = True
-
-
-class Tagged(BaseModel):
-    """A tagged union of models."""
-
-    pet: Annotated[Cat | Dog, Field(discriminator="kind")]
-
-
-class Titled(BaseModel):
-    """Explicit titles, descriptions and examples: annotations."""
-
-    model_config = ConfigDict(title="Custom")
-
-    x: int = Field(title="Explicit", description="kept", examples=[1])
-
-
-class Tree(BaseModel):
-    """A recursive model."""
-
-    name: str
-    children: list[Tree] = []
-
-
-class Point(BaseModel):
-    """A closed nested model."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    lat: float = Field(ge=-90, le=90)
-    color: Color
-
-
-class Forbid(BaseModel):
-    """Closed models without defaults: the contract and the harness say the same, once
-    names, titles, the enum written inline and ``anyOf`` against ``oneOf`` are put aside."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    x: int
-    when: datetime
-    at: Point
-    near: list[Point]
-    note: str | None
-
-
-class Allow(BaseModel):
-    """Open to other keys (the contract closes it anyway)."""
-
-    model_config = ConfigDict(extra="allow")
-
-    x: int
-
-
-class Outer(BaseModel):
-    """pydantic's default (``extra="ignore"``) around ``Allow``: only the nested model is
-    open."""
-
-    inner: Allow
-    many: list[Allow]
-    maybe: Allow | None
-
-
-class Computed(BaseModel):
-    """A computed field: in the serialization, not in the validation."""
-
-    w: int
-    h: int
-
-    @computed_field
-    @property
-    def area(self) -> int:
-        return self.w * self.h
-
-
-class Excluded(BaseModel):
-    """An excluded field: in the validation, not in the serialization."""
-
-    keep: int
-    secret: str = Field(exclude=True)
-
-
-class Serialized(BaseModel):
-    """A serializer that changes the field's JSON type."""
-
-    at: datetime
-
-    @field_serializer("at")
-    def _at(self, v: datetime) -> int:
-        return int(v.timestamp())
-
-
-class Code(RootModel[Annotated[str, StringConstraints(max_length=5)]]):
-    """A constrained string with a name of its own."""
-
-
-class Overlap(BaseModel):
-    """A constraint written both on a type and where it is used: pydantic enforces both (at
-    most 5 characters), JSON Schema 2020-12 asserts a ``$ref`` and its siblings both, and the
-    contract keeps only the use site's (decisions I33)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    code: Annotated[Code, Field(max_length=10)]
-    maybe: Annotated[Code, Field(max_length=10)] | None
+    from tests.contract.zoo import (
+        Aliases,
+        Allow,
+        Camel,
+        Choices,
+        Collections,
+        Computed,
+        ComputedAlias,
+        Constrained,
+        Defaults,
+        EnumOverlap,
+        Enums,
+        Excluded,
+        Factories,
+        Files,
+        Forbid,
+        Literals,
+        Nested,
+        Optionals,
+        OuterAllow,
+        Plain,
+        Serialized,
+        SplitAlias,
+        Tagged,
+        Times,
+        Titled,
+        Tree,
+    )
+
+# PEP 695 aliases (``type Short = ...`` from Python 3.12), spelled for 3.11.
+Short = TypeAliasType("Short", Annotated[str, StringConstraints(max_length=5)])
+Documented = TypeAliasType("Documented", Annotated[Short, Field(description="A short text.")])
+
+
+class Bounded(BaseModel):
+    """A bound on a named type (``Short``, at most 5 characters, through a documented alias)
+    and again where it is used: pydantic measures the string and enforces both, the harness
+    writes ``{$ref: Documented, maxLength: 10}``, and the contract the tighter of each pair
+    (decisions I38)."""
+
+    loose: Annotated[Documented, Field(max_length=10)]
+    tight: Annotated[Documented, Field(max_length=3)]
+    low: Annotated[Documented, Field(min_length=2)]
 
 
 @agent.defn
@@ -294,17 +85,17 @@ class Zoo:
         )
 
     @agent.accepts
-    async def defaults(self, req: Defaults) -> Defaults:
+    async def computed(self, req: Computed) -> Computed:
         """Echo."""
         return req
 
     @agent.accepts
-    async def optionals(self, req: Optionals) -> Optionals:
+    async def computed_alias(self, req: ComputedAlias) -> ComputedAlias:
         """Echo."""
         return req
 
     @agent.accepts
-    async def aliases(self, req: Aliases) -> Aliases:
+    async def excluded(self, req: Excluded) -> Excluded:
         """Echo."""
         return req
 
@@ -319,12 +110,52 @@ class Zoo:
         return req
 
     @agent.accepts
-    async def choices(self, req: Choices) -> Choices:
+    async def serialized(self, req: Serialized) -> Serialized:
+        """Echo."""
+        return req
+
+    @agent.accepts
+    async def defaults(self, req: Defaults) -> Defaults:
+        """Echo."""
+        return req
+
+    @agent.accepts
+    async def factories(self, req: Factories) -> Factories:
+        """Echo."""
+        return req
+
+    @agent.accepts
+    async def optionals(self, req: Optionals) -> Optionals:
         """Echo."""
         return req
 
     @agent.accepts
     async def nested(self, req: Nested) -> Nested:
+        """Echo."""
+        return req
+
+    @agent.accepts
+    async def tagged(self, req: Tagged) -> Tagged:
+        """Echo."""
+        return req
+
+    @agent.accepts
+    async def enum_overlap(self, req: EnumOverlap) -> EnumOverlap:
+        """Echo."""
+        return req
+
+    @agent.accepts
+    async def plain(self, req: Plain) -> Plain:
+        """Echo."""
+        return req
+
+    @agent.accepts
+    async def aliases(self, req: Aliases) -> Aliases:
+        """Echo."""
+        return req
+
+    @agent.accepts
+    async def choices(self, req: Choices) -> Choices:
         """Echo."""
         return req
 
@@ -359,11 +190,6 @@ class Zoo:
         return req
 
     @agent.accepts
-    async def tagged(self, req: Tagged) -> Tagged:
-        """Echo."""
-        return req
-
-    @agent.accepts
     async def titled(self, req: Titled) -> Titled:
         """Echo."""
         return req
@@ -384,56 +210,45 @@ class Zoo:
         return req
 
     @agent.accepts
-    async def outer(self, req: Outer) -> Outer:
+    async def outer(self, req: OuterAllow) -> OuterAllow:
         """Echo."""
         return req
 
     @agent.accepts
-    async def computed(self, req: Computed) -> Computed:
-        """Echo."""
-        return req
-
-    @agent.accepts
-    async def excluded(self, req: Excluded) -> Excluded:
-        """Echo."""
-        return req
-
-    @agent.accepts
-    async def serialized(self, req: Serialized) -> Serialized:
-        """Echo."""
-        return req
-
-    @agent.accepts
-    async def overlap(self, req: Overlap) -> Overlap:
+    async def bounded(self, req: Bounded) -> Bounded:
         """Echo."""
         return req
 
 
 #: Each handler's model (input and output alike).
 MODELS: dict[str, type[BaseModel]] = {
-    "defaults": Defaults,
-    "optionals": Optionals,
-    "aliases": Aliases,
+    "computed": Computed,
+    "computed_alias": ComputedAlias,
+    "excluded": Excluded,
     "split_alias": SplitAlias,
     "camel": Camel,
-    "choices": Choices,
+    "serialized": Serialized,
+    "defaults": Defaults,
+    "factories": Factories,
+    "optionals": Optionals,
     "nested": Nested,
+    "tagged": Tagged,
+    "enum_overlap": EnumOverlap,
+    "plain": Plain,
+    "aliases": Aliases,
+    "choices": Choices,
     "enums": Enums,
     "literals": Literals,
     "constrained": Constrained,
     "collections": Collections,
     "times": Times,
     "files": Files,
-    "tagged": Tagged,
     "titled": Titled,
     "tree": Tree,
     "forbid": Forbid,
     "allow": Allow,
-    "outer": Outer,
-    "computed": Computed,
-    "excluded": Excluded,
-    "serialized": Serialized,
-    "overlap": Overlap,
+    "outer": OuterAllow,
+    "bounded": Bounded,
 }
 
 

@@ -4,8 +4,10 @@ and an input JSON value for it; ``tests/contract/test_serialized.py`` derives a 
 and returning the model and checks that what a buyer receives -- a workflow entry's result
 and a bound handler's -- is what the contract describes.
 
-The same cases are what kontra-sdk#53's harness check reports (``harness_zoo.py`` on that
-branch), all 23 of them; they are written out here so this seam does not depend on it.
+The same models are what the harness check compares (decisions I33): ``harness_zoo.py`` sells
+each as one handler of an agent, all but ``Overlap``, and asserts the contract equal to
+temporal-agent-harness's schema of it but for ``Allow``'s ``extra="allow"``.
+
 ``Times`` writes its durations as seconds (``ser_json_timedelta="float"``): an ISO duration
 output is refused (I38), and ``Overlap`` has no value at all (see :data:`CASES`)."""
 

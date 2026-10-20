@@ -640,35 +640,35 @@ serve(ReconAgent.sweep, plugins=[AgentHarnessPlugin()])
   `kontra pull` generates a buyer's client from the published contract, after checking the
   catalog's hash -- the only schema a buyer should trust, since your code is exactly what they
   cannot see. So `kontra publish` and `kontra contract` compare the two for the handler you
-  sell, and warn on stderr where they differ once both are in one canonical form (names,
-  titles, descriptions, key order, `anyOf` against `oneOf` for an optional field and the
-  other differences that change no valid value are set aside, as is the contract closing a
-  model that keeps pydantic's default `extra="ignore"`, which changes no value exchanged:
-  decisions I33). The command goes on either way; the contract is what is published. The
-  models above agree, and nothing is printed; with `model_config = ConfigDict(extra="allow")`
-  on `Report`:
+  sell. Both describe the input as validated and the output as your reply is serialized
+  (decisions I38), so once both are in one canonical form they are equal, and nothing is
+  printed: names, titles, descriptions, key order, `anyOf` against `oneOf` for an optional
+  field, a default beside an output field that is always there, a constraint on a type and
+  again where it is used written as one, and the other differences that change no valid
+  value are set aside, as is the contract closing a model that keeps pydantic's default
+  `extra="ignore"`, which changes no value exchanged (decisions I33). What remains is
+  printed on stderr, and the command goes on either way; the contract is what is published.
+  The models above agree; with `model_config = ConfigDict(extra="allow")` on `Report`:
 
   ```text
   warning: acme/recon@1.0.0 (ReconAgent.sweep): the contract differs from temporal-agent-harness's schema for this handler in 1 place. Buyers get the contract (`kontra pull`); your harness-codegen types follow the harness's:
     output $defs.Report.additionalProperties: contract false, harness true
-    (open) the contract closes every model (no keys but its fields) and the harness's schema leaves this one open, as extra="allow" does: the model keeps other keys, and serializes them into the reply; pydantic's default (extra="ignore", which drops them) or extra="forbid" on the model makes the two agree
+    (open) the contract closes every model (no keys but its fields) and the harness's schema leaves this one open, as extra="allow" does: the model keeps other keys and serializes them into its reply, which the contract refuses, so a reply that carries one fails the job; pydantic's default (extra="ignore", which drops them) or extra="forbid" on the model makes the two agree
   ```
 
-  Each line is one place, in the contract's terms, and one of four kinds:
+  Each line is one place, in the contract's terms:
 
-  | Kind | What differs | What to do |
+  | Line | What differs | What to do |
   |---|---|---|
-  | `open` | the harness's schema leaves a model open to other keys (`additionalProperties: true`, from `extra="allow"`: the model keeps them, and serializes them into your reply), and the contract closes every model to its fields. pydantic's default, `extra="ignore"`, is never reported: it drops other keys and never sends one, so the contract closing it is Kontra's policy, not a difference | drop `extra="allow"`: keep pydantic's default, or set `model_config = ConfigDict(extra="forbid")`, with which your agent also refuses unknown keys from any caller, as the gate does |
-  | `defaults` | on the output, the harness requires the fields that have a default (it describes the reply as serialized, where every field is present); the contract lets them be absent | nothing: both describe the reply you send |
-  | `serialization` | on the output, a computed field, an excluded field, a serialization alias or a serializer that changes a field's JSON type | keep them off output models: the job's result is the serialization, and the contract describes the model as validated, so it does not say what the buyer receives |
-  | `drift` | anything else on the input; and, on either side, a constraint written both on a type and where it is used (`Annotated[Code, Field(max_length=10)]` over a `Code` with its own `max_length=5`, or `json_schema_extra` over an enum's values): pydantic enforces both, the harness's schema says both, the contract keeps only the second | report it: the two emitters walked your models differently. For the second, write the constraint in one place; until then the contract accepts input your agent refuses |
+  | `open` | the harness's schema leaves a model open to other keys (`additionalProperties: true`, from `extra="allow"`: the model keeps them, and serializes them into your reply, which then fails the job), and the contract closes every model to its fields | drop `extra="allow"`: keep pydantic's default, or set `model_config = ConfigDict(extra="forbid")`, with which your agent also refuses unknown keys from any caller, as the gate does |
+  | any other | the two emitters describe the same model differently, which neither should: a bug in Kontra's derivation or in the harness's | report it, with the model, at the address the warning gives. Buyers still get the contract |
 
   Nothing is compared, and nothing said, for a workflow entry or when the harness is not
   installed. The harness's schema comes from its own `schema` command, run by the same Python
   as `kontra publish`; if it cannot answer (your agent's module fails to import there), the
-  warning says why and publishing goes on. The seam ③ tests hold the comparison to a model
-  zoo and the test agents (`tests/contract/test_harness.py`), so a harness release that walks
-  models differently fails CI.
+  warning says why and publishing goes on. The seam ③ tests hold the two equal for the test
+  agents and a zoo of every kind of field (`tests/contract/test_harness.py`), so a harness
+  release, or a change to Kontra's derivation, that walks models differently fails CI.
 - **A hire is one turn.** The job is Kontra's wrapper workflow, `kontra.turn.v1`, started as
   `job-<id>` like any job. It starts your agent as a child (its whole history encrypted to you
   alone), sends the buyer's input as one message to the handler, waits for the handler's

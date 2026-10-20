@@ -11,7 +11,8 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field, RootModel, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from typing_extensions import TypeAliasType
 
 from kontra.contract import OfferingSpec, derive_document
 from kontra.contract import harness as h
@@ -41,8 +42,10 @@ def _harness(inp: str, out: str, defs: dict[str, Any], handler: str = "run") -> 
     }
 
 
-def _found(differences: tuple[Difference, ...]) -> set[tuple[str, str, str]]:
-    return {(d.side, d.path, d.kind) for d in differences}
+def _found(differences: tuple[Difference, ...]) -> set[tuple[str, str]]:
+    """Where each difference is; none of them ``open``."""
+    assert not any(d.open for d in differences)
+    return {(d.side, d.path) for d in differences}
 
 
 class Host(BaseModel):
@@ -101,19 +104,24 @@ class Paint(BaseModel):
 
 
 def test_an_enum_written_inline_is_the_named_one(enrich_spec: OfferingSpec) -> None:
-    defs = {
-        "Color": {"enum": ["red", "blue"], "title": "Color", "type": "string"},
-        "Paint": {
+    def paint(*required: str) -> dict[str, Any]:
+        return {
             "additionalProperties": False,
             "properties": {
                 "color": {"$ref": "#/$defs/Color", "default": "red"},
                 "maybe": {"anyOf": [{"$ref": "#/$defs/Color"}, {"type": "null"}]},
             },
-            "required": ["maybe"],
+            "required": list(required),
             "type": "object",
-        },
+        }
+
+    defs = {
+        "Color": {"enum": ["red", "blue"], "title": "Color", "type": "string"},
+        "Paint-Input": paint("maybe"),
+        "Paint-Output": paint("color", "maybe"),
     }
-    assert compare_handler(_doc(enrich_spec, Paint), _harness("Paint", "Paint", defs), "run") == ()
+    harness = _harness("Paint-Input", "Paint-Output", defs)
+    assert compare_handler(_doc(enrich_spec, Paint), harness, "run") == ()
 
 
 class Note(BaseModel):
@@ -126,7 +134,9 @@ class Note(BaseModel):
     size: int = 3
 
 
-def _note(**size: Any) -> dict[str, Any]:
+def _note(*, output: bool = False, **size: Any) -> dict[str, Any]:
+    """``Note`` as ``agent_schema`` writes it: an input, or an output (serialization mode),
+    which requires every field and keeps each default beside it."""
     return {
         "additionalProperties": False,
         "properties": {
@@ -135,38 +145,54 @@ def _note(**size: Any) -> dict[str, Any]:
             "size": {"type": "integer", "default": 3, **size},
         },
         "type": "object",
+        **({"required": ["text", "tags", "size"]} if output else {}),
     }
+
+
+def _notes(inp: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
+    return _harness("Note-Input", "Note-Output", {"Note-Input": inp, "Note-Output": out})
 
 
 def test_optional_null_and_composite_defaults(enrich_spec: OfferingSpec) -> None:
     """``anyOf: [T, null]`` is the contract's ``oneOf``; ``default: null`` and a list or
     object default are no default (decisions I2)."""
-    found = compare_handler(
-        _doc(enrich_spec, Note), _harness("Note", "Note", {"Note": _note()}), "run"
-    )
+    found = compare_handler(_doc(enrich_spec, Note), _notes(_note(), _note(output=True)), "run")
     assert found == ()
 
 
 def test_a_scalar_default_is_compared(enrich_spec: OfferingSpec) -> None:
     """A buyer's generated code fills a scalar default in, so a different one is reported."""
-    harness = _harness("Note", "Note", {"Note": _note(default=4)})
+    harness = _notes(_note(default=4), _note(output=True))
     found = compare_handler(_doc(enrich_spec, Note), harness, "run")
-    assert [(d.side, d.path, d.contract, d.harness, d.kind) for d in found] == [
-        ("input", "$defs.Note.properties.size.default", 3, 4, "drift"),
-        ("output", "$defs.Note.properties.size.default", 3, 4, "serialization"),
-    ]
+    assert found == (Difference("input", "$defs.NoteInput.properties.size.default", 3, 4),)
+
+
+def test_a_default_on_a_required_member_is_no_default(enrich_spec: OfferingSpec) -> None:
+    """The harness's output schema requires every field the reply carries and keeps each
+    one's default beside it (``size: {default: 3}``, and ``4`` here); the contract writes
+    none there (decisions I38). A required member is never absent, so its default never
+    applies: no difference, whatever its value. Not required, it is compared."""
+    doc = _doc(enrich_spec, Note)
+    assert compare_handler(doc, _notes(_note(), _note(output=True, default=4)), "run") == ()
+    optional = _note(output=True, default=4)
+    optional["required"] = ["text", "tags"]
+    assert compare_handler(doc, _notes(_note(), optional), "run") == (
+        Difference("output", "$defs.NoteOutput.properties.size.default", ABSENT, 4),
+        Difference(
+            "output", "$defs.NoteOutput.required", ["size", "tags", "text"], ["tags", "text"]
+        ),
+    )
 
 
 def test_anyof_with_a_branch_that_may_be_null_is_not_oneof(enrich_spec: OfferingSpec) -> None:
     """``anyOf`` and ``oneOf`` agree only when the other branch cannot be null."""
     loose = _note()
     loose["properties"]["text"] = {"anyOf": [{"type": ["string", "null"]}, {"type": "null"}]}
-    found = compare_handler(
-        _doc(enrich_spec, Note), _harness("Note", "Note", {"Note": loose}), "run"
-    )
-    paths = {d.path for d in found}
-    assert "$defs.Note.properties.text.anyOf" in paths
-    assert "$defs.Note.properties.text.oneOf" in paths
+    found = compare_handler(_doc(enrich_spec, Note), _notes(loose, _note(output=True)), "run")
+    assert _found(found) == {
+        ("input", "$defs.NoteInput.properties.text.anyOf"),
+        ("input", "$defs.NoteInput.properties.text.oneOf"),
+    }
 
 
 class Cat(BaseModel):
@@ -249,7 +275,7 @@ def test_a_recursive_model_is_compared_once(enrich_spec: OfferingSpec) -> None:
         _doc(enrich_spec, Tree), _harness("Tree-Input", "Tree-Output", defs), "run"
     )
     assert [(d.side, d.path, d.contract, d.harness) for d in found] == [
-        ("output", "$defs.Tree.properties.name.type", "string", "integer")
+        ("output", "$defs.TreeOutput.properties.name.type", "string", "integer")
     ]
 
 
@@ -279,26 +305,32 @@ def test_values_compare_as_canonical_json(enrich_spec: OfferingSpec) -> None:
     assert {d.path for d in found} == {"$defs.Ranged.properties.on.const"}
 
 
-class Code(RootModel[Annotated[str, StringConstraints(max_length=5)]]):
-    """A constrained string with a name of its own."""
+# PEP 695 aliases (``type Short = ...`` from Python 3.12), spelled for 3.11. A bound on an
+# alias of a constrained alias and again where it is used: pydantic measures the string and
+# enforces both, and writes ``{$ref: Documented, maxLength: 10}``. (On ``Short`` itself it
+# would replace the alias's bound with the field's, in its schema and its validation alike.)
+Short = TypeAliasType("Short", Annotated[str, StringConstraints(max_length=5)])
+Documented = TypeAliasType("Documented", Annotated[Short, Field(description="A short text.")])
 
 
 class Overlap(BaseModel):
-    """``max_length`` on the type and where it is used: pydantic enforces both."""
+    """``max_length`` on the type and where it is used: at most 5 characters."""
 
     model_config = ConfigDict(extra="forbid")
 
-    code: Annotated[Code, Field(max_length=10)]
+    code: Annotated[Documented, Field(max_length=10)]
 
 
-def _overlap(code: dict[str, Any], site: dict[str, Any]) -> dict[str, Any]:
-    """``Overlap`` as ``agent_schema`` writes it, with ``Code``'s body and the use site's
-    members beside its ``$ref``."""
+def _overlap(code: dict[str, Any], site: dict[str, Any], *, alias: bool = False) -> dict[str, Any]:
+    """``Overlap`` as ``agent_schema`` writes it, with ``Short``'s body and the use site's
+    members beside its ``$ref`` (to ``Documented``, an alias of ``Short``, with ``alias``)."""
+    used = "Documented" if alias else "Short"
     return {
-        "Code": {"title": "Code", "description": "A constrained string.", **code},
+        "Short": {"title": "Short", "description": "A constrained string.", **code},
+        "Documented": {"$ref": "#/$defs/Short", "description": "A short text."},
         "Overlap": {
             "additionalProperties": False,
-            "properties": {"code": {"$ref": "#/$defs/Code", **site}},
+            "properties": {"code": {"$ref": f"#/$defs/{used}", **site}},
             "required": ["code"],
             "title": "Overlap",
             "type": "object",
@@ -306,24 +338,42 @@ def _overlap(code: dict[str, Any], site: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_a_constraint_on_both_a_type_and_its_use_is_both(enrich_spec: OfferingSpec) -> None:
+def test_a_constraint_on_both_a_type_and_its_use_is_their_conjunction(
+    enrich_spec: OfferingSpec,
+) -> None:
     """JSON Schema 2020-12 asserts a ``$ref``'s definition and its siblings both, so the
-    harness's ``{$ref: Code, maxLength: 10}`` over ``Code``'s ``maxLength: 5`` accepts at most
-    5 characters, as the model does; the contract says 10. A use site that writes what its
-    definition also writes is compared as the ``allOf`` of the two, and reported (``drift``
-    on both sides: it is the emitters, not the serialization)."""
-    defs = _overlap({"maxLength": 5, "type": "string"}, {"maxLength": 10})
+    harness's ``{$ref: Documented, maxLength: 10}`` over ``Short``'s ``maxLength: 5`` accepts
+    at most 5 characters, as the model does, and so does the contract (decisions I38): the
+    tighter bound, no difference."""
+    doc = _doc(enrich_spec, Overlap)
+    assert doc["$defs"]["Overlap"]["properties"]["code"] == {
+        "description": "A short text.",
+        "maxLength": 5,
+        "type": "string",
+    }
+    defs = _overlap({"maxLength": 5, "type": "string"}, {"maxLength": 10}, alias=True)
+    assert compare_handler(doc, _harness("Overlap", "Overlap", defs), "run") == ()
+
+
+def test_a_use_site_no_one_value_conjoins_stays_beside_its_definition(
+    enrich_spec: OfferingSpec,
+) -> None:
+    """Two patterns have no one-value conjunction: the harness's node is the ``allOf`` of
+    the two, which the contract never writes (derivation refuses such a field, I38), and it
+    is reported as it is, on both sides."""
+    defs = _overlap({"pattern": "^a", "type": "string"}, {"pattern": "^b"})
     found = compare_handler(_doc(enrich_spec, Overlap), _harness("Overlap", "Overlap", defs), "run")
     where = "$defs.Overlap.properties.code"
-    both = [{"maxLength": 5, "type": "string"}, {"maxLength": 10}]
-    assert [(d.side, d.path, d.contract, d.harness, d.kind) for d in found] == [
-        ("input", f"{where}.allOf", ABSENT, both, "drift"),
-        ("input", f"{where}.maxLength", 10, ABSENT, "drift"),
-        ("input", f"{where}.type", "string", ABSENT, "drift"),
-        ("output", f"{where}.allOf", ABSENT, both, "drift"),
-        ("output", f"{where}.maxLength", 10, ABSENT, "drift"),
-        ("output", f"{where}.type", "string", ABSENT, "drift"),
-    ]
+    both = [{"pattern": "^a", "type": "string"}, {"pattern": "^b"}]
+    assert found == tuple(
+        Difference(side, f"{where}.{key}", contract, harness)
+        for side in ("input", "output")
+        for key, contract, harness in (
+            ("allOf", ABSENT, both),
+            ("maxLength", 5, ABSENT),
+            ("type", "string", ABSENT),
+        )
+    )
 
 
 class Letter(enum.Enum):
@@ -339,8 +389,10 @@ class Extra(BaseModel):
     c: Letter = Field(json_schema_extra={"enum": ["a", "z"]})
 
 
-def test_json_schema_extra_over_a_named_type_is_both(enrich_spec: OfferingSpec) -> None:
-    """The contract accepts ``"z"``; the harness's schema, and the model, do not."""
+def test_json_schema_extra_over_a_named_type_is_their_conjunction(
+    enrich_spec: OfferingSpec,
+) -> None:
+    """Both sides accept ``"a"`` alone: the values the two ``enum``s share."""
     defs = {
         "Letter": {"enum": ["a", "b"], "title": "Letter", "type": "string"},
         "Extra": {
@@ -350,12 +402,9 @@ def test_json_schema_extra_over_a_named_type_is_both(enrich_spec: OfferingSpec) 
             "type": "object",
         },
     }
-    found = compare_handler(_doc(enrich_spec, Extra), _harness("Extra", "Extra", defs), "run")
-    assert _found(found) == {
-        (side, f"$defs.Extra.properties.c.{key}", "drift")
-        for side in ("input", "output")
-        for key in ("allOf", "enum", "type")
-    }
+    doc = _doc(enrich_spec, Extra)
+    assert doc["$defs"]["Extra"]["properties"]["c"] == {"enum": ["a"], "type": "string"}
+    assert compare_handler(doc, _harness("Extra", "Extra", defs), "run") == ()
 
 
 @pytest.mark.parametrize(
@@ -363,11 +412,13 @@ def test_json_schema_extra_over_a_named_type_is_both(enrich_spec: OfferingSpec) 
     [
         ({"type": "string"}, {"maxLength": 5}),  # a constraint only the use site writes
         ({"maxLength": 5, "type": "string"}, {"maxLength": 5}),  # the same one twice
+        ({"maxLength": 8, "type": "string"}, {"maxLength": 5}),  # the tighter of two
+        ({"maxLength": 5, "type": "string"}, {"maxLength": 8}),
         # The use site's annotations are its own: a field's description over its type's.
         ({"maxLength": 5, "type": "string"}, {"description": "The code.", "examples": ["ab"]}),
     ],
 )
-def test_a_use_site_that_changes_nothing_joins_its_definition(
+def test_a_use_site_joins_its_definition_as_their_conjunction(
     enrich_spec: OfferingSpec, code: dict[str, Any], site: dict[str, Any]
 ) -> None:
     class Overlap(BaseModel):
@@ -379,6 +430,59 @@ def test_a_use_site_that_changes_nothing_joins_its_definition(
         _doc(enrich_spec, Overlap), _harness("Overlap", "Overlap", _overlap(code, site)), "run"
     )
     assert found == ()
+
+
+@pytest.mark.parametrize(
+    ("body", "site", "joined"),
+    [
+        # The tighter bound of each pair, on both sides of a range.
+        (
+            {"maximum": 10, "minimum": 0, "type": "integer"},
+            {"maximum": 5, "minimum": 1},
+            {"maximum": 5, "minimum": 1, "type": "integer"},
+        ),
+        (
+            {"exclusiveMaximum": 1, "exclusiveMinimum": 0, "type": "number"},
+            {"exclusiveMaximum": 2, "exclusiveMinimum": -1},
+            {"exclusiveMaximum": 1, "exclusiveMinimum": 0, "type": "number"},
+        ),
+        (
+            {"maxItems": 3, "minItems": 1, "type": "array"},
+            {"maxItems": 2, "minItems": 2},
+            {"maxItems": 2, "minItems": 2, "type": "array"},
+        ),
+        # integer within number; the least common multiple; uniqueness if either says so.
+        ({"type": "number"}, {"type": "integer"}, {"type": "integer"}),
+        ({"multipleOf": 4}, {"multipleOf": 6}, {"multipleOf": 12}),
+        ({"uniqueItems": False}, {"uniqueItems": True}, {"uniqueItems": True}),
+        # The values both enums list, in the definition's order.
+        ({"enum": ["c", "b", "a"]}, {"enum": ["a", "c", "z"]}, {"enum": ["c", "a"]}),
+        # A group of keywords that read each other joins a definition that writes none of it.
+        (
+            {"type": "object"},
+            {"additionalProperties": False, "properties": {"a": {}}},
+            {"additionalProperties": False, "properties": {"a": {}}, "type": "object"},
+        ),
+    ],
+)
+def test_a_use_site_s_assertions_are_conjoined(
+    body: dict[str, Any], site: dict[str, Any], joined: dict[str, Any]
+) -> None:
+    resolved = h._resolve({"$ref": "#/$defs/T", "title": "Use", **site}, {"T": body})
+    assert resolved == {**joined, "title": "Use"}
+
+
+def test_an_alias_of_a_named_type_is_followed() -> None:
+    """``{$ref: Documented, maxLength: 10}``, ``Documented`` itself ``{$ref: Short,
+    description}``: the chain resolves to ``Short``'s body, its annotation and the bound."""
+    defs = {
+        "Short": {"maxLength": 5, "type": "string"},
+        "Documented": {"$ref": "#/$defs/Short", "description": "A short text."},
+    }
+    resolved = h._resolve({"$ref": "#/$defs/Documented", "maxLength": 10}, defs)
+    assert resolved == {"maxLength": 5, "type": "string", "description": "A short text."}
+    loop = {"A": {"$ref": "#/$defs/B"}, "B": {"$ref": "#/$defs/A"}}
+    assert "allOf" not in h._resolve({"$ref": "#/$defs/A"}, loop)  # bounded, never endless
 
 
 @pytest.mark.parametrize(
@@ -394,14 +498,21 @@ def test_a_use_site_that_changes_nothing_joins_its_definition(
         ({"prefixItems": [{}], "type": "array"}, {"items": False}),
         ({"if": {}, "then": {}}, {"else": False}),
         ({"type": "object"}, {"unevaluatedProperties": False}),
+        # No one value says what the two do.
         ({"type": "string"}, {"type": "integer"}),
+        ({"pattern": "^a"}, {"pattern": "^b"}),
+        ({"format": "date"}, {"format": "uuid"}),
+        ({"const": "a"}, {"const": "b"}),
+        ({"enum": ["a"]}, {"enum": ["b"]}),
+        ({"multipleOf": 0.5}, {"multipleOf": 2}),
     ],
 )
 def test_a_use_site_that_would_change_its_definition_stays_beside_it(
     body: dict[str, Any], site: dict[str, Any]
 ) -> None:
     """Keywords that read each other are never split between the use site and the
-    definition: the node stays the conjunction."""
+    definition, and two values no one value conjoins stay apart: the node stays the
+    conjunction."""
     resolved = h._resolve({"$ref": "#/$defs/T", "title": "Use", **site}, {"T": body})
     assert resolved == {"title": "Use", "allOf": [body, site]}
 
@@ -414,26 +525,28 @@ def test_null_inside_a_conjunction(enrich_spec: OfferingSpec) -> None:
     class Maybe(BaseModel):
         model_config = ConfigDict(extra="forbid")
 
-        maybe: Annotated[Code, Field(max_length=10)] | None
+        maybe: Annotated[str, Field(pattern="^a")] | None
 
-    defs = _overlap({"maxLength": 5, "type": "string"}, {})
+    defs = _overlap({"pattern": "^a", "type": "string"}, {})
     defs["Maybe"] = {
         "additionalProperties": False,
         "properties": {
             "maybe": {
-                "anyOf": [{"$ref": "#/$defs/Code", "maxLength": 10}, {"type": "null"}],
+                "anyOf": [{"$ref": "#/$defs/Short", "pattern": "^b"}, {"type": "null"}],
             }
         },
         "required": ["maybe"],
         "type": "object",
     }
     found = compare_handler(_doc(enrich_spec, Maybe), _harness("Maybe", "Maybe", defs), "run")
-    assert {d.path for d in found} == {
-        f"$defs.Maybe.properties.maybe.oneOf[0].{key}" for key in ("allOf", "maxLength", "type")
+    assert _found(found) == {
+        (side, f"$defs.Maybe.properties.maybe.oneOf[0].{key}")
+        for side in ("input", "output")
+        for key in ("allOf", "pattern", "type")
     }
 
 
-# --------------------------------------------------------------------------- semantic
+# --------------------------------------------------------------------------- what is reported
 
 
 class Open(BaseModel):
@@ -461,12 +574,12 @@ class Holder(BaseModel):
     ignored: Open
 
 
-def _open(**extra: Any) -> dict[str, Any]:
-    """``Open`` as ``agent_schema`` writes it, or ``Allowed`` with
-    ``additionalProperties=True``."""
+def _open(*, output: bool = False, **extra: Any) -> dict[str, Any]:
+    """``Open`` as ``agent_schema`` writes it (an input, or an output, which requires
+    ``hops`` beside its default), or ``Allowed`` with ``additionalProperties=True``."""
     return {
         "properties": {"host": {"type": "string"}, "hops": {"type": "integer", "default": 1}},
-        "required": ["host"],
+        "required": ["host", "hops"] if output else ["host"],
         "type": "object",
         **extra,
     }
@@ -476,15 +589,12 @@ def test_the_contract_closes_models_by_policy(enrich_spec: OfferingSpec) -> None
     """Kontra closes every model (decisions I2, section 11.3) and the harness's schema
     writes no ``additionalProperties`` for pydantic's default ``extra="ignore"``, which
     drops other keys on input and never emits one: no value exchanged differs, so neither
-    side reports it. What does differ still is: the harness's output schema requires a
-    field with a default (``defaults``, its serialization mode)."""
-    defs = {"Open-Input": _open(), "Open-Output": _open(required=["hops", "host"])}
+    side reports it."""
+    defs = {"Open-Input": _open(), "Open-Output": _open(output=True)}
     found = compare_handler(
         _doc(enrich_spec, Open), _harness("Open-Input", "Open-Output", defs), "run"
     )
-    assert [(d.side, d.path, d.contract, d.harness, d.kind) for d in found] == [
-        ("output", "$defs.Open.required", ["host"], ["hops", "host"], "defaults"),
-    ]
+    assert found == ()
 
 
 @pytest.mark.parametrize("model", [Allowed, Holder])
@@ -492,27 +602,36 @@ def test_additional_properties_true_is_open(enrich_spec: OfferingSpec, model: ty
     """``extra="allow"``: the harness's ``additionalProperties: true`` is kept, at the root
     as nested, and against the contract's ``false`` is ``open`` on both sides, with both
     values. The ``extra="ignore"`` models around and beside it are not."""
-    defs = {
-        "Allowed": _open(additionalProperties=True),
-        "Open": _open(),
-        "Holder": {
+
+    def holder(mode: str) -> dict[str, Any]:
+        return {
             "properties": {
-                "allowed": {"$ref": "#/$defs/Allowed"},
-                "ignored": {"$ref": "#/$defs/Open"},
+                "allowed": {"$ref": f"#/$defs/Allowed-{mode}"},
+                "ignored": {"$ref": f"#/$defs/Open-{mode}"},
             },
             "required": ["allowed", "ignored"],
             "type": "object",
+        }
+
+    defs = {
+        **{
+            f"Allowed-{m}": _open(output=m == "Output", additionalProperties=True)
+            for m in ("Input", "Output")
         },
+        **{f"Open-{m}": _open(output=m == "Output") for m in ("Input", "Output")},
+        **{f"Holder-{m}": holder(m) for m in ("Input", "Output")},
     }
     name = model.__name__
-    found = compare_handler(_doc(enrich_spec, model), _harness(name, name, defs), "run")
-    assert [(d.side, d.path, d.contract, d.harness, d.kind) for d in found] == [
-        ("input", "$defs.Allowed.additionalProperties", False, True, "open"),
-        ("output", "$defs.Allowed.additionalProperties", False, True, "open"),
-    ]
+    found = compare_handler(
+        _doc(enrich_spec, model), _harness(f"{name}-Input", f"{name}-Output", defs), "run"
+    )
+    assert found == (
+        Difference("input", "$defs.AllowedInput.additionalProperties", False, True, open=True),
+        Difference("output", "$defs.AllowedOutput.additionalProperties", False, True, open=True),
+    )
 
 
-def _extra(contract: Any, harness: Any) -> list[tuple[Any, Any, str]]:
+def _extra(contract: Any, harness: Any) -> list[tuple[Any, Any, bool]]:
     """The input differences between two objects that differ only in their
     ``additionalProperties`` (each a value, or :data:`ABSENT` for none)."""
 
@@ -521,7 +640,7 @@ def _extra(contract: Any, harness: Any) -> list[tuple[Any, Any, str]]:
 
     walk = h._Walk("input", {}, {})
     walk.run(node(contract), node(harness), "x")
-    return [(d.contract, d.harness, d.kind) for d in walk.found]
+    return [(d.contract, d.harness, d.open) for d in walk.found]
 
 
 @pytest.mark.parametrize(
@@ -535,11 +654,11 @@ def _extra(contract: Any, harness: Any) -> list[tuple[Any, Any, str]]:
         (ABSENT, True, []),
         (True, True, []),
         # ... except against the contract's false, where it is kept: extra="allow".
-        (False, True, [(False, True, "open")]),
-        (True, False, [(True, False, "drift")]),
-        (ABSENT, False, [(ABSENT, False, "drift")]),
+        (False, True, [(False, True, True)]),
+        (True, False, [(True, False, False)]),
+        (ABSENT, False, [(ABSENT, False, False)]),
         # A schema (typed extras) is no true: compared like any other member.
-        (False, {"type": "integer"}, [(False, {"type": "integer"}, "drift")]),
+        (False, {"type": "integer"}, [(False, {"type": "integer"}, False)]),
         ({"type": "integer"}, {"type": "integer"}, []),
     ],
 )
@@ -549,11 +668,9 @@ def test_additional_properties_pair_by_pair(contract: Any, harness: Any, found: 
     assert _extra(contract, harness) == found
 
 
-def test_other_differences_are_serialization_on_the_output_and_drift_on_the_input(
-    enrich_spec: OfferingSpec,
-) -> None:
-    """A field one side lacks: on the output it is how the reply is serialized (a computed
-    field here); on the input nothing explains it."""
+def test_any_other_difference_is_reported_as_it_is(enrich_spec: OfferingSpec) -> None:
+    """A field one side lacks (here a computed one the contract does not have), on either
+    side: the emitters disagree, and nothing explains it away."""
     body = _host()
     body["properties"]["area"] = {"readOnly": True, "type": "integer"}
     body["required"] = ["area", "host", "port"]
@@ -561,10 +678,9 @@ def test_other_differences_are_serialization_on_the_output_and_drift_on_the_inpu
         _doc(enrich_spec, Host), _harness("Host", "Host", {"Host": body}), "run"
     )
     assert _found(found) == {
-        ("input", "$defs.Host.properties.area", "drift"),
-        ("input", "$defs.Host.required", "drift"),
-        ("output", "$defs.Host.properties.area", "serialization"),
-        ("output", "$defs.Host.required", "serialization"),
+        (side, f"$defs.Host.{key}")
+        for side in ("input", "output")
+        for key in ("properties.area", "required")
     }
     [area] = [d for d in found if d.side == "output" and d.path.endswith("area")]
     assert (area.contract, area.harness) == (ABSENT, {"type": "integer"})  # canonical: no readOnly
@@ -589,10 +705,9 @@ def test_a_type_change_is_reported_where_it_is(enrich_spec: OfferingSpec) -> Non
         _doc(enrich_spec, Stamped), _harness("Stamped", "Stamped", {"Stamped": body}), "run"
     )
     assert _found(found) == {
-        ("input", "$defs.Stamped.properties.at.format", "drift"),
-        ("input", "$defs.Stamped.properties.at.type", "drift"),
-        ("output", "$defs.Stamped.properties.at.format", "serialization"),
-        ("output", "$defs.Stamped.properties.at.type", "serialization"),
+        (side, f"$defs.Stamped.properties.at.{key}")
+        for side in ("input", "output")
+        for key in ("format", "type")
     }
 
 
@@ -624,28 +739,29 @@ def test_a_handler_the_harness_does_not_have_is_an_error(enrich_spec: OfferingSp
 # --------------------------------------------------------------------------- what a person reads
 
 
-def test_describe_says_each_difference_then_what_each_kind_means(enrich_spec: OfferingSpec) -> None:
+def test_describe_says_each_difference_then_what_they_mean(enrich_spec: OfferingSpec) -> None:
     defs = {
         "Allowed-Input": _open(additionalProperties=True),
-        "Allowed-Output": _open(additionalProperties=True, required=["hops", "host"]),
+        "Allowed-Output": _open(output=True, additionalProperties=True),
     }
+    defs["Allowed-Output"]["properties"]["hops"]["type"] = "string"
     found = compare_handler(
         _doc(enrich_spec, Allowed), _harness("Allowed-Input", "Allowed-Output", defs), "run"
     )
-    lines = h.describe(found)
-    assert lines[:3] == [
-        "input  $defs.Allowed.additionalProperties: contract false, harness true",
-        "output $defs.Allowed.additionalProperties: contract false, harness true",
-        'output $defs.Allowed.required: contract ["host"], harness ["hops","host"]',
+    assert h.describe(found) == [
+        "input  $defs.AllowedInput.additionalProperties: contract false, harness true",
+        "output $defs.AllowedOutput.additionalProperties: contract false, harness true",
+        'output $defs.AllowedOutput.properties.hops.type: contract "integer", harness "string"',
+        f"(open) {h.OPEN_NOTE}",
+        f"the other lines: {h.OTHER_NOTE}",
     ]
-    assert lines[3] == f"(open) {h.NOTES['open']}"
-    assert lines[4] == f"(defaults) {h.NOTES['defaults']}"
-    assert len(lines) == 5
+    assert h.describe(found[:2]) == [*h.describe(found)[:2], f"(open) {h.OPEN_NOTE}"]
+    assert h.describe(found[2:]) == [h.describe(found)[2], h.OTHER_NOTE]
     assert h.describe(()) == []
 
 
 def test_a_long_value_is_cut_and_control_characters_are_escaped() -> None:
-    d = Difference("input", "$defs.A.description", "x" * 500, "a\x1b[31mb", "drift")
+    d = Difference("input", "$defs.A.description", "x" * 500, "a\x1b[31mb")
     text = str(d)
     assert "\x1b" not in text
     assert "\\u001b" in text

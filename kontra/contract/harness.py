@@ -12,19 +12,21 @@ warning at ``kontra publish`` and a failing seam ③ test, not a buyer's surpris
 What is compared: the contract's ``execute`` input and output against the handler's ``input``
 and ``output`` in the harness's document, each with everything it references. Nothing else of
 the harness's document is read -- the init data, the agent's other handlers and its declared
-states are the agent's envelope, never the operation. Both sides are put in one canonical form
-first, which removes every difference that does not change which JSON values are valid, each
-by a rule I33 lists and ``tests/contract/test_harness_rules.py`` tests:
+states are the agent's envelope, never the operation. Both emitters describe an input in
+pydantic's validation mode and an output in its serialization mode (decisions I38), so the
+two documents say the same once both are in one canonical form, which removes every
+difference that does not change which JSON values are valid, each by a rule I33 lists and
+``tests/contract/test_harness_rules.py`` tests:
 
 * references are followed on both sides, and a definition is matched by where it is used, not
-  by its name (``Report`` against the harness's ``Report-Output``, ``KontraArtifact`` against
-  ``Artifact``, an enum Kontra writes inline against the harness's ``$ref``); a recursive
-  model is compared once. JSON Schema 2020-12 asserts a ``$ref``'s definition and the members
-  beside it both, so a use site joins its definition only where that changes nothing: its
-  annotations replace the definition's, and an assertion the definition does not otherwise
-  make joins it. One the definition also makes (``Annotated[Code, Field(max_length=10)]``
-  over ``Code``'s own ``max_length=5``) leaves the two side by side, ``allOf``, and the other
-  side differs from that (``drift``, input or output);
+  by its name (``ReportOutput`` against the harness's ``Report-Output``, ``KontraArtifact``
+  against ``Artifact``, an enum Kontra writes inline against the harness's ``$ref``); a
+  recursive model is compared once. JSON Schema 2020-12 asserts a ``$ref``'s definition and
+  the members beside it both, so a use site joins its definition as their conjunction: its
+  annotations replace the definition's, an assertion the definition does not make joins it,
+  and one both make is the one value that says what the two do (the tighter bound, the common
+  ``enum`` values, ``integer`` within ``number``). Where no one value does, the two stay side
+  by side, ``allOf``, and differ from the contract, which never writes one;
 * annotations are dropped: ``title``, ``description``, ``examples``, ``$comment``,
   ``deprecated``, ``readOnly``, ``writeOnly``; so is the OpenAPI ``discriminator`` (the
   branches' ``const`` tags select the branch);
@@ -36,21 +38,19 @@ by a rule I33 lists and ``tests/contract/test_harness_rules.py`` tests:
   ``extra="ignore"``, which drops other keys on input and never emits one on output, so no
   value exchanged differs. ``additionalProperties: true`` is its absence, on either side,
   except against the contract's ``false``: there it is ``extra="allow"`` (the model keeps
-  other keys and serializes them), kept, and reported. A schema there (typed extras) is no
-  ``true``, and is compared like any other member;
+  other keys and serializes them), kept, and reported ``open``. A schema there (typed
+  extras) is no ``true``, and is compared like any other member;
 * ``anyOf: [T, {type: null}]`` is ``oneOf: [T, {type: null}]`` when ``T`` cannot be null;
 * a ``default`` of ``null``, a list or an object is no default (decisions I2: null is the
-  absence of one, and nexgen materialises only scalar defaults). A scalar default is compared:
-  a buyer's generated code fills it in.
+  absence of one, and nexgen materialises only scalar defaults), and neither is a default on
+  a member its object requires, which never applies: the harness's output schema keeps a
+  field's default beside the ``required`` that lists it, and the contract writes none there
+  (I38). Any other scalar default is compared: a buyer's generated code fills it in.
 
-What remains is reported, each :class:`Difference` with a :data:`Kind`: ``open`` (the contract
-closes every model, section 11.3, and the harness's schema says ``additionalProperties: true``,
-as ``extra="allow"`` does), ``defaults`` (on the output, the harness's serialization-mode
-schema requires fields that have a default; the reply always carries them), ``serialization``
-(any other output difference: the harness describes the model as serialized -- computed and
-excluded fields, serialization aliases, serializers -- and the contract as validated) and
-``drift`` (any other input difference, and a use site written beside its definition on either
-side: the emitters disagree).
+What remains is reported, each a :class:`Difference`: ``open`` where the harness's schema
+says ``additionalProperties: true`` (``extra="allow"``) and the contract closes the model,
+which the seller can act on; anything else is the two emitters describing the same model
+differently, a bug in one of them, reported as it is.
 
 The harness's schema comes from its own CLI, ``temporal-agent-harness schema module:Class``,
 run by :func:`harness_schema` as a subprocess of this interpreter: the same document
@@ -62,6 +62,7 @@ the CLI's name and the document's shape as constants, checked against the harnes
 from __future__ import annotations
 
 import json
+import math
 import os
 import selectors
 import subprocess
@@ -81,7 +82,8 @@ from kontra.contract.validate import validate_document
 __all__ = [
     "ABSENT",
     "HARNESS_SCRIPT",
-    "NOTES",
+    "OPEN_NOTE",
+    "OTHER_NOTE",
     "SCHEMA_COMMAND",
     "SCHEMA_DEFS",
     "SCHEMA_HANDLERS",
@@ -91,7 +93,6 @@ __all__ = [
     "SCHEMA_TIMEOUT",
     "Difference",
     "HarnessSchemaError",
-    "Kind",
     "agent_target",
     "compare_handler",
     "describe",
@@ -264,28 +265,21 @@ def _last_line(stderr: bytes) -> str:
 
 # --------------------------------------------------------------------------- the comparison
 
-#: What a difference means; :data:`NOTES` says it in a sentence.
-Kind = Literal["open", "defaults", "serialization", "drift"]
 Side = Literal["input", "output"]
 
-NOTES: Final[Mapping[Kind, str]] = {
-    "open": (
-        "the contract closes every model (no keys but its fields) and the harness's schema "
-        'leaves this one open, as extra="allow" does: the model keeps other keys, and '
-        'serializes them into the reply; pydantic\'s default (extra="ignore", which drops '
-        'them) or extra="forbid" on the model makes the two agree'
-    ),
-    "defaults": (
-        "the harness's output schema (serialization mode) requires the fields that have a "
-        "default, which the reply always carries; the contract lets them be absent"
-    ),
-    "serialization": (
-        "the harness describes the output as serialized (computed and excluded fields, "
-        "serialization aliases, serializers), the contract as validated: the job's result is "
-        "the serialization"
-    ),
-    "drift": "the two emitters describe the same model differently",
-}
+#: What an ``open`` difference means, and what any other one does.
+OPEN_NOTE: Final = (
+    "the contract closes every model (no keys but its fields) and the harness's schema "
+    'leaves this one open, as extra="allow" does: the model keeps other keys and serializes '
+    "them into its reply, which the contract refuses, so a reply that carries one fails the "
+    'job; pydantic\'s default (extra="ignore", which drops them) or extra="forbid" on the '
+    "model makes the two agree"
+)
+OTHER_NOTE: Final = (
+    "the two emitters describe the same model differently, which neither should (a bug in "
+    "one of them): please report it, with the model, at "
+    "https://github.com/medmahmoudi26/kontra-sdk/issues"
+)
 
 
 class _Absent:
@@ -303,13 +297,15 @@ ABSENT: Final = _Absent()
 class Difference:
     """One place where the contract and the harness's schema still differ after both are in
     the canonical form. ``path`` is in the contract's terms (``$defs.Report.required``);
-    ``contract``/``harness`` are the values there, or :data:`ABSENT`."""
+    ``contract``/``harness`` are the values there, or :data:`ABSENT`. ``open`` is the
+    harness's ``additionalProperties: true`` (``extra="allow"``) against the contract's
+    ``false``; any other difference is the emitters disagreeing."""
 
     side: Side
     path: str
     contract: Any
     harness: Any
-    kind: Kind
+    open: bool = False
 
     def __str__(self) -> str:
         return (
@@ -319,12 +315,14 @@ class Difference:
 
 
 def describe(differences: Iterable[Difference]) -> list[str]:
-    """Lines for a person: one per difference, then what each kind present means."""
+    """Lines for a person: one per difference, then what they mean."""
     found = list(differences)
     lines = [str(d) for d in found]
-    for kind in NOTES:
-        if any(d.kind == kind for d in found):
-            lines.append(f"({kind}) {NOTES[kind]}")
+    opened = sum(d.open for d in found)
+    if opened:
+        lines.append(f"(open) {OPEN_NOTE}")
+    if opened < len(found):
+        lines.append(("the other lines: " if opened else "") + OTHER_NOTE)
     return lines
 
 
@@ -365,8 +363,8 @@ _NULL: Mapping[str, Any] = {"type": "null"}
 #: (a field's own ``description`` or ``default`` over its type's).
 _OVERRIDE = _ANNOTATIONS | {"default", _DISCRIMINATOR}
 #: Keywords that read one another in one schema object (``additionalProperties`` refuses the
-#: keys ``properties`` and ``patternProperties`` beside it do not name): never split between
-#: a use site and its definition.
+#: keys ``properties`` and ``patternProperties`` beside it do not name): a use site's joins
+#: its definition only where the definition writes none of the group, or the group alike.
 _TOGETHER = (
     frozenset({"properties", "patternProperties", "additionalProperties"}),
     frozenset({"prefixItems", "items"}),
@@ -375,6 +373,11 @@ _TOGETHER = (
 )
 #: Keywords that read every applicator beside them.
 _UNEVALUATED = frozenset({"unevaluatedProperties", "unevaluatedItems"})
+#: Bounds two schemas may each write: both hold, so the conjunction is the tighter.
+_UPPER = frozenset({"maximum", "exclusiveMaximum", "maxLength", "maxItems", "maxProperties"})
+_LOWER = frozenset({"minimum", "exclusiveMinimum", "minLength", "minItems", "minProperties"})
+#: How many ``$ref`` aliases are followed in a row (``A: {$ref: B, description}``).
+_ALIASES = 32
 
 
 def compare_handler(
@@ -410,50 +413,82 @@ def _ref_name(node: Mapping[str, Any], defs: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _resolve(node: Mapping[str, Any], defs: Mapping[str, Any]) -> Mapping[str, Any]:
-    """A ``$ref`` node as one schema. JSON Schema 2020-12 asserts the definition and the
-    members beside the ``$ref`` both (``{$ref: X, k: v}`` is ``{allOf: [X, {k: v}]}``), so
-    the use site joins its definition only where that is the same schema: its annotations
-    replace the definition's, and its assertions join it if the definition makes none of
-    them otherwise (:func:`_joins`). If it does (``Annotated[Code, Field(max_length=10)]``
-    over ``Code``'s own ``max_length=5``: at most 5 characters), the node is that ``allOf``,
-    the use site's annotations beside it."""
-    if _ref_name(node, defs) is None:
+def _resolve(node: Mapping[str, Any], defs: Mapping[str, Any], depth: int = 0) -> Mapping[str, Any]:
+    """A ``$ref`` node as one schema: its definition (itself resolved, if it is an alias of
+    another) and the use site's members together. JSON Schema 2020-12 asserts the definition
+    and the members beside the ``$ref`` both (``{$ref: X, k: v}`` is ``{allOf: [X, {k:
+    v}]}``), so they are joined only as their conjunction (:func:`_join`): the use site's
+    annotations replace the definition's, and its assertions join it. Where no one schema
+    says what the two do, the node is that ``allOf``, the use site's annotations beside it."""
+    name = _ref_name(node, defs)
+    if name is None or depth > _ALIASES:
         return node
-    return _beside(node, defs)[0]
-
-
-def _beside(node: Mapping[str, Any], defs: Mapping[str, Any]) -> tuple[Mapping[str, Any], bool]:
-    """:func:`_resolve` of a ``$ref`` node, and whether its use site stayed beside the
-    definition (``allOf``) rather than joining it."""
-    body = defs[cast(str, _ref_name(node, defs))]
-    target = dict(cast(Mapping[str, Any], body)) if isinstance(body, dict) else {}
+    body = defs[name]
+    target = (
+        _resolve(cast(Mapping[str, Any], body), defs, depth + 1) if isinstance(body, dict) else {}
+    )
     notes = {k: v for k, v in node.items() if k in _OVERRIDE}
     site = {k: v for k, v in node.items() if k != "$ref" and k not in _OVERRIDE}
-    if _joins(target, site):
-        return {**target, **site, **notes}, False
-    return {**notes, "allOf": [target, site]}, True
+    joined = _join(target, site)
+    if joined is None:
+        return {**notes, "allOf": [dict(target), site]}
+    return {**joined, **notes}
 
 
-def _joins(body: Mapping[str, Any], site: Mapping[str, Any]) -> bool:
-    """Whether a use site's assertions put in its definition's object assert what the two
-    did side by side: each is one the definition does not make, or makes alike, and none
-    reads a keyword beside it (:data:`_TOGETHER`, :data:`_UNEVALUATED`) that the two write
-    differently."""
+def _join(body: Mapping[str, Any], site: Mapping[str, Any]) -> dict[str, Any] | None:
+    """``body`` and a use site's assertions ``site`` as one schema object that asserts what
+    the two do side by side, or None where there is none: an assertion the body does not make
+    joins it, one it makes alike is kept, one it makes otherwise is conjoined
+    (:func:`_conjoin`); keywords that read each other (:data:`_TOGETHER`) join only a body
+    that writes none of their group or the group alike, and nothing joins beside an
+    ``unevaluated*``."""
+    out = dict(body)
     if not site:
-        return True
+        return out
     if _UNEVALUATED & (set(body) | set(site)):
-        return False
+        return None
     for key, value in site.items():
         group = next((g for g in _TOGETHER if key in g), None)
         if group is not None:
-            mine = {k: v for k, v in site.items() if k in group}
             theirs = {k: v for k, v in body.items() if k in group}
-            if not _same(mine, theirs):
-                return False
-        elif key in body and not _same(body[key], value):
-            return False
-    return True
+            if theirs and not _same({k: v for k, v in site.items() if k in group}, theirs):
+                return None
+            out[key] = value
+        elif key not in body or _same(body[key], value):
+            out[key] = value
+        else:
+            both = _conjoin(key, body[key], value)
+            if both is ABSENT:
+                return None
+            out[key] = both
+    return out
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _conjoin(key: str, a: Any, b: Any) -> Any:
+    """One value of ``key`` that asserts what ``a`` and ``b`` both do, or :data:`ABSENT`."""
+    if key in _UPPER and _number(a) and _number(b):
+        return min(a, b)
+    if key in _LOWER and _number(a) and _number(b):
+        return max(a, b)
+    if key == "type" and isinstance(a, str) and isinstance(b, str):
+        return "integer" if {a, b} == {"integer", "number"} else ABSENT
+    if key == "enum" and isinstance(a, list) and isinstance(b, list):
+        later = cast(list[Any], b)
+        both = [v for v in cast(list[Any], a) if any(_same(v, w) for w in later)]
+        return both or ABSENT
+    if key == "multipleOf" and _positive_int(a) and _positive_int(b):
+        return math.lcm(cast(int, a), cast(int, b))
+    if key == "uniqueItems" and isinstance(a, bool) and isinstance(b, bool):
+        return a or b
+    return ABSENT
 
 
 def _rejects_null(node: Any, defs: Mapping[str, Any], depth: int = 0) -> bool:
@@ -514,8 +549,16 @@ def _canonical(node: Mapping[str, Any], defs: Mapping[str, Any]) -> dict[str, An
         del out["default"]
     required = out.get("required")
     if isinstance(required, list):
-        if required:
-            out["required"] = sorted(cast(list[Any], required), key=str)
+        needed = cast(list[Any], required)
+        props = out.get("properties")
+        if isinstance(props, dict):
+            # A required member is never absent, so its default never applies.
+            out["properties"] = {
+                name: _without_default(sub) if name in needed else sub
+                for name, sub in cast(Mapping[str, Any], props).items()
+            }
+        if needed:
+            out["required"] = sorted(needed, key=str)
         else:
             del out["required"]
     branches = out.get("anyOf")
@@ -525,6 +568,12 @@ def _canonical(node: Mapping[str, Any], defs: Mapping[str, Any]) -> dict[str, An
         if len(nulls) == 1 and _rejects_null(next(b for b in pair if b != _NULL), defs):
             out["oneOf"] = out.pop("anyOf")
     return out
+
+
+def _without_default(node: Any) -> Any:
+    if isinstance(node, dict) and "default" in node:
+        return {k: v for k, v in cast(Mapping[str, Any], node).items() if k != "default"}
+    return node
 
 
 class _Walk:
@@ -564,29 +613,22 @@ class _Walk:
                 else:
                     self._leaf(where, cbody, hbody)
             return
-        # One side wrote inline what the other names (an enum): compare the definition in place.
-        # A use site that stayed beside its definition is the emitters disagreeing, whichever
-        # the side.
-        cnode, cbeside = _beside(c, self.cdefs) if cname is not None else (c, False)
-        hnode, hbeside = _beside(h, self.hdefs) if hname is not None else (h, False)
-        self._members(
-            _canonical(cnode, self.cdefs),
-            _canonical(hnode, self.hdefs),
-            path,
-            kind="drift" if cbeside or hbeside else None,
-        )
+        # One side wrote inline what the other names (an enum, a constrained scalar, with
+        # the use site's own members): compare the definition in place.
+        cnode = _resolve(c, self.cdefs) if cname is not None else c
+        hnode = _resolve(h, self.hdefs) if hname is not None else h
+        self._members(_canonical(cnode, self.cdefs), _canonical(hnode, self.hdefs), path)
 
-    def _members(
-        self, c: Mapping[str, Any], h: Mapping[str, Any], path: str, *, kind: Kind | None = None
-    ) -> None:
+    def _members(self, c: Mapping[str, Any], h: Mapping[str, Any], path: str) -> None:
         for key in sorted(set(c) | set(h)):
             cv, hv = c.get(key, ABSENT), h.get(key, ABSENT)
             where = join_path(path, key)
             if key == _EXTRA and _closed_alike(cv, hv):
                 continue
-            if cv is ABSENT or hv is ABSENT:
-                shown = self._shown(cv, key), self._shown(hv, key, harness=True)
-                self._differ(where, key, *shown, c, kind=kind)
+            if key == _EXTRA and cv is False and hv is True:
+                self.found.append(Difference(self.side, where, cv, hv, open=True))
+            elif cv is ABSENT or hv is ABSENT:
+                self._differ(where, self._shown(cv, key), self._shown(hv, key, harness=True))
             elif key in _ONE and isinstance(cv, dict) and isinstance(hv, dict):
                 self._todo.append((cast(Mapping[str, Any], cv), cast(Mapping[str, Any], hv), where))
             elif key in _MAP and isinstance(cv, dict) and isinstance(hv, dict):
@@ -599,9 +641,7 @@ class _Walk:
                             (cast(Mapping[str, Any], cs), cast(Mapping[str, Any], hs), sub)
                         )
                     else:
-                        self._differ(
-                            sub, name, self._shown(cs), self._shown(hs, harness=True), c, kind=kind
-                        )
+                        self._differ(sub, self._shown(cs), self._shown(hs, harness=True))
             elif (
                 key in _LIST
                 and isinstance(cv, list)
@@ -614,7 +654,7 @@ class _Walk:
                 ):
                     self._todo.append((cb, hb, join_path(where, i)))
             else:
-                self._leaf(where, cv, hv, key=key, parent=c, kind=kind)
+                self._leaf(where, cv, hv)
 
     def _shown(self, value: Any, key: str = "", *, harness: bool = False) -> Any:
         """A whole member one side lacks, as the canonical form shows it (a schema, or each
@@ -625,44 +665,9 @@ class _Walk:
             return [self._shown(v, harness=harness) for v in cast(list[Any], value)]
         return value
 
-    def _leaf(
-        self,
-        path: str,
-        c: Any,
-        h: Any,
-        *,
-        key: str = "",
-        parent: Mapping[str, Any] | None = None,
-        kind: Kind | None = None,
-    ) -> None:
+    def _leaf(self, path: str, c: Any, h: Any) -> None:
         if not _same(c, h):
-            self._differ(path, key, c, h, parent or {}, kind=kind)
+            self._differ(path, c, h)
 
-    def _differ(
-        self,
-        path: str,
-        key: str,
-        c: Any,
-        h: Any,
-        parent: Mapping[str, Any],
-        *,
-        kind: Kind | None = None,
-    ) -> None:
-        found = kind or self._kind(key, c, h, parent)
-        self.found.append(Difference(self.side, path, c, h, found))
-
-    def _kind(self, key: str, c: Any, h: Any, parent: Mapping[str, Any]) -> Kind:
-        if key == _EXTRA and c is False and h is True:
-            return "open"
-        if self.side == "input":
-            return "drift"
-        if key == "required":
-            have = set(cast(list[str], c)) if isinstance(c, list) else set[str]()
-            want = set(cast(list[str], h)) if isinstance(h, list) else set[str]()
-            props = parent.get("properties")
-            declared = (
-                set(cast(Mapping[str, Any], props)) if isinstance(props, dict) else set[str]()
-            )
-            if have < want and want - have <= declared:
-                return "defaults"
-        return "serialization"
+    def _differ(self, path: str, c: Any, h: Any) -> None:
+        self.found.append(Difference(self.side, path, c, h))
