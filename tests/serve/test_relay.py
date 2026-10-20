@@ -245,6 +245,25 @@ async def test_outcome_failures_poll_again_with_a_new_id(
         assert waits[0] == cooldown
 
 
+async def test_truncated_at_offset_0_is_a_refusal_not_a_spin(waits: list[float]) -> None:
+    """A stream never answers offset 0 as truncated: a worker that does (for free: a refused
+    update costs it no history) is backed off from like any other refusal, not polled again
+    at once; the first ``TruncatedOffset`` past 0 still re-reads from the base at once."""
+    truncated: list[Step] = [failure("TruncatedOffset")] * 6
+    service = Scripted([*truncated, success(envelope([ITEM], 1))])
+    batches, _ = await run(service, start=5)
+    assert service.offsets()[:7] == [5, 0, 0, 0, 0, 0, 0]
+    assert waits[:5] == [0.5, 1.0, 2.0, 4.0, 8.0]
+    assert batches[0].items[0].offset == 0
+    # A successful answer resets the back-off.
+    service = Scripted(
+        [failure("TruncatedOffset"), success(envelope([], 0)), failure("TruncatedOffset")]
+    )
+    waits.clear()
+    await run(service)
+    assert waits == [0.5, 0.5]
+
+
 async def test_a_workflow_that_completed_under_an_accepted_poll_ends_the_relay_when_closed(
     waits: list[float],
 ) -> None:
@@ -305,8 +324,9 @@ async def test_a_refused_token_stops_the_relay(status: RPCStatusCode, waits: lis
         Payload(metadata={"encoding": b"binary/kontra-age", "kontra-v": b"1"}, data=b"age-encryption.org/v1\n..."),
         Payload(metadata={"encoding": b"json/plain"}, data=b'{"items": [], "next_offset": 0, "more_ready": false}'),
         envelope([{"topic": LISTED, "offset": 0, "ct": base64.b64encode(b'{"plain": true}').decode()}], 1),
+        Payload(metadata={"encoding": s.STREAM_ENCODING, "kontra-v": b"1"}, data=b"[" * 100_000),
     ],
-    ids=["whole-ciphertext", "plaintext", "plaintext-item"],
+    ids=["whole-ciphertext", "plaintext", "plaintext-item", "nested-past-the-stack"],
 )  # fmt: skip
 async def test_an_answer_that_is_not_an_envelope_stops_the_relay(
     answer: Payload, waits: list[float]
@@ -390,6 +410,19 @@ async def test_the_relay_names_its_topics() -> None:
             await run(Scripted([]), topics=bad)
     with pytest.raises(ValueError, match="start"):
         await run(Scripted([]), start=-1)
+
+
+async def test_the_start_is_the_callers_to_say() -> None:
+    """The gate relays a job from offset 0 (owner, OD2); ``"tail"`` stays available, but a
+    gate that says nothing gets an error, not the tail start the owner rejected."""
+    import inspect
+
+    assert inspect.signature(_relay.relay).parameters["start"].default is inspect.Parameter.empty
+    with pytest.raises(TypeError, match="start"):
+        async for _ in _relay.relay(  # type: ignore[call-arg]  # pyright: ignore[reportCallIssue]
+            Scripted([]), namespace="acme", job_id=JOB, topics=[LISTED], closed=never
+        ):
+            pass
 
 
 def test_the_relay_imports_no_contrib() -> None:

@@ -12,7 +12,8 @@ imports it and reads a stream with nothing else.
   finds an update by its id. Never ``PollWorkflowExecutionUpdate`` or
   ``DescribeWorkflowExecution``, which the authorizer refuses a relay.
 * ``QueryWorkflow`` of :data:`~kontra.contract.names.STREAM_OFFSET_QUERY`, only for a
-  ``"tail"`` start; its answer must be the marked plaintext offset.
+  ``"tail"`` start; its answer must be the marked plaintext offset. The gate starts a job's
+  relay from offset 0 instead (decisions I31, OD2), and ``start`` has no default.
 
 Each answer is a stream envelope (:mod:`kontra.codec.stream`), read without a key: a topic
 the buyer may read is named in the clear, any other is ``null`` and dropped here; every
@@ -23,13 +24,16 @@ boundary), and passes that offset as ``start`` when it relays the same job again
 own resume is served from the gate's store and never moves the relay.
 
 Failures, by the outcome's ``ApplicationFailureInfo.type``: ``StreamDraining`` (the run
-continues-as-new) is polled again after a short cooldown, ``TruncatedOffset`` from offset 0,
-``AcceptedUpdateCompletedWorkflow`` again unless the job is closed, ``KontraStreamFull`` (the
-job refuses polls past its history budget) stops with ``history_budget``; any other rejection
-(no stream registered yet, say) backs off while the job is open -- rejections cost the job no
-history. RPC errors: NOT_FOUND / FAILED_PRECONDITION stop when ``closed()`` says so, else back
-off; RESOURCE_EXHAUSTED backs off up to a minute; PERMISSION_DENIED / UNAUTHENTICATED stop
-with ``denied`` (the gate mints a new token or gives up). ``closed()`` is the gate's own
+continues-as-new) is polled again after a short cooldown, ``TruncatedOffset`` from offset 0
+(at once; at offset 0 itself it is a refusal like any other, since a stream never answers
+that), ``AcceptedUpdateCompletedWorkflow`` again unless the job is closed,
+``KontraStreamFull`` (the job refuses polls past its history budget) stops with
+``history_budget``; any other rejection (no stream registered yet, say) backs off while the
+job is open -- rejections cost the job no history, so a worker could answer them for free,
+as fast as the relay asks. RPC errors: NOT_FOUND / FAILED_PRECONDITION stop when
+``closed()`` says so, else back off; RESOURCE_EXHAUSTED backs off up to a minute;
+PERMISSION_DENIED / UNAUTHENTICATED stop with ``denied`` (the gate mints a new token or
+gives up). ``closed()`` is the gate's own
 observer (decisions I6), asked after every failure and every empty wait. Between answers that
 were not ``more_ready`` the loop waits :data:`MIN_INTERVAL` or what ``pace()`` says, whichever
 is longer; ``pace()`` returning None stops it with ``history_budget`` (:func:`pace_for` is the
@@ -45,7 +49,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Literal, Protocol
@@ -248,17 +252,20 @@ async def relay(
     job_id: str,
     topics: Sequence[str],
     closed: Callable[[], Awaitable[bool]],
-    start: int | Literal["tail"] = "tail",
+    start: int | Literal["tail"],
     first_execution_run_id: Callable[[], str] = lambda: "",
     pace: Callable[[], Awaitable[float | None]] | None = None,
     min_interval: float = MIN_INTERVAL,
     rpc_timeout: float = 30.0,
     identity: str = "kontra-relay",
-) -> AsyncIterator[RelayBatch]:
+) -> AsyncGenerator[RelayBatch, None]:
     """Read ``job_id``'s stream (see the module docstring) until the job is closed, the
     caller stops iterating, or :class:`RelayStopped`. ``topics``: the offering's streams and
-    ``kontra.progress``. ``start``: an offset (the gate's persisted cursor), or ``"tail"``
-    (the stream's current end, read with the offset query)."""
+    ``kontra.progress``. ``start``, required: an offset -- ``0`` on a job's first relay
+    (decisions I31, owner OD2: from the start of the log, once per job, so a buyer who
+    listens late still gets the whole stream from the gate's store), then the gate's
+    persisted cursor -- or ``"tail"`` (the stream's current end, read with the offset
+    query), for a caller that wants only what comes next."""
     workflow_id = job_workflow_id(job_id)  # constructed, never parsed
     wanted = _topics(topics)
     shown = frozenset(wanted)
@@ -286,14 +293,16 @@ async def relay(
                 raise RelayStopped("history_budget", "the job refuses polls past its budget")
             if kind == _STREAM_DRAINING:
                 await _sleep(_COOLDOWN)
-            elif kind == _TRUNCATED_OFFSET:
-                offset = 0
+            elif kind == _TRUNCATED_OFFSET and offset != 0:
+                offset = 0  # the log was truncated past us: read from its base
             elif kind == _COMPLETED_WORKFLOW:
                 if await closed():
                     return
                 await _sleep(_COOLDOWN)
             else:
-                # Not written to the job's history: wait while the job is open.
+                # Not written to the job's history: wait while the job is open. A stream
+                # never refuses offset 0 as truncated, so a worker that does is answered as
+                # any other refusal, not polled again at once.
                 if await closed():
                     return
                 await rejected.wait()

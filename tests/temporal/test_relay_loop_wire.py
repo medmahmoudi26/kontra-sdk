@@ -171,6 +171,7 @@ async def test_the_relay_reads_a_jobs_stream_with_its_two_calls_only(
                         job_id=job_id,
                         topics=[LISTED],
                         closed=closed,
+                        start="tail",
                         first_execution_run_id=lambda: pinned,
                         min_interval=0.0,
                         rpc_timeout=5.0,
