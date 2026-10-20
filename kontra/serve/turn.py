@@ -18,11 +18,22 @@ header all work unchanged), and the wrapper:
    to that message;
 3. signals ``close`` once the reply is in, waits for the agent to finish (its teardown runs
    before the job delivers), and returns the reply -- the job's result, encrypted to the
-   buyer like any job result.
+   buyer like any job result, and keyed by the output model's aliases, as a workflow
+   entry's result is (the harness publishes it by field name).
+
+A worker lost mid-turn -- a deploy, a crash -- costs nothing: the activity is retried on
+another worker, its update id gets the first attempt's admission back, and it reads the
+stream again from the same offset. temporalio's stream client ends its iteration, rather than
+raising, when its poll is cancelled or times out, so the end of the stream is read as final
+only by the wrapper, which sees the agent itself end.
 
 The v1 constraint: a job is one turn. A handler that asks for a tool approval or a callback
 would wait for a person or a client the buyer does not have, so it fails the job at once
-(session jobs, with buyer approvals, are kontra-sdk#60). A handler that raises fails the job,
+(session jobs, with buyer approvals, are kontra-sdk#60). That includes a gated call an
+agent's auto-mode evaluator would have decided: the harness publishes the approval request
+*before* it consults the evaluator, and nothing on the stream says then whether a person will
+be needed. A call the agent's ``ToolApprovalPolicy`` approves publishes no request at all, so
+a handler sold on Kontra allow-lists the tools it uses. A handler that raises fails the job,
 non-retryably, with the handler's message -- delivered encrypted to the buyer as the failure.
 The agent ending before it replied fails the job too.
 
@@ -40,11 +51,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, cast
 
+from pydantic import BaseModel, ValidationError
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowUpdateFailedError
 from temporalio.common import RetryPolicy
@@ -58,11 +71,14 @@ with workflow.unsafe.imports_passed_through():
 __all__ = [
     "TURN_ACTIVITY",
     "TURN_WORKFLOW",
+    "StreamEnded",
     "TurnActivities",
     "TurnJob",
     "TurnRequest",
     "TurnWorkflow",
+    "as_output",
     "await_reply",
+    "read_reply",
 ]
 
 #: The wrapper workflow's Temporal name: the job of a bound-handler offering.
@@ -131,7 +147,8 @@ class TurnJob:
     agent: str
     #: The ``@agent.accepts`` handler's name: the message's ``type``.
     handler: str
-    #: The input, ``model_dump(mode="json")``: the message's ``payload``.
+    #: The input, ``model_dump(mode="json", by_alias=True)``: the message's ``payload``,
+    #: keyed as the harness validates it (by alias).
     payload: dict[str, Any]
 
 
@@ -146,6 +163,11 @@ class TurnRequest:
 
 def _failure(message: str) -> ApplicationError:
     return ApplicationError(message, type=_FAILURE, non_retryable=True)
+
+
+class StreamEnded(Exception):
+    """The agent's event stream ended before the reply: the agent ended, or the reading was
+    cancelled or timed out (temporalio's stream client says all three the same way)."""
 
 
 def _remaining() -> timedelta:
@@ -183,7 +205,8 @@ class TurnWorkflow:
             schedule_to_close_timeout=left,
             heartbeat_timeout=_HEARTBEAT_TIMEOUT,
             # Failures it reports are final (non-retryable); a worker lost mid-turn retries,
-            # and the update id makes the retry pick up the same message.
+            # and the update id makes the retry pick up the same message. The agent ending
+            # is noticed here, by the wait below, not by the activity.
             retry_policy=RetryPolicy(maximum_interval=timedelta(seconds=10)),
         )
         await workflow.wait([turn, child], return_when=asyncio.FIRST_COMPLETED)
@@ -215,10 +238,12 @@ class TurnWorkflow:
 class TurnActivities:
     """``kontra.turn.v1.deliver``, bound to the worker's own client (it talks to the agent, a
     child of the job: :class:`~kontra.plugin.KontraPlugin` binds it when it builds a
-    bound-handler offering's worker)."""
+    bound-handler offering's worker) and to the handler's output model (the reply is
+    re-keyed by its aliases, :func:`as_output`)."""
 
-    def __init__(self, client: Client) -> None:
+    def __init__(self, client: Client, output: type[BaseModel] | None = None) -> None:
         self._client = client
+        self._output = output
 
     @activity.defn(name=TURN_ACTIVITY)
     async def deliver(self, req: TurnRequest) -> dict[str, Any]:
@@ -237,7 +262,7 @@ class TurnActivities:
         except WorkflowUpdateFailedError as e:
             raise _failure(f"the agent refused the message: {e.cause}") from None
         async with _heartbeating():
-            return await self._reply(req, reply)
+            return as_output(self._output, await self._reply(req, reply))
 
     async def _reply(self, req: TurnRequest, reply: Mapping[str, Any]) -> dict[str, Any]:
         message_id, offset = reply.get("message_id"), reply.get("accepted_offset")
@@ -250,9 +275,29 @@ class TurnActivities:
             result_type=dict[str, Any],
             poll_cooldown=_POLL,
         )
-        return await await_reply(
+        return await read_reply(
             (item.data async for item in items), message_id, reply.get("turn_id")
         )
+
+
+async def read_reply(
+    events: AsyncIterator[object], message_id: str, turn_id: object
+) -> dict[str, Any]:
+    """:func:`await_reply`, in the activity: the stream ending first is never final here.
+    Cancelled (the wrapper saw the agent end, or the worker is stopping), it is the
+    activity's cancellation, which a stopping worker reports as a retryable failure;
+    otherwise (a poll that timed out, the agent closing) a retryable failure. Either way the
+    wrapper decides: a retry resumes the same message from the same offset, and the agent
+    having ended fails the job there."""
+    try:
+        return await await_reply(events, message_id, turn_id)
+    except StreamEnded:
+        pass
+    if activity.is_cancelled() or activity.is_worker_shutdown():
+        raise asyncio.CancelledError
+    raise ApplicationError(
+        "the agent's event stream ended before its reply; reading it again", type=_FAILURE
+    )
 
 
 async def await_reply(
@@ -260,8 +305,9 @@ async def await_reply(
 ) -> dict[str, Any]:
     """The reply to ``message_id`` among the agent's events (each an ``AgentEvent`` envelope
     as JSON), or the failure that ends the job: the handler's error, a tool approval or a
-    callback asked for (a job is one turn), the turn ending without it, or the stream (the
-    agent) ending first. Events of other messages are not ours and are passed over."""
+    callback asked for (a job is one turn), or the turn ending without it. The stream
+    ending first is :class:`StreamEnded`, not a failure: :func:`read_reply` says what it
+    means. Events of other messages are not ours and are passed over."""
     async for event in events:
         envelope = _mapping(event)
         body = _mapping(envelope.get(EVENT))
@@ -278,7 +324,31 @@ async def await_reply(
                 raise _failure(f"the handler asked for {_ASKED[kind]}: {_ONE_TURN}")
         elif kind == TURN_END and envelope.get(EVENT_TURN_ID) == turn_id:
             raise _failure("the agent's turn ended without a reply")
-    raise _failure("the agent ended before replying")
+    raise StreamEnded
+
+
+#: ``model_validate``'s ``by_alias``/``by_name`` (pydantic 2.11; kontra-sdk takes 2.9 up).
+_BY_NAME = "by_name" in inspect.signature(BaseModel.model_validate).parameters
+
+
+def as_output(model: type[BaseModel] | None, reply: dict[str, Any]) -> dict[str, Any]:
+    """The handler's reply as the job's result. The harness publishes it as
+    ``model_dump(mode="json")``, keyed by field name; a job's result is the output model's
+    JSON keyed by alias -- what temporalio's pydantic converter writes for a workflow
+    entry's result, and what the contract and the buyer's model read. Validated by name (or
+    alias), dumped by alias; a reply that is not the model fails the job."""
+    if model is None:
+        return reply
+    try:
+        if _BY_NAME:
+            value = model.model_validate(reply, by_alias=True, by_name=True)
+        else:  # pragma: no cover - pydantic < 2.11 validates by alias only
+            value = model.model_validate(reply)
+    except ValidationError as e:
+        # Where and what, never the value: the reply is the buyer's output.
+        said = "; ".join(f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors())
+        raise _failure(f"the handler's reply is not a {model.__name__} ({said})") from None
+    return value.model_dump(mode="json", by_alias=True)
 
 
 def _mapping(value: object) -> Mapping[str, Any]:

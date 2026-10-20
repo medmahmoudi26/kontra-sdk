@@ -44,6 +44,12 @@ def test_the_installed_temporalio_is_in_range() -> None:
         ("1.34.0", True),
         ("1.37.12", True),
         ("1.35.0rc1", True),
+        ("1.34.0.post1", True),
+        ("1.34.1rc1", True),
+        ("1.34.0rc1", False),  # PEP 440: before 1.34, outside >=1.34
+        ("1.34.0a1", False),
+        ("1.34.0.dev0", False),
+        ("1.38.0rc1", False),
         ("1.33.9", False),
         ("1.38.0", False),
         ("2.0.0", False),
@@ -64,6 +70,54 @@ def test_outside_the_range_warns_and_refuses(
     assert "outside the range kontra-sdk is tested on (temporalio>=1.34,<1.38)" in line
     with pytest.raises(ServeError, match="refusing to start: temporalio"):
         _compat.check_temporalio()
+
+
+_ORDERED = [
+    "1.34.0",
+    "1.34",
+    "1.34.0rc1",
+    "1.34rc2",
+    "1.34.0a1",
+    "1.34.0b3",
+    "1.34.0.dev0",
+    "1.34.0-alpha.2",
+    "1.34.0.post1",
+    "1.34.0.post1.dev0",
+    "1.34.0+local.1",
+    "1.34.1rc1",
+    "1.35.0rc1",
+    "1.37.99",
+    "1.38.0rc1",
+    "1.38.0",
+    "1.33.99",
+    "2.0.0",
+]
+
+
+def test_the_range_check_orders_versions_as_pep_440_does(tmp_path: Path) -> None:
+    """The same answer as the specifier pip resolves ``pyproject.toml``'s pin with
+    (pre-releases allowed, as ``pip install --pre`` would). ``packaging`` asked in a
+    process of its own: under pytest, ``tests/packaging`` shadows it."""
+    import json
+    import subprocess
+    import sys
+
+    probe = (
+        "import json, sys\n"
+        "from packaging.specifiers import SpecifierSet\n"
+        "spec = SpecifierSet(sys.argv[1], prereleases=True)\n"
+        "print(json.dumps([spec.contains(v) for v in json.loads(sys.argv[2])]))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe, _compat.temporalio_range(), json.dumps(_ORDERED)],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=tmp_path,
+    ).stdout
+    expected = dict(zip(_ORDERED, json.loads(out), strict=True))
+    assert {v: _compat.in_range(v) for v in _ORDERED} == expected
+    assert expected["1.34.0rc1"] is False  # the case the check used to get wrong
 
 
 async def test_a_worker_refuses_to_start_outside_it(

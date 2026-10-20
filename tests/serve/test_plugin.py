@@ -7,7 +7,9 @@ and no CLI."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
+import re
 import runpy
 import textwrap
 import uuid
@@ -17,13 +19,15 @@ from typing import Any
 
 import pytest
 import temporalio.worker
-from temporalio.client import Client
+from temporalio.client import Client, ClientConfig, HeaderCodecBehavior
 from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import (
     DataConverter,
+    DefaultFailureConverter,
     DefaultFailureConverterWithEncodedAttributes,
     PayloadCodec,
 )
+from temporalio.plugin import SimplePlugin
 
 from kontra import KontraPlugin
 from kontra.codec import KontraCodec, KontraFailureConverter
@@ -34,7 +38,7 @@ from kontra.testing import Marketplace, TestParty
 from kontra.testing.devserver import DevServer
 
 from . import seller
-from .flows import EchoChild, UpperFlow, shout
+from .flows import EchoChild, ImpostorFlow, UpperFlow, shout
 from .models import Shout
 from .probes import where
 from .support import MARKER, Buyer, write_offering
@@ -312,6 +316,140 @@ async def test_a_plugin_after_kontra_cannot_undo_it(dev_server: DevServer, tmp_p
             assert worker.task_queue == "elsewhere"
             with pytest.raises(ServeError, match=r"a plugin that ran after Kontra changed"):
                 await worker.run()
+        finally:
+            await plugin.aclose()
+
+
+class _ImpostorPlugin(temporalio.worker.Plugin):
+    """A worker-only plugin that swaps the entry class for another of its Temporal name, and
+    with ``strip`` also moves the queue and drops Kontra's Nexus service and interceptor."""
+
+    def __init__(self, *, strip: bool = False) -> None:
+        self.strip = strip
+
+    def configure_worker(self, config: Any) -> Any:
+        config["workflows"] = [ImpostorFlow if w is UpperFlow else w for w in config["workflows"]]
+        if self.strip:
+            config["task_queue"] = "elsewhere"
+            config["nexus_service_handlers"] = []
+            config["interceptors"] = []
+        return config
+
+    async def run_worker(self, worker: temporalio.worker.Worker, next: Any) -> None:
+        await next(worker)
+
+    def configure_replayer(self, config: Any) -> Any:
+        return config
+
+    def run_replayer(self, replayer: Any, histories: Any, next: Any) -> Any:
+        return next(replayer, histories)
+
+
+@pytest.mark.temporal
+@pytest.mark.parametrize(
+    ("strip", "entry_from_a_client_plugin", "said"),
+    [
+        (False, False, r"UpperFlow is no longer registered"),
+        (True, False, r"its task queue is 'elsewhere'; Kontra's Nexus service is gone"),
+        (False, True, r"UpperFlow is no longer registered"),
+    ],
+)
+async def test_a_plugin_after_kontra_cannot_swap_the_entry_class_past_the_check(
+    dev_server: DevServer, tmp_path: Path, strip: bool, entry_from_a_client_plugin: bool, said: str
+) -> None:
+    """The start check used to claim the worker from its final config only: a worker-only
+    plugin that replaced UpperFlow with another class of the same name took the worker out
+    of Kontra's sight, and with it the check -- queue moved, Nexus service and interceptor
+    gone, no ServeError. Now the worker is claimed from the config it was built with too,
+    and by what Kontra put on it (its Nexus service, when the entry came from a client
+    plugin before Kontra's and the worker's own config never named it), and refused."""
+    async with Marketplace(dev_server=dev_server) as mp:
+        acme = await mp.party("acme")
+        plugin = KontraPlugin(seller.bind(write_offering(tmp_path)), session=acme.session)
+        before = [SimplePlugin("adds-the-entry", workflows=[UpperFlow])]
+        client = await Client.connect(
+            "kontra", plugins=[*(before if entry_from_a_client_plugin else []), plugin]
+        )
+        try:
+            worker = temporalio.worker.Worker(
+                client,
+                task_queue="x",
+                workflows=[EchoChild] if entry_from_a_client_plugin else [UpperFlow],
+                plugins=[_ImpostorPlugin(strip=strip)],
+            )
+            with pytest.raises(ServeError, match=r"a plugin that ran after Kontra changed") as e:
+                async with asyncio.timeout(30):  # unchecked, it would serve until stopped
+                    await worker.run()
+            assert re.search(said, str(e.value)), str(e.value)
+        finally:
+            await plugin.aclose()
+
+
+class _EncodeHeaders(SimplePlugin):
+    """A client plugin that turns header encoding back on."""
+
+    def __init__(self) -> None:
+        super().__init__("encode-headers")
+
+    def configure_client(self, config: ClientConfig) -> ClientConfig:
+        config = super().configure_client(config)
+        config["header_codec_behavior"] = HeaderCodecBehavior.CODEC
+        return config
+
+
+@pytest.mark.temporal
+async def test_a_client_plugin_after_kontra_cannot_undo_the_converter(
+    dev_server: DevServer, tmp_path: Path
+) -> None:
+    """In a worker main of the seller's own, plugin order is theirs: a client plugin after
+    Kontra has the last word on the client. One that put temporalio's failure converter
+    back would write failure messages to history in plaintext (the codec alone was
+    checked, and passed); offloading storage and header encoding likewise. The worker is
+    refused when it is built; with Kontra last, the same worker builds."""
+    async with Marketplace(dev_server=dev_server) as mp:
+        acme = await mp.party("acme")
+        plugin = KontraPlugin(seller.bind(write_offering(tmp_path)), session=acme.session)
+        await plugin.prepare()
+        try:
+            service = mp.client(acme.namespace).service_client
+            cases = [
+                (
+                    SimplePlugin(
+                        "plaintext-failures",
+                        data_converter=lambda dc: dataclasses.replace(
+                            dc, failure_converter_class=DefaultFailureConverter
+                        ),
+                    ),
+                    r"failure converter is DefaultFailureConverter, which writes failure "
+                    r"messages in plaintext",
+                ),
+                (
+                    SimplePlugin(
+                        "offload-everything",
+                        data_converter=lambda dc: dataclasses.replace(
+                            dc, external_storage=_storage(0)
+                        ),
+                    ),
+                    r"external storage offloads payloads from 0 bytes",
+                ),
+                (_EncodeHeaders(), r"encodes headers"),
+            ]
+            for after, said in cases:
+                client = Client(service, plugins=[plugin, after])
+                assert client.data_converter.payload_codec is plugin.codec  # what was checked
+                with pytest.raises(
+                    ServeError, match=rf"ran after Kontra changed the client.*{said}"
+                ):
+                    temporalio.worker.Worker(
+                        client, task_queue="x", workflows=[UpperFlow], activities=[shout, where]
+                    )
+            built = temporalio.worker.Worker(
+                Client(service, plugins=[plugin]),
+                task_queue="x",
+                workflows=[UpperFlow],
+                activities=[shout, where],
+            )
+            assert built.task_queue == plugin.offerings[0].offering_id.task_queue
         finally:
             await plugin.aclose()
 

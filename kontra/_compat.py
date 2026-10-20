@@ -21,6 +21,7 @@ __all__ = [
     "TEMPORALIO_MAX",
     "TEMPORALIO_MIN",
     "check_temporalio",
+    "in_range",
     "temporalio_range",
     "temporalio_version",
     "temporalio_warning",
@@ -31,10 +32,14 @@ TEMPORALIO_MIN = (1, 34)
 #: The first temporalio minor outside the tested range, exclusive.
 TEMPORALIO_MAX = (1, 38)
 
-#: A release version as temporalio publishes them (``1.34.0``, ``1.35.0rc1``): numbers only
-#: are read, anchored at both ends.
+#: A release version as temporalio publishes them (``1.34.0``, ``1.35.0rc1``): the numbers
+#: and the suffix, anchored at both ends.
 _NUM = r"(0|[1-9][0-9]{0,5})"
 _VERSION = re.compile(rf"{_NUM}\.{_NUM}(?:\.{_NUM})?([A-Za-z0-9.+-]{{0,32}})", re.ASCII)
+#: A PEP 440 pre-release or development suffix (``rc1``, ``.dev0``, ``-alpha.2``), which
+#: sorts *before* its release: ``1.34.0rc1 < 1.34``, outside ``>=1.34``. A post-release
+#: (``.post1``) or a local label (``+abc``) sorts after it.
+_PRE = re.compile(r"[-_.]?(a|b|c|rc|alpha|beta|pre|preview|dev)[-_.]?[0-9]*", re.ASCII | re.I)
 
 
 def temporalio_range() -> str:
@@ -43,30 +48,42 @@ def temporalio_range() -> str:
     return f">={lo[0]}.{lo[1]},<{hi[0]}.{hi[1]}"
 
 
+def _installed_version() -> str:
+    import temporalio
+
+    return str(getattr(temporalio, "__version__", ""))
+
+
 def temporalio_version(version: str | None = None) -> tuple[int, int, int] | None:
     """``(major, minor, patch)`` of ``version`` (default: the installed
     ``temporalio.__version__``), or None when it is not a version string."""
-    if version is None:
-        import temporalio
-
-        version = str(getattr(temporalio, "__version__", ""))
-    m = _VERSION.fullmatch(version)
+    m = _VERSION.fullmatch(_installed_version() if version is None else version)
     if m is None:
         return None
     return int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
 
 
-def _installed() -> str:
-    import temporalio
+def in_range(version: str) -> bool:
+    """``version`` inside ``>=MIN,<MAX`` as PEP 440 orders it (pre-releases allowed, as
+    ``pip install --pre`` would): a pre-release of a minor inside the range is inside; one of
+    the lowest, ``1.34.0rc1``, sorts before ``1.34`` and is not; one of the excluded upper
+    bound, ``1.38.0rc1``, is not either."""
+    parsed = temporalio_version(version)
+    if parsed is None or not TEMPORALIO_MIN <= parsed[:2] < TEMPORALIO_MAX:
+        return False
+    m = _VERSION.fullmatch(version)
+    suffix = m.group(4) if m is not None else ""
+    return not (parsed == (*TEMPORALIO_MIN, 0) and _PRE.match(suffix) is not None)
 
-    return str(getattr(temporalio, "__version__", "unknown"))
+
+def _installed() -> str:
+    return _installed_version() or "unknown"
 
 
 def temporalio_warning() -> str | None:
     """One line saying the installed temporalio is outside the tested range, or None when it
     is inside."""
-    parsed = temporalio_version()
-    if parsed is not None and TEMPORALIO_MIN <= parsed[:2] < TEMPORALIO_MAX:
+    if in_range(_installed_version()):
         return None
     return (
         f"temporalio {_installed()} is outside the range kontra-sdk is tested on "

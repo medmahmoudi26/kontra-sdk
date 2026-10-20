@@ -12,7 +12,9 @@ offering's own task queue (derived from ``name@version``; passing ``task_queue``
 
 Every ``temporalio.worker.Worker`` keyword is passed to each inner worker verbatim, except:
 ``workflows`` (the offering's entry class goes first: it is how the plugin knows which
-offering a worker serves), and ``plugins``, which are routed -- a plugin that is also a
+offering a worker serves), ``workflow_runner`` (Temporal's ``SandboxedWorkflowRunner``
+arrives as a copy with ``kontra`` passed through, :func:`with_kontra_passthrough`; any other
+runner is untouched), and ``plugins``, which are routed -- a plugin that is also a
 ``temporalio.client.Plugin`` (any ``SimplePlugin``: ``OpenAIAgentsPlugin``, the agent
 harness's ``AgentHarnessPlugin``, :class:`~kontra.contrib.parallel.ParallelPlugin`) goes on the
 client, in your order, before Kontra's, so it may set the payload converter; a worker-only

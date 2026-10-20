@@ -246,12 +246,12 @@ async def test_ac18_a_hold_for_one_contract_is_refused_by_a_handler_serving_anot
         pass  # published: hash X
     drift(project)
     (project / "drifted.py").write_text(
-        "from kontra.serve import worker as w\n"
+        "from kontra.plugin import KontraPlugin\n"
         "\n"
         "async def no_hash_lock(self, gate, profile):\n"
         "    return {b.key: b.contract_hash() for b in self.offerings}\n"
         "\n"
-        "w.Worker._hash_lock = no_hash_lock\n"
+        "KontraPlugin._hash_lock = no_hash_lock\n"
         "\n"
         "from worker import worker  # noqa: E402\n"
         "\n"

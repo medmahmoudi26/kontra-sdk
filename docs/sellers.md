@@ -48,8 +48,10 @@ The offering is `<party>/wordcount`, where the party is your profile's handle (o
 Each fact has one owner. The rule that matters most: **`workflows.py` and `activities.py` are
 vanilla Temporal** -- `from temporalio import workflow, activity` -- **and import nothing from
 `kontra`** (`docs/decisions.md` I29). They are ordinary Temporal code, tested and run like any
-other: delete `worker.py` and they run on any Temporal worker, unmodified. **`worker.py` is
-the one file that imports `kontra`**: it binds the code to the offering. Besides it,
+other: delete `worker.py` and they run on any Temporal worker, unmodified -- all but
+[`Artifact`](#files-artifact) I/O, which needs the Kontra runtime that `worker.py`'s plugin
+installs in the process (an offering without `Artifact`, like `examples/hello`, needs
+nothing). **`worker.py` is the one file that imports `kontra`**: it binds the code to the offering. Besides it,
 `quote.py` takes `Quote` from `kontra.serve`, and `models.py` may use `kontra.types.Artifact`, a
 pydantic model of a file reference, which your activities reach through `models.py`. Your
 project depends on `kontra-sdk`, which brings `temporalio` in the range it is tested on
@@ -163,8 +165,14 @@ Plain Temporal: activities, retries, timers, child workflows, signals, updates, 
 `temporalio.workflow` and `temporalio.activity` are the whole API, `RetryPolicy` comes from
 `temporalio.common`, and `ApplicationError` from `temporalio.exceptions` (raise it with
 `non_retryable=True` to stop retries). Kontra adds nothing to the namespace you import:
-`kontra.workflow`, `kontra.activity` and their re-exports are gone, and `kontra.workflow`
-says so, naming the import to write instead.
+`kontra.workflow`, `kontra.activity` and the `RetryPolicy`, `ApplicationError` and `Page`
+re-exports are gone. Code written for them fails at import with Python's own error, which
+names no replacement: `from kontra import workflow` (or `RetryPolicy`, ...) is an
+`ImportError`, "cannot import name 'workflow' from 'kontra'", and `import kontra.workflow` or
+`from kontra.workflow import defn` a `ModuleNotFoundError`. Only `kontra.workflow` read as an
+attribute says what to write. The replacements: `from temporalio import workflow, activity`,
+`from temporalio.common import RetryPolicy`, `from temporalio.exceptions import
+ApplicationError`, and `from kontra.contrib.parallel import Page` (or a model of your own).
 
 ```python
 # workflows.py
@@ -592,15 +600,25 @@ serve(ReconAgent.sweep, plugins=[AgentHarnessPlugin()])
   (`agent.Injected[...]`) are not part of it. Pass the handler, `ReconAgent.sweep`, never the
   class: `serve(ReconAgent)` is refused, naming the fix. The class must be module-level and
   importable, and its init data, if it takes any, optional: a job starts the agent with none.
+  A handler an agent inherits unchanged from another agent class is refused too
+  (`ReconV2.sweep` *is* `ReconV1.sweep`, so it cannot say which agent you mean): override it
+  in each agent class that sells it. Pydantic aliases work as on a workflow: the message is
+  the input's JSON by alias, and so is the job's result.
 - **A hire is one turn.** The job is Kontra's wrapper workflow, `kontra.turn.v1`, started as
   `job-<id>` like any job. It starts your agent as a child (its whole history encrypted to you
   alone), sends the buyer's input as one message to the handler, waits for the handler's
   reply on the agent's event stream, closes the agent, and delivers the reply, encrypted to
-  the buyer. A handler that raises fails the job with its message, without retrying.
+  the buyer. A handler that raises fails the job with its message, without retrying. A
+  worker that stops mid-turn (a deploy, a crash) loses nothing: the turn's activity is retried
+  on the next worker and picks the same message up where it was.
 - **No approvals, no callbacks.** A job has no buyer to ask: a handler that requests a tool
   approval or a callback fails the job at once. Run tools that need no approval
-  (`ToolApprovalPolicy.allow_inherently_safe()`, or your own policy). Session jobs, with buyer
-  approvals, are kontra-sdk#60.
+  (`ToolApprovalPolicy.allow_inherently_safe()`, or your own policy): a call the policy
+  approves raises no request at all. That includes the tools an auto-mode evaluator would
+  approve: the harness publishes the approval request before it asks the evaluator, and
+  nothing tells, at that moment, whether a person will be needed, so the job fails there too;
+  allow-list those tools in the policy instead. Session jobs, with buyer approvals, are
+  kontra-sdk#60.
 - `kontra graph` does not draw a handler offering yet (kontra-sdk#56).
 
 **An agent that is a process**, [`examples/chef-claude`](../examples/chef-claude): no SDK at
@@ -640,9 +658,12 @@ serve(
 every function `@activity.defn` decorated in your project: the modules loaded from under
 `worker.py`'s directory by then (dot-directories, `tests`, `test`, `venv`, `build`, `dist`,
 `node_modules` and `site-packages` left out), each activity once, in its own module. An
-activity nothing imports cannot be referenced by a workflow either, so there is no list to
-keep. Two activities of one Temporal name are refused, naming both modules: rename one
-(`@activity.defn(name=...)`). Every other keyword is `temporalio.worker.Worker`'s, passed
+activity a factory of your project makes (`fetch = make_activity("fetch")` in a module of the
+project, `make_activity` in another) is found where it is bound. An activity nothing imports
+cannot be referenced by a workflow either, so there is no list to keep -- except for the
+activities the scan cannot see: a method (it needs its instance), and one defined or made
+outside the project (a library's), which you pass in `activities=`. Two activities of one
+Temporal name are refused, naming both: rename one (`@activity.defn(name=...)`). Every other keyword is `temporalio.worker.Worker`'s, passed
 through verbatim: `workflows=[Child]` registers further workflows, unbound, for the children
 `Flow` starts; `activities=[...]` adds to what was found (methods decorated as activities need
 their instance: `activities=[obj.method]`); `plugins=[...]` adds Temporal plugins. `quote=`
@@ -654,11 +675,14 @@ Temporal's `OpenAIAgentsPlugin`, the agent harness's `AgentHarnessPlugin`,
 order, and Kontra's own plugin, `KontraPlugin`, comes last: a payload converter yours chose
 stays, and the connection, the namespace and the codec are Kontra's. A worker-only plugin goes
 to the worker, where it runs after Kontra's configuration: one that changes the task queue,
-removes Kontra's Nexus service, puts another interceptor before Kontra's, or builds the worker
-on a client without Kontra's codec is refused before the worker polls. Kontra also refuses a
-client plugin that sets another payload codec or failure converter (Kontra's encrypt), or
-external storage that would offload a job's payload at or below Kontra's claim-check
-threshold, where the buyer could not read it.
+removes Kontra's Nexus service, puts another interceptor before Kontra's, swaps the entry
+class for another of the same name, or builds the worker on a client without Kontra's codec is
+refused before the worker polls. Kontra also refuses a client plugin that sets another payload
+codec or failure converter (Kontra's encrypt), or external storage that would offload a job's
+payload at or below Kontra's claim-check threshold, where the buyer could not read it -- and
+checks the client again when it builds and starts a worker, so a client plugin placed after
+Kontra (in a worker main of your own) that sets any of them back, or encodes headers, is
+refused there.
 
 `kontra serve` and `python worker.py` run it; `kontra publish` imports `worker.py` and reads
 the offering from it without starting anything (imported, `serve()` only builds the worker
@@ -693,7 +717,9 @@ before `execute` starts anything, the encryption codec, the task queue, derived 
 [Versions](#versions)). It passes `kontra` through the workflow sandbox: Kontra's own turn
 wrapper runs in it, your models may use `kontra.types`, and a workflow that hires imports
 `kontra.hire`. `workflows`, `nexus_service_handlers` and `interceptors` are merged with
-Kontra's; every other keyword reaches the inner worker unchanged. Written out, `worker.py`
+Kontra's, and a `workflow_runner` that is Temporal's `SandboxedWorkflowRunner` reaches the
+inner worker as a copy with `kontra` added to its passthrough modules (any other runner is
+untouched); every other keyword reaches the inner worker unchanged. Written out, `worker.py`
 exposes a module-level `worker`: `kontra serve` runs it and `kontra publish` imports it to
 find the offerings.
 
@@ -1311,7 +1337,8 @@ finish on a worker that still serves it.
 kontra-sdk declares the `temporalio` range it runs on, `temporalio>=1.34,<1.38` (its suite
 runs on the minor its lock holds: 1.34, today the only one released in the range), and your
 project gets `temporalio` through it: you import it directly, so compatibility is a
-dependency range, not an import path. Outside that range a Kontra worker refuses to start
+dependency range, not an import path. Outside that range -- read as pip reads it, so
+`1.34.0rc1`, which comes before `1.34`, is outside -- a Kontra worker refuses to start
 (Kontra's codec relies on experimental temporalio APIs a minor release may change), and
 `kontra publish` and `kontra serve` say so first, before they import `worker.py` (`publish`
 on stderr, `serve` in its log):

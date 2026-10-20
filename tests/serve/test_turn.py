@@ -4,7 +4,8 @@ A real agent written with Temporal's agent harness (``tests/serve/harness_agents
 handler needs no model, served by ``serve(ReconAgent.sweep, plugins=[AgentHarnessPlugin()])``
 on a real dev server with the fake gate: a hire is one turn, its result the handler's reply;
 a handler that raises fails the job, non-retryably, with its message; the agent is closed
-after the turn. Seam ⑤: the marker-string scan of the job's wrapper and of the agent child's
+after the turn; a worker stopped mid-turn costs the job nothing; aliased models travel by
+alias both ways. Seam ⑤: the marker-string scan of the job's wrapper and of the agent child's
 histories finds neither the buyer's input nor the output in plaintext
 (``tests/codec/test_codec_turn.py``, with the seam's other scans). Then what binding
 refuses, the reply selection, and Kontra's copy of the harness's wire shape checked against
@@ -12,6 +13,7 @@ the harness itself (the golden pattern: Kontra never imports it at runtime)."""
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import inspect
 import json
@@ -27,6 +29,7 @@ import pytest
 from click.testing import CliRunner
 from temporalio.client import NexusOperationFailureError, WorkflowExecutionStatus
 from temporalio.exceptions import ApplicationError
+from temporalio.testing import ActivityEnvironment
 
 from kontra.cli import cli as kontra_cli
 from kontra.cli._project import load_worker
@@ -37,7 +40,18 @@ from kontra.serve.turn import TURN_ACTIVITY, TURN_WORKFLOW, await_reply
 from kontra.testing import Marketplace
 from kontra.testing.devserver import DevServer
 
-from .harness_agents import MayHaveData, NeedsData, ReconAgent, Report, local_handler, quote
+from .harness_agents import (
+    Hop,
+    HopAgent,
+    Hopped,
+    MayHaveData,
+    NeedsData,
+    ReconAgent,
+    Report,
+    hop_quote,
+    local_handler,
+    quote,
+)
 from .support import MARKER, Buyer, failure_text
 
 HERE = Path(__file__).parent
@@ -72,9 +86,9 @@ serve(ReconAgent.sweep, quote=quote, plugins=[AgentHarnessPlugin()])
 """
 
 
-def _project(root: Path) -> Path:
+def _project(root: Path, worker: str = _WORKER) -> Path:
     _offering_yaml(root)
-    (root / "worker.py").write_text(textwrap.dedent(_WORKER).lstrip())
+    (root / "worker.py").write_text(textwrap.dedent(worker).lstrip())
     return root
 
 
@@ -120,6 +134,47 @@ def test_an_agent_that_requires_init_data_is_refused(tmp_path: Path) -> None:
 def test_an_agent_defined_in_a_function_is_refused(tmp_path: Path) -> None:
     with pytest.raises(BindingError, match="defined inside a function"):
         offering(_offering_yaml(tmp_path), entry=local_handler(), quote=quote)
+
+
+def test_a_handler_another_agent_inherits_is_refused(tmp_path: Path) -> None:
+    """``ReconV2.sweep is ReconV1.sweep``: the function names ReconV1 (its ``__qualname__``),
+    so ``serve(ReconV2.sweep)`` would bind ReconV1 and every job would run the agent the
+    seller did not name. Refused for either class, with the fix; a handler a subclass
+    overrides is its own, and binds."""
+    from tests.serve.inherited_agents import ReconV1, ReconV2
+    from tests.serve.inherited_agents import quote as v_quote
+
+    yaml = _offering_yaml(tmp_path)
+    for entry in (ReconV2.sweep, ReconV1.sweep):
+        with pytest.raises(BindingError) as refused:
+            offering(yaml, entry=entry, quote=v_quote)
+        said = str(refused.value)
+        assert re.search(
+            r"ReconV1\.sweep is inherited unchanged by \S*inherited_agents\.ReconV2:", said
+        )
+        assert "Override sweep in each agent class that sells it" in said
+    own = offering(yaml, entry=ReconV2.probe, quote=v_quote)
+    assert (own.agent, own.agent_type, own.handler) == (ReconV2, "ReconV2", "probe")
+    base = offering(yaml, entry=ReconV1.probe, quote=v_quote)
+    assert (base.agent, base.agent_type) == (ReconV1, "ReconV1")
+
+
+def test_the_message_and_the_reply_are_keyed_by_alias(tmp_path: Path) -> None:
+    """The harness validates the message against the handler's model, by alias; it
+    publishes the reply by field name, and the job's result is re-keyed by alias -- what a
+    workflow entry's result is (temporalio's pydantic converter) and what the buyer reads."""
+    bound = offering(_offering_yaml(tmp_path), entry=HopAgent.hop, quote=hop_quote)
+    job = bound.job_input(Hop.model_validate({"from": "a"}))
+    assert job.payload == {"from": "a"}
+    Hop.model_validate(job.payload)  # what the harness does with it
+    by_name = Hopped.model_validate({"to": "a+1", "via-hops": 1}).model_dump(mode="json")
+    assert by_name == {"to_": "a+1", "via_hops": 1}  # what the harness publishes
+    assert kturn.as_output(Hopped, by_name) == {"to": "a+1", "via-hops": 1}
+    assert kturn.as_output(Hopped, {"to": "a+1", "via-hops": 1}) == {"to": "a+1", "via-hops": 1}
+    with pytest.raises(ApplicationError, match=r"not a Hopped \(via-hops: Field required\)") as bad:
+        kturn.as_output(Hopped, {"to": f"{MARKER}"})
+    assert MARKER not in bad.value.message  # where and what, never the buyer's value
+    assert bad.value.non_retryable
 
 
 def test_a_method_that_is_no_handler_is_refused(tmp_path: Path) -> None:
@@ -214,6 +269,126 @@ async def test_a_handler_that_raises_fails_the_job_with_its_message(
             assert attempts == [1]
 
 
+async def _messages(agent: Any, *, completed: bool = False) -> list[str]:
+    """The update ids of the messages the agent admitted (its stream's polls are updates
+    too), or of those whose update has completed too."""
+    events = (await agent.fetch_history()).events
+    admitted = [
+        e.workflow_execution_update_accepted_event_attributes.accepted_request.meta.update_id
+        for e in events
+        if e.HasField("workflow_execution_update_accepted_event_attributes")
+        and e.workflow_execution_update_accepted_event_attributes.accepted_request.input.name
+        == kturn.SEND_AGENT_MESSAGE_UPDATE
+    ]
+    if not completed:
+        return admitted
+    done = {
+        e.workflow_execution_update_completed_event_attributes.meta.update_id
+        for e in events
+        if e.HasField("workflow_execution_update_completed_event_attributes")
+    }
+    return [u for u in admitted if u in done]
+
+
+_SLOW_WORKER = """
+from temporal_agent_harness.plugin import AgentHarnessPlugin
+
+from kontra import serve
+from tests.serve.harness_agents import SlowAgent, quote
+
+serve(SlowAgent.sweep, quote=quote, plugins=[AgentHarnessPlugin()])
+"""
+
+
+async def _until(check: Any, what: str, within: float = 30.0) -> None:
+    for _ in range(int(within * 10)):
+        if await check():
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"not within {within} s: {what}")
+
+
+@pytest.mark.temporal
+async def test_a_worker_stopped_mid_turn_costs_the_job_nothing(
+    dev_server: DevServer, tmp_path: Path
+) -> None:
+    """A deploy: the seller's worker stops gracefully while the handler is still working
+    (the turn activity is reading the agent's stream), and a new one starts. temporalio's
+    stream client ends its iteration when the shutdown cancels its poll; read as the agent
+    having ended, that failed the job for good. Now the activity is retried on the new
+    worker, its update id gets the first attempt's admission back (the message is not sent
+    twice), and the job delivers the handler's reply."""
+    with load_worker(_project(tmp_path / "p", _SLOW_WORKER)) as worker:
+        [bound] = worker.offerings
+        async with Marketplace(dev_server=dev_server) as mp:
+            acme = await mp.party("acme")
+            bob = await mp.party(f"bob-{uuid.uuid4().hex[:6]}", balance="100.00")
+            seller = mp.client(acme.namespace)
+            async with mp.serve(worker, acme):
+                entry = await bob.gate.get_offering(bound.key)
+                buyer = Buyer(mp, bob)
+                value = {"host": "a.example"}
+                hired = await buyer.hire(entry, value)
+                handle = await buyer.start(hired, value, result_type=Report)
+                agent = seller.get_workflow_handle(agent_workflow_id(hired.job_id))
+
+                async def reading() -> bool:
+                    try:
+                        return bool(await _messages(agent, completed=True))
+                    except Exception:
+                        return False
+
+                # The message admitted and its update completed: the activity is reading
+                # the stream, where a cancelled poll ends the iteration instead of raising.
+                await _until(reading, "the message admitted")
+                await asyncio.sleep(0.5)
+            # Stopped mid-turn: the handler sleeps 6 s on a durable timer.
+            async with mp.serve(worker, acme):
+                async with asyncio.timeout(60):
+                    out = await handle.result()
+            assert out == Report(host="a.example", open=len("a.example"))
+            root = job_workflow_id(hired.job_id)
+            history = await seller.get_workflow_handle(root).fetch_history()
+            attempts = [
+                e.activity_task_started_event_attributes.attempt
+                for e in history.events
+                if e.HasField("activity_task_started_event_attributes")
+            ]
+            assert attempts == [2]  # the first attempt's start is not kept once it retried
+            assert len(await _messages(agent)) == 1  # one message, not two
+
+
+_HOP_WORKER = """
+from temporal_agent_harness.plugin import AgentHarnessPlugin
+
+from kontra import serve
+from tests.serve.harness_agents import HopAgent, hop_quote
+
+serve(HopAgent.hop, quote=hop_quote, plugins=[AgentHarnessPlugin()])
+"""
+
+
+@pytest.mark.temporal
+async def test_a_handler_with_aliased_models_is_sold_like_a_workflow(
+    dev_server: DevServer, tmp_path: Path
+) -> None:
+    """The buyer sends ``{"from": ...}`` (the contract is by alias); the harness admits the
+    message, and the buyer's model reads the result: by alias both ways."""
+    with load_worker(_project(tmp_path / "p", _HOP_WORKER)) as worker:
+        [bound] = worker.offerings
+        async with Marketplace(dev_server=dev_server) as mp:
+            acme = await mp.party("acme")
+            bob = await mp.party(f"bob-{uuid.uuid4().hex[:6]}", balance="100.00")
+            async with mp.serve(worker, acme):
+                entry = await bob.gate.get_offering(bound.key)
+                buyer = Buyer(mp, bob)
+                value = {"from": "a"}
+                hired = await buyer.hire(entry, value)
+                handle = await buyer.start(hired, value, result_type=Hopped)
+                out = await handle.result()
+    assert out == Hopped.model_validate({"to": "a+1", "via-hops": 1})
+
+
 # --------------------------------------------------------------------------- the reply
 
 
@@ -259,7 +434,6 @@ async def test_the_reply_is_our_messages_handler_end() -> None:
         ([_event("callback_requested")], "asked for a callback: .*kontra-sdk#60"),
         ([_event("turn_end", message_id=None)], "turn ended without a reply"),
         ([_event("message_handler_end", output=[1])], "not an object"),
-        ([], "the agent ended before replying"),
     ],
 )
 async def test_everything_but_the_reply_fails_the_job_for_good(
@@ -269,6 +443,62 @@ async def test_everything_but_the_reply_fails_the_job_for_good(
         await await_reply(_events(*events), "m1", "t1")
     assert re.search(said, failed.value.message), failed.value.message
     assert failed.value.non_retryable
+
+
+async def test_the_stream_ending_first_is_not_a_failure_of_its_own() -> None:
+    """temporalio's stream client ends its iteration -- it does not raise -- when the agent
+    ends, when its poll times out, and when the reading is cancelled: the end alone says
+    nothing, and is not the job's failure."""
+    with pytest.raises(kturn.StreamEnded):
+        await await_reply(_events(_event("message_accepted")), "m1", "t1")
+
+
+async def _cut_by_a_cancel() -> AsyncIterator[object]:
+    """What ``WorkflowStreamClient.subscribe`` does when its poll is cancelled: it returns."""
+    try:
+        await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        return
+    yield  # pragma: no cover
+
+
+async def _cut_by_shutdown() -> AsyncIterator[object]:
+    """The stream ending while the worker stops (its poll timed out, say)."""
+    from temporalio import activity
+
+    await activity.wait_for_worker_shutdown()
+    return
+    yield  # pragma: no cover
+
+
+async def test_a_cancelled_or_stopping_activity_is_cancelled_not_failed() -> None:
+    """In the activity, the stream ending is read against the activity's own state: a
+    cancellation (the wrapper's, or a stopping worker's -- which temporalio reports as a
+    retryable worker-shutdown failure) stays a cancellation, so the turn is retried on the
+    next worker; any other end is a retryable failure. Never the job's final failure: the
+    wrapper decides that, by seeing the agent end."""
+
+    async def read(events: AsyncIterator[object]) -> dict[str, Any]:
+        return await kturn.read_reply(events, "m1", "t1")
+
+    env = ActivityEnvironment()
+    reading = asyncio.ensure_future(env.run(read, _cut_by_a_cancel()))
+    await asyncio.sleep(0.05)
+    env.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+
+    env = ActivityEnvironment()
+    reading = asyncio.ensure_future(env.run(read, _cut_by_shutdown()))
+    await asyncio.sleep(0.05)
+    env.worker_shutdown()
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+
+    with pytest.raises(ApplicationError) as ended:
+        await ActivityEnvironment().run(read, _events(_event("message_accepted")))
+    assert not ended.value.non_retryable
+    assert "ended before its reply" in ended.value.message
 
 
 async def test_another_turns_end_is_not_ours() -> None:

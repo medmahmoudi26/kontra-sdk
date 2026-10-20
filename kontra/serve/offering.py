@@ -175,7 +175,36 @@ def _owner(fn: Callable[..., Any]) -> type:
             f"{qualname} cannot be found again as {module_name}.{qualname}; pass the handler "
             "of a module-level agent class, as `serve(Agent.handler)`"
         )
+    heirs = _inheritors(owner, fn)
+    if heirs:
+        # `Heir.handler is Owner.handler`: a function cannot say which class it was read
+        # through, so the class it names is not necessarily the one the seller meant.
+        names = ", ".join(f"{h.__module__}.{h.__qualname__}" for h in heirs)
+        raise BindingError(
+            f"{qualname} is inherited unchanged by {names}: `serve({heirs[0].__name__}."
+            f"{fn.__name__})` and `serve({qualname})` are the same function, and Kontra "
+            f"cannot tell which agent you mean. Override {fn.__name__} in each agent class "
+            "that sells it (decorated with @agent.accepts; it may just call super()), so "
+            "every agent has a handler of its own"
+        )
     return owner
+
+
+def _inheritors(owner: type, fn: Callable[..., Any]) -> list[type]:
+    """The workflow classes below ``owner`` (an ``@agent.defn`` of their own) that expose
+    ``fn`` itself, not an override of it."""
+    found: list[type] = []
+    seen: set[type] = set()
+    pending = list(owner.__subclasses__())
+    while pending:
+        cls = pending.pop(0)
+        if cls in seen:
+            continue
+        seen.add(cls)
+        pending.extend(cls.__subclasses__())
+        if "__temporal_workflow_definition" in vars(cls) and getattr(cls, fn.__name__, None) is fn:
+            found.append(cls)
+    return found
 
 
 def _handler_types(fn: Callable[..., Any]) -> _Entry:
@@ -186,7 +215,8 @@ def _handler_types(fn: Callable[..., Any]) -> _Entry:
     if defn is None or defn.name is None:
         raise BindingError(
             f"{cls.__name__} is not an agent workflow with a fixed name; decorate it with "
-            "@agent.defn (temporal-agent-harness)"
+            "@agent.defn (temporal-agent-harness). A handler an agent inherits from a base "
+            f"class names the base: override {fn.__name__} in the agent class"
         )
     if not inspect.iscoroutinefunction(fn):
         raise BindingError(f"{label} must be an async handler")
@@ -348,9 +378,12 @@ class BoundOffering:
 
     def job_input(self, inp: BaseModel) -> Any:
         """What the job's workflow is started with: the validated input itself, or, for a
-        handler, the turn wrapper's :class:`~kontra.serve.turn.TurnJob`."""
+        handler, the turn wrapper's :class:`~kontra.serve.turn.TurnJob`, whose payload is the
+        input's JSON keyed by alias -- what the harness validates the message against, and
+        what temporalio's pydantic converter writes for a workflow entry."""
         if self.agent_type is not None and self.handler is not None:
-            return TurnJob(self.agent_type, self.handler, inp.model_dump(mode="json"))
+            payload = inp.model_dump(mode="json", by_alias=True)
+            return TurnJob(self.agent_type, self.handler, payload)
         return inp
 
     @property

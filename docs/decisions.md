@@ -1521,7 +1521,9 @@ lines on agent workflows and batches in mock runs. A seller's `workflows.py` and
 `activities.py` are vanilla `temporalio`: they import Temporal themselves and nothing from
 `kontra`. `worker.py` is the one file of an offering that imports `kontra`; besides it,
 `quote.py` takes `Quote` from `kontra.serve` and `models.py` may use `kontra.types`
-(`Artifact`). Delete `worker.py` and the rest runs on any Temporal worker, unmodified.
+(`Artifact`). Delete `worker.py` and the rest runs on any Temporal worker, unmodified --
+all but `Artifact` I/O (`kontra.types`), which needs the Kontra runtime that `worker.py`'s
+plugin installs in the process; an offering without `Artifact` needs nothing.
 
 - **Why.** The façade was never a security boundary. What constrains a seller does not care
   what their code imports: the Authorizer (seam ①: deny by default, a token scoped to the
@@ -1546,9 +1548,11 @@ lines on agent workflows and batches in mock runs. A seller's `workflows.py` and
   defined in that module (a function one module imports from another counts once, in its
   own), skipping dot-directories, `tests`, `test`, `venv`, `node_modules`, `__pycache__`,
   `build`, `dist`, `site-packages` and `kontra` itself, in import then definition order; then
-  the `activities=` passed, by identity, none twice. A method still needs
-  `activities=[obj.method]`. Two activities of one Temporal name are a `BindingError` naming
-  both modules, never the last one silently winning. `KontraPlugin` and a `Worker(...)`
+  the activities a project module binds that a function of another project module made (a
+  factory's, whose own module never binds them); then the `activities=` passed, by identity,
+  none twice. A method still needs `activities=[obj.method]`, and so does an activity defined
+  or made outside the project. Two activities of one Temporal name are a `BindingError` naming
+  both, never the last one silently winning. `KontraPlugin` and a `Worker(...)`
   written out discover nothing: they register what they are given.
 - **`serve(entry, /, *, quote=None, **worker_kwargs)`.** `entry` is a `@workflow.defn` class or
   one `@agent.accepts` handler of an agent written with Temporal's agent harness
@@ -1562,7 +1566,11 @@ lines on agent workflows and batches in mock runs. A seller's `workflows.py` and
   return, cross-checked with the models the agent declares for it. An agent whose init data
   is required is refused: Kontra has nothing to pass, and init data is no part of the
   contract. A handler of a class defined in a function or in `__main__` is refused, as a
-  workflow class is.
+  workflow class is. So is a handler another agent class inherits unchanged: `ReconV2.sweep`
+  *is* `ReconV1.sweep`, the class is found from the function's `__qualname__`, and a function
+  cannot say which class it was read through, so `serve(ReconV2.sweep)` would serve
+  `ReconV1`. Refused rather than guessed, with the fix (override the handler in each agent
+  class that sells it); an explicit `entry=Agent, handler="name"` form was not added.
 - **`KontraPlugin` (`kontra.plugin`) is everything Kontra adds to a seller's Temporal**, as one
   `temporalio.plugin.SimplePlugin` (client and worker plugin) named `kontra.KontraPlugin`:
   - *connection*: the profile resolved (or `KONTRA_API_KEY`), its key checked against the
@@ -1596,8 +1604,15 @@ lines on agent workflows and batches in mock runs. A seller's `workflows.py` and
     hash-lock refusal comes out of the worker's run, not out of `prepare()`. Then the worker's
     final config is checked: a plugin given to the worker alone runs after Kontra's
     `configure_worker`, and a changed task queue, a dropped Nexus service, another interceptor
-    first, or a client without Kontra's codec is a `ServeError`. A revoked session is
-    diagnosed as before.
+    first, an entry class no longer registered (a same-named swap included), or a client
+    whose converter is no longer what `configure_client` made (Kontra's codec and failure
+    converter, no offloading storage, headers unencoded) is a `ServeError`. The worker is
+    claimed for that check from the config it was built with as well as its final one, and
+    by Kontra's own Nexus service or interceptor on it, so a plugin cannot get past it by
+    moving the entry class. The client is checked the same way in `configure_worker`: a
+    client plugin placed after Kontra has the last word on the client. A start check that
+    fails fails the workers starting with it and is then forgotten: a seller's main that
+    runs the worker again checks again. A revoked session is diagnosed as before.
 
   The constructor does no I/O. `await plugin.prepare()` (idempotent; the connection hook runs
   it) checks the range, opens the session and builds the codec, and `aclose()` releases them.
@@ -1633,9 +1648,20 @@ lines on agent workflows and batches in mock runs. A seller's `workflows.py` and
   input as the handler's message (`send_agent_message`, with an update id stable across
   attempts) and reads the `turn_events` stream from the receipt's offset to the reply to that
   message, then signals `close`, waits for the agent, and returns the reply as the job's
-  result. A handler that raises fails the job, non-retryably, with its message; a tool
-  approval or a callback for that message fails it at once (a job is one turn, without buyer
-  approvals; session jobs are kontra-sdk#60); the agent ending first fails it. Kontra never
+  result. The message is the input's JSON by alias (what the harness validates it against),
+  and the reply, which the harness publishes by field name, is validated against the output
+  model and returned by alias: a job's result reads the same as a workflow entry's. A handler
+  that raises fails the job, non-retryably, with its message; a tool approval or a callback
+  for that message fails it at once (a job is one turn, without buyer approvals; session jobs
+  are kontra-sdk#60) -- an approval an auto-mode evaluator would have given included, since
+  the harness publishes the request before it consults the evaluator and the stream says
+  nothing then about whether a person will be needed (a tool the agent's policy allow-lists
+  raises no request); the agent ending first fails it. The stream ending is never final in
+  the activity: temporalio's stream client ends its iteration, rather than raising, when its
+  poll is cancelled or times out, so a worker stopping mid-turn makes the activity's
+  cancellation (retried on the next worker, whose update id gets the same admission back)
+  and any other end a retryable failure; only the wrapper, seeing the child end, fails the
+  job for it. Kontra never
   imports the harness: its wire shape (the update, signal and topic names, the envelope and
   reply fields, the event types) is written out once in `turn.py`, and a golden test holds it
   to the harness. The activity heartbeats for liveness only: the interceptor never forwards
@@ -1676,7 +1702,9 @@ lines on agent workflows and batches in mock runs. A seller's `workflows.py` and
   before they import `worker.py`, which may be what then fails. The lock stays on the minor
   the suite last ran green on (Dependabot ignores temporalio minors), and widening the range
   is a deliberate PR after a green suite on the new minor. Today the range admits only 1.34:
-  1.35 to 1.37 are not released.
+  1.35 to 1.37 are not released. The check orders versions as PEP 440 does: a pre-release of
+  a minor inside the range (`1.35.0rc1`) is in it, one of the lowest bound (`1.34.0rc1`,
+  `1.34.0.dev0`) sorts before `1.34` and is not, as pip would have it.
 - **The publish scan is dropped** (decision 2). `kontra publish` no longer refuses `temporalio`
   imports or `continue_as_new` in seller code (`kontra/cli/_seller_code.py` is deleted; the
   gate's copy is kontra-cloud#46): continuing as new is the seller's business, and an import

@@ -468,6 +468,95 @@ async def test_the_hash_lock_publishes_on_a_dev_profile(bound: Any) -> None:
     assert hashes == {bound.key: bound.contract_hash()}
 
 
+class _FlakyGate(_CatalogGate):
+    """The catalog behind a gate that fails the first ``fail`` lookups (a 503: it did not
+    answer), slowly enough for a second worker to be waiting on the first one's check."""
+
+    def __init__(self, entry: m.CatalogEntry, *, fail: int) -> None:
+        super().__init__(entry)
+        self.fail = fail
+        self.calls = 0
+
+    async def get_offering(self, ref: str) -> m.CatalogEntry:
+        self.calls += 1
+        await asyncio.sleep(0.05)
+        if self.calls <= self.fail:
+            raise GateError(503, "unavailable", "the gate did not answer")
+        return await super().get_offering(ref)
+
+
+class _Verifier:
+    async def load(self) -> None:
+        return None
+
+
+class _Progress:
+    def start(self) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _state(gate: Any) -> Any:
+    from kontra.plugin import _Prepared
+
+    return _Prepared(
+        session=None,  # type: ignore[arg-type]
+        profile=_profile(dev=False),
+        gate=gate,
+        codec=None,  # type: ignore[arg-type]
+        jobs=None,  # type: ignore[arg-type]
+        verifier=_Verifier(),  # type: ignore[arg-type]
+        progress=_Progress(),  # type: ignore[arg-type]
+        interceptor=None,  # type: ignore[arg-type]
+    )
+
+
+async def _start(plugin: KontraPlugin, state: Any) -> None:
+    async with plugin._serving(state):
+        pass
+
+
+async def test_a_failed_start_check_is_checked_again_at_the_next_start(bound: Any) -> None:
+    """A gate that did not answer the hash lock fails the workers starting then -- all of
+    them, at once, with the one check's error -- and is then forgotten: a seller's own main
+    that runs the worker again checks again and serves, instead of re-raising the first
+    failure forever (and spinning on it, without a pause, if it does not back off)."""
+    plugin = KontraPlugin(bound)
+    gate = _FlakyGate(_entry(bound.document()), fail=1)
+    state = _state(gate)
+    together = await asyncio.gather(
+        _start(plugin, state), _start(plugin, state), return_exceptions=True
+    )
+    assert [type(r) for r in together] == [ServeError, ServeError]
+    assert together[0] is together[1]  # one check, one answer, for the workers starting with it
+    assert "cannot check" in str(together[0])
+    assert gate.calls == 1
+    await _start(plugin, state)  # the next start checks again, and the gate answers now
+    assert (gate.calls, state.checked, state.check_failure) == (2, True, None)
+    await _start(plugin, state)  # checked once it passed: not again
+    assert gate.calls == 2
+
+
+async def test_every_start_takes_the_hash_lock_through_the_plugin(
+    bound: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``tests/e2e/test_seller.py``'s acceptance-18 test starts a drifted worker with the
+    hash lock taken out by assigning ``KontraPlugin._hash_lock`` -- in a string, which no type
+    checker reads. This holds the seam it relies on: the start check calls exactly that."""
+    called: list[Any] = []
+
+    async def no_hash_lock(self: KontraPlugin, gate: Any, profile: Any) -> dict[str, str]:
+        called.append(gate)
+        return {b.key: b.contract_hash() for b in self.offerings}
+
+    monkeypatch.setattr(KontraPlugin, "_hash_lock", no_hash_lock)
+    gate = _CatalogGate(_entry(bound.document(), contract_hash="sha256:" + "1" * 64))
+    await _start(KontraPlugin(bound), _state(gate))  # drifted, and still it starts
+    assert called == [gate]
+
+
 async def test_the_hash_lock_names_both_hashes(bound: Any) -> None:
     theirs = "sha256:" + "1" * 64
     gate = _CatalogGate(_entry(bound.document(), contract_hash=theirs))

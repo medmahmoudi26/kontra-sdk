@@ -21,9 +21,10 @@ worker.run()
 ```
 
 Workflows and activities import nothing from here, nor from ``kontra`` at all: they are
-vanilla ``temporalio`` (decisions I29), and run on any Temporal worker. ``worker.py`` is the
-one file that imports ``kontra`` (``quote.py`` takes :class:`Quote` from here, and
-``models.py`` may use :mod:`kontra.types`). A seller with a worker main of their own puts
+vanilla ``temporalio`` (decisions I29), and run on any Temporal worker (all but
+:class:`~kontra.types.Artifact` I/O, which needs the runtime the plugin installs).
+``worker.py`` is the one file that imports ``kontra`` (``quote.py`` takes :class:`Quote` from
+here, and ``models.py`` may use :mod:`kontra.types`). A seller with a worker main of their own puts
 :class:`~kontra.plugin.KontraPlugin` on their Temporal client instead.
 
 This package is callable: ``kontra.serve(...)`` is :func:`serve`. Python binds the attribute

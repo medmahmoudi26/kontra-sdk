@@ -367,6 +367,54 @@ def test_two_activities_of_one_name_are_refused_naming_both(tmp_path: Path) -> N
         pass
 
 
+_FACTORY = """
+    from temporalio import activity
+
+    def make(name: str):
+        @activity.defn(name=name)
+        async def fetch(url: str) -> str:
+            return name + url
+
+        return fetch
+    """
+
+
+def _activity_names(fns: list[Any]) -> list[str]:
+    return [getattr(f, "__temporal_activity_definition").name for f in fns]
+
+
+def test_activities_a_factory_of_the_project_makes_are_registered(tmp_path: Path) -> None:
+    """An activity a function makes (``fetch_a = make("fetch_a")``) has the factory's module
+    as its own, and that module never binds it: the scan used to pass it over, the worker
+    started, and the first job failed on an activity not registered. It is found where a
+    project module binds it, after those defined at module level, once however often it is
+    bound; two made with one name are refused, naming both."""
+    worker_py = "import made\nfrom kontra import serve\nfrom workflows import Flow\nserve(Flow)\n"
+    made = """
+        from factory import make
+
+        fetch_a = make("fetch_a")
+        fetch_b = make("fetch_b")
+        again = fetch_a
+        """
+    root = _project(tmp_path / "p", worker_py, **{"factory.py": _FACTORY, "made.py": made})
+    with load_worker(root) as worker:
+        found = worker.options["activities"]
+        assert _activity_names(found) == ["shout", "fetch_a", "fetch_b"]
+        assert found[1] is sys.modules["made"].fetch_a
+    twice = made + 'fetch_c = make("fetch_a")\n'
+    root = _project(tmp_path / "q", worker_py, **{"factory.py": _FACTORY, "made.py": twice})
+    with (
+        pytest.raises(
+            BindingError,
+            match=r"'fetch_a' is defined twice in the project: made\.fetch_a \(made by "
+            r"factory\.make\.<locals>\.fetch\) and made\.fetch_c",
+        ),
+        load_worker(root),
+    ):
+        pass
+
+
 # --------------------------------------------------------------------------- running
 
 

@@ -19,9 +19,11 @@ It builds the :class:`~kontra.serve.Worker` a seller would otherwise write by ha
 * the activities are every module-level function temporalio's ``@activity.defn`` stamped in
   a module loaded from under the calling file's directory (the project) -- its tests,
   virtual environments, build output and ``kontra`` itself left out -- in import, then
-  definition order, then the ``activities=`` passed (by identity, none twice). A method
-  needs its instance: pass ``activities=[obj.method]``. Two activities with one Temporal
-  name are refused, naming both modules;
+  definition order; then those a project module binds that a function of another project
+  module made (``fetch = make_activity("fetch")``); then the ``activities=`` passed (by
+  identity, none twice). A method needs its instance: pass ``activities=[obj.method]``; an
+  activity made or defined outside the project (a library's) is passed the same way. Two
+  activities with one Temporal name are refused, naming both;
 * every other keyword is ``temporalio.worker.Worker``'s, passed to ``Worker`` verbatim:
   ``workflows=`` for further workflows (the children the entry starts), and ``plugins=``,
   which :class:`~kontra.serve.Worker` routes -- client plugins go on the client before
@@ -135,33 +137,43 @@ def project_activities(base: Path) -> list[Any]:
     """What serve() registers by itself (see the module docstring): every module-level
     function stamped by temporalio's ``activity.defn`` in a module of the project under
     ``base``, defined in that module (a function a module imports from another is found
-    once, in its own), in import then definition order. Two of one Temporal name are a
-    :class:`BindingError` naming both modules -- never the last one silently winning."""
+    once, in its own), in import then definition order; then every such function a project
+    module binds that was *made* in another project module -- by a factory, whose module
+    never binds what it returns. Two of one Temporal name are a :class:`BindingError`
+    naming both -- never the last one silently winning."""
+    modules = [(n, m) for n, m in list(sys.modules.items()) if _in_project(n, m, base)]
+    project = {n for n, _ in modules}
     found: list[Any] = []
-    named: dict[str, Any] = {}
-    for name, module in list(sys.modules.items()):
-        if not _in_project(name, module, base):  # sys.modules may hold None: no __file__
-            continue
-        for obj in list(vars(module).values()):
+    named: dict[str, tuple[Any, str]] = {}
+
+    def add(obj: Any, where: str) -> None:
+        if any(obj is seen for seen in found):
+            return
+        key = _activity_name(obj)
+        other = named.get(key)
+        if other is not None:
+            what = f"activity {key!r}" if key else "a dynamic activity"
+            raise BindingError(
+                f"{what} is defined twice in the project: {other[1]} and {where}; Temporal "
+                "registers one per name -- rename one (@activity.defn(name=...))"
+            )
+        named[key] = (obj, where)
+        found.append(obj)
+
+    made: list[tuple[Any, str]] = []
+    for name, module in modules:
+        for attr, obj in list(vars(module).items()):
             if not (
                 inspect.isfunction(obj)
-                and obj.__module__ == name
                 and getattr(obj, "__temporal_activity_definition", None) is not None
             ):
                 continue
-            if any(obj is seen for seen in found):
-                continue
-            key = _activity_name(obj)
-            other = named.get(key)
-            if other is not None:
-                what = f"activity {key!r}" if key else "a dynamic activity"
-                raise BindingError(
-                    f"{what} is defined twice in the project: {other.__module__}."
-                    f"{other.__qualname__} and {name}.{obj.__qualname__}; Temporal "
-                    "registers one per name -- rename one (@activity.defn(name=...))"
-                )
-            named[key] = obj
-            found.append(obj)
+            if obj.__module__ == name:
+                add(obj, f"{name}.{obj.__qualname__}")
+            elif obj.__module__ in project:  # imported, or made by a factory: see below
+                made.append((obj, f"{name}.{attr} (made by {obj.__module__}.{obj.__qualname__})"))
+    for obj, where in made:  # what no module defines at its own top level
+        add(obj, where)
     return found
 
 

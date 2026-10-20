@@ -15,7 +15,8 @@ Temporal worker, and nothing else:
   replaced by the pydantic one. Kontra refuses what would defeat it: another payload codec,
   a failure converter other than temporalio's default (Kontra installs its own, which
   encrypts failure messages), and external storage that would offload a job's payload where
-  the buyer cannot read it. Headers stay out of the codec;
+  the buyer cannot read it. Headers stay out of the codec. A client plugin placed after
+  Kontra has the last word on the client, so the worker hooks check the client again;
 * **worker** (``configure_worker``): a worker whose ``workflows`` hold an offering's entry
   class -- the bound workflow, or the agent of a bound handler; for several offerings of one
   class, the one whose task queue the worker names -- serves that offering: its
@@ -26,7 +27,9 @@ Temporal worker, and nothing else:
 * **start** (``run_worker``), once per plugin: the gate's JWKS for the hold check, the hash
   lock (each offering's contract hash must equal the catalog's; a ``kontra dev`` profile
   publishes an unpublished version), the progress forwarder; then a check that no plugin
-  that ran after Kontra (one given to the worker only) undid any of the above.
+  that ran after Kontra (one given to the worker only) undid any of the above. A failed
+  check fails the workers starting with it and is then forgotten: a later start checks
+  again.
 
 Put it **last** in ``Client.connect(plugins=[...])``: the last client plugin has the final word
 on the connection, the namespace and the converter. ``kontra.serve.serve`` and
@@ -54,7 +57,7 @@ from pathlib import Path
 from typing import Any
 
 import temporalio.worker
-from temporalio.client import ClientConfig, HeaderCodecBehavior
+from temporalio.client import Client, ClientConfig, HeaderCodecBehavior
 from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import DataConverter, DefaultFailureConverter, DefaultPayloadConverter
 from temporalio.plugin import SimplePlugin
@@ -165,6 +168,24 @@ def _dedupe(items: Iterable[Any]) -> list[Any]:
     return out
 
 
+def _storage_problem(dc: DataConverter, codec: KontraCodec) -> str | None:
+    """What is wrong with ``dc``'s external storage, if anything: a threshold at or below the
+    codec's claim-check threshold (plus framing) offloads a job's payload to a store its
+    buyer cannot read. Encoding is converter, codec, then storage: storage only ever sees
+    ciphertext, but the reference it leaves in history resolves only on the seller's side."""
+    storage = dc.external_storage
+    inline = codec.claim_check_threshold
+    if storage is None or inline is None:
+        return None
+    threshold = storage.payload_size_threshold
+    if threshold > inline + _INLINE_OVERHEAD:
+        return None
+    return (
+        f"external storage offloads payloads from {threshold} bytes, at or below Kontra's "
+        f"claim-check threshold ({inline} bytes of ciphertext)"
+    )
+
+
 class _ServiceKey:
     """A ``ServiceClient`` as :meth:`kontra.auth.Session.keep_fresh` holds a client: an
     ``api_key`` property whose setter re-sends it on every later call, as
@@ -197,9 +218,11 @@ class _Prepared:
     interceptor: KontraInterceptor
     #: The refreshers started for service clients this plugin connected.
     keys: list[_ServiceKey] = field(default_factory=list[_ServiceKey])
-    #: The start checks (JWKS, hash lock) ran; or how they failed.
+    #: The start checks (JWKS, hash lock) ran; or how they failed, for the workers starting
+    #: alongside the one that ran them (``starting``): a worker started later checks again.
     checked: bool = False
-    check_failure: BaseException | None = None
+    check_failure: Exception | None = None
+    starting: int = 0
     #: Claimed workers running now (the progress forwarder runs while there are any).
     serving: int = 0
     #: The progress flush started when the last of them stopped (see ``_serving``).
@@ -462,18 +485,13 @@ class KontraPlugin(SimplePlugin):
                 f"the client has the failure converter {dc.failure_converter_class.__name__}; "
                 "Kontra installs its own, which encrypts failure messages: remove it"
             )
-        storage = dc.external_storage
-        inline = codec.claim_check_threshold
-        if storage is not None and inline is not None:
-            threshold = storage.payload_size_threshold
-            if threshold <= inline + _INLINE_OVERHEAD:
-                raise ServeError(
-                    f"the client's external storage offloads payloads from {threshold} bytes, "
-                    f"at or below Kontra's claim-check threshold ({inline} bytes of "
-                    "ciphertext): a job's payload would go where its buyer cannot read it. "
-                    f"Raise its payload_size_threshold above {inline + _INLINE_OVERHEAD}, or "
-                    "remove it"
-                )
+        storage = _storage_problem(dc, codec)
+        if storage is not None:
+            raise ServeError(
+                f"the client's {storage}: a job's payload would go where its buyer cannot "
+                f"read it. Raise its payload_size_threshold above "
+                f"{(codec.claim_check_threshold or 0) + _INLINE_OVERHEAD}, or remove it"
+            )
         converter = dc.payload_converter_class
         if converter is DefaultPayloadConverter:
             converter = PydanticPayloadConverter
@@ -483,6 +501,34 @@ class KontraPlugin(SimplePlugin):
             payload_codec=codec,
             failure_converter_class=KontraFailureConverter,
         )
+
+    @staticmethod
+    def _client_problems(client: Client | None, codec: KontraCodec) -> list[str]:
+        """What is wrong with the client a worker of Kontra's runs on: what
+        :meth:`configure_client` sets, checked again on the client as it ended up. A client
+        plugin placed after Kontra has the last word on the client, and may have put back a
+        failure converter that writes messages in plaintext, offloading external storage, or
+        header encoding."""
+        if client is None:
+            return ["it has no client"]
+        dc = client.data_converter
+        problems: list[str] = []
+        if dc.payload_codec is not codec:
+            problems.append("its client has no Kontra codec")
+        if dc.failure_converter_class is not KontraFailureConverter:
+            problems.append(
+                f"its client's failure converter is {dc.failure_converter_class.__name__}, "
+                "which writes failure messages in plaintext"
+            )
+        storage = _storage_problem(dc, codec)
+        if storage is not None:
+            problems.append(f"its client's {storage}")
+        behavior = client.config(active_config=True).get(
+            "header_codec_behavior", HeaderCodecBehavior.NO_CODEC
+        )
+        if behavior != HeaderCodecBehavior.NO_CODEC:
+            problems.append("its client encodes headers (the job header must stay readable)")
+        return problems
 
     # ------------------------------------------------------------------ worker
 
@@ -521,6 +567,13 @@ class KontraPlugin(SimplePlugin):
                 "KontraPlugin (Client.connect(..., plugins=[..., kontra])); the plugin "
                 "given to a worker alone cannot encrypt its payloads"
             )
+        problems = self._client_problems(client, state.codec)
+        if problems:
+            raise ServeError(
+                f"refusing to serve {bound.key}: a client plugin that ran after Kontra changed "
+                f"the client ({'; '.join(problems)}); put KontraPlugin last in "
+                "Client.connect(plugins=[...])"
+            )
         queue = bound.offering_id.task_queue
         given = config.get("task_queue")
         if given not in (queue, TARGET):
@@ -547,7 +600,8 @@ class KontraPlugin(SimplePlugin):
         config["interceptors"] = [state.interceptor, *config.get("interceptors", ())]
         config["workflow_runner"] = with_kontra_passthrough(config.get("workflow_runner"))
         if bound.kind == "handler":
-            config["activities"] = [*config.get("activities", ()), TurnActivities(client).deliver]
+            turn = TurnActivities(client, bound.output_type)
+            config["activities"] = [*config.get("activities", ()), turn.deliver]
         return config
 
     def _recheck(self, bound: BoundOffering, config: WorkerConfig, state: _Prepared) -> None:
@@ -561,9 +615,11 @@ class KontraPlugin(SimplePlugin):
         interceptors = list(config.get("interceptors", ()))
         if not interceptors or interceptors[0] is not state.interceptor:
             problems.append("Kontra's interceptor is not the first")
-        client = config.get("client")
-        if client is None or client.data_converter.payload_codec is not state.codec:
-            problems.append("its client has no Kontra codec")
+        workflows = list(config.get("workflows", ()))
+        for cls in (bound.workflow, bound.agent):
+            if cls is not None and not any(w is cls for w in workflows):
+                problems.append(f"{cls.__qualname__} is no longer registered")
+        problems += self._client_problems(config.get("client"), state.codec)
         if problems:
             raise ServeError(
                 f"refusing to serve {bound.key}: a plugin that ran after Kontra changed the "
@@ -573,13 +629,44 @@ class KontraPlugin(SimplePlugin):
 
     # ------------------------------------------------------------------ running
 
+    def _claimed(self, worker: temporalio.worker.Worker) -> BoundOffering | None:
+        """The offering a starting worker serves. Claimed as :meth:`configure_worker` claims
+        it -- from the config the worker was built with, before any plugin, or from its final
+        one -- else recognised by what Kontra put on it (the Nexus service it generated, an
+        offering's task queue, its interceptor): a plugin that ran after Kontra may have
+        swapped the entry class for another of the same name, and a worker Kontra configured
+        is re-checked, never waved through as somebody else's."""
+        active = worker.config(active_config=True)
+        bound = self._claim(worker.config()) or self._claim(active)
+        if bound is not None:
+            return bound
+        handlers = list(active.get("nexus_service_handlers", ()))
+        for b in self._offerings:
+            ours = self._handlers.get(b.key)
+            if ours is not None and any(h is ours for h in handlers):
+                return b
+        for b in self._offerings:  # a worker polling an offering's queue serves it
+            if active.get("task_queue") == b.offering_id.task_queue:
+                return b
+        state = self._state
+        if state is not None and any(
+            i is state.interceptor for i in active.get("interceptors", ())
+        ):
+            raise ServeError(
+                "refusing to serve: a plugin that ran after Kontra changed a worker Kontra "
+                "configured, and it no longer registers the class of any offering this plugin "
+                f"binds ({', '.join(b.key for b in self._offerings)}); give that plugin to the "
+                "client, before Kontra, or drop it"
+            )
+        return None
+
     async def run_worker(
         self,
         worker: temporalio.worker.Worker,
         next: Callable[[temporalio.worker.Worker], Awaitable[None]],
     ) -> None:
         config = worker.config(active_config=True)
-        bound = self._claim(config)
+        bound = self._claimed(worker)
         if bound is None:
             await next(worker)
             return
@@ -605,24 +692,35 @@ class KontraPlugin(SimplePlugin):
     @contextlib.asynccontextmanager
     async def _serving(self, state: _Prepared) -> AsyncGenerator[None]:
         """The start checks, once for the plugin, and the progress forwarder while any of
-        its workers runs (it sends what is queued when the last one stops)."""
-        async with state.lock:
-            if state.check_failure is not None:
-                raise state.check_failure
-            if not state.checked:
-                try:
-                    await state.verifier.load()
-                    await self._hash_lock(state.gate, state.profile)
-                except BaseException as e:
-                    state.check_failure = e
-                    raise
-                state.checked = True
-            if state.serving == 0:
-                if state.flushing is not None:  # the previous run's, still sending
-                    await asyncio.gather(state.flushing, return_exceptions=True)
-                    state.flushing = None
-                state.progress.start()
-            state.serving += 1
+        its workers runs (it sends what is queued when the last one stops).
+
+        A check that fails fails the workers starting with it, at once and with the same
+        error; it is not remembered beyond them. A seller's main that runs the worker again
+        -- after a gate that did not answer, or after publishing the version it was told is
+        not published -- gets the checks again, not the first failure forever."""
+        state.starting += 1
+        try:
+            async with state.lock:
+                if state.check_failure is not None:
+                    raise state.check_failure
+                if not state.checked:
+                    try:
+                        await state.verifier.load()
+                        await self._hash_lock(state.gate, state.profile)
+                    except Exception as e:  # a cancellation is the cancelled worker's own
+                        state.check_failure = e
+                        raise
+                    state.checked = True
+                if state.serving == 0:
+                    if state.flushing is not None:  # the previous run's, still sending
+                        await asyncio.gather(state.flushing, return_exceptions=True)
+                        state.flushing = None
+                    state.progress.start()
+                state.serving += 1
+        finally:
+            state.starting -= 1
+            if state.starting == 0:
+                state.check_failure = None
         try:
             yield
         finally:

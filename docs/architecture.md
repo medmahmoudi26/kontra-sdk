@@ -118,7 +118,8 @@ Rules that keep the seams real:
   talks to the internal frontend.
 - **Sellers write native Temporal** (decisions I29, superseding D1/I20). Seller
   `workflows.py` and `activities.py` import `temporalio` directly and nothing from `kontra`, so
-  without `worker.py` they run on any Temporal worker; `worker.py` is the one file that imports
+  without `worker.py` they run on any Temporal worker (all but `Artifact` I/O, which needs the
+  Kontra runtime `worker.py`'s plugin installs); `worker.py` is the one file that imports
   `kontra` (`quote.py` takes `kontra.serve.Quote`, `models.py` may use `kontra.types.Artifact`).
   The tests check the examples and the `kontra init` scaffold, and run `examples/hello` without
   `worker.py` on a plain Temporal worker. What constrains a seller is not what they import: the
