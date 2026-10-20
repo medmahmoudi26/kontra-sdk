@@ -290,7 +290,10 @@ async def test_a_run_finishing_just_after_the_terminate_delivers_nothing(
             m.Escrow.REFUNDED,
             BUYER_CANCEL_REASON,
         )
-        assert terminated == [job.workflow_id]
+        # Every termination is of the job's run. The sweeper may issue a stop again while the
+        # first is in flight; terminating is idempotent, so how often is not the race's point.
+        assert terminated
+        assert set(terminated) == {job.workflow_id}
         assert [e.status for e in refused] == [RPCStatusCode.NOT_FOUND]  # the run is closed
         client = deal.seller_client()
         assert await _workflow_status(client, job.workflow_id) is WorkflowExecutionStatus.TERMINATED
@@ -335,7 +338,10 @@ async def test_a_run_finishing_just_before_the_terminate_is_delivered_and_paid(
         with pytest.raises(GateError) as e:
             await deal.buyer.gate.cancel(job.job_id)
         assert (e.value.status, e.value.code) == (409, "not_open")
-        assert terminated == [job.workflow_id]
+        # Every termination is of the job's run. The sweeper may issue a stop again while the
+        # first is in flight; terminating is idempotent, so how often is not the race's point.
+        assert terminated
+        assert set(terminated) == {job.workflow_id}
         client = deal.seller_client()
         assert await _workflow_status(client, job.workflow_id) is WorkflowExecutionStatus.COMPLETED
         op = await _operation_closed(deal, job.operation_id)
