@@ -1067,6 +1067,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+dev = [
+    { name = "fastapi" },
+    { name = "uvicorn" },
+]
 mcp = [
     { name = "mcp" },
 ]
@@ -1103,6 +1107,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.1,<9" },
+    { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.115" },
     { name = "fastapi", marker = "extra == 'testing'", specifier = ">=0.115" },
     { name = "google-re2", specifier = ">=1.1,<2" },
     { name = "httpx", specifier = ">=0.27,<1" },
@@ -1117,10 +1122,11 @@ requires-dist = [
     { name = "rfc8785", specifier = ">=0.1.4,<0.2" },
     { name = "temporalio", specifier = ">=1.34,<1.38" },
     { name = "temporalio", extras = ["opentelemetry"], marker = "extra == 'opentelemetry'", specifier = ">=1.34,<1.38" },
+    { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.30" },
     { name = "uvicorn", marker = "extra == 'testing'", specifier = ">=0.30" },
     { name = "webauthn", marker = "extra == 'testing'", specifier = ">=3.0.1,<4" },
 ]
-provides-extras = ["mcp", "opentelemetry", "testing"]
+provides-extras = ["mcp", "opentelemetry", "dev", "testing"]
 
 [package.metadata.requires-dev]
 dev = [
