@@ -211,6 +211,14 @@ ZOO: dict[str, tuple[tuple[str, ...], set[tuple[str, str, str]]]] = {
         ("output", "$defs.Serialized.properties.at.format", "serialization"),
         ("output", "$defs.Serialized.properties.at.type", "serialization"),
     }),
+    # The harness writes {$ref: Code, maxLength: 10}, both asserted (at most 5); the contract
+    # keeps the use site's 10 (decisions I33, for the owner). Drift on both sides.
+    "overlap": ((), {
+        (side, f"$defs.Overlap.properties.{field}.{key}", "drift")
+        for side in ("input", "output")
+        for field in ("code", "maybe.oneOf[0]")
+        for key in ("allOf", "maxLength", "type")
+    }),
 }  # fmt: skip
 
 
@@ -232,7 +240,8 @@ def test_the_zoo_s_differences_say_what_differs(
     enrich_spec: OfferingSpec, schemas: dict[type, dict[str, Any]]
 ) -> None:
     """The values behind a few verdicts: defaults the output requires, a serializer's type,
-    a computed field, and the closed model that agrees."""
+    a computed field, the closed model that agrees, and a constraint on both a type and its
+    use."""
 
     def compare(handler: str) -> dict[tuple[str, str], tuple[Any, Any]]:
         model = zoo.MODELS[handler]
@@ -254,6 +263,15 @@ def test_the_zoo_s_differences_say_what_differs(
         {"type": "integer"},
     )
     assert compare("forbid") == {}
+    # The contract accepts a 10-character code the model refuses; the harness says both.
+    assert compare("overlap")[("input", "$defs.Overlap.properties.code.allOf")] == (
+        h.ABSENT,
+        [{"maxLength": 5, "type": "string"}, {"maxLength": 10}],
+    )
+    assert compare("overlap")[("input", "$defs.Overlap.properties.code.maxLength")] == (
+        10,
+        h.ABSENT,
+    )
 
 
 # --------------------------------------------------------------------------- the warning

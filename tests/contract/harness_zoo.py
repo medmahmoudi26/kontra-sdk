@@ -20,6 +20,8 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    RootModel,
+    StringConstraints,
     computed_field,
     field_serializer,
 )
@@ -252,6 +254,21 @@ class Serialized(BaseModel):
         return int(v.timestamp())
 
 
+class Code(RootModel[Annotated[str, StringConstraints(max_length=5)]]):
+    """A constrained string with a name of its own."""
+
+
+class Overlap(BaseModel):
+    """A constraint written both on a type and where it is used: pydantic enforces both (at
+    most 5 characters), JSON Schema 2020-12 asserts a ``$ref`` and its siblings both, and the
+    contract keeps only the use site's (decisions I33)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: Annotated[Code, Field(max_length=10)]
+    maybe: Annotated[Code, Field(max_length=10)] | None
+
+
 @agent.defn
 class Zoo:
     """Echoes each model back: one handler per case."""
@@ -369,6 +386,11 @@ class Zoo:
         """Echo."""
         return req
 
+    @agent.accepts
+    async def overlap(self, req: Overlap) -> Overlap:
+        """Echo."""
+        return req
+
 
 #: Each handler's model (input and output alike).
 MODELS: dict[str, type[BaseModel]] = {
@@ -393,6 +415,7 @@ MODELS: dict[str, type[BaseModel]] = {
     "computed": Computed,
     "excluded": Excluded,
     "serialized": Serialized,
+    "overlap": Overlap,
 }
 
 

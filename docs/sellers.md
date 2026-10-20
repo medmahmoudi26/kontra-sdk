@@ -653,7 +653,7 @@ serve(ReconAgent.sweep, plugins=[AgentHarnessPlugin()])
   | `open` | the contract closes every model; pydantic's default `extra="ignore"` leaves the harness's open | `model_config = ConfigDict(extra="forbid")`: your agent then refuses unknown keys from any caller, as the gate does |
   | `defaults` | on the output, the harness requires the fields that have a default (it describes the reply as serialized, where every field is present); the contract lets them be absent | nothing: both describe the reply you send |
   | `serialization` | on the output, a computed field, an excluded field, a serialization alias or a serializer that changes a field's JSON type | keep them off output models: the job's result is the serialization, and the contract describes the model as validated, so it does not say what the buyer receives |
-  | `drift` | anything else, on the input | report it: the two emitters walked your models differently |
+  | `drift` | anything else on the input; and, on either side, a constraint written both on a type and where it is used (`Annotated[Code, Field(max_length=10)]` over a `Code` with its own `max_length=5`, or `json_schema_extra` over an enum's values): pydantic enforces both, the harness's schema says both, the contract keeps only the second | report it: the two emitters walked your models differently. For the second, write the constraint in one place; until then the contract accepts input your agent refuses |
 
   Nothing is compared, and nothing said, for a workflow entry or when the harness is not
   installed. The harness's schema comes from its own `schema` command, run by the same Python
@@ -1136,9 +1136,9 @@ printed (sign-ups are by invitation; see [buyers.md](buyers.md#setup)).
 `kontra publish`:
 
 1. loads `worker.py` and each bound offering's `offering.yaml`;
-2. derives the contract document and seals it with your public key and its hash; for one
-   handler of a harness agent, it then compares the contract with the harness's schema for
-   that handler and warns where they differ ([Agents](#agents));
+2. derives the contract document and seals it with its hash (the party is sealed; no key goes
+   in, decisions I7); for one handler of a harness agent, it then compares the contract with
+   the harness's schema for that handler and warns where they differ ([Agents](#agents));
 3. sends it to the gate, which requires your login, **confirmed within the hour** (a worker
    token never qualifies), validates it, assigns the version an opaque Nexus endpoint name and creates the
    endpoint itself, pointed at your namespace and the version's task queue;

@@ -19,7 +19,12 @@ by a rule I33 lists and ``tests/contract/test_harness_rules.py`` tests:
 * references are followed on both sides, and a definition is matched by where it is used, not
   by its name (``Report`` against the harness's ``Report-Output``, ``KontraArtifact`` against
   ``Artifact``, an enum Kontra writes inline against the harness's ``$ref``); a recursive
-  model is compared once;
+  model is compared once. JSON Schema 2020-12 asserts a ``$ref``'s definition and the members
+  beside it both, so a use site joins its definition only where that changes nothing: its
+  annotations replace the definition's, and an assertion the definition does not otherwise
+  make joins it. One the definition also makes (``Annotated[Code, Field(max_length=10)]``
+  over ``Code``'s own ``max_length=5``) leaves the two side by side, ``allOf``, and the other
+  side differs from that (``drift``, input or output);
 * annotations are dropped: ``title``, ``description``, ``examples``, ``$comment``,
   ``deprecated``, ``readOnly``, ``writeOnly``; so is the OpenAPI ``discriminator`` (the
   branches' ``const`` tags select the branch);
@@ -35,7 +40,8 @@ closes every model, section 11.3, and the harness leaves this one open), ``defau
 output, the harness's serialization-mode schema requires fields that have a default; the reply
 always carries them), ``serialization`` (any other output difference: the harness describes the
 model as serialized -- computed and excluded fields, serialization aliases, serializers -- and
-the contract as validated) and ``drift`` (any other input difference: unexplained).
+the contract as validated) and ``drift`` (any other input difference, and a use site written
+beside its definition on either side: the emitters disagree).
 
 The harness's schema comes from its own CLI, ``temporal-agent-harness schema module:Class``,
 run by :func:`harness_schema` as a subprocess of this interpreter: the same document
@@ -48,14 +54,16 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from importlib.metadata import entry_points
 from pathlib import Path
-from typing import Any, Final, Literal, cast
+from typing import IO, Any, Final, Literal, cast
 
 from kontra.contract.canonical import canonical_json
 from kontra.contract.errors import ContractError, join_path
@@ -117,6 +125,11 @@ sys.exit(script.load()())
 
 #: How much of the harness's error output a refusal quotes.
 _ERROR_CHARS = 300
+#: How much of the end of that output is read to find the line quoted: the seller's module is
+#: imported in the child, and may log without bound.
+_STDERR_TAIL = 64 * 1024
+#: The largest schema document read (an agent's every handler, init data and states).
+_SCHEMA_BYTES = 16 * 1024 * 1024
 
 
 class HarnessSchemaError(Exception):
@@ -167,36 +180,72 @@ def harness_schema(
             str(out),
         ]
         try:
-            proc = subprocess.run(  # noqa: S603 -- argv, no shell
-                argv,
-                cwd=cwd,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-                check=False,
-            )
+            status, stderr = _run(argv, cwd=cwd, env=env, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise HarnessSchemaError(
                 f"`{HARNESS_SCRIPT} {SCHEMA_COMMAND} {target}` did not answer within {timeout:g}s"
             ) from None
         except OSError as exc:
             raise HarnessSchemaError(f"cannot run {HARNESS_SCRIPT}: {exc}") from None
-        if proc.returncode != 0:
-            said = _last_line(proc.stderr) or f"exit status {proc.returncode}"
+        if status != 0:
+            said = _last_line(stderr) or f"exit status {status}"
             raise HarnessSchemaError(f"`{HARNESS_SCRIPT} {SCHEMA_COMMAND} {target}`: {said}")
         try:
-            text = out.read_text(encoding="utf-8")
+            with out.open("rb") as f:
+                raw = f.read(_SCHEMA_BYTES + 1)
         except OSError as exc:
             raise HarnessSchemaError(f"{HARNESS_SCRIPT} wrote no schema: {exc}") from None
+    if len(raw) > _SCHEMA_BYTES:
+        raise HarnessSchemaError(
+            f"{HARNESS_SCRIPT}'s schema is larger than {_SCHEMA_BYTES} bytes; not read"
+        )
     try:
-        data: Any = json.loads(text)
+        data: Any = json.loads(raw.decode("utf-8"))
     except (ValueError, RecursionError) as exc:
         raise HarnessSchemaError(f"{HARNESS_SCRIPT}'s schema is not JSON: {exc}") from None
     if not isinstance(data, dict):
         raise HarnessSchemaError(f"{HARNESS_SCRIPT}'s schema is not a JSON object")
     return cast(dict[str, Any], data)
+
+
+def _run(
+    argv: list[str], *, cwd: Path | None, env: dict[str, str], timeout: float
+) -> tuple[int, bytes]:
+    """Run ``argv`` to its end: its exit status and the last :data:`_STDERR_TAIL` bytes of
+    its standard error, read as they come, so no more than that is ever held, in memory or
+    on disk, however much it writes. Raises :class:`subprocess.TimeoutExpired` after
+    ``timeout`` seconds (a descendant holding standard error open counts), the child
+    killed."""
+    proc = subprocess.Popen(  # noqa: S603 -- argv, no shell
+        argv,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    stream = cast(IO[bytes], proc.stderr)
+    deadline = time.monotonic() + timeout
+    tail = bytearray()
+    try:
+        with stream, selectors.DefaultSelector() as ready:
+            ready.register(stream, selectors.EVENT_READ)
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                if not ready.select(left):
+                    continue
+                chunk = os.read(stream.fileno(), _STDERR_TAIL)
+                if not chunk:
+                    break
+                tail += chunk
+                del tail[:-_STDERR_TAIL]
+        return proc.wait(max(0.0, deadline - time.monotonic())), bytes(tail)
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
 
 
 def _last_line(stderr: bytes) -> str:
@@ -300,6 +349,20 @@ _MAP = frozenset({"properties", "patternProperties", "dependentSchemas"})
 _LIST = frozenset({"oneOf", "anyOf", "allOf", "prefixItems"})
 _DEFS_REF = "#/$defs/"
 _NULL: Mapping[str, Any] = {"type": "null"}
+#: What a ``$ref``'s use site writes over its definition's: annotations, which assert nothing
+#: (a field's own ``description`` or ``default`` over its type's).
+_OVERRIDE = _ANNOTATIONS | {"default", _DISCRIMINATOR}
+#: Keywords that read one another in one schema object (``additionalProperties`` refuses the
+#: keys ``properties`` and ``patternProperties`` beside it do not name): never split between
+#: a use site and its definition.
+_TOGETHER = (
+    frozenset({"properties", "patternProperties", "additionalProperties"}),
+    frozenset({"prefixItems", "items"}),
+    frozenset({"contains", "minContains", "maxContains"}),
+    frozenset({"if", "then", "else"}),
+)
+#: Keywords that read every applicator beside them.
+_UNEVALUATED = frozenset({"unevaluatedProperties", "unevaluatedItems"})
 
 
 def compare_handler(
@@ -336,14 +399,49 @@ def _ref_name(node: Mapping[str, Any], defs: Mapping[str, Any]) -> str | None:
 
 
 def _resolve(node: Mapping[str, Any], defs: Mapping[str, Any]) -> Mapping[str, Any]:
-    """A ``$ref`` node as its definition with the use site's members over it."""
-    name = _ref_name(node, defs)
-    if name is None:
+    """A ``$ref`` node as one schema. JSON Schema 2020-12 asserts the definition and the
+    members beside the ``$ref`` both (``{$ref: X, k: v}`` is ``{allOf: [X, {k: v}]}``), so
+    the use site joins its definition only where that is the same schema: its annotations
+    replace the definition's, and its assertions join it if the definition makes none of
+    them otherwise (:func:`_joins`). If it does (``Annotated[Code, Field(max_length=10)]``
+    over ``Code``'s own ``max_length=5``: at most 5 characters), the node is that ``allOf``,
+    the use site's annotations beside it."""
+    if _ref_name(node, defs) is None:
         return node
-    body = defs[name]
-    merged = dict(cast(Mapping[str, Any], body)) if isinstance(body, dict) else {}
-    merged.update({k: v for k, v in node.items() if k != "$ref"})
-    return merged
+    return _beside(node, defs)[0]
+
+
+def _beside(node: Mapping[str, Any], defs: Mapping[str, Any]) -> tuple[Mapping[str, Any], bool]:
+    """:func:`_resolve` of a ``$ref`` node, and whether its use site stayed beside the
+    definition (``allOf``) rather than joining it."""
+    body = defs[cast(str, _ref_name(node, defs))]
+    target = dict(cast(Mapping[str, Any], body)) if isinstance(body, dict) else {}
+    notes = {k: v for k, v in node.items() if k in _OVERRIDE}
+    site = {k: v for k, v in node.items() if k != "$ref" and k not in _OVERRIDE}
+    if _joins(target, site):
+        return {**target, **site, **notes}, False
+    return {**notes, "allOf": [target, site]}, True
+
+
+def _joins(body: Mapping[str, Any], site: Mapping[str, Any]) -> bool:
+    """Whether a use site's assertions put in its definition's object assert what the two
+    did side by side: each is one the definition does not make, or makes alike, and none
+    reads a keyword beside it (:data:`_TOGETHER`, :data:`_UNEVALUATED`) that the two write
+    differently."""
+    if not site:
+        return True
+    if _UNEVALUATED & (set(body) | set(site)):
+        return False
+    for key, value in site.items():
+        group = next((g for g in _TOGETHER if key in g), None)
+        if group is not None:
+            mine = {k: v for k, v in site.items() if k in group}
+            theirs = {k: v for k, v in body.items() if k in group}
+            if not _same(mine, theirs):
+                return False
+        elif key in body and not _same(body[key], value):
+            return False
+    return True
 
 
 def _rejects_null(node: Any, defs: Mapping[str, Any], depth: int = 0) -> bool:
@@ -353,6 +451,11 @@ def _rejects_null(node: Any, defs: Mapping[str, Any], depth: int = 0) -> bool:
     schema = cast(Mapping[str, Any], node)
     if _ref_name(schema, defs) is not None:
         return _rejects_null(_resolve(schema, defs), defs, depth + 1)
+    conjuncts = schema.get("allOf")
+    if isinstance(conjuncts, list) and any(
+        _rejects_null(b, defs, depth + 1) for b in cast(list[Any], conjuncts)
+    ):
+        return True
     kind = schema.get("type")
     if isinstance(kind, str):
         return kind != "null"
@@ -439,18 +542,26 @@ class _Walk:
                     self._leaf(where, cbody, hbody)
             return
         # One side wrote inline what the other names (an enum): compare the definition in place.
+        # A use site that stayed beside its definition is the emitters disagreeing, whichever
+        # the side.
+        cnode, cbeside = _beside(c, self.cdefs) if cname is not None else (c, False)
+        hnode, hbeside = _beside(h, self.hdefs) if hname is not None else (h, False)
         self._members(
-            _canonical(_resolve(c, self.cdefs), self.cdefs),
-            _canonical(_resolve(h, self.hdefs), self.hdefs),
+            _canonical(cnode, self.cdefs),
+            _canonical(hnode, self.hdefs),
             path,
+            kind="drift" if cbeside or hbeside else None,
         )
 
-    def _members(self, c: Mapping[str, Any], h: Mapping[str, Any], path: str) -> None:
+    def _members(
+        self, c: Mapping[str, Any], h: Mapping[str, Any], path: str, *, kind: Kind | None = None
+    ) -> None:
         for key in sorted(set(c) | set(h)):
             cv, hv = c.get(key, ABSENT), h.get(key, ABSENT)
             where = join_path(path, key)
             if cv is ABSENT or hv is ABSENT:
-                self._differ(where, key, self._shown(cv), self._shown(hv, harness=True), c)
+                shown = self._shown(cv, key), self._shown(hv, key, harness=True)
+                self._differ(where, key, *shown, c, kind=kind)
             elif key in _ONE and isinstance(cv, dict) and isinstance(hv, dict):
                 self._todo.append((cast(Mapping[str, Any], cv), cast(Mapping[str, Any], hv), where))
             elif key in _MAP and isinstance(cv, dict) and isinstance(hv, dict):
@@ -463,7 +574,9 @@ class _Walk:
                             (cast(Mapping[str, Any], cs), cast(Mapping[str, Any], hs), sub)
                         )
                     else:
-                        self._differ(sub, name, self._shown(cs), self._shown(hs, harness=True), c)
+                        self._differ(
+                            sub, name, self._shown(cs), self._shown(hs, harness=True), c, kind=kind
+                        )
             elif (
                 key in _LIST
                 and isinstance(cv, list)
@@ -476,12 +589,15 @@ class _Walk:
                 ):
                     self._todo.append((cb, hb, join_path(where, i)))
             else:
-                self._leaf(where, cv, hv, key=key, parent=c)
+                self._leaf(where, cv, hv, key=key, parent=c, kind=kind)
 
-    def _shown(self, value: Any, *, harness: bool = False) -> Any:
-        """A whole member one side lacks, as the canonical form shows it."""
+    def _shown(self, value: Any, key: str = "", *, harness: bool = False) -> Any:
+        """A whole member one side lacks, as the canonical form shows it (a schema, or each
+        schema of an ``allOf``, ``anyOf``, ``oneOf`` or ``prefixItems``)."""
         if isinstance(value, dict):
             return _canonical(cast(Mapping[str, Any], value), self.hdefs if harness else self.cdefs)
+        if key in _LIST and isinstance(value, list):
+            return [self._shown(v, harness=harness) for v in cast(list[Any], value)]
         return value
 
     def _leaf(
@@ -492,12 +608,23 @@ class _Walk:
         *,
         key: str = "",
         parent: Mapping[str, Any] | None = None,
+        kind: Kind | None = None,
     ) -> None:
         if not _same(c, h):
-            self._differ(path, key, c, h, parent or {})
+            self._differ(path, key, c, h, parent or {}, kind=kind)
 
-    def _differ(self, path: str, key: str, c: Any, h: Any, parent: Mapping[str, Any]) -> None:
-        self.found.append(Difference(self.side, path, c, h, self._kind(key, c, h, parent)))
+    def _differ(
+        self,
+        path: str,
+        key: str,
+        c: Any,
+        h: Any,
+        parent: Mapping[str, Any],
+        *,
+        kind: Kind | None = None,
+    ) -> None:
+        found = kind or self._kind(key, c, h, parent)
+        self.found.append(Difference(self.side, path, c, h, found))
 
     def _kind(self, key: str, c: Any, h: Any, parent: Mapping[str, Any]) -> Kind:
         if key == "additionalProperties" and c is False and h is ABSENT:

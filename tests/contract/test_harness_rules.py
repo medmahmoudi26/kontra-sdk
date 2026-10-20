@@ -6,11 +6,12 @@ hand in the shape ``agent_schema`` emits. None of this needs the harness install
 from __future__ import annotations
 
 import enum
+import tracemalloc
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, RootModel, StringConstraints
 
 from kontra.contract import OfferingSpec, derive_document
 from kontra.contract import harness as h
@@ -278,6 +279,160 @@ def test_values_compare_as_canonical_json(enrich_spec: OfferingSpec) -> None:
     assert {d.path for d in found} == {"$defs.Ranged.properties.on.const"}
 
 
+class Code(RootModel[Annotated[str, StringConstraints(max_length=5)]]):
+    """A constrained string with a name of its own."""
+
+
+class Overlap(BaseModel):
+    """``max_length`` on the type and where it is used: pydantic enforces both."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: Annotated[Code, Field(max_length=10)]
+
+
+def _overlap(code: dict[str, Any], site: dict[str, Any]) -> dict[str, Any]:
+    """``Overlap`` as ``agent_schema`` writes it, with ``Code``'s body and the use site's
+    members beside its ``$ref``."""
+    return {
+        "Code": {"title": "Code", "description": "A constrained string.", **code},
+        "Overlap": {
+            "additionalProperties": False,
+            "properties": {"code": {"$ref": "#/$defs/Code", **site}},
+            "required": ["code"],
+            "title": "Overlap",
+            "type": "object",
+        },
+    }
+
+
+def test_a_constraint_on_both_a_type_and_its_use_is_both(enrich_spec: OfferingSpec) -> None:
+    """JSON Schema 2020-12 asserts a ``$ref``'s definition and its siblings both, so the
+    harness's ``{$ref: Code, maxLength: 10}`` over ``Code``'s ``maxLength: 5`` accepts at most
+    5 characters, as the model does; the contract says 10. A use site that writes what its
+    definition also writes is compared as the ``allOf`` of the two, and reported (``drift``
+    on both sides: it is the emitters, not the serialization)."""
+    defs = _overlap({"maxLength": 5, "type": "string"}, {"maxLength": 10})
+    found = compare_handler(_doc(enrich_spec, Overlap), _harness("Overlap", "Overlap", defs), "run")
+    where = "$defs.Overlap.properties.code"
+    both = [{"maxLength": 5, "type": "string"}, {"maxLength": 10}]
+    assert [(d.side, d.path, d.contract, d.harness, d.kind) for d in found] == [
+        ("input", f"{where}.allOf", ABSENT, both, "drift"),
+        ("input", f"{where}.maxLength", 10, ABSENT, "drift"),
+        ("input", f"{where}.type", "string", ABSENT, "drift"),
+        ("output", f"{where}.allOf", ABSENT, both, "drift"),
+        ("output", f"{where}.maxLength", 10, ABSENT, "drift"),
+        ("output", f"{where}.type", "string", ABSENT, "drift"),
+    ]
+
+
+class Letter(enum.Enum):
+    A = "a"
+    B = "b"
+
+
+class Extra(BaseModel):
+    """``json_schema_extra`` writing over an enum's own ``enum``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    c: Letter = Field(json_schema_extra={"enum": ["a", "z"]})
+
+
+def test_json_schema_extra_over_a_named_type_is_both(enrich_spec: OfferingSpec) -> None:
+    """The contract accepts ``"z"``; the harness's schema, and the model, do not."""
+    defs = {
+        "Letter": {"enum": ["a", "b"], "title": "Letter", "type": "string"},
+        "Extra": {
+            "additionalProperties": False,
+            "properties": {"c": {"$ref": "#/$defs/Letter", "enum": ["a", "z"]}},
+            "required": ["c"],
+            "type": "object",
+        },
+    }
+    found = compare_handler(_doc(enrich_spec, Extra), _harness("Extra", "Extra", defs), "run")
+    assert _found(found) == {
+        (side, f"$defs.Extra.properties.c.{key}", "drift")
+        for side in ("input", "output")
+        for key in ("allOf", "enum", "type")
+    }
+
+
+@pytest.mark.parametrize(
+    ("code", "site"),
+    [
+        ({"type": "string"}, {"maxLength": 5}),  # a constraint only the use site writes
+        ({"maxLength": 5, "type": "string"}, {"maxLength": 5}),  # the same one twice
+        # The use site's annotations are its own: a field's description over its type's.
+        ({"maxLength": 5, "type": "string"}, {"description": "The code.", "examples": ["ab"]}),
+    ],
+)
+def test_a_use_site_that_changes_nothing_joins_its_definition(
+    enrich_spec: OfferingSpec, code: dict[str, Any], site: dict[str, Any]
+) -> None:
+    class Overlap(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        code: str = Field(max_length=5)
+
+    found = compare_handler(
+        _doc(enrich_spec, Overlap), _harness("Overlap", "Overlap", _overlap(code, site)), "run"
+    )
+    assert found == ()
+
+
+@pytest.mark.parametrize(
+    ("body", "site"),
+    [
+        # additionalProperties reads properties beside it: alone at the use site it refuses
+        # every key, beside the definition's properties only the others.
+        ({"properties": {"a": {}}, "type": "object"}, {"additionalProperties": False}),
+        (
+            {"properties": {"a": {}}, "additionalProperties": False},
+            {"additionalProperties": False},
+        ),
+        ({"prefixItems": [{}], "type": "array"}, {"items": False}),
+        ({"if": {}, "then": {}}, {"else": False}),
+        ({"type": "object"}, {"unevaluatedProperties": False}),
+        ({"type": "string"}, {"type": "integer"}),
+    ],
+)
+def test_a_use_site_that_would_change_its_definition_stays_beside_it(
+    body: dict[str, Any], site: dict[str, Any]
+) -> None:
+    """Keywords that read each other are never split between the use site and the
+    definition: the node stays the conjunction."""
+    resolved = h._resolve({"$ref": "#/$defs/T", "title": "Use", **site}, {"T": body})
+    assert resolved == {"title": "Use", "allOf": [body, site]}
+
+
+def test_null_inside_a_conjunction(enrich_spec: OfferingSpec) -> None:
+    """An optional field over such a use site is still ``oneOf`` against ``anyOf``: the
+    ``allOf`` cannot be null when one of its branches cannot, so the difference is reported
+    inside the branch, not as the union."""
+
+    class Maybe(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        maybe: Annotated[Code, Field(max_length=10)] | None
+
+    defs = _overlap({"maxLength": 5, "type": "string"}, {})
+    defs["Maybe"] = {
+        "additionalProperties": False,
+        "properties": {
+            "maybe": {
+                "anyOf": [{"$ref": "#/$defs/Code", "maxLength": 10}, {"type": "null"}],
+            }
+        },
+        "required": ["maybe"],
+        "type": "object",
+    }
+    found = compare_handler(_doc(enrich_spec, Maybe), _harness("Maybe", "Maybe", defs), "run")
+    assert {d.path for d in found} == {
+        f"$defs.Maybe.properties.maybe.oneOf[0].{key}" for key in ("allOf", "maxLength", "type")
+    }
+
+
 # --------------------------------------------------------------------------- semantic
 
 
@@ -436,3 +591,50 @@ def test_a_harness_that_cannot_run_says_why(monkeypatch: pytest.MonkeyPatch) -> 
         h.harness_schema("agents:Agent")
     assert "kontra-no-such-script schema agents:Agent" in str(info.value)
     assert "\n" not in str(info.value)
+
+
+def test_a_harness_that_floods_stderr_is_read_from_the_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The seller's module is imported in the child and may log without bound: only the end
+    of its error output is read, for the one line a refusal quotes."""
+    flood = 16 * 1024 * 1024
+    monkeypatch.setattr(
+        h,
+        "_RUN_SCRIPT",
+        "import sys\n"
+        f"sys.stderr.write('noise ' * {flood // 6} + '\\n')\n"
+        "sys.stderr.write('the last line\\n')\n"
+        "sys.exit(1)\n",
+    )
+    tracemalloc.start()
+    try:
+        with pytest.raises(HarnessSchemaError, match=r"the last line$"):
+            h.harness_schema("agents:Agent")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < flood // 8
+
+
+def test_a_harness_that_does_not_answer_is_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The limit holds while the child writes nothing, and while it writes without end."""
+    for program in (
+        "import time\ntime.sleep(30)\n",
+        "import sys\nwhile True: sys.stderr.write('x' * 4096)\n",
+    ):
+        monkeypatch.setattr(h, "_RUN_SCRIPT", program)
+        with pytest.raises(HarnessSchemaError, match=r"did not answer within 0\.5s"):
+            h.harness_schema("agents:Agent", timeout=0.5)
+
+
+def test_a_schema_past_the_limit_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The document is read up to a limit, never whole whatever its size."""
+    monkeypatch.setattr(
+        h,
+        "_RUN_SCRIPT",
+        "import sys\nopen(sys.argv[-1], 'w').write('[' + '0,' * 2048 + '0]')\n",
+    )
+    monkeypatch.setattr(h, "_SCHEMA_BYTES", 1024)
+    with pytest.raises(HarnessSchemaError, match="larger than 1024 bytes"):
+        h.harness_schema("agents:Agent")
