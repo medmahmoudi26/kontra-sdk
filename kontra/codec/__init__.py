@@ -68,6 +68,15 @@ than download it again on every retry.
 The reply of a handled operation carries no Python stack trace (:func:`data_converter`):
 temporalio chains the exception behind its own handler errors, and the reply of a generated
 service is plaintext in the caller's history and the platform's.
+
+A job's workflow stream crosses the boundary sealed item by item (decisions I31,
+:mod:`kontra.codec.stream`). Kontra's workflow interceptor marks the answer of a stream poll
+on a job root (``kontra-stream: poll/v1``); :meth:`KontraCodec.encode` turns it into the
+stream envelope, each item sealed on its own (a topic the buyer may read to the seller's set
+and the job's buyer key, any other to the seller's set alone, its name hidden), the offsets
+in the clear; :meth:`KontraCodec.decode` turns the envelope back into the exact poll result.
+A marked offset answer (``offset/v1``) passes in plaintext: a log length. A marked payload
+anywhere but a seller's job workflow is refused, never encrypted some other way.
 """
 
 from __future__ import annotations
@@ -96,6 +105,14 @@ from temporalio.converter import (
 )
 
 from kontra.codec import age
+from kontra.codec import stream as _stream
+from kontra.codec.stream import (
+    OFFSET_MARK,
+    POLL_MARK,
+    STREAM_ENCODING,
+    STREAM_MARK,
+    EnvelopeError,
+)
 from kontra.contract.names import job_id_from_workflow_id
 from kontra.gate_client import models as m
 
@@ -106,6 +123,8 @@ __all__ = [
     "MAX_CLAIM_CHECK",
     "PLAINTEXT_KEY",
     "QUOTE_OPERATION",
+    "STREAM_ENCODING",
+    "STREAM_MARK",
     "BlobGate",
     "BlobStore",
     "BuyerKeys",
@@ -430,6 +449,17 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
     async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
         if not payloads:
             return []
+        if not any(STREAM_MARK in p.metadata for p in payloads):
+            return await self._encode(payloads)
+        out: list[Payload] = []
+        for p in payloads:
+            if STREAM_MARK in p.metadata:
+                out.append(await self._encode_marked(p))
+            else:
+                out += await self._encode([p])
+        return out
+
+    async def _encode(self, payloads: Sequence[Payload]) -> list[Payload]:
         recipients = await self.recipients()
         if recipients is None:
             ctx = self._context
@@ -444,6 +474,65 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
                 raise CodecError(f"encryption failed: {e}") from e
             out.append(await self._maybe_claim_check(ciphertext))
         return out
+
+    async def _encode_marked(self, p: Payload) -> Payload:
+        """A stream answer Kontra's workflow interceptor marked (decisions I31): a poll
+        result becomes the stream envelope, an offset passes in plaintext. Only a seller's
+        job workflow marks one; anywhere else it is refused, never encoded another way."""
+        ctx = self._context
+        job_id = (
+            job_id_from_workflow_id(ctx.workflow_id)
+            if isinstance(ctx, WorkflowSerializationContext)
+            else None
+        )
+        if self._role != "seller" or job_id is None:
+            raise CodecError(
+                "a workflow-stream answer is marked outside a seller's job workflow; refusing "
+                "it rather than choose its recipients"
+            )
+        mark = p.metadata[STREAM_MARK]
+        if mark == OFFSET_MARK:
+            try:
+                _stream.parse_offset(p)
+            except EnvelopeError as e:
+                raise CodecError(f"a marked stream offset: {e}") from e
+            return p  # plaintext by design: a log length
+        if mark != POLL_MARK:
+            raise CodecError("an unknown workflow-stream mark")
+        if self._buyer_keys is None:
+            raise CodecError(f"cannot seal job {job_id}'s stream: no buyer key lookup")
+        buyer = await _resolve(self._buyer_keys.buyer_key, job_id, "buyer")
+        try:
+            return await _stream.seal_poll(
+                p,
+                buyer_recipients=_distinct([*self._recipients, buyer]),
+                seller_recipients=list(self._recipients),
+                put_blob=self._put_blob if self._blobs is not None else None,
+            )
+        except (EnvelopeError, age.AgeError) as e:
+            raise CodecError(f"cannot seal job {job_id}'s stream: {e}") from e
+
+    async def _put_blob(self, ciphertext: bytes) -> tuple[str, int]:
+        """A sealed stream item above the inline limit, to the blob store."""
+        assert self._blobs is not None
+        digest = sha256(ciphertext).hexdigest()
+        try:
+            await self._blobs.put(digest, ciphertext)
+        except CodecError:
+            raise
+        except Exception as e:
+            raise CodecError(f"claim-check upload failed: {e}") from e
+        return digest, len(ciphertext)
+
+    async def _open_stream(self, p: Payload) -> Payload:
+        """A stream envelope as the poll result it was sealed from."""
+        if isinstance(self._context, NexusSerializationContext):
+            raise InvalidPayload("a workflow-stream envelope is never a Nexus payload")
+        fetch = self._fetch_blob if self._blobs is not None else None
+        try:
+            return await _stream.open_poll(p, self._identities(), fetch_blob=fetch)
+        except EnvelopeError as e:
+            raise InvalidPayload(f"cannot open a workflow-stream envelope: {e}") from e
 
     async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
         calling = self._calling()
@@ -472,6 +561,8 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
                 else:
                     self._fetched += 1
                     out.append(self._open(await self._fetch(p.data)))
+            elif encoding == STREAM_ENCODING:
+                out.append(await self._open_stream(p))
             elif calling is not None:
                 out.append(_plaintext_result(calling, p))
             else:
@@ -539,6 +630,11 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         if self._blobs is None:
             raise CodecError("payload is claim-checked but no blob store is configured")
         digest, size = _parse_reference(reference)
+        return await self._fetch_blob(digest, size)
+
+    async def _fetch_blob(self, digest: str, size: int) -> bytes:
+        if self._blobs is None:
+            raise CodecError("payload is claim-checked but no blob store is configured")
         if size > self._max_claim_check:
             # Refused before asking for it: a reference is a claim anyone can write.
             raise InvalidPayload(
