@@ -2491,8 +2491,11 @@ the relay's rate, which the bound relies on, are #59's own rules (I30, Q10 and Q
   never a workflow task. `kontra.testing.Marketplace.serve` gives 8 s (`SERVE_UPLOAD_BUDGET`,
   still under the 10 s task timeout): on a loaded test machine an answer's 64 items took longer
   than 2 s to reach the fake gate's bucket, and the heartbeat acceptance tests, which count
-  every item, lost the rest as gaps. The stubs keep their own tests, with a budget below a
-  second.
+  every item, lost the rest as gaps. A seller run as its own process (`kontra serve`,
+  `python worker.py`) takes the budget from `KONTRA_STREAM_UPLOAD_BUDGET` (seconds, at most
+  `STREAM_UPLOAD_BUDGET_MAX` = 8; anything else is logged and the 2 s default used, as
+  `KONTRA_PROGRESS_INTERVAL` is), which the examples' sellers set to 8 for the same reason.
+  The stubs keep their own tests, with a budget below a second.
 * **A re-read stores nothing new.** Items are **sealed deterministically per worker**: the age
   file key, ephemeral keys and nonce derive from `HMAC(seal_key, job, recipients, sealed
   plaintext)`, `seal_key = HKDF(the worker's age identity)`. The same worker re-sealing an item
