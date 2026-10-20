@@ -516,7 +516,9 @@ adapter (`kontra.engine.temporal`); a second one ships only once it proves, with
   frontend, its HTTP API or (with `--ui`) its UI on 127.0.0.1 -- other local users, and a web
   page whose name rebinds to 127.0.0.1 for the HTTP API and the UI, which check no `Host`. The
   dev gate and the codec server do check `Host` and take JSON bodies only, the dev gate's
-  control routes need a token that only ever travels on standard input, and payloads stay
+  control routes need a token that only ever travels on standard input (and that the CLI sends
+  only to a port that has first proved it holds it: a stale record's port may be anyone's after
+  a reboot), and payloads stay
   sealed to the parties' keys, which never leave the machine. So `kontra dev` proves the gate's
   API and escrow, never seam ①: a workflow the Authorizer refuses (a schedule, outward Nexus, a
   query of another namespace) works there and fails on the platform. Seam ① is proved by `make

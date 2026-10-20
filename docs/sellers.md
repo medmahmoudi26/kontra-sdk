@@ -981,8 +981,8 @@ kontra dev down [--reset]     # --reset also deletes kept state and the logs
 `kontra dev up` runs Kontra on this machine with no containers and nothing to pull: the dev gate
 (the gate's whole API, escrow by the platform's own rules, play money) and a Temporal dev server,
 in one background process. It needs `pip install "kontra-sdk[dev]"` (`[testing]` includes it),
-downloads the Temporal CLI once (checked against the checksums kontra-sdk pins; `KONTRA_TEMPORAL_CLI`
-names one on disk instead), and logs you in as a dev party named after your user name (`--handle`
+downloads the Temporal CLI once (checked against the checksums kontra-sdk pins, into a cache only
+you may write; `KONTRA_TEMPORAL_CLI` names one on disk instead, server 1.32 or later), and logs you in as a dev party named after your user name (`--handle`
 picks another) with 100.00 of play money. There is no login step: the profile it writes is what
 `kontra serve`, `kontra hire` and `kontra mcp` use. It refuses to replace a real login in the same
 `KONTRA_HOME` (`KONTRA_HOME=~/.kontra-dev kontra dev`, or `--replace-profile`).
@@ -1003,7 +1003,8 @@ the joining home says to run it in the home that started the stack. A home that 
 handle is a second machine of the same party: pass `--handle` to be someone else.
 
 What the dev stack is not: the Temporal dev server runs **no Authorizer**, the gate keeps blobs in
-memory rather than in a bucket, and the money is a ledger in memory. A workflow that does something
+memory rather than in a bucket (`--persist` also writes them to `$KONTRA_HOME/dev/data/blobs/`),
+and the money is a ledger in memory. A workflow that does something
 the platform's Authorizer refuses works here and fails there (see [security](security.md)); Kontra's
 own end-to-end suite covers that half (`make e2e`, against the prod gate image). The dev server's
 frontend, its HTTP API and (with `--ui`) its UI take no credentials: anyone on this machine's

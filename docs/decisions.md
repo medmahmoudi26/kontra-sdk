@@ -2684,7 +2684,9 @@ read A's stream from 0 and was told the budget was spent; about four and a half 
 2. **Two gate packages.** The prod gate stays in `kontra-cloud` and is never imported here. The dev
    gate is `kontra.devgate`, in this repository and wheel: `DevGate` (the old `FakeGate`, moved with
    `git mv`; `kontra.testing.FakeGate` and `kontra.testing.fake_gate` re-export it, so it is one
-   class) serves every seam ② row. A module, not a distribution: it is built from `kontra.escrow`,
+   class; the in-memory ledger it runs on is `kontra.devgate.ledger`, re-exported as
+   `kontra.testing.ledger`, so the host never imports the testing package) serves every seam ②
+   row. A module, not a distribution: it is built from `kontra.escrow`,
    `kontra.ledger`, `kontra._control`, `kontra.contract`, `kontra.gate_client` and `kontra.engine`,
    so a second distribution would ship in lockstep anyway, and FastAPI stays out of a worker's
    install through a `[dev]` extra instead (`[testing]` includes it). Drift between the two gates is
@@ -2694,14 +2696,18 @@ read A's stream from 0 and was told the budget was spent; about four and a half 
 3. **One host process.** `python -m kontra.devgate` runs `DevGate` under uvicorn on its main event
    loop and a Temporal CLI dev server as its child (pinned and checksum-verified, a `--db-filename`,
    loopback only, in the host's process group). `kontra dev up` starts it detached and returns
-   (`--foreground` to watch it). The codec server stays its own process: the gate stands in for the
-   platform and never holds a party's key (I7, I28).
+   (`--foreground` runs it in the terminal, recorded like a detached host: `stack.json`, the
+   registry, the remembered ports and `--persist`, the up/down lock released once it serves). The
+   codec server stays its own process: the gate stands in for the platform and never holds a
+   party's key (I7, I28).
 
 4. **No login verb.** `up` mints the dev party from the OS user (`--handle` overrides, else the
    existing dev party, else `default_handle()`); the host has no `KONTRA_DEV` mode switch, and `up`
    exits 0 only when a dev profile is written. The punt is gone structurally, and a dev profile is
-   told `kontra dev up`, never `kontra login` (`auth`, `profile`, the CLI hints, the MCP errors);
-   a test greps the dev CLI and the host for both. `--env-file` and `--no-login` are gone.
+   told `kontra dev up`, never `kontra login` (`auth`, `profile`, the CLI hints, the MCP errors,
+   and the dev gate's own messages: `DevGate.sign_in`); a test greps the dev CLI and every module
+   of `kontra/devgate/` for both, `gate.py` allowed the one constant a non-dev gate's messages use.
+   `--env-file` and `--no-login` are gone.
 
 5. **State.** In memory by default (dies with `down`, a crash or a reboot); `--persist` (remembered)
    keeps a versioned tagged-JSON snapshot decoded only into a class allowlist — never pickle, so a
@@ -2755,7 +2761,7 @@ read A's stream from 0 and was told the budget was spent; about four and a half 
     signal the recorded group only when the host led it (pgid == pid), it is not the command's
     own group, and a member's command line names this home: the host's `--home` label (a label
     on argv, never the token) or the Temporal child's `--db-filename` under this home. A forged
-    or recycled record is forgotten, never signalled (`tests/cli/test_dev.py`).
+    or recycled record is forgotten, never signalled (`tests/cli/test_dev_commands.py`).
 
 14. **The `[dev]` extra is checked at once.** Without FastAPI or uvicorn, `up` exits 1 before
     anything else with `pip install "kontra-sdk[dev]"`; `down`, `status` and `logs` never import
@@ -2767,7 +2773,10 @@ read A's stream from 0 and was told the budget was spent; about four and a half 
     stream and its relay's offset and budgets are kept, so cursors still line up with the offset
     a resumed relay polls from; the relay's task, timer and listener count are not. `gate.json`
     is read only when it is the user's and no one else may write it; a restore decodes
-    everything before it touches the gate.
+    everything before it touches the gate. Every byte string of 4 KiB or more (blobs, artifact
+    parts) is `data/blobs/<sha256>`, written once and named by digest; a pass writes `gate.json`
+    only when its digest changed. `--no-persist` on a running stack stops the loop and deletes
+    the snapshot.
 
 16. **The e2e stack lost what `kontra dev` used.** `compose.yaml`'s `observability` profile,
     `observability/prometheus.yml` and `x-kontra-dev-settings` are gone (nothing here or in
@@ -2785,6 +2794,40 @@ read A's stream from 0 and was told the budget was spent; about four and a half 
 
 18. **Costs accepted**: dev ≠ prod at the Authorizer and storage; loopback Temporal is
     unauthenticated (payloads stay sealed, the HTTP API's port is kernel-chosen, the UI is opt-in);
-    in-memory blobs; the FakeGate move (`git mv` keeps history, the alias keeps every import);
+    blobs in memory (a 3 GB artifact is 3 GB of the host's memory; `--persist` also writes them
+    to `data/blobs/`); the FakeGate move (`git mv` keeps history, the alias keeps every import);
     `kontra-cloud#47` is a no-code-change follow-up (keep `KONTRA_DEV=1` in the prod image for the
     e2e stack, optionally guarded to a loopback URL).
+
+19. **What the review of #57 changed.** _The choices below were made by the implementer in the
+    owner's place, as kontra-sdk#50 directs; each is listed on #57 for the owner to confirm or
+    overturn._
+    - **The host proves its token before it is sent.** A stale `stack.json` (every reboot leaves
+      one) names a port anyone may hold by now, and any 200 used to pass for this home's host.
+      `GET /_devgate/hello?nonce=N` (no token, no `Origin`) answers HMAC-SHA256(token, a fixed
+      context + N); the CLI checks it in constant time against a fresh nonce, then asks `ready`
+      with the bearer over the same connection, and that document's pid must be the record's.
+      The reviewer also proposed requiring `_group_is_ours`; not taken: a `--foreground` record's
+      group is the terminal's job, not one `up` made, and the proof already binds the port to
+      the token only the spawned host was given.
+    - **A stale home leaves another home's registry entry**: cleanup unregisters a port only if
+      the registry still names this home, compared and removed under the registry's flock, so
+      the home that started on that port since stays joinable (OD7).
+    - **The Temporal CLI cache.** The Makefile exports `KONTRA_TEMPORAL_CLI=<the cache path>`;
+      that value is the managed cache (downloaded when absent), not an override that must exist.
+      The download is made beside its target (one filesystem: no EXDEV with a tmpfs `/tmp`).
+      Every directory on the way to the cache must be the user's or root's and not writable by
+      others unless sticky, as ssh's StrictModes; a group-writable one of the user's private
+      group (umask 002) is accepted. A cache that fails this is refused (`XDG_CACHE_HOME` or
+      `KONTRA_TEMPORAL_CLI` gets past it), not moved elsewhere. The host runs the CLI only while
+      it is the file it took (device, inode, size, mtime), a `--ui` restart included. An
+      override whose `--version` names no server is refused.
+    - **State files**: written through `mkstemp` in directories that must be the user's
+      (`dev/`, `data/`, `logs/`, `dev-gates/`: one of ours others may write is tightened to
+      0700, another user's refused).
+    - **A startup failure stops what it started**: whatever fails after the Temporal child is up
+      stops it (`--foreground` and any library user of `DevStack` orphaned it), and a child that
+      never answered is killed.
+    - **`POST /_devgate/config`** may take a Temporal restart (the stop grace and the ready wait);
+      the CLI waits that long. A fresh gate that replaced a dev profile, with no `--persist` state
+      restored, says to restart any `kontra serve` started before it (design §4.1.10).
