@@ -16,7 +16,7 @@ from kontra.gate_client import GateClient
 from kontra.gate_client import models as m
 from kontra.gate_client.routes import BY_NAME, ROUTES, Route
 
-from ._support import NOW, Recorder, event, json_response, minimal, query, sse, static
+from ._support import Recorder, event, json_response, minimal, query, sse, static
 
 JOB = "0123456789abcdef0123456789abcdef"
 KEY_ID = "key_0123456789abcdef"
@@ -80,7 +80,7 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     "devices": (lambda c: c.devices(), {}),
     "add_device": (lambda c: c.add_device("laptop", AGE, "cli"), {}),
     "remove_device": (lambda c: c.remove_device(AGE), {"public_key": AGE}),
-    "publish": (lambda c: c.publish({"nexusrpc": "1.0.0"}), {}),
+    "publish": (lambda c: c.publish({"nexusrpc": "1.0.0"}, streams=["turn_events"]), {}),
     "search": (lambda c: c.search("enrich"), {}),
     "get_offering": (
         lambda c: c.get_offering("acme/enrich@1.2.0"),
@@ -113,13 +113,7 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
         ),
         {},
     ),
-    "progress": (lambda c: _drain(c.progress(JOB)), {"job_id": JOB}),
-    "post_progress": (
-        lambda c: c.post_progress(
-            JOB, m.ProgressPost.model_validate({"at": NOW, "activity": "a", "ciphertext_b64": "AA"})
-        ),
-        {"job_id": JOB},
-    ),
+    "stream": (lambda c: _drain(c.stream(JOB, topics=["turn_events"])), {"job_id": JOB}),
     "create_artifact": (lambda c: c.create_artifact(m.ArtifactCreate(size=10)), {}),
     "complete_artifact": (
         lambda c: c.complete_artifact(
@@ -194,7 +188,7 @@ async def test_route_conformance(route: Route) -> None:
         assert req.content == b""
     if route.stream:
         assert req.headers["accept"] == "text/event-stream"
-        assert [e.seq for e in result] == [1]
+        assert [e.cursor for e in result] == [1]
     elif route.response is not None:
         assert isinstance(result, route.response)
 
@@ -239,7 +233,7 @@ async def test_empty_path_parameter_is_refused_before_sending() -> None:
         with pytest.raises(ValueError, match="empty"):
             await c.job("")
         with pytest.raises(ValueError, match="empty"):
-            await _drain(c.progress(""))
+            await _drain(c.stream(""))
     assert rec.requests == []
 
 
@@ -395,3 +389,19 @@ async def test_disputes_can_be_paged() -> None:
         await c.disputes()
         await c.disputes(cursor="c3", limit=10)
     assert [query(r) for r in rec.requests] == [{"limit": "50"}, {"cursor": "c3", "limit": "10"}]
+
+
+def test_the_stream_replaces_the_progress_routes() -> None:
+    """#52 (decisions I31): the job's stream is ``GET /v1/jobs/{id}/stream`` (SSE of
+    StreamEvent, the job's parties), and the bespoke progress channel is gone, both verbs."""
+    from kontra.gate_client.routes import BY_NAME, ROUTES
+
+    stream = BY_NAME["stream"]
+    assert (stream.method, stream.path, stream.auth) == ("GET", "/v1/jobs/{job_id}/stream", "party")
+    assert stream.stream is True
+    assert stream.response is m.StreamEvent
+    assert "progress" not in BY_NAME
+    assert "post_progress" not in BY_NAME
+    assert not [r for r in ROUTES if r.path.endswith("/progress")]
+    assert not hasattr(m, "ProgressEvent")
+    assert not hasattr(m, "ProgressPost")
