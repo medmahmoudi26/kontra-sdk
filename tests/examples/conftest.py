@@ -4,8 +4,9 @@ serves the example sellers -- ``examples/enrich``, ``examples/legacy-actor``,
 ``examples/hello`` and ``examples/sweep``, each its own ``python worker.py`` process; the
 chefs are started by their own tests -- next to local web sites for them to fetch.
 
-Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once into the temp
-directory; with neither the binary nor the network, these tests are skipped."""
+Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once and
+checksum-verified (``kontra.devgate.temporal_cli``); with neither the binary nor the network,
+these tests are skipped."""
 
 from __future__ import annotations
 

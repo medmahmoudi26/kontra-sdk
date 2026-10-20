@@ -3,9 +3,12 @@
 Standalone Nexus operations (how a buyer's script or the gate starts ``execute`` without a
 worker, decisions I4) need Temporal server 1.32+ with two dynamic-config switches; the dev
 server in Temporal CLI 1.9.1 is server 1.32.0. :func:`start_dev_server` starts it through
-``temporalio.testing.WorkflowEnvironment.start_local`` -- the binary at
-``$KONTRA_TEMPORAL_CLI`` if set, else CLI 1.9.1 downloaded once into the temp directory --
-with its HTTP API on a free port (the gate relays quotes over it).
+``temporalio.testing.WorkflowEnvironment.start_local`` with the binary
+:func:`kontra.devgate.temporal_cli.ensure` hands back -- ``$KONTRA_TEMPORAL_CLI`` if set, else
+the pinned CLI 1.9.1, downloaded once into the user's cache and checked against the archive and
+binary sha256 kontra-sdk pins (temporalio's own downloader checks no digest, and runs whatever
+sits at a predictable name in the shared temp directory) -- with its HTTP API on a free port
+(the gate relays quotes over it).
 
 The returned :class:`DevServer` is the *internal* frontend: no authorizer, every API open.
 Namespaces are created through :class:`kontra._control.Control`, as the gate does.
@@ -19,7 +22,6 @@ usable from any loop).
 from __future__ import annotations
 
 import asyncio
-import os
 import socket
 import threading
 from collections.abc import Coroutine, Sequence
@@ -44,7 +46,8 @@ __all__ = [
     "start_dev_server",
 ]
 
-#: Overrides the downloaded CLI with a binary on disk (no network needed).
+#: Overrides the downloaded CLI with a binary on disk (no network needed); the same variable as
+#: :data:`kontra.devgate.temporal_cli.CLI_ENV`.
 CLI_ENV = "KONTRA_TEMPORAL_CLI"
 DEV_SERVER_VERSION = "v1.9.1"
 #: What standalone Nexus operations need on server 1.32 (decisions I4).
@@ -111,26 +114,30 @@ async def start_dev_server(
     extra_args: Sequence[str] = (),
 ) -> DevServer:
     """Start a dev server with standalone Nexus enabled and its HTTP API on ``http_port``
-    (a free port by default). ``cli_path`` defaults to ``$KONTRA_TEMPORAL_CLI``; without
-    either, CLI ``version`` is downloaded (cached in the temp directory)."""
-    cli = cli_path or os.environ.get(CLI_ENV) or None
+    (a free port by default). ``cli_path`` is a binary to run as it is; without it,
+    :func:`kontra.devgate.temporal_cli.ensure` gives the CLI (``$KONTRA_TEMPORAL_CLI``, else
+    the pinned ``version``, downloaded once and checksum-verified). Only the pinned version can
+    be verified: another ``version`` raises :class:`ValueError` (pass ``cli_path`` instead)."""
+    from kontra.devgate import temporal_cli
+
+    if cli_path is None:
+        if version.removeprefix("v") != temporal_cli.VERSION:
+            raise ValueError(
+                f"only the pinned Temporal CLI {temporal_cli.VERSION} is downloaded and verified; "
+                f"for {version}, pass cli_path= (or set {CLI_ENV})"
+            )
+        # Off the event loop: the first call downloads (~50 MB) and hashes the binary.
+        cli_path = str(await asyncio.to_thread(temporal_cli.ensure))
     port = http_port or free_port()
     args: list[str] = []
     for value in DYNAMIC_CONFIG:
         args += ["--dynamic-config-value", value]
     args += ["--http-port", str(port), *extra_args]
-    if cli:
-        env = await WorkflowEnvironment.start_local(
-            dev_server_existing_path=cli,
-            dev_server_log_level=log_level,
-            dev_server_extra_args=args,
-        )
-    else:
-        env = await WorkflowEnvironment.start_local(
-            dev_server_download_version=version,
-            dev_server_log_level=log_level,
-            dev_server_extra_args=args,
-        )
+    env = await WorkflowEnvironment.start_local(
+        dev_server_existing_path=cli_path,
+        dev_server_log_level=log_level,
+        dev_server_extra_args=args,
+    )
     target = env.client.service_client.config.target_host
     host = target.rsplit(":", 1)[0]
     return DevServer(env=env, grpc_address=target, http_base=f"http://{host}:{port}")

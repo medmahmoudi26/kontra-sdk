@@ -4,7 +4,7 @@ A snapshot is one JSON document whose values carry a type tag (``$dt``, ``$dec``
 ``$set``, ``$dc`` ...). It is decoded **only** into an explicit allowlist of record classes
 (:data:`ALLOWED`): a state file that could name any callable would be code execution at the next
 ``up``. Only the durable state is kept (:data:`KEPT`); quotes, device flows, links, ceremonies,
-rate counters, the outbox, the stream events, locks and relay tasks are transient and start empty.
+rate counters, the outbox, locks and relay tasks are transient and start empty (:data:`TRANSIENT`).
 
 The drift guard is ``tests/devgate/test_store.py``: a full lifecycle through ``Marketplace``,
 snapshot, restore into a fresh gate, every view compared, and a class the census finds but
@@ -27,27 +27,40 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
-__all__ = ["ALLOWED", "FORMAT", "dec", "enc", "restore", "snapshot", "write_doc", "write_snapshot"]
+__all__ = [
+    "ALLOWED",
+    "FORMAT",
+    "KEPT",
+    "LEDGER_KEPT",
+    "TRANSIENT",
+    "dec",
+    "enc",
+    "read_doc",
+    "restore",
+    "snapshot",
+    "write_doc",
+    "write_snapshot",
+]
 
 FORMAT = "kontra-devgate/1"
 
 #: What a snapshot may hold: these classes and nothing else. Keyed on where the class lives now
-#: (``kontra.devgate.gate`` after the FakeGate move, decisions I34).
+#: (``kontra.devgate.gate`` after the FakeGate move, decisions I34). It is the census of every
+#: record class reachable from :data:`KEPT` and :data:`LEDGER_KEPT` (``tests/devgate/test_store.py``
+#: walks the field types and fails on a class missing here, or listed here and never reached).
 ALLOWED: dict[str, tuple[str, ...]] = {
     "kontra.devgate.gate": (
         "_Party", "_PartyKey", "_Session", "_Refresh", "_DeviceKey", "_KeyWrapRow",
         "_Offering", "_Job", "_ApiKey", "_Artifact", "_PasskeyUser", "_Passkey", "_RelayState",
     ),
-    "kontra.escrow": ("JobRecord", "ObservedStatus", "EffectKind", "Provenance"),
-    "kontra.gate_client.models": ("Escrow", "JobState", "ProgressEvent"),
-    "kontra.ledger": (
-        "Money", "Account", "Handle", "HandleState", "HoldState", "Op", "Posting", "Split",
-    ),
+    "kontra.escrow": ("JobRecord", "ObservedStatus", "EffectKind"),
+    "kontra.engine": ("Liveness",),
+    "kontra.gate_client.models": ("Escrow", "JobState", "StreamEvent"),
+    "kontra.ledger": ("Money", "Account", "Handle", "HandleState", "HoldState", "Op", "Posting", "Split"),
     "kontra.testing.ledger": ("_Account", "_HoldRow", "_Movement"),
     "kontra.contract.validate": ("ContractInfo",),
     "kontra.contract.names": ("OfferingId", "Version"),
     "kontra.contract.facts": ("XKontra",),
-    "kontra._control": ("HistorySummary",),
 }  # fmt: skip
 
 #: Gate attributes kept; everything else is transient and starts empty.
@@ -57,6 +70,14 @@ KEPT = (
     "_passkey_users", "_passkey_rows",
 )  # fmt: skip
 LEDGER_KEPT = ("_holds", "_moves", "_accounts", "_postings", "_next_event")
+#: The gate's other stores, deliberately not kept (short-lived, or rebuilt by the constructor):
+#: quotes (10-minute TTL), device flows, magic links, confirmations, ceremonies, handoffs, rate
+#: counters, the outbox, per-party locks, the engines. The drift guard fails on a store of state
+#: (a dict, list, set or deque attribute) that is in neither this nor :data:`KEPT`.
+TRANSIENT = (
+    "quotes", "_quote_rate", "_devices", "_magic", "_confirmations", "_handoffs", "handoffs",
+    "_ceremonies", "_magic_rate", "outbox", "_party_locks", "engines",
+)  # fmt: skip
 
 #: Transient object types dropped field-by-field (a running task, a lock, a wake event).
 _SKIP_TYPES: tuple[type, ...] = (
@@ -66,8 +87,15 @@ _SKIP_TYPES: tuple[type, ...] = (
     asyncio.Handle,
     asyncio.TimerHandle,
 )
-#: Fields dropped by name because they hold live stream state, rebuilt after a restart (§5.4).
-_DROP_FIELDS = {"kontra.devgate.gate._Job": {"events", "last_progress", "progress_final"}}
+#: Fields dropped by name: live state of a running process, which a restored gate starts afresh
+#: (§5.4). A job's stored stream (``events``, ``progress_final``, ``last_progress``) and its
+#: relay's persisted offset and budgets are kept, so cursors still line up with the offset a
+#: resumed relay polls from; the relay's task, its pause timer and its listener count are not
+#: (no listener survives a restart: the relay starts again at the next one, from the offset).
+_DROP_FIELDS = {
+    "kontra.devgate.gate._Job": frozenset({"changed"}),
+    "kontra.devgate.gate._RelayState": frozenset({"task", "pause", "listeners"}),
+}
 
 
 def _cls(path: str) -> type:
@@ -187,29 +215,65 @@ def restore(gate: Any, doc: dict[str, Any]) -> None:
     are refused on issuer and clients refresh transparently, §5.4). Refuses an unknown format."""
     import jwt.algorithms
     from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
 
     if doc.get("format") != FORMAT:
         raise ValueError(
             f"the dev state in this home was written in {doc.get('format')!r}, not {FORMAT}; "
             "`kontra dev down --reset` discards it"
         )
+    # Decode everything before touching the gate: a refused class (or any other error) leaves
+    # it as it was, never half restored.
+    unknown = (set(doc["gate"]) - set(KEPT)) | (set(doc["ledger"]) - set(LEDGER_KEPT))
+    if unknown:
+        raise ValueError(f"a dev state file may not set {sorted(unknown)}")
+    kept = {name: dec(value) for name, value in doc["gate"].items()}
+    ledger = {name: dec(value) for name, value in doc["ledger"].items()}
+    url_secret = dec(doc["url_secret"])
+    proof_key = dec(doc["job_key_proof_key"])
     key = serialization.load_pem_private_key(doc["signing_key"]["pem"].encode(), password=None)
+    if not isinstance(key, ec.EllipticCurvePrivateKey):
+        raise ValueError("a dev state file's signing key is not an ES256 key")
     ring = gate.keys
     ring._key = key
     ring.kid = doc["signing_key"]["kid"]
     jwk = json.loads(jwt.algorithms.ECAlgorithm.to_jwk(cast(Any, key.public_key())))
     jwk.update(kid=ring.kid, use="sig", alg="ES256")
     ring._jwk = jwk
-    gate._url_secret = dec(doc["url_secret"])
-    gate.job_key_proof_key = dec(doc["job_key_proof_key"])
-    for name, value in doc["gate"].items():
-        setattr(gate, name, dec(value))
-    for name, value in doc["ledger"].items():
-        setattr(gate.ledger, name, dec(value))
+    gate._url_secret = url_secret
+    gate.job_key_proof_key = proof_key
+    for name, value in kept.items():
+        setattr(gate, name, value)
+    for name, value in ledger.items():
+        setattr(gate.ledger, name, value)
 
 
 def write_snapshot(gate: Any, path: Path) -> None:
-    write_doc(path, json.dumps(snapshot(gate), default=str))
+    # No ``default=``: :func:`enc` yields JSON values only, and anything else must fail loudly
+    # rather than be written as a string that no longer decodes to what it was.
+    write_doc(path, json.dumps(snapshot(gate)))
+
+
+def read_doc(path: Path) -> dict[str, Any] | None:
+    """The snapshot at ``path``, or None when there is none. Read through
+    :func:`kontra.profile._read_private`: a file another user owns or may write is refused, as
+    ``stack.json`` is (it holds the gate's signing key and every session)."""
+    from kontra.profile import ProfileError, _read_private
+
+    try:
+        raw = _read_private(path)
+    except FileNotFoundError:
+        return None
+    except ProfileError:
+        raise ValueError(
+            f"the dev state {path} is not this user's private file (another user owns it, or "
+            "every user may write it); refusing to restore it. `kontra dev down --reset` "
+            "discards it"
+        ) from None
+    doc = json.loads(raw)
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path} is not a dev state document")
+    return cast(dict[str, Any], doc)
 
 
 def write_doc(path: Path, raw: str) -> None:

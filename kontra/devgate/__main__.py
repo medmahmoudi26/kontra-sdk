@@ -4,6 +4,11 @@ It reads one JSON line on standard input -- ``{"token": ..., "config": {...}}`` 
 :class:`~kontra.devgate.stack.DevStack`, writes ``ready`` (or ``error: ...``) on the inherited
 ready pipe, and serves until SIGTERM/SIGINT or ``POST /_devgate/stop``. The token travels on
 stdin only, never argv or the environment (both readable in ``/proc``).
+
+``--home <KONTRA_HOME>`` on the command line is a label, not a setting (it must equal the
+config's ``home``): it makes the host's command line name the home it serves, which is how
+``kontra dev`` tells its own orphaned process group from a stranger's after a crash or a
+reboot (a recorded pid may since belong to anyone), before it signals anything.
 """
 
 from __future__ import annotations
@@ -76,6 +81,13 @@ async def _run(token: str, cfg: dict[str, Any], ready_fd: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    label: str | None = None
+    if args:
+        if len(args) != 2 or args[0] != "--home":
+            print("usage: python -m kontra.devgate [--home KONTRA_HOME] < config", file=sys.stderr)
+            return 2
+        label = args[1]
     line = sys.stdin.readline()
     if not line.strip():
         print('a {"token", "config"} line is expected on standard input', file=sys.stderr)
@@ -86,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
         cfg = dict(message["config"])
     except (ValueError, KeyError, TypeError) as exc:
         print(f"malformed host message: {exc}", file=sys.stderr)
+        return 2
+    if label is not None and label != cfg.get("home"):
+        print("--home is not the config's home", file=sys.stderr)
         return 2
     ready_fd = int(cfg.pop("ready_fd", -1))
     _setup_logging(Path(cfg["home"]))

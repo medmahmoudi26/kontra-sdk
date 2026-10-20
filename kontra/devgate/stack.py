@@ -117,6 +117,9 @@ class DevStack:
         )
         if self._persist:
             self._restore()
+            # At once, so the kept pair (gate.json and temporal.db) is whole from the start: a
+            # host killed before its first periodic snapshot leaves a state to restore.
+            self._snapshot_now()
         await self._start_serving()
         if self._persist:
             self._persist_task = self._loop.create_task(
@@ -209,9 +212,9 @@ class DevStack:
     def _restore(self) -> None:
         from kontra.devgate import store
 
-        path = self._store_path()
-        if path.exists():
-            store.restore(self.gate, json.loads(path.read_text(encoding="utf-8")))
+        doc = store.read_doc(self._store_path())  # 0600 and ours, or refused
+        if doc is not None:
+            store.restore(self.gate, doc)
 
     def _snapshot_now(self) -> None:
         from kontra.devgate import store
@@ -222,16 +225,19 @@ class DevStack:
         from kontra.devgate import store
 
         last = ""
-        try:
-            while True:
+        while True:
+            try:
                 await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                return
+            try:
                 doc = await self.gate.run(lambda: _wrap(store.snapshot(self.gate)))
-                raw = json.dumps(doc, default=str)
+                raw = json.dumps(doc)
                 if raw != last:
                     store.write_doc(self._store_path(), raw)
                     last = raw
-        except asyncio.CancelledError:
-            pass
+            except Exception:  # keep snapshotting: the next pass may succeed, `down` retries
+                logging.getLogger("kontra.devgate").exception("a --persist snapshot failed")
 
     # ------------------------------------------------------------------ the ASGI wrapper
 

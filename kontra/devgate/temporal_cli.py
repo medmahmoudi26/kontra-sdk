@@ -18,6 +18,7 @@ import json
 import os
 import platform
 import re
+import stat
 import sys
 import tarfile
 import tempfile
@@ -116,7 +117,8 @@ def ensure(*, version: str = VERSION, say: Callable[[str], None] | None = None) 
         return cli
 
     target = cache_path(version)
-    if target.is_file() and _cache_is_good(target):
+    _own_dir(target.parent)
+    if _owned_file(target) and _cache_is_good(target):
         return target
     return _download(version, target, say)
 
@@ -128,12 +130,44 @@ def _sidecar(target: Path) -> Path:
     return target.with_name("temporal.sha256")
 
 
+def _own_dir(path: Path) -> None:
+    """Make ``path`` (the version's cache directory) this user's own: what sits in it is run.
+    ``XDG_CACHE_HOME`` may name a shared place; there, whoever plants a binary and a sidecar
+    first would choose what runs as us. Created 0700; an existing one of ours that others may
+    write is tightened to 0700; one that is not ours (or not a real directory) is refused."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not hasattr(os, "getuid"):
+        return
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise TemporalCLIError(
+            f"{path} is not a directory of yours; the Temporal CLI it holds would run as you. "
+            f"Remove it, or set {CLI_ENV} to a binary you trust"
+        )
+    if st.st_mode & 0o022:
+        path.chmod(0o700)
+
+
+def _owned_file(path: Path) -> bool:
+    """A regular file (not a link) of this user's that no one else may write: the only kind
+    of cached binary or sidecar the fast path may trust."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o022:
+        return False
+    return not hasattr(os, "getuid") or st.st_uid == os.getuid()
+
+
 def _cache_is_good(target: Path) -> bool:
     """A cached binary to trust: the sidecar records its size and mtime (the fast path), else
     the binary is re-hashed against the pinned :data:`BINARY_SHA256` and, if it matches, a
     sidecar is written so the next ``up`` takes the fast path. Without a pin for this platform
     an unverifiable cache is rejected (the archive-verified download is the fallback)."""
     try:
+        if not _owned_file(_sidecar(target)):
+            raise ValueError("an untrusted sidecar")
         doc = json.loads(_sidecar(target).read_text(encoding="utf-8"))
         want_size, want_mtime = int(doc["size"]), float(doc["mtime"])
     except (OSError, ValueError, KeyError, TypeError):
@@ -151,9 +185,14 @@ def _cache_is_good(target: Path) -> bool:
 
 def _write_sidecar(target: Path, sha: str) -> None:
     st = target.stat()
-    _sidecar(target).write_text(
-        json.dumps({"sha256": sha, "size": st.st_size, "mtime": st.st_mtime}), encoding="utf-8"
-    )
+    doc = json.dumps({"sha256": sha, "size": st.st_size, "mtime": st.st_mtime}).encode()
+    path = _sidecar(target)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    with os.fdopen(fd, "wb") as f:
+        os.fchmod(
+            f.fileno(), 0o644
+        )  # whatever the umask: the fast path trusts no group-writable file
+        f.write(doc)
 
 
 # --------------------------------------------------------------------------- the download
