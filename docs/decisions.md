@@ -3033,8 +3033,13 @@ command #42's (merged as #46).
    console's history fetches from the subagent's own history -- the workflow id the event names,
    whole and opaque, and only one the agent's history says it started (never parsed). Bounded:
    three deep, sixteen subagent histories per snapshot, the row and byte caps; past a bound the
-   row links out (`?w=<that id>`) and says why. **OD3**: a batch child's `pages= · n/N` is read
-   from its own history (its item activity's completions of its schedulings).
+   row links out (`?w=<that id>`) and says why. A nested row links to the subagent's child node
+   (its activities are its own history's, not drawn), and the handoff row carries the event that
+   started it. **OD3**: a batch child's `pages= · n/N` is read from its own runs, the first and
+   each it continued as new into (up to 64): `n` its item activity's completions (and failures,
+   counted apart), `N` the batch's own count when its spec opens with this machine's codec --
+   `items=`'s length, or the items of the pages fetched so far, shown `≥N` while more may come --
+   else what it scheduled. An open batch run is in the snapshot's key, as an agent child is.
 
 7. **Approvals and callbacks (OD7).** No live Allow/Deny on a `kontra.turn.v1` job: its wrapper
    ends the turn on an approval or a callback (one hire is one turn; sessions are #60), so its row
@@ -3042,9 +3047,21 @@ command #42's (merged as #46).
    full set of protections `docs/security.md` lists, and replay (client-side, from seq 0 at 10×,
    never re-sending) are the second half of #54.
 
-8. **Bounds.** A summary is at most 120 characters; an item over 256 KiB (#52's inline cap) is a
-   row that says so; past 5000 rows or 4 MiB of summaries, one row says how many more there are.
+8. **Bounds.** Every string read from an event is capped (120 characters; an id at 1000,
+   Temporal's limit, and a row whose `tool_id` was cut is not answerable); an item over 256 KiB
+   (#52's inline cap) is a row that says so. One budget covers all the session emits, in the
+   order it is drawn -- each turn, row and nested row, a subagent's included: past 5000 of them
+   or 4 MiB serialized, one row says how many more there are. A timestamp that is no finite time
+   (`Infinity`, `NaN`, past ±10¹¹ s) is none; and a session the renderer cannot take is the
+   pane's `undecodable` state, logged, never a failed graph.
 
 9. **No browser in `make check` (OD9).** The lifecycle test (`tests/cli/test_session_lifecycle.py`,
    `ReconHarnessAgent` in `tests/serve/recon_harness.py`, a scripted model and a real subagent,
    no LLM) checks behaviour over HTTP; PR screenshots are scratch tooling, and no extra is added.
+
+10. **One page, measured.** The turn header names the input's type as the agent's own
+    `agent_interface` query says it (asked once per run, three seconds; else its first field).
+    A run that is no agent draws exactly the page it drew before: no session card, the 360px
+    column, the same layout and framing (compared pixel for pixel over the graph fixtures). On an
+    agent's page the right column is as tall as the room below its top, so the session, its
+    footer and the node pane are in view together, and the session follows its tail.

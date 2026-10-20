@@ -109,6 +109,7 @@ pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 var(--mon
 .node:hover>.box{stroke-width:2.2}
 .bad-t{fill:var(--bad)}.wait-t{fill:var(--wait)}.run-t{fill:var(--run)}.mute-t{fill:var(--mute)}
 .badge .bad-s{stroke:var(--bad)}.badge .wait-s{stroke:var(--wait)}.badge .mute-s{stroke:var(--line)}
+.badge .wait-s.needs{fill:color-mix(in srgb,var(--wait) 12%,var(--panel))}
 .term circle{fill:var(--panel);stroke:var(--edge);stroke-width:1.4}
 .term text{font:600 10px var(--mono);fill:var(--mute);letter-spacing:.04em}
 .term.done circle{stroke:var(--ok)}
@@ -118,7 +119,7 @@ pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 var(--mon
   @keyframes march{to{stroke-dashoffset:-18}}
 }
 /* the agent session pane, beside the graph (decisions I36): the same tokens, one page */
-@media (min-width:901px){.split{grid-template-columns:minmax(0,1fr) 420px}}
+@media (min-width:901px){.split.agent{grid-template-columns:minmax(0,1fr) 420px}}
 .controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
 .controls button{display:inline-flex;align-items:center;gap:6px;font:500 13px/1 var(--sans);padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--ink);cursor:pointer}
 .controls button:hover{border-color:var(--accent)}
@@ -129,12 +130,14 @@ h1 .off{color:var(--accent)}
 .rightcol{display:flex;flex-direction:column;gap:14px;min-width:0}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);min-width:0;display:flex;flex-direction:column}
 #session{display:flex;flex-direction:column;min-height:0;flex:1 1 auto}
-/* wide: the column stays in view; the session takes what the node pane does not need */
+/* wide: the column stays in view, as tall as the room below its top (fit(), from the page's
+   script); the session takes what the node pane does not need, and scrolls on its own */
 @media (min-width:901px){
   .rightcol{position:sticky;top:12px;max-height:calc(100vh - 24px)}
-  .rightcol>.card{flex:0 1 auto;min-height:220px}
+  .rightcol.fitted{max-height:none}
+  .rightcol>.card{flex:0 1 auto;min-height:0}
   .rightcol .rows-wrap{overflow:auto;flex:1 1 auto;min-height:0}
-  .rightcol .pane{position:static;flex:0 0 auto;max-height:48vh;overflow:auto}
+  .rightcol.fitted .pane{position:static;flex:0 0 auto;max-height:50%;overflow:auto}
 }
 .chead{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line)}
 .chead h2{margin:0;font:600 12px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--mute)}
@@ -152,13 +155,14 @@ h1 .off{color:var(--accent)}
 .row.isbody{cursor:pointer}
 .row.sel{background:color-mix(in srgb,var(--accent) 9%,var(--panel));border-left-color:var(--accent)}
 .row.nest{padding-left:33px}
+.row.nest.d2{padding-left:55px}.row.nest.d3{padding-left:77px}
 .row.nest .g::before{content:"\2514\00a0";color:var(--ghost);margin-left:-14px}
 .row .g{font-family:var(--mono);color:var(--mute);text-align:center;white-space:nowrap}
 .row .mid{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .row .lbl{font:600 12.5px/1.4 var(--mono);color:var(--ink)}
 .row .sum{color:var(--mute);font-size:12.5px}
 .row .rt{font:11px/1 var(--mono);color:var(--mute);font-variant-numeric:tabular-nums;white-space:nowrap;display:inline-flex;gap:6px;align-items:center}
-.row.working .g,.row.scheduled .g{color:var(--run)}
+.row.working .g{color:var(--run)}.row.scheduled .g{color:var(--wait)}
 .row.completed .g{color:var(--ok)}
 .row.failed .g,.row.failed .lbl{color:var(--bad)}
 .row.generic .lbl{font-weight:500;color:var(--mute)}
@@ -210,11 +214,11 @@ h1 .off{color:var(--accent)}
       <span><i class="k-child"></i>child workflow / batch</span>
       <span><i class="k-timer"></i>timer</span>
     </div>
-    <div class="split">
+    <div id="split" class="split">
       <main id="canvas" class="canvas" aria-label="Workflow graph"></main>
-      <div class="rightcol">
+      <div id="rightcol" class="rightcol">
         <section id="session-card" class="card" hidden aria-label="Agent session">
-          <header class="chead"><h2>Session</h2><span id="strm" class="strm off">stream turn_events</span></header>
+          <header class="chead"><h2>Session</h2><span id="strm" class="strm off" hidden></span></header>
           <div id="session"></div>
           <div id="session-footer" class="sfooter" hidden></div>
         </section>
@@ -323,10 +327,50 @@ function fit(text, px, face) {
 let G = null, selected = null, closeStream = null, ioCache = new Map(), running = false;
 // The agent session (S), the run it belongs to, the SSE indicator and the one fetch in flight.
 let S = null, curW = null, curR = null, streamOpen = false, fetching = null, again = false, shownEvent = null;
+// The graph as drawn (G, and a placeholder for a tool call waiting on an approval), and the
+// node each pending approval's row links to.
+let D = null, needs = new Map(), subs = new Set();
 
 function stateOf(n) {
   if (n.reached === false) return running ? "pending" : "unreached";
   return n.status || "pending";
+}
+// Every row of the session, nested ones included, in the order the pane draws them.
+function allRows(rows) { return (rows || []).flatMap(r => [r, ...allRows(r.children)]); }
+function sessionRows() { return S && !S.empty ? S.turns.flatMap(t => allRows(t.rows)) : []; }
+// The child nodes a handoff row links to: the subagents' own.
+function subagentNodes() { return new Set(sessionRows().filter(r => r.label === "handoff" && r.node).map(r => r.node)); }
+// A tool call waiting on its approval (the wireframe's "needs ✓"): the agent's node of that
+// tool when one is drawn and not done, else a placeholder after the agent's latest step.
+function agentLayer(g) { // the agent's own steps: inside its child (case a), else the run's own
+  if (!S || S.empty) return undefined;
+  if (S.agent.case !== "a") return null;
+  const host = g.nodes.find(n => n.kind === "child" && n.ref && n.ref.workflow_id === S.agent.workflow_id);
+  return host ? host.id : undefined;
+}
+function needsOf(g) {
+  const out = new Map(), layer = agentLayer(g);
+  if (layer === undefined) return out;
+  for (const row of sessionRows()) {
+    if (row.label !== "approval.requested" || !row.pending || !row.tool_id) continue;
+    const drawn = g.nodes.find(n => (n.parent ?? null) === layer && n.name === row.tool_name && n.status !== "completed" && n.status !== "failed");
+    out.set(row.tool_id, drawn ? drawn.id : `needs ✓ ${row.tool_id}`);
+  }
+  return out;
+}
+function withNeeds(g) {
+  const wants = needsOf(g), layer = agentLayer(g);
+  if (!wants.size) return g;
+  const nodes = g.nodes.map(n => ([...wants.values()].includes(n.id) ? { ...n, needs: true } : n)), edges = [...g.edges];
+  for (const row of sessionRows()) {
+    const id = wants.get(row.tool_id);
+    if (!id || nodes.some(n => n.id === id)) continue;
+    const mine = nodes.filter(n => (n.parent ?? null) === layer && n.reached !== false && !n.placeholder);
+    const last = mine.reduce((a, n) => (a && (ms((a.t || {}).scheduled) || 0) >= (ms((n.t || {}).scheduled) || 0) ? a : n), null);
+    nodes.push({ id, name: row.tool_name, label: row.tool_name, kind: "activity", status: "pending", parent: layer, needs: true, placeholder: true, t: {} });
+    edges.push({ from: last ? last.id : START, to: id, parent: layer, reached: false });
+  }
+  return { ...g, nodes, edges };
 }
 
 // ------------------------------------------------------------------ layout
@@ -430,24 +474,35 @@ function anchor(L, id, side) {
   if (L.vertical) return side === "out" ? { x: p.x, y: p.y + hh } : side === "in" ? { x: p.x, y: p.y - hh } : { x: p.x + hw, y: p.y };
   return side === "out" ? { x: p.x + hw, y: p.y } : side === "in" ? { x: p.x - hw, y: p.y } : { x: p.x, y: p.y + hh };
 }
-function draw(g) {
+function draw(base) {
   // Top to bottom beside a session (the wireframe's), or when left to right does not fit the
   // canvas; nodes narrowed to fit.
+  const g = withNeeds(base);
+  D = g; subs = subagentNodes();
   const avail = Math.max(280, $("canvas").clientWidth - 2);
   W = 184;
-  let vertical = matchMedia("(max-width: 640px)").matches || (S && !S.empty) || g.nodes.some(n => n.parent != null);
-  let L = layout(g, vertical, null);
-  if (!vertical && L.width + 48 > avail) { vertical = true; L = layout(g, true, null); }
-  if (vertical && L.width + 48 > avail) {
-    W = Math.max(120, Math.min(184, Math.floor(184 * (avail - 48) / L.width)));
-    L = layout(g, true, null);
+  const nested = g.nodes.some(n => n.parent != null);
+  let vertical = matchMedia("(max-width: 640px)").matches || (S && !S.empty) || nested;
+  let L = layout(g, vertical, null), box;
+  if (!nested) {
+    // Nothing nested: laid out, narrowed and framed exactly as the page did before it had a session.
+    if (!vertical) { const across = [...L.pos.values()].map(p => p.x); vertical = Math.max(...across) - Math.min(...across) + W + 48 > avail; }
+    if (vertical) { W = Math.max(120, Math.min(184, Math.floor((avail - 48 - (L.widest - 1) * 16) / L.widest))); L = layout(g, true, null); }
+    const xs = [...L.pos.values()].map(p => p.x), ys = [...L.pos.values()].map(p => p.y);
+    box = { minX: Math.min(...xs) - W / 2 - 24, maxX: Math.max(...xs) + W / 2 + 24, minY: Math.min(...ys) - H / 2 - 30, maxY: Math.max(...ys) + H / 2 + 24, legacy: true };
+  } else {
+    if (!vertical && L.width + 48 > avail) { vertical = true; L = layout(g, true, null); }
+    if (vertical && L.width + 48 > avail) {
+      W = Math.max(120, Math.min(184, Math.floor(184 * (avail - 48) / L.width)));
+      L = layout(g, true, null);
+    }
+    box = { minX: L.minX - 24, maxX: L.maxX + 24, minY: L.minY - 30, maxY: L.maxY + 24 };
   }
   const svg = sv("svg", { xmlns: SVGNS, role: "group", "aria-label": `${g.workflow?.type || "Workflow"} graph` });
   const defs = sv("defs");
   for (const [id, cls] of [["arr", "arrow"], ["arr-dim", "arrow-dim"]])
     defs.append(sv("marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, sv("path", { d: "M0,0 L10,5 L0,10 z", class: cls })));
   svg.append(defs);
-  const box = { minX: L.minX - 24, maxX: L.maxX + 24, minY: L.minY - 30, maxY: L.maxY + 24 };
   const top = sv("g");
   drawLayout(L, top, box, g);
   svg.append(top);
@@ -483,7 +538,7 @@ function drawLayout(L, into, box, g) {
                      : `M${p.x - 16},${p.y - s.h / 2} C${p.x - 24},${p.y - s.h / 2 - 40} ${p.x + 24},${p.y - s.h / 2 - 40} ${p.x + 16},${p.y - s.h / 2}`;
       attrs.class += " back";
       if (!L.vertical) box.minY = Math.min(box.minY, p.y - s.h / 2 - 40);
-      else box.maxX = Math.max(box.maxX, p.x + s.w / 2 + 50);
+      else if (!box.legacy) box.maxX = Math.max(box.maxX, p.x + s.w / 2 + 50);
     } else if (L.back.has(e)) { // back to an earlier step: around the graph
       const a = anchor(L, e.from, "side"), b = anchor(L, e.to, "side");
       detour += 14;
@@ -536,12 +591,13 @@ function drawLayout(L, into, box, g) {
     if (n.attempt > 1) badges.push([`×${n.attempt}`, st === "failed" || st === "timed_out" ? "bad" : "wait"]);
     if (n.parallel > 1) badges.push([`∥${n.parallel}`, "mute"]);
     if (n.count > 1 && n.count > (n.parallel || 1)) badges.push([`↻${Math.round(n.count / Math.max(1, n.parallel || 1))}`, "mute"]);
+    if (n.needs) badges.push(["needs ✓", "wait"]); // a tool call waiting on an approval
     let bx = s.w / 2 - 4;
     for (const [text, tone] of badges) {
       const bw = 10 + text.length * 7.2;
       bx -= bw;
       g1.append(sv("g", { class: "badge", transform: `translate(${bx},${-s.h / 2 - 9})` },
-        sv("rect", { class: `${tone}-s`, width: bw, height: 17, rx: 8.5 }),
+        sv("rect", { class: `${tone}-s${text.startsWith("needs") ? " needs" : ""}`, width: bw, height: 17, rx: 8.5 }),
         sv("text", { class: `${tone}-t`, x: bw / 2, y: 12.2, "text-anchor": "middle" }, text)));
       bx -= 4;
     }
@@ -561,11 +617,14 @@ function drawLayout(L, into, box, g) {
   }
 }
 function metaLine(n, st, now) {
+  if (n.placeholder) return "needs an approval first";
   if (st === "unreached") return "branch not taken";
   if (st === "pending") return "not reached yet";
   const t = n.t || {};
-  // A batch's progress, from its child's own history (OD3).
-  const prog = n.progress ? ` · ${n.progress.pages ? "pages= · " : ""}${n.progress.done}/${n.progress.total}` : "";
+  // A batch's progress, from its child's own runs (OD3): ≥ while more pages may come.
+  const p = n.progress;
+  const prog = p ? ` · ${p.pages != null ? "pages= · " : ""}${p.done}/${p.bound ? "≥" : ""}${p.total}` : "";
+  if (subs.has(n.id)) return st === "running" || st === "scheduled" ? "child · subagent · handoff · running" : "child · subagent · handoff";
   const kind = isBatch(n) ? `batch${prog} · ` : n.kind === "child" ? "child · " : "";
   if (st === "running" || st === "scheduled") {
     // Backing off: since the attempt that failed ended, not since the step was first scheduled.
@@ -610,16 +669,22 @@ function json(v) {
 function pane() {
   const box = $("pane");
   if (shownEvent) return eventPane(shownEvent);
-  const n = selected && G.nodes.find(x => x.id === selected);
+  const n = selected && (D || G).nodes.find(x => x.id === selected);
   if (!n) { box.replaceChildren(el("p", { class: "pane-empty" }, "Select a step to see its attempts, timing, input and result, and to open it in Temporal UI, its logs or its trace.")); return; }
+  if (n.placeholder) {
+    box.replaceChildren(el("h2", {}, el("span", { class: "k" }, "Node"), title(n), el("span", { class: "pill s-pending" }, "needs ✓")),
+      el("p", { class: "muted" }, "The agent asked to run this tool and waits on an approval: it is scheduled once the call is allowed."));
+    return;
+  }
   const st = stateOf(n), t = n.t || {}, ref = n.ref || {};
   const facts = el("dl", { class: "facts" });
   const fact = (k, v) => { if (v != null && v !== "") facts.append(el("dt", {}, k), el("dd", {}, v)); };
   const kind = isBatch(n) ? `${KIND.child} · batch` : n.parent ? `${KIND[n.kind] || n.kind} · of the agent child` : KIND[n.kind] || n.kind;
   fact("kind", kind);
   fact("queue", ref.task_queue);
-  fact("attempt", n.attempt ? (n.attempt > 1 ? `${n.attempt} (retried ${n.attempt - 1}×)` : "1") : null);
-  if (n.progress) fact("progress", `${n.progress.pages ? "pages= · " : ""}${n.progress.done} of ${n.progress.total} items done`);
+  const p = n.progress, items = p ? ` (${p.bound ? "≥" : ""}${p.total} items)` : "";
+  fact("attempt", n.attempt ? (n.attempt > 1 ? `${n.attempt} (retried ${n.attempt - 1}×)${items}` : `1${items}`) : p ? `1${items}` : null);
+  if (p) fact("result", `${p.pages != null ? `${p.pages} page${p.pages === 1 ? "" : "s"} · ` : ""}${p.done} item${p.done === 1 ? "" : "s"} · ${p.failed || 0} fail`);
   if (n.count > 1) fact("ran", n.parallel > 1 ? `${n.count} times, up to ${n.parallel} at once` : `${n.count} times (a loop)`);
   const closed = ms(t.closed), start = ms(t.scheduled);
   fact("duration", closed != null ? dur(start, closed) : start != null && (st === "running" || st === "scheduled") ? `${dur(start, api.now())} so far` : null);
@@ -715,19 +780,28 @@ function header(g) {
   const agent = S && S.reason !== "no-agent" && S.agent && S.agent.type ? S.agent : null;
   document.title = `${agent ? agent.name || agent.type : wf.type || "Run"} · Kontra Run Graph`;
   if (agent) {
-    // The wireframe's header: the offering, then the agent's handler.
+    // The wireframe's header: the offering, then the agent's handler; KONTRA DEV once.
     $("wf-type").replaceChildren("KONTRA DEV · ", el("span", { class: "off" }, agent.offering || ""), ` · ${agent.name || agent.type}`);
   } else $("wf-type").textContent = wf.type || "Workflow";
-  $("wf-id").textContent = wf.workflow_id || "";
+  $("to-runs").textContent = agent ? "runs" : "kontra dev · runs";
+  const id = String(wf.workflow_id || "");
+  $("wf-id").textContent = agent && id.length > 24 ? `${id.slice(0, 12)}…${id.slice(-4)}` : id;
+  $("wf-id").title = id;
   const pill = $("wf-status");
   pill.hidden = !wf.status; pill.className = `pill s-${wf.status}`; pill.textContent = STATUS[wf.status] || wf.status || "";
+  // The wireframe's second line is an agent's: a run that is no agent keeps the line it had.
   $("sess-queue").replaceChildren(...(wf.task_queue ? ["queue ", el("code", {}, wf.task_queue)] : []));
   $("sess-run").replaceChildren(...(wf.run_id ? ["run ", el("code", { title: wf.run_id }, `${String(wf.run_id).slice(0, 8)}…${String(wf.run_id).slice(-4)}`)] : []));
+  $("sess-queue").hidden = $("sess-run").hidden = !agent;
+  $("ind").hidden = !agent;
   const t = wf.t || {};
   const end = ms(t.closed) ?? (running ? api.now() : null);
   const d = dur(ms(t.started), end);
-  $("wf-time").textContent = t.started ? `started ${clock(t.started)}${d ? ` · ${running ? "running for " : "took "}${d}` : ""}` : "";
-  const nav = linkRow(wf.links, [["temporal", "Temporal UI"], ["logs", "Grafana"], ["trace", "Trace"]]);
+  const when = t.started ? `started ${clock(t.started)}${d ? ` · ${running ? "running for " : "took "}${d}` : ""}` : "";
+  // An agent's header is the wireframe's two lines: the clock is the status pill's title there.
+  $("wf-time").textContent = agent ? "" : when;
+  pill.title = agent ? when : "";
+  const nav = linkRow(wf.links, agent ? [["temporal", "Temporal UI"], ["logs", "Grafana"]] : [["temporal", "Temporal UI"], ["logs", "Grafana"], ["trace", "Trace"]]);
   $("wf-links").replaceChildren(...(nav ? nav.childNodes : []));
   const note = $("notice");
   if (g.static_graph === false) {
@@ -737,13 +811,14 @@ function header(g) {
   } else note.hidden = true;
 }
 function indicator(open) {
-  $("ind").hidden = false;
   $("ind").classList.toggle("off", !open);
   $("strm").classList.toggle("off", !open);
 }
 function turnHead(turn) {
   const keys = turn.input_keys || [];
-  const sig = turn.handler ? ` · ${turn.handler}(${keys.slice(0, 1).join("")}${keys.length > 1 ? ", …" : ""})` : "";
+  // The input's type when the agent says it (its agent_interface), else its first field.
+  const shown = turn.input_type || `${keys.slice(0, 1).join("")}${keys.length > 1 ? ", …" : ""}`;
+  const sig = turn.handler ? ` · ${turn.handler}(${shown})` : "";
   const h = el("div", { class: "turnhead", title: turn.handler ? `${turn.handler}(${keys.join(", ")})` : null },
     "── turn ", el("b", {}, String(turn.turn_number ?? "?")), el("span", { class: "sig" }, sig));
   if (turn.status && turn.status !== "running") h.append(el("span", { class: `tstatus pill s-${turn.status}` }, STATUS[turn.status] || turn.status));
@@ -751,11 +826,13 @@ function turnHead(turn) {
 }
 let lastRt = null; // a row's time is shown when it moved since the row before
 function rowEl(row, nested) {
-  const node = row.node;
-  const cls = ["row", row.state || "", nested ? "nest" : "", row.type === "unknown" ? "generic" : "", node ? "islink" : row.offset != null && !nested ? "isbody" : "",
+  const node = row.node || (row.tool_id ? needs.get(row.tool_id) : null) || null;
+  if (node && !row.node) row = { ...row, node }; // a call waiting on its approval: its "needs ✓" node
+  const cls = ["row", row.state || "", nested ? `nest d${nested}` : "", row.type === "unknown" ? "generic" : "", node ? "islink" : row.offset != null && !nested ? "isbody" : "",
     selected && selected === node ? "sel" : ""].filter(Boolean).join(" ");
   const r = el("div", { class: cls, "data-node": node || null, "data-offset": row.offset != null ? String(row.offset) : null, "data-event": row.event_id != null ? String(row.event_id) : null });
-  if (node) r.setAttribute("title", row.node_fallback ? `${node} · linked by name and order: its input is sealed to another key` : `${node} · event #${row.event_id ?? "?"}`);
+  if (node) r.setAttribute("title", row.node_fallback ? `${node} · linked by name and order: its input is sealed to another key`
+    : nested ? `${node} · in the subagent's own history` : `${node}${row.event_id != null ? ` · event #${row.event_id}` : ""}`);
   r.append(el("span", { class: "g" }, row.glyph || "·"));
   const mid = el("span", { class: "mid" }, el("span", { class: "lbl" }, row.label));
   if (row.summary) mid.append(el("span", { class: "sum" }, " " + row.summary));
@@ -779,7 +856,8 @@ function gate(row, agent) {
   panel.append(el("div", { class: "to" }, row.hint ? `${row.tool_name || row.summary} → ${row.hint}` : row.tool_name || row.summary || "tool"));
   let note;
   if (!row.pending) note = `answered · ${row.resolution || "resolved"}${row.auto ? ` · auto: ${row.auto}` : ""}`;
-  else if (agent.case === "a") note = "informational: a hired turn ends on it (one hire is one turn; sessions are #60)";
+  else if (agent.case === "a") note = "informational: a hired turn ends on it (one hire is one turn)";
+  else if (agent.status !== "running") note = "run ended · unanswered";
   else note = `waiting on the seller${row.auto ? ` · auto: ${row.auto}` : ""}`;
   panel.append(el("div", { class: "note" }, note));
   return panel;
@@ -788,48 +866,80 @@ function emptyState(session) {
   const msg = { "no-agent": "This offering has no agent session (its entry is not an agent).",
     "no-events": "No agent events yet — the run has not started its first turn.",
     "not-in-history": "This run's events are not in history yet: nobody has read its turn_events stream.",
-    "in-bucket": "This job's events are in the bucket, by reference: the codec server holds no gate session to fetch them." }[session.reason] || "No agent session.";
+    "in-bucket": "This job's events are in the bucket, by reference: the codec server holds no gate session to fetch them.",
+    "undecodable": "This run's agent events could not be rendered: the codec server's log says why." }[session.reason] || "No agent session.";
   return el("div", { class: "sess-empty" }, el("p", {}, msg));
+}
+function rowsOf(wrap, rows, agent, depth) {
+  for (const row of rows) {
+    if (row.type === "truncated") { wrap.append(el("div", { class: "subnote" }, row.summary)); continue; }
+    wrap.append(rowEl(row, depth));
+    // A handoff's own rows under it, a subagent's subagents' under theirs (OD5: at most 3 deep).
+    rowsOf(wrap, row.children || [], agent, Math.min(3, depth + 1));
+    if (row.note) wrap.append(el("div", { class: "subnote" }, row.note));
+    if (row.link) wrap.append(el("div", { class: "subnote" }, el("a", { href: api.href(row.link), target: "_blank", rel: "noopener noreferrer" }, "open the subagent ↗"), ` · ${row.link_reason || ""}`));
+    if (!depth && (row.label === "approval.requested" || row.label === "callback.requested")) wrap.append(gate(row, agent));
+  }
 }
 function renderSession(session) {
   S = session;
   const card = $("session-card"), box = $("session"), foot = $("session-footer");
-  card.hidden = false;
+  // A run that is no agent has no session card: its page is the graph page it always was.
+  card.hidden = session.empty && session.reason === "no-agent";
+  if (card.hidden) return;
   const agent = session.agent || {};
+  $("strm").hidden = false;
+  $("strm").textContent = `stream ${session.stream || "turn_events"}`;
   if (session.empty) { box.replaceChildren(emptyState(session)); foot.hidden = true; return; }
-  // A live session follows its tail (the newest row is the one that matters), unless scrolled up.
-  const old = box.querySelector(".rows-wrap");
-  const tail = !old || old.dataset.run !== String(agent.run_id) || old.scrollTop + old.clientHeight >= old.scrollHeight - 8;
-  const wrap = el("div", { class: "rows-wrap", "data-run": String(agent.run_id) });
+  // A live session follows its tail (the newest row is the one that matters), unless scrolled
+  // up: read before the old rows go (a detached box scrolls nowhere).
+  const old = box.querySelector(".rows-wrap"), same = !!old && old.dataset.run === String(agent.run_id);
+  const tail = !same || old.dataset.tail !== "0", top = same ? old.scrollTop : 0;
+  const wrap = el("div", { class: "rows-wrap", "data-run": String(agent.run_id), "data-tail": tail ? "1" : "0" });
+  // At the bottom it follows; scrolled up by the user, it stays (a box resized as the column
+  // settles scrolls too, and that is no one leaving the tail).
+  const touched = () => { wrap.dataset.user = String(Date.now()); };
+  for (const kind of ["wheel", "touchstart", "keydown", "pointerdown"]) wrap.addEventListener(kind, touched, { passive: true });
+  wrap.addEventListener("scroll", () => {
+    if (wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 8) wrap.dataset.tail = "1";
+    else if (Date.now() - Number(wrap.dataset.user || 0) < 1500) wrap.dataset.tail = "0";
+  }, { passive: true });
   lastRt = null;
   for (const turn of session.turns) {
     wrap.append(turnHead(turn));
-    for (const row of turn.rows) {
-      if (row.type === "truncated") { wrap.append(el("div", { class: "subnote" }, row.summary)); continue; }
-      wrap.append(rowEl(row, false));
-      for (const child of row.children || []) wrap.append(rowEl(child, true));
-      if (row.note) wrap.append(el("div", { class: "subnote" }, row.note));
-      if (row.link) wrap.append(el("div", { class: "subnote" }, el("a", { href: api.href(row.link), target: "_blank", rel: "noopener noreferrer" }, "open the subagent ↗"), ` · ${row.link_reason || ""}`));
-      if (row.label === "approval.requested" || row.label === "callback.requested") wrap.append(gate(row, agent));
-    }
+    rowsOf(wrap, turn.rows, agent, 0);
   }
+  if (old) rowsSeen.unobserve(old);
   box.replaceChildren(wrap);
-  if (tail) wrap.scrollTop = wrap.scrollHeight;
-  else if (old) wrap.scrollTop = old.scrollTop;
+  if (tail) pin(wrap); else wrap.scrollTop = top;
+  rowsSeen.observe(wrap); // and again whenever the box is resized (the node pane, the column)
   const f = session.footer || {};
   foot.hidden = false;
   foot.replaceChildren(el("span", { class: "key" }, `${f.count || 0} events`), el("span", { class: "key" }, `seq ${f.last_offset ?? "—"}`),
     el("span", {}, "dedupe by seq (the stream offset)"), el("span", {}, `decrypted with ${f.decrypted || "this machine's dev key"}`));
   highlightRows();
 }
+// A box at its tail stays there as the column around it settles.
+function pin(w) { w.scrollTop = w.scrollHeight; }
+const rowsSeen = new ResizeObserver(entries => { for (const e of entries) if (e.target.dataset.tail === "1") pin(e.target); });
+// Wide: the right column is as tall as the room below where it starts, so the session, its
+// footer and the node pane are in view together (the wireframe's); its rows scroll on their own.
+function fitColumn() {
+  const col = $("rightcol"), on = !!S && !(S.empty && S.reason === "no-agent") && matchMedia("(min-width: 901px)").matches;
+  $("split").classList.toggle("agent", !!S && !(S.empty && S.reason === "no-agent"));
+  col.classList.toggle("fitted", on);
+  col.style.height = on ? `${Math.max(320, innerHeight - ($("split").getBoundingClientRect().top + scrollY) - 12)}px` : "";
+}
 
 // ------------------------------------------------------------------ views
 function paint(view) {
   const g = view.graph;
   G = g; S = view.session || null;
-  if (selected && !g.nodes.some(n => n.id === selected)) selected = null;
+  needs = needsOf(g);
+  if (selected && !withNeeds(g).nodes.some(n => n.id === selected)) selected = null;
   header(g);
   if (S) renderSession(S); else $("session-card").hidden = true;
+  fitColumn();
   draw(g);
   pane();
 }
@@ -885,7 +995,7 @@ function fail(err) {
   note.textContent = `Could not load: ${err.message}`;
   note.hidden = false;
 }
-addEventListener("resize", () => { if (G) draw(G); });
+addEventListener("resize", () => { if (G) { fitColumn(); draw(G); } });
 // While the run is open, its clocks keep moving between events.
 setInterval(() => { if (G && running && !document.hidden) { header(G); draw(G); } }, 1000);
 if (api.query.w) graphView(api.query.w, api.query.r); else runsView();

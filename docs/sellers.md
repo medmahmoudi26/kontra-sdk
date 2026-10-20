@@ -1179,7 +1179,9 @@ like the decoding, it runs for a dev profile only.
 A run of an agent gets a second column on the same page, beside its graph: **SESSION**, the
 agent's turns as it ran them, above the **NODE** pane of the step you selected (on a narrow
 screen the session goes under the graph and the node pane under it). Each turn is a header
-(`── turn 1 · sweep(domains)`) over its rows, in the order the agent published them:
+(`── turn 1 · sweep(SweepRequest)`: the handler and its input's type, as the agent's own
+`agent_interface` query names it; the input's first field when it does not answer) over its
+rows, in the order the agent published them:
 
 ```text
 ▸ turn.started    input: 12 domains          +00:00
@@ -1201,10 +1203,13 @@ bound handler's job (`serve(Agent.handler)`) draws its agent child as a box insi
 with the agent's own steps (each tool's activity, the subagents it started) as real nodes in
 it. A row is linked by the `tool_id` the harness carries in each tool activity's input,
 decrypted with this machine's key; when an input is sealed to another key, by the tool's name
-and order, and the row says so. A `handoff` row is the subagent's child node, with the
-subagent's own rows nested under it, read from its own history (three subagents deep, sixteen
-in one view; past that the row links to the subagent's own page and says why). Any other row
-opens its event's body in the pane, decoded here.
+and order, and the row says so. A `handoff` row is the subagent's child node (`child · subagent
+· handoff`), with the subagent's own rows nested under it, read from its own history (three
+subagents deep, sixteen in one view; past that the row links to the subagent's own page and
+says why); a nested row selects that child node too. A tool call waiting on an approval marks
+its node `needs ✓` (a placeholder node until the agent schedules it). A batch child shows
+`pages= · 7/12` (`7/≥8` while more pages may come): its items done, of the batch's own count.
+Any other row opens its event's body in the pane, decoded here.
 
 The footer counts the events and gives the last `seq`: an event's offset on the stream, the
 one counter it has, and the one the pane dedupes by. The rows and their short summaries come
@@ -1260,8 +1265,9 @@ own, with its raw type, never dropped:
 | `state_snapshot` | no row (counted) |
 | `state_patch` | no row (counted) |
 
-A summary is at most 120 characters, never a whole body; a stream item over 256 KiB is a row
-that says it is too large; past 5000 rows or 4 MiB of summaries, one row says how many more
+A summary, and every other string read from an event, is at most 120 characters (an id 1000),
+never a whole body; a stream item over 256 KiB is a row that says it is too large; past 5000
+turns and rows (a subagent's nested rows included) or 4 MiB of them, one row says how many more
 there are.
 
 ## Publishing and serving
