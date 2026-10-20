@@ -6,13 +6,15 @@ no login verb and no ``--real`` mode: the compose stack with the prod gate image
 repository's e2e tooling (``make stack-up``/``make e2e``), never a choice here. Only
 ``--observability`` runs containers (a shipped observability-only compose file).
 
-``down``, ``status`` and ``logs`` talk to the host over three control routes and never import
+``down``, ``status`` and ``logs`` talk to the host over its control routes and never import
 FastAPI or uvicorn; ``up``'s ports come from ``$KONTRA_HOME/dev/settings.json`` and the flags
 below, never the ``KONTRA_DEV_*_PORT`` the e2e stack reads (OD8).
 """
 
 from __future__ import annotations
 
+import contextlib
+import hmac
 import json
 import os
 import re
@@ -22,6 +24,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,8 +37,10 @@ import kontra
 from kontra.cli._common import CliError, default_handle, emit_json, fail, run
 from kontra.devgate import state
 from kontra.devgate.state import Ports
+from kontra.devgate.temporal import RESTART_SECONDS
 
 if TYPE_CHECKING:
+    from kontra.devgate.stack import StackConfig
     from kontra.devgate.state import StackRecord
     from kontra.profile import Profile
 
@@ -63,15 +68,22 @@ OBSERVABILITY_SERVICES = ("prometheus", "prometheus-agent", "grafana", "otelcol"
 _READY_TIMEOUT = 120.0
 _STOP_WAIT = 20.0
 _HOST_HTTP_TIMEOUT = 10.0
+#: ``POST /_devgate/config`` answers after a ``--ui``/``--observability`` toggle has restarted
+#: Temporal (a stop grace and a ready wait): the request may take that long.
+_CONFIG_TIMEOUT = RESTART_SECONDS + _HOST_HTTP_TIMEOUT
+_NEW_GATE = (
+    "a new dev gate: restart any `kontra serve` started before it (its offering is not in "
+    "this catalog)"
+)
 
 
 # --------------------------------------------------------------------------- talking to the host
 
 
-def _host_http() -> httpx.Client:
+def _host_http(timeout: float | None = None) -> httpx.Client:
     """A client for the host and the codec server: never through a proxy (the control token
     must not leave this machine)."""
-    return httpx.Client(trust_env=False, timeout=_HOST_HTTP_TIMEOUT)
+    return httpx.Client(trust_env=False, timeout=timeout or _HOST_HTTP_TIMEOUT)
 
 
 def _host_headers(port: int, token: str | None = None) -> dict[str, str]:
@@ -81,11 +93,22 @@ def _host_headers(port: int, token: str | None = None) -> dict[str, str]:
     return headers
 
 
-def _ready_doc(port: int, token: str) -> dict[str, Any] | None:
-    """``GET /_devgate/ready`` with the token, proving the process on ``port`` is this host's
-    (not another home's, not a stale pid); the host's readiness document, or None."""
+def _ready_doc(port: int, token: str, pid: int | None = None) -> dict[str, Any] | None:
+    """The readiness document of the host that holds ``token`` on ``port`` (and is ``pid``,
+    when given), or None. A stale record's port may be anyone's by now (a reboot frees it
+    for the first taker), so the token is never sent before the port proves it holds it:
+    ``GET /_devgate/hello`` with a fresh nonce must answer :func:`state.hello_proof` of it,
+    then ``GET /_devgate/ready`` goes over the same connection with the bearer."""
+    nonce = secrets.token_hex(16)
     try:
         with _host_http() as http:
+            hello = http.get(
+                f"http://127.0.0.1:{port}/_devgate/hello",
+                params={"nonce": nonce},
+                headers=_host_headers(port),
+            )
+            if not _proves(hello, token, nonce):
+                return None
             r = http.get(
                 f"http://127.0.0.1:{port}/_devgate/ready", headers=_host_headers(port, token)
             )
@@ -97,11 +120,29 @@ def _ready_doc(port: int, token: str) -> dict[str, Any] | None:
         doc = r.json()
     except ValueError:
         return None
-    return doc if isinstance(doc, dict) else None
+    if not isinstance(doc, dict):
+        return None
+    if pid is not None and doc.get("pid") != pid:  # pyright: ignore[reportUnknownMemberType]
+        return None
+    return {str(k): v for k, v in doc.items()}  # pyright: ignore[reportUnknownVariableType]
 
 
-def _control_post(port: int, token: str, route: str, body: dict[str, Any]) -> dict[str, Any]:
-    with _host_http() as http:
+def _proves(hello: httpx.Response, token: str, nonce: str) -> bool:
+    if hello.status_code != 200:
+        return False
+    try:
+        proof: Any = hello.json().get("proof")
+    except (ValueError, AttributeError):
+        return False
+    want = state.hello_proof(token, nonce)
+    return isinstance(proof, str) and hmac.compare_digest(proof.encode(), want.encode())
+
+
+def _control_post(
+    port: int, token: str, route: str, body: dict[str, Any], *, timeout: float | None = None
+) -> dict[str, Any]:
+    """POST a control route of a host :func:`_ready_doc` has just proven."""
+    with _host_http(timeout) as http:
         r = http.post(
             f"http://127.0.0.1:{port}/_devgate/{route}",
             headers=_host_headers(port, token),
@@ -423,11 +464,13 @@ class _suppress_process_errors:
 
 def _cleanup_stack(record: StackRecord, *, persist: bool, home: Path) -> None:
     """Stop the recorded stack's process group if it is still ours (:func:`_group_is_ours`),
-    then forget it and (unless persist) wipe the in-memory data."""
+    then forget it and (unless persist) wipe the in-memory data. The registry entry of its
+    gate port goes only if it still names this home: since a crash or a reboot, another home
+    may have started on that port, and others join it through that entry (OD7)."""
     if _group_is_ours(record, home):
         _signal_group(record.pgid)
     state.remove_stack_record(home)
-    state.unregister_port(record.port_set.gate)
+    state.unregister_port(record.port_set.gate, home)
     if not persist:
         shutil.rmtree(state.data_dir(home), ignore_errors=True)
 
@@ -655,9 +698,10 @@ def up(
     overrides = _port_overrides(**port_kwargs)
     ports = state.resolve_ports(home, overrides)
 
-    with state.lock(home):
+    with contextlib.ExitStack() as held:
+        held.enter_context(state.lock(home))  # a --foreground stack lets go once it serves
         record = state.read_stack_record(home)
-        doc = None if record is None else _ready_doc(record.port_set.gate, record.token)
+        doc = None if record is None else _ready_doc(record.port_set.gate, record.token, record.pid)
         if record is not None and doc is not None:
             if record.port_set != ports and any(v is not None for v in overrides.values()):
                 fail(
@@ -676,6 +720,7 @@ def up(
                 record.token,
                 "config",
                 {"ui": ui, "metrics": observability, "persist": want_persist},
+                timeout=_CONFIG_TIMEOUT,
             )
             # Remembered at once: `down` keeps the snapshot (or wipes it) by this setting.
             settings.persist = want_persist
@@ -693,6 +738,7 @@ def up(
             _finish(home, joined_ports, handle, existing, ui, False, False, fresh=False)
             return
         state.joined_path(home).unlink(missing_ok=True)  # the stack it joined is gone
+        restored = want_persist and (state.dev_dir(home) / "data" / "gate.json").is_file()
         _start_fresh(
             home,
             ports,
@@ -703,11 +749,23 @@ def up(
             foreground,
             handle,
             existing,
+            release=held.close,
+            restored=restored,
         )
         if foreground:
             return  # _start_fresh ran it in the foreground and has returned on Ctrl-C
 
-    _finish(home, ports, handle, existing, ui, observability, want_persist, fresh=True)
+    _finish(
+        home,
+        ports,
+        handle,
+        existing,
+        ui,
+        observability,
+        want_persist,
+        fresh=True,
+        restored=restored,
+    )
 
 
 def _require_dev_extra() -> None:
@@ -750,7 +808,7 @@ def _joinable(home: Path, gate_port: int) -> tuple[Path, StackRecord] | None:
     record = state.read_stack_record(owner)
     if record is None or record.port_set.gate != gate_port:
         return None
-    if _ready_doc(gate_port, record.token) is None:
+    if _ready_doc(gate_port, record.token, record.pid) is None:
         return None
     return owner, record
 
@@ -804,9 +862,13 @@ def _start_fresh(
     foreground: bool,
     handle: str | None,
     existing: Profile | None,
+    *,
+    release: Callable[[], None],
+    restored: bool,
 ) -> None:
     """Bind-check the ports this ``up`` will bind, ensure the CLI, and start the host
-    (detached, or in the foreground)."""
+    (detached, or in the foreground: ``release`` lets go of the ``up``/``down`` lock once
+    that stack is recorded and serving)."""
     from kontra.devgate import temporal_cli
 
     _check_free(
@@ -821,7 +883,14 @@ def _start_fresh(
     if not persist:
         # In memory: nothing of an earlier stack's Temporal db survives into this one.
         shutil.rmtree(state.dev_dir(home) / "data", ignore_errors=True)
-    cli = temporal_cli.ensure(say=lambda m: click.echo(m, err=True))
+    try:
+        cli = temporal_cli.ensure(say=lambda m: click.echo(m, err=True))
+    except (temporal_cli.TemporalCLIError, httpx.HTTPError, OSError) as e:
+        fail(
+            f"kontra dev up needs the Temporal CLI {temporal_cli.VERSION}: {e}\n"
+            f"  (offline, or to use your own: {temporal_cli.CLI_ENV}=/path/to/temporal, "
+            f"server {temporal_cli.MIN_SERVER[0]}.{temporal_cli.MIN_SERVER[1]}+)"
+        )
     if foreground:
         _run_foreground(
             home,
@@ -832,6 +901,8 @@ def _start_fresh(
             persist=persist,
             handle=handle,
             existing=existing,
+            release=release,
+            restored=restored,
         )
         return
     token = secrets.token_urlsafe(32)
@@ -845,7 +916,7 @@ def _start_fresh(
         token=token,
         timeout=timeout,
     )
-    doc = _ready_doc(ports.gate, token)
+    doc = _ready_doc(ports.gate, token, pid)
     if doc is None:
         with _suppress_process_errors():
             os.killpg(pid, signal.SIGKILL)
@@ -881,9 +952,14 @@ def _run_foreground(
     persist: bool,
     handle: str | None,
     existing: Profile | None,
+    release: Callable[[], None],
+    restored: bool,
 ) -> None:
     """Run the stack in this process until Ctrl-C (for a container entrypoint, or to watch the
-    log live). The profile is minted once serving, as detached ``up`` does."""
+    log live). Once it serves it is recorded as a detached ``up`` records its host --
+    ``stack.json`` (this process), the registry entry, the ports and ``--persist`` -- and the
+    ``up``/``down`` lock is released, so ``status``, ``down`` (over ``POST /_devgate/stop``), a
+    plain ``up`` and another home's join all see it. It forgets itself on the way out."""
     import asyncio
 
     from kontra.auth import login
@@ -899,41 +975,91 @@ def _run_foreground(
         party = default_handle()
 
     async def _serve() -> None:
-        async with DevStack(config, token=token) as stack:
+        stack = DevStack(config, token=token)
+        try:
+            await stack.__aenter__()
+        except Exception as e:  # the stack stopped its Temporal child before raising
+            fail(f"kontra dev up failed: {e}")
+        try:
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, stack.request_stop)
-            profile = await login(stack.gate_url, handle=party, dev=True, home=home)
-            codec = None
-            if ui:
-                grafana = f"http://localhost:{ports.grafana}" if metrics else None
-                try:
-                    codec = _start_codec(
-                        home, codec_port=ports.codec, ui_port=ports.ui, grafana_url=grafana
-                    )
-                except CliError as e:
-                    click.echo(f"codec server not started: {e.format_message()}", err=True)
-            if metrics:
-                _observability_up(ports)
-            _print_summary(
-                home,
-                ports,
-                profile,
-                ui=ui,
-                observability=metrics,
-                persist=persist,
-                codec=codec,
-                fresh=True,
-            )
-            click.echo("serving in the foreground; Ctrl-C to stop")
+            _record_foreground(home, ports, cli, stack.temporal_http_port, token, config)
+            release()
             try:
+                profile = await login(stack.gate_url, handle=party, dev=True, home=home)
+                codec = None
+                if ui:
+                    grafana = f"http://localhost:{ports.grafana}" if metrics else None
+                    try:
+                        codec = _start_codec(
+                            home, codec_port=ports.codec, ui_port=ports.ui, grafana_url=grafana
+                        )
+                    except CliError as e:
+                        click.echo(f"codec server not started: {e.format_message()}", err=True)
+                if metrics:
+                    _observability_up(ports)
+                _print_summary(
+                    home,
+                    ports,
+                    profile,
+                    ui=ui,
+                    observability=metrics,
+                    persist=persist,
+                    codec=codec,
+                    fresh=True,
+                    existing=existing,
+                    restored=restored,
+                )
+                click.echo("serving in the foreground; Ctrl-C to stop")
                 await stack.wait_closed()
             finally:
                 _stop_codec(home)
                 if metrics:
                     _observability_down(ports)
+                _forget_foreground(home, ports.gate, token)
+        finally:
+            await stack.__aexit__(None, None, None)
 
     run(lambda: _serve())
+
+
+def _record_foreground(
+    home: Path, ports: Ports, cli: Path, temporal_http: int, token: str, config: StackConfig
+) -> None:
+    """What a detached ``up`` writes after its host is ready, for this process's stack."""
+    from kontra.devgate import temporal_cli
+
+    record = state.StackRecord(
+        pid=os.getpid(),
+        # The terminal's job group, which this command did not make: _group_is_ours never
+        # signals it unless this process leads it (pgid == pid).
+        pgid=os.getpgrp(),
+        token=token,
+        started_at=datetime.now(UTC).isoformat(),
+        sdk_version=_sdk_version(),
+        cli={"path": str(cli), "version": temporal_cli.VERSION},
+        ports=asdict(ports),
+        temporal_http=temporal_http,
+        ui=config.ui,
+        metrics=config.metrics,
+        persist=config.persist,
+    )
+    state.write_stack_record(record, home)
+    state.register_port(ports.gate, home)
+    state.remember_ports(ports, home)
+    settings = state.read_settings(home)
+    settings.persist = config.persist
+    state.write_settings(settings, home)
+
+
+def _forget_foreground(home: Path, gate_port: int, token: str) -> None:
+    """Remove this process's record (not one a later ``up`` wrote) and its registry entry.
+    No lock: ``down`` holds it while it waits for this process to exit."""
+    record = state.read_stack_record(home)
+    if record is not None and hmac.compare_digest(record.token, token):
+        state.remove_stack_record(home)
+    state.unregister_port(gate_port, home)
 
 
 def _finish(
@@ -946,6 +1072,7 @@ def _finish(
     persist: bool,
     *,
     fresh: bool,
+    restored: bool = False,
 ) -> None:
     """Check the gate is a dev gate, mint the profile, start/stop the codec and observability,
     and print. Exit 0 means a dev profile was written; every other outcome is 1."""
@@ -977,6 +1104,8 @@ def _finish(
         persist=persist,
         codec=codec,
         fresh=fresh,
+        existing=existing,
+        restored=restored,
     )
 
 
@@ -1026,7 +1155,12 @@ def _print_summary(
     persist: bool,
     codec: str | None,
     fresh: bool,
+    existing: Profile | None = None,
+    restored: bool = False,
 ) -> None:
+    """The summary of design §4.1.10. A fresh gate that replaced a dev profile, and kept no
+    state (``--persist`` restored none), says to restart a ``kontra serve`` started before it:
+    its offering is not in the new catalog and its session is refused."""
     from kontra.profile import KEY_FILE, PROFILE_FILE
 
     kept = "`kontra dev up --persist` keeps it" if not persist else "kept with --persist"
@@ -1046,6 +1180,8 @@ def _print_summary(
         click.echo(
             f"  grafana   http://localhost:{ports.grafana}   otlp http://127.0.0.1:{ports.otlp} (kontra serve --otlp)"
         )
+    if fresh and not restored and existing is not None and existing.dev:
+        click.echo(_NEW_GATE)
     click.echo("next: kontra init <name> && cd <name> && kontra serve")
 
 
@@ -1065,7 +1201,10 @@ def down(reset: bool, volumes: bool) -> None:
     owner = _joined_owner(home)
     if owner is not None:
         theirs = state.read_stack_record(owner)
-        if theirs is not None and _ready_doc(theirs.port_set.gate, theirs.token) is not None:
+        if (
+            theirs is not None
+            and _ready_doc(theirs.port_set.gate, theirs.token, theirs.pid) is not None
+        ):
             fail(f"this home joined the stack of KONTRA_HOME={owner}; run `kontra dev down` there")
         state.joined_path(home).unlink(missing_ok=True)  # that stack is gone: forget it
 
@@ -1073,7 +1212,7 @@ def down(reset: bool, volumes: bool) -> None:
         record = state.read_stack_record(home)
         settings = state.read_settings(home)
         if record is not None:
-            if _ready_doc(record.port_set.gate, record.token) is not None:
+            if _ready_doc(record.port_set.gate, record.token, record.pid) is not None:
                 _control_post(record.port_set.gate, record.token, "stop", {})
                 _wait_for_exit(record.pid, _STOP_WAIT)
             _cleanup_stack(record, persist=settings.persist and not reset, home=home)
@@ -1111,7 +1250,7 @@ def status(as_json: bool) -> None:
     joined = owner is not None
     # A joined home shows the stack it joined (the owner's record holds its token).
     record = state.read_stack_record(owner if owner is not None else home)
-    doc = None if record is None else _ready_doc(record.port_set.gate, record.token)
+    doc = None if record is None else _ready_doc(record.port_set.gate, record.token, record.pid)
     running = doc is not None
     stale = record is not None and not running
     codec = _codec_state(home)
