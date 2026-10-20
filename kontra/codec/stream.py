@@ -18,11 +18,12 @@ read under :data:`BUYER_TOPICS_KEY`), cut to at most :data:`STREAM_ITEMS_MAX` it
                {"topic": ... | null, "offset": 43, "size": 880, "sha256": null}],
      "next_offset": 57, "more_ready": false}
 
-* Each item is sealed on its own: the age ciphertext of the item's own ``Payload`` with two
-  more metadata keys, :data:`SEALED_TOPIC_KEY` and :data:`SEALED_OFFSET_KEY`, so the topic
-  and the offset are authenticated by the ciphertext and a reader checks both against what the
-  relay says (:func:`open_item`): a gate, a bucket or a token holder cannot relabel, reorder or
-  swap items.
+* Each item is sealed on its own: the age ciphertext of the item's own ``Payload`` with
+  three more metadata keys, :data:`SEALED_TOPIC_KEY`, :data:`SEALED_OFFSET_KEY` and
+  :data:`SEALED_JOB_KEY`, so the topic, the offset and the job are authenticated by the
+  ciphertext and a reader checks all three against what the relay says (:func:`open_item`): a
+  gate, a bucket or a token holder cannot relabel, reorder or swap items, within a job or
+  across two whose keys the reader holds.
 * A topic the buyer may read (the offering's ``streams:`` and ``kontra.progress``) is sealed
   to the seller's recipients and the job's buyer key, and named in the clear; any other topic
   to the seller's recipients only, its name ``null`` (it lives inside the ciphertext only).
@@ -85,6 +86,8 @@ __all__ = [
     "POLL_MARK",
     "REF_ENTRY_MAX",
     "REPLAYED_MARK",
+    "SEALED_JOB_KEY",
+    "SEALED_KEYS",
     "SEALED_OFFSET_KEY",
     "SEALED_TOPIC_KEY",
     "STREAM_BUSY",
@@ -128,9 +131,13 @@ OFFSET_MARK = b"offset/v1"
 REPLAYED_MARK = b"replayed/v1"
 #: On a marked poll result: the JSON list of topics the buyer may read.
 BUYER_TOPICS_KEY = "kontra-stream-buyer"
-#: Inside a sealed item: its topic and its offset (ASCII decimal).
+#: Inside a sealed item: its topic, its offset (ASCII decimal) and its job.
 SEALED_TOPIC_KEY = "kontra-topic"
 SEALED_OFFSET_KEY = "kontra-offset"
+SEALED_JOB_KEY = "kontra-job"
+#: Every key a sealed item carries: a payload that opens with any of them is a stream item,
+#: and is never read as anything else (``kontra.codec.KontraCodec`` refuses it).
+SEALED_KEYS = frozenset({SEALED_TOPIC_KEY, SEALED_OFFSET_KEY, SEALED_JOB_KEY})
 #: The envelope's own version (its JSON ``v``): references only (decisions I39).
 ENVELOPE_VERSION = 2
 #: The most items one answer lists. Kontra's workflow interceptor cuts an answer here (the
@@ -420,12 +427,16 @@ def _poll_result(marked: Payload) -> tuple[list[tuple[str, int, Payload]], int, 
 # --------------------------------------------------------------------------- the codec side
 
 
-def _sealed_plaintext(inner: Payload, topic: str, offset: int) -> bytes:
+def _sealed_plaintext(inner: Payload, topic: str, offset: int, job_id: str) -> bytes:
+    """The bytes an item is sealed from: its ``Payload`` with its topic, offset and job.
+    Serialized deterministically (map entries sorted): the same item is the same bytes in
+    every process, so a worker's seed, its file and its blob are the same after a restart."""
     sealed = Payload()
     sealed.CopyFrom(inner)
     sealed.metadata[SEALED_TOPIC_KEY] = topic.encode()
     sealed.metadata[SEALED_OFFSET_KEY] = str(offset).encode("ascii")
-    return sealed.SerializeToString()
+    sealed.metadata[SEALED_JOB_KEY] = job_id.encode()
+    return sealed.SerializeToString(deterministic=True)
 
 
 async def seal_poll(
@@ -460,7 +471,7 @@ async def seal_poll(
     for topic, offset, inner in items:
         visible = topic in listed
         recipients = buyer_recipients if visible else seller_recipients
-        plain = _sealed_plaintext(inner, topic, offset)
+        plain = _sealed_plaintext(inner, topic, offset, scope)
         key = BlobRefs.key(scope, plain, recipients)
         ref = refs.get(key) if refs is not None else None
         if ref is not None:
@@ -533,22 +544,21 @@ async def _store(
 
 
 async def open_poll(
-    envelope: Payload, identities: Sequence[str], *, fetch_blob: FetchBlob | None
+    envelope: Payload, identities: Sequence[str], *, fetch_blob: FetchBlob, job_id: str
 ) -> Payload:
-    """The envelope as the ``PollResult`` JSON a stock subscriber expects, opened with this
-    party's ``identities`` (every item is sealed to the seller's set). Each reference is
-    fetched (``fetch_blob`` verifies it; a few at once); a stub, or every item without
-    ``fetch_blob``, is dropped (an item nobody can relay). An item that will not open, or names
-    another topic or offset than its place, raises :class:`EnvelopeError`."""
+    """The envelope of a poll of ``job_id``'s stream as the ``PollResult`` JSON a stock
+    subscriber expects, opened with this party's ``identities`` (every item is sealed to the
+    seller's set). Each reference is fetched (``fetch_blob`` verifies it; a few at once); a
+    stub is dropped (an item nobody can relay). An item that will not open, or names another
+    topic, offset or job than its place, raises :class:`EnvelopeError`."""
     parsed = parse_envelope(envelope)
-    wanted = [i for i in parsed.items if i.sha256 is not None and fetch_blob is not None]
+    wanted = [i for i in parsed.items if i.sha256 is not None]
     fetched: dict[int, bytes] = {}
     if wanted:
         gate = asyncio.Semaphore(_FETCH_CONCURRENCY)
 
         async def fetch(item: EnvelopeItem) -> None:
             assert item.sha256 is not None
-            assert fetch_blob is not None
             async with gate:
                 fetched[item.offset] = await fetch_blob(item.sha256, item.size)
 
@@ -561,7 +571,7 @@ async def open_poll(
         ct = fetched.get(item.offset)
         if ct is None:
             continue
-        inner, topic = _open(ct, identities, item.offset)
+        inner, topic = _open(ct, identities, item.offset, job_id)
         if item.topic is not None and item.topic != topic:
             raise EnvelopeError(f"the item at offset {item.offset} was relabelled")
         items.append(
@@ -577,8 +587,9 @@ async def open_poll(
     )
 
 
-def _open(ct: bytes, identities: Sequence[str], offset: int) -> tuple[Payload, str]:
-    """Decrypt one sealed item; its own (sealed) topic, its offset checked, both stripped."""
+def _open(ct: bytes, identities: Sequence[str], offset: int, job_id: str) -> tuple[Payload, str]:
+    """Decrypt one sealed item; its own (sealed) topic, its offset and its job checked, all
+    three stripped."""
     try:
         plain = age.decrypt(ct, list(identities))
     except age.AgeError as e:
@@ -591,20 +602,25 @@ def _open(ct: bytes, identities: Sequence[str], offset: int) -> tuple[Payload, s
     topic_raw = inner.metadata.get(SEALED_TOPIC_KEY)
     if inner.metadata.get(SEALED_OFFSET_KEY) != str(offset).encode("ascii") or topic_raw is None:
         raise EnvelopeError(f"the item at offset {offset} was relabelled")
+    if inner.metadata.get(SEALED_JOB_KEY) != job_id.encode():
+        raise EnvelopeError(f"the item at offset {offset} is not this job's")
     try:
         topic = topic_raw.decode("utf-8")
     except UnicodeDecodeError:
         raise EnvelopeError(f"the item at offset {offset} has no topic") from None
-    del inner.metadata[SEALED_TOPIC_KEY]
-    del inner.metadata[SEALED_OFFSET_KEY]
+    for key in SEALED_KEYS:
+        del inner.metadata[key]
     return inner, topic
 
 
-def open_item(ct: bytes, identities: Sequence[str], *, topic: str, offset: int) -> Payload:
-    """The buyer's side: one relayed item, its ``topic`` and ``offset`` (as the relay said
-    them) checked against the sealed ones, which are then stripped. :class:`ItemUnreadable`
-    when it is not sealed to ``identities``; :class:`EnvelopeError` when it was relabelled."""
-    inner, sealed = _open(ct, identities, offset)
+def open_item(
+    ct: bytes, identities: Sequence[str], *, topic: str, offset: int, job_id: str
+) -> Payload:
+    """The buyer's side: one relayed item of ``job_id``'s stream, its ``topic`` and ``offset``
+    (as the relay said them) and its job checked against the sealed ones, which are then
+    stripped. :class:`ItemUnreadable` when it is not sealed to ``identities``;
+    :class:`EnvelopeError` when it was relabelled or is another job's."""
+    inner, sealed = _open(ct, identities, offset, job_id)
     if sealed != topic:
         raise EnvelopeError(f"the item at offset {offset} was relabelled")
     return inner

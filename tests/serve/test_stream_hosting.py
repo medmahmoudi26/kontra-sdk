@@ -103,7 +103,7 @@ class Rig:
         kw.setdefault("start", 0)
         kw.setdefault("min_interval", 0.0)
         kw.setdefault("rpc_timeout", 5.0)
-        kw.setdefault("blobs", self.blobs.fetch)
+        kw.setdefault("blobs", self.blobs.reader(job))
         return _relay.relay(
             self.plain.workflow_service,
             namespace="default",
@@ -164,11 +164,11 @@ async def until_closed(
     return got
 
 
-def opened(item: _relay.RelayItem) -> Any:
+def opened(item: _relay.RelayItem, job: str) -> Any:
     assert item.ciphertext is not None
     from temporalio.contrib.pydantic import PydanticPayloadConverter
 
-    p = s.open_item(item.ciphertext, [BUYER[0]], topic=item.topic, offset=item.offset)
+    p = s.open_item(item.ciphertext, [BUYER[0]], topic=item.topic, offset=item.offset, job_id=job)
     return PydanticPayloadConverter().from_payload(p)
 
 
@@ -200,7 +200,7 @@ async def test_a_root_without_a_stream_gets_kontras(rig: Rig) -> None:
     job, handle = await rig.start(HostedJob.run, Burst(3, MARKER))
     items = await collect(rig.relay(job), 3)
     assert [(i.topic, i.offset) for i in items] == [(LISTED, 0), (LISTED, 2), (LISTED, 4)]
-    assert [opened(i)["i"] for i in items] == [0, 1, 2]
+    assert [opened(i, job)["i"] for i in items] == [0, 1, 2]
     # The seller's stock subscriber reads every topic through the codec, unchanged.
     sub = WorkflowStreamClient.create(rig.seller, job_workflow_id(job))
     seen: list[tuple[str, Any]] = []
@@ -309,7 +309,7 @@ async def test_an_answer_lists_at_most_the_item_cap(rig: Rig) -> None:
     items = await collect(rig.relay(job, min_interval=2.0), n)
     assert loop.time() - began < 2.0  # more_ready: polled again at once
     assert [i.offset for i in items] == list(range(n))
-    assert all(opened(i)["i"] == i.offset for i in items)
+    assert all(opened(i, job)["i"] == i.offset for i in items)
     await handle.signal(FilledJob.finish)
     assert await handle.result() == "ok"
     history = await history_of(rig, job)
@@ -393,7 +393,7 @@ async def test_the_answers_of_one_workflow_task_stay_within_its_budget(
     ):
         got = await asyncio.wait_for(asyncio.gather(*reading), 60)
         assert [[i.offset for i in items] for items in got] == [list(range(6))] * 4
-        assert all(len(opened(i)["pad"]) == 1_000 for items in got for i in items)
+        assert all(len(opened(i, job)["pad"]) == 1_000 for items in got for i in items)
         assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
         await handle.signal(FilledJob.finish)
         assert await handle.result() == "ok"
@@ -593,7 +593,7 @@ async def test_a_slow_bucket_never_times_a_workflow_task_out(
 
 async def _one(blobs: MemoryBlobs, rig: Rig, job: str) -> list[_relay.RelayBatch]:
     """One relay answer from offset 0, read through ``blobs``."""
-    it = rig.relay(job, blobs=blobs.fetch)
+    it = rig.relay(job, blobs=blobs.reader(job))
     try:
         return [await anext(it)]
     finally:

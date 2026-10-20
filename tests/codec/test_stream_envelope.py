@@ -137,10 +137,10 @@ async def test_every_item_is_a_reference_to_its_jobs_blob() -> None:
             with pytest.raises(AgeError):
                 decrypt(ct, BUYER[0])
             with pytest.raises(s.ItemUnreadable):
-                s.open_item(ct, [BUYER[0]], topic="private", offset=i.offset)
+                s.open_item(ct, [BUYER[0]], topic="private", offset=i.offset, job_id=JOB)
         else:
             value = CONVERTER.from_payload(
-                s.open_item(ct, [BUYER[0]], topic=i.topic, offset=i.offset)
+                s.open_item(ct, [BUYER[0]], topic=i.topic, offset=i.offset, job_id=JOB)
             )
             assert isinstance(value, dict)
         with pytest.raises(AgeError):
@@ -152,12 +152,33 @@ async def test_open_item_catches_a_relabelled_or_reordered_item() -> None:
     [envelope] = await codec(blobs=blobs).encode([marked(sample())])
     first, _, progress, _ = s.parse_envelope(envelope).items
     with pytest.raises(s.EnvelopeError, match="relabelled"):
-        s.open_item(blob(blobs, first), [BUYER[0]], topic=PROGRESS_TOPIC, offset=0)
+        s.open_item(blob(blobs, first), [BUYER[0]], topic=PROGRESS_TOPIC, offset=0, job_id=JOB)
     with pytest.raises(s.EnvelopeError, match="relabelled"):
-        s.open_item(blob(blobs, first), [BUYER[0]], topic="events", offset=2)
-    inner = s.open_item(blob(blobs, progress), [BUYER[0]], topic=PROGRESS_TOPIC, offset=2)
-    assert s.SEALED_TOPIC_KEY not in inner.metadata
-    assert s.SEALED_OFFSET_KEY not in inner.metadata
+        s.open_item(blob(blobs, first), [BUYER[0]], topic="events", offset=2, job_id=JOB)
+    inner = s.open_item(
+        blob(blobs, progress), [BUYER[0]], topic=PROGRESS_TOPIC, offset=2, job_id=JOB
+    )
+    assert s.SEALED_KEYS.isdisjoint(inner.metadata)
+
+
+async def test_an_item_is_its_jobs_alone() -> None:
+    """A gate that serves another job's item -- the same topic, the same offset, sealed by
+    the same seller, opened with every job key a buyer holds -- as this job's: the job is
+    sealed inside the item, so the buyer refuses it, and so does the seller's own decode of
+    an envelope pointing at it."""
+    blobs = Blobs()
+    [mine] = await codec(blobs=blobs).encode([marked(sample())])
+    [theirs] = await codec(OTHER_JOB, blobs=blobs).encode([marked(sample())])
+    spliced = s.parse_envelope(theirs).items[0]  # events, offset 0, job OTHER_JOB's
+    ct = blob(blobs, spliced)
+    assert s.open_item(ct, [BUYER[0]], topic="events", offset=0, job_id=OTHER_JOB)
+    with pytest.raises(s.EnvelopeError, match="not this job's"):
+        s.open_item(ct, [BUYER[0]], topic="events", offset=0, job_id=JOB)
+    env = json.loads(mine.data)
+    env["items"][0]["sha256"], env["items"][0]["size"] = spliced.sha256, spliced.size
+    forged = Payload(metadata=dict(mine.metadata), data=json.dumps(env).encode())
+    with pytest.raises(InvalidPayload, match="not this job's"):
+        await codec(blobs=blobs).decode([forged])
 
 
 async def test_references_swapped_between_offsets_do_not_decode_for_the_seller() -> None:
@@ -239,8 +260,64 @@ async def test_without_a_store_every_item_is_a_stub_the_seller_drops() -> None:
     env = s.parse_envelope(stub)
     assert [i.sha256 for i in env.items] == [None] * 4
     assert all(i.size > 0 for i in env.items)
-    [back] = await codec().decode([stub])
+    [back] = await codec(blobs=Blobs()).decode([stub])
     assert CONVERTER.from_payload(back, PollResult).items == []
+
+
+async def test_a_stream_item_is_never_opened_as_another_payload() -> None:
+    """An unlisted item's digest and size are in every envelope a relay token holder reads.
+    Named as an ordinary claim-check reference (in a job's input, say), or its ciphertext
+    sent inline, the seller's codec would fetch it with the seller's own rights and decode it
+    as that payload -- a seller-private item handed to whatever the offering does with its
+    input. A payload that opens with a sealed item's keys is refused: only a stream envelope
+    opens one."""
+    blobs = Blobs()
+    [envelope] = await codec(blobs=blobs).encode([marked(sample())])
+    private = next(i for i in s.parse_envelope(envelope).items if i.topic is None)
+    assert private.sha256 is not None
+    reference = json.dumps({"sha256": private.sha256, "size": private.size}).encode()
+    named = Payload(metadata={"encoding": b"binary/kontra-claim-check", "kontra-v": b"1"}, data=reference)  # fmt: skip
+    inline = Payload(
+        metadata={"encoding": b"binary/kontra-age", "kontra-v": b"1"}, data=blob(blobs, private)
+    )
+    for payload in (named, inline):
+        with pytest.raises(InvalidPayload, match="sealed stream item"):
+            await codec(blobs=blobs).decode([payload])
+
+
+async def test_the_bucket_double_scopes_as_the_gate_does() -> None:
+    """``MemoryBlobs``, the bucket of the hosting and wire tests, keeps the gate's rules: a
+    stream blob is its job's alone -- another job's reader never reads it, and a call naming
+    it for another job, or naming a claim-check's digest, is refused whole."""
+    from memory_blobs import BlobScopeError, MemoryBlobs
+
+    blobs = MemoryBlobs()
+    [envelope] = await codec(blobs=blobs).encode([marked(sample())])
+    first = s.parse_envelope(envelope).items[0]
+    assert first.sha256 is not None
+    ct = blobs.data[first.sha256]
+    assert await blobs.reader(JOB)(first.sha256, first.size) == ct
+    assert await blobs.reader(OTHER_JOB)(first.sha256, first.size) is None
+    assert await blobs.reader(JOB)(first.sha256, first.size - 1) is None
+    with pytest.raises(BlobScopeError):
+        await blobs.put_stream(OTHER_JOB, [(first.sha256, ct)], lambda _: None)
+    with pytest.raises(BlobScopeError):
+        await blobs.put(first.sha256, ct)  # a stream blob is never a claim-check
+    claim = encrypt(b"claim-checked", [SELLER[1]])
+    await blobs.put(hashlib.sha256(claim).hexdigest(), claim)
+    with pytest.raises(BlobScopeError):
+        await blobs.put_stream(JOB, [(hashlib.sha256(claim).hexdigest(), claim)], lambda _: None)
+
+
+async def test_a_codec_that_cannot_fetch_answers_the_envelope_as_it_is() -> None:
+    """A seller codec with no blob store (``kontra dev``'s codec server, say) cannot fetch an
+    envelope's items: it answers the envelope unchanged -- the references in view -- never a
+    poll result with its items missing."""
+    blobs = Blobs()
+    [envelope] = await codec(blobs=blobs).encode([marked(sample())])
+    assert all(i.sha256 is not None for i in s.parse_envelope(envelope).items)
+    [back] = await codec().decode([envelope])
+    assert back == envelope
 
 
 async def test_a_failing_bucket_costs_items_never_the_answer() -> None:
@@ -328,6 +405,72 @@ async def test_a_reread_past_the_cache_seals_the_same_bytes() -> None:
         assert (await other.encode([marked(items)]))[0].data == two.data
     assert (len(blobs.data), blobs.uploads) == (stored, uploads)
     assert len(blobs.calls) == 12  # the gate was asked (exists), never uploaded to
+
+
+_SEAL_IN_A_PROCESS = """
+import asyncio, base64, json, os, sys
+from temporalio.api.common.v1 import Payload
+from temporalio.contrib.workflow_streams import PollResult
+from temporalio.contrib.workflow_streams._types import _WorkflowStreamWireItem
+from temporalio.contrib.pydantic import PydanticPayloadConverter
+from temporalio.converter import WorkflowSerializationContext
+from kontra.codec import KontraCodec
+from kontra.codec import stream as s
+from kontra.contract.names import job_workflow_id
+
+class Keys:
+    async def buyer_key(self, job_id):
+        return os.environ["BUYER"]
+
+class Store:
+    async def put_stream(self, job_id, blobs, done):
+        for digest, _ in blobs:
+            done(digest)
+
+conv = PydanticPayloadConverter()
+[inner] = conv.to_payloads([{"n": 1}])
+inner.metadata.update({"a": b"1", "b": b"2", "c": b"3"})
+items = [_WorkflowStreamWireItem(topic="events", data=base64.b64encode(inner.SerializeToString()).decode(), offset=0)]
+[marked] = conv.to_payloads([PollResult(items=items, next_offset=1)])
+marked.metadata[s.STREAM_MARK] = s.POLL_MARK
+marked.metadata[s.BUYER_TOPICS_KEY] = s.buyer_topics(["events"])
+codec = KontraCodec(os.environ["SECRET"], [os.environ["PUBLIC"]], role="seller", buyer_keys=Keys(), blobs=Store())
+codec = codec.with_context(WorkflowSerializationContext(namespace="acme", workflow_id=job_workflow_id(os.environ["JOB"])))
+[envelope] = asyncio.run(codec.encode([marked]))
+print(json.loads(envelope.data)["items"][0]["sha256"])
+"""
+
+
+def test_a_restarted_worker_seals_an_item_to_the_same_bytes() -> None:
+    """Per-worker sealing holds across processes: a worker restarted, or another pod with the
+    same mounted key, seals the same item to the same file (its sealed plaintext is
+    serialized deterministically, whatever order a process keeps a Payload's metadata in), so
+    a re-read after a restart stores nothing new."""
+    import os
+    import subprocess
+    import sys
+
+    env = {
+        **os.environ,
+        "SECRET": SELLER[0],
+        "PUBLIC": SELLER[1],
+        "BUYER": BUYER[1],
+        "JOB": JOB,
+        "PYTHONHASHSEED": "random",
+    }
+    digests = {
+        subprocess.run(
+            [sys.executable, "-c", _SEAL_IN_A_PROCESS],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+        ).stdout.strip()
+        for _ in range(4)
+    }
+    assert len(digests) == 1, digests
+    assert all(len(d) == 64 for d in digests)
 
 
 async def test_sealing_is_per_worker_and_per_job() -> None:

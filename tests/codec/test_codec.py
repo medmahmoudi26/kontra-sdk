@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -863,6 +864,57 @@ async def test_gate_blob_store_reads_a_blob_within_the_limit() -> None:
     assert await GateBlobStore(bucket).get("a" * 64, limit=10_000) == b"\x00" * 10_000
     bucket.sent = 0
     assert await GateBlobStore(bucket).get("a" * 64) == b"\x00" * 10_000  # no limit asked
+    await bucket.http.aclose()
+
+
+class _RefusingBucket:
+    """The gate's stream-blob route, and a bucket that refuses every PUT as S3 refuses a
+    request carrying a header its URL was not signed for."""
+
+    def __init__(self) -> None:
+        self.puts: list[httpx.Request] = []
+        self.http = httpx.AsyncClient(transport=httpx.MockTransport(self._serve))
+
+    async def _serve(self, request: httpx.Request) -> httpx.Response:
+        self.puts.append(request)
+        return httpx.Response(403, content=b"<Error><Code>AccessDenied</Code></Error>")
+
+    async def create_blob(self, req: m.BlobCreate) -> m.BlobUrl:
+        raise AssertionError("not used")
+
+    async def get_blob(self, sha256: str) -> m.BlobUrl:
+        raise AssertionError("not used")
+
+    async def create_stream_blobs(self, job_id: str, req: m.StreamBlobsCreate) -> m.StreamBlobUrls:
+        later = datetime.now(UTC)
+        return m.StreamBlobUrls(
+            blobs=[
+                m.StreamBlobUrl(
+                    sha256=b.sha256, url=f"http://bucket.invalid/{b.sha256}", expires_at=later
+                )
+                for b in req.blobs
+            ]
+        )
+
+
+async def test_a_bucket_refusing_stream_uploads_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stream PUT the bucket refuses leaves its item a stub (never an error) -- and is in the
+    seller's logs, once for the answer, with the status and the count, so a bucket that refuses
+    every upload is seen there and not only as ``unavailable`` gaps at the buyer's."""
+    bucket = _RefusingBucket()
+    blobs = [(sha256(bytes([i])).hexdigest(), bytes([i])) for i in range(8)]
+    stored: list[str] = []
+    with caplog.at_level(logging.WARNING, logger="kontra.codec"):
+        await GateBlobStore(bucket).put_stream(JOB, blobs, stored.append)
+    assert stored == []
+    assert len(bucket.puts) == 8
+    assert all(r.headers["x-amz-checksum-sha256"] for r in bucket.puts)
+    [record] = [r for r in caplog.records if r.name == "kontra.codec"]
+    assert record.levelno == logging.WARNING
+    assert "8 of 8" in record.getMessage()
+    assert "403 x8" in record.getMessage()
     await bucket.http.aclose()
 
 

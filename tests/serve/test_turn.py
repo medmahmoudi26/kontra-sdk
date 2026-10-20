@@ -418,7 +418,7 @@ async def _turn_events(party: Any, job_id: str) -> list[dict[str, Any]]:
     async for e in party.gate.stream(job_id, topics=[kturn.TURN_EVENTS_TOPIC]):
         if e.kind is m.StreamEventKind.ITEM:
             ct = base64.b64decode(e.ciphertext_b64)
-            p = open_item(ct, [party.identity], topic=e.topic, offset=e.offset)
+            p = open_item(ct, [party.identity], topic=e.topic, offset=e.offset, job_id=job_id)
             out.append(json.loads(p.data))
     return out
 

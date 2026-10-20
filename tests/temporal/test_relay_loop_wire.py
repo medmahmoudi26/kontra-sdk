@@ -135,7 +135,7 @@ async def test_the_relay_reads_a_jobs_stream_with_its_two_calls_only(
                     first_execution_run_id=lambda: pinned,
                     min_interval=0.0,
                     rpc_timeout=10.0,
-                    blobs=BLOBS.fetch,
+                    blobs=BLOBS.reader(job_id),
                 ):
                     items += batch.items
                     dropped += batch.dropped
@@ -147,7 +147,7 @@ async def test_the_relay_reads_a_jobs_stream_with_its_two_calls_only(
             for item in items:
                 assert item.ciphertext is not None
                 assert item.ciphertext.startswith(s.AGE_MAGIC)
-                payload = s.open_item(item.ciphertext, [BUYER_KEY[0]], topic=LISTED, offset=item.offset)  # fmt: skip
+                payload = s.open_item(item.ciphertext, [BUYER_KEY[0]], topic=LISTED, offset=item.offset, job_id=job_id)  # fmt: skip
                 values.append(PydanticPayloadConverter().from_payload(payload, str))
                 decrypt(item.ciphertext, SELLER_KEY[0])  # the seller's set reads it too
             assert values == [f"step-{n}" for n in range(steps)]
@@ -163,7 +163,7 @@ async def test_the_relay_reads_a_jobs_stream_with_its_two_calls_only(
                     start=0,
                     closed=closed,
                     min_interval=0.0,
-                    blobs=BLOBS.fetch,
+                    blobs=BLOBS.reader(job_id),
                 ):
                     assert batch.items == ()
                     assert batch.dropped == steps
@@ -235,7 +235,9 @@ async def test_the_buyer_key_opens_no_unlisted_item(cluster: Cluster) -> None:
                 ct = BLOBS.data[item.sha256]
                 with pytest.raises(AgeError):
                     decrypt(ct, BUYER_KEY[0])
-                inner = s.open_item(ct, [SELLER_KEY[0]], topic=UNLISTED, offset=item.offset)
+                inner = s.open_item(
+                    ct, [SELLER_KEY[0]], topic=UNLISTED, offset=item.offset, job_id=job_id
+                )
                 assert PydanticPayloadConverter().from_payload(inner, str).startswith("line-")
         finally:
             with contextlib.suppress(RPCError):

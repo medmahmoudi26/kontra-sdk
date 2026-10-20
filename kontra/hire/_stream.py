@@ -12,9 +12,9 @@ seller's).
 
 Delivery: at-least-once from the gate, deduplicated here by the gate's ``cursor`` (a replay
 after a reconnect) and by the item's ``offset`` in the job's log (a gate that re-read a poll).
-An item not sealed for us, or relabelled, is logged and skipped. An item too large to relay,
-not stored by the seller's worker in time (``unavailable``, decisions I39), or past the gate's
-budget, is a gap: logged, skipped. The relay stopping (the job's history
+An item not sealed for us, relabelled, or another job's, is logged and skipped. An item too
+large to relay, not stored by the seller's worker in time (``unavailable``, decisions I39), or
+past the gate's budget, is a gap: logged, skipped. The relay stopping (the job's history
 budget, a seller worker that does not speak the stream envelope) is
 :class:`~kontra.hire.StreamInterrupted`. The end of the iteration is the gate saying the job
 is closed and its relay finished. ``cursor`` is the last event consumed: pass it as ``after``
@@ -50,10 +50,10 @@ _NULL = b"binary/null"
 
 
 def open_event(event: m.StreamEvent, identities: Sequence[str], job_id: str) -> Payload | None:
-    """An ``item`` event's ``Payload``, opened with ``identities`` and its sealed topic and
-    offset checked against the event's; None (logged) when it was not sealed for us or was
-    relabelled -- what a catalog that lists a topic the seller's worker does not, or a gate
-    that misbehaves, looks like."""
+    """An ``item`` event's ``Payload``, opened with ``identities`` and its sealed topic,
+    offset and job checked against the event's and ``job_id``; None (logged) when it was not
+    sealed for us, was relabelled or is another job's -- what a catalog that lists a topic the
+    seller's worker does not, or a gate that misbehaves, looks like."""
     if event.ciphertext_b64 is None or event.topic is None or event.offset is None:
         return None
     try:
@@ -62,7 +62,9 @@ def open_event(event: m.StreamEvent, identities: Sequence[str], job_id: str) -> 
         log.warning("job %s: stream item %d is not base64; skipped", job_id, event.cursor)
         return None
     try:
-        return _stream.open_item(ct, identities, topic=event.topic, offset=event.offset)
+        return _stream.open_item(
+            ct, identities, topic=event.topic, offset=event.offset, job_id=job_id
+        )
     except _stream.ItemUnreadable as err:
         log.warning("job %s: stream item %d is not sealed for us: %s", job_id, event.cursor, err)
     except _stream.EnvelopeError as err:

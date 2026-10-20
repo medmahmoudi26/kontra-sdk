@@ -392,9 +392,12 @@ async def test_an_item_not_stored_or_not_the_jobs_is_a_gap(live: Live) -> None:
 
 @pytest.mark.timeout(60)
 async def test_stream_blobs_are_the_jobs_sellers(live: Live) -> None:
-    """``POST /v1/jobs/{id}/stream/blobs``: the job's seller only; a blob of it is read by
-    that seller (``GET /v1/blobs/{sha256}``), 404 for anyone else, and never handed out by
-    the claim-check route; a digest stored for another job, or for no job, is refused."""
+    """``POST /v1/jobs/{id}/stream/blobs``: the job's seller only; its PUT URL is short-lived
+    and signed for the blob's ``x-amz-checksum-sha256``, as S3 signs a header -- refused
+    without it or with another --; a blob stored already gets no URL at all; a blob of it is
+    read by that seller (``GET /v1/blobs/{sha256}``), 404 for anyone else, and never handed
+    out by the claim-check route; a digest stored for another job, or for no job, is
+    refused."""
     ct = encrypt(b"stream item", [KEY[1]])
     digest = hashlib.sha256(ct).hexdigest()
     req = m.StreamBlobsCreate(blobs=[m.BlobCreate(sha256=digest, size=len(ct))])
@@ -403,11 +406,27 @@ async def test_stream_blobs_are_the_jobs_sellers(live: Live) -> None:
     assert e.value.status == 403
     [url] = (await live.seller.gate.create_stream_blobs(live.job.job_id, req)).blobs
     assert not url.exists
+    assert url.url is not None
+    assert url.expires_at is not None
+    assert url.expires_at <= live.gate.now() + timedelta(seconds=m.STREAM_URL_TTL_MAX)
+    checksum = base64.b64encode(bytes.fromhex(digest)).decode()
+    wrong = base64.b64encode(hashlib.sha256(b"other").digest()).decode()
     async with httpx.AsyncClient(timeout=10) as http:
-        put = await http.put(url.url, content=ct, headers={"Content-Length": str(len(ct))})
+        for headers in ({}, {"x-amz-checksum-sha256": wrong}):
+            refused = await http.put(
+                url.url, content=ct, headers={"Content-Length": str(len(ct)), **headers}
+            )
+            assert refused.status_code == 403, headers
+        assert digest not in live.gate.blobs
+        put = await http.put(
+            url.url,
+            content=ct,
+            headers={"Content-Length": str(len(ct)), "x-amz-checksum-sha256": checksum},
+        )
     assert put.status_code == 200
     [again] = (await live.seller.gate.create_stream_blobs(live.job.job_id, req)).blobs
     assert again.exists
+    assert (again.url, again.expires_at) == (None, None)  # nothing minted to read it with
     assert (await live.seller.gate.get_blob(digest)).exists
     with pytest.raises(GateError) as e:
         await live.buyer.gate.get_blob(digest)

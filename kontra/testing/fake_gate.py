@@ -286,6 +286,13 @@ _SECRET_LEN = 43  # secrets.token_urlsafe(32)
 _SECRET = re.compile(r"[A-Za-z0-9_-]{43}", re.ASCII)
 _PATH_VERSION_MAX = 29
 _SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)
+
+
+def _checksum(digest: str) -> str:
+    """``x-amz-checksum-sha256`` for a blob named by its hex ``digest``: its base64."""
+    return base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+
+
 #: Printable ASCII, no control characters (it becomes a header value downstream).
 _CONTENT_TYPE = re.compile(r"[\x21-\x7e][\x20-\x7e]{0,254}", re.ASCII)
 
@@ -1031,6 +1038,7 @@ class FakeGate:
         part_size: int = 16 * 1024 * 1024,
         max_input_bytes: int = 5 * 1000**3,
         url_ttl: timedelta = timedelta(hours=1),
+        stream_url_ttl: timedelta = timedelta(seconds=m.STREAM_URL_TTL_MAX),
         relay_interval: float = MIN_INTERVAL,
         relay_grace: float = RELAY_GRACE,
         relay_rpc_timeout: float = 30.0,
@@ -1097,6 +1105,9 @@ class FakeGate:
         self.part_size = part_size
         self.max_input_bytes = max_input_bytes
         self.url_ttl = url_ttl
+        if not timedelta(0) < stream_url_ttl <= timedelta(seconds=m.STREAM_URL_TTL_MAX):
+            raise ValueError(f"stream_url_ttl is at most {m.STREAM_URL_TTL_MAX} seconds")
+        self.stream_url_ttl = stream_url_ttl
         self.relay_interval = relay_interval
         self.relay_grace = relay_grace
         self.relay_rpc_timeout = relay_rpc_timeout
@@ -4322,21 +4333,43 @@ class FakeGate:
 
     # ------------------------------------------------------------------ artifacts & blobs
 
-    def _sign_url(self, method: str, path: str, length: int | None, exp: int) -> str:
-        msg = f"{method}\n{path}\n{'-' if length is None else length}\n{exp}".encode()
-        sig = hmac.new(self._url_secret, msg, hashlib.sha256).hexdigest()
+    def _sign_url(
+        self, method: str, path: str, length: int | None, exp: int, checksum: str | None = None
+    ) -> str:
+        """A URL for ``method`` on ``path``, signed for its ``length`` and expiry and, with
+        ``checksum`` (a stream blob's PUT, as S3 signs ``x-amz-checksum-sha256``), for the
+        header the request must then carry."""
+        msg = f"{method}\n{path}\n{'-' if length is None else length}\n{exp}"
+        if checksum is not None:
+            msg += f"\n{checksum}"
+        sig = hmac.new(self._url_secret, msg.encode(), hashlib.sha256).hexdigest()
         query = f"exp={exp}&sig={sig}" if length is None else f"len={length}&exp={exp}&sig={sig}"
+        if checksum is not None:
+            query += "&ck=1"
         return f"{self.base_url}{path}?{query}"
 
     def check_url(self, request: Request, method: str, length: int | None) -> None:
-        """Verify a URL this gate signed: path, method, signed length, expiry."""
+        """Verify a URL this gate signed: path, method, signed length, expiry; and for one
+        signed with a checksum, that the request carries that ``x-amz-checksum-sha256``."""
         q = request.query_params
         exp_text, sig = q.get("exp", ""), q.get("sig", "")
         signed_len = q.get("len")
         if length is not None and signed_len != str(length):
             raise GateHTTPError(403, "signature_mismatch", "the URL was not signed for this object")
-        msg = f"{method}\n{request.url.path}\n{'-' if length is None else length}\n{exp_text}".encode()
-        want = hmac.new(self._url_secret, msg, hashlib.sha256).hexdigest()
+        msg = f"{method}\n{request.url.path}\n{'-' if length is None else length}\n{exp_text}"
+        if q.get("ck") is not None:
+            # As S3 signs a header: the request carries it, exactly, or the signature fails.
+            # The checksum signed is the blob's own digest, the path's last part.
+            digest = request.url.path.rsplit("/", 1)[-1]
+            checksum = _checksum(digest) if _SHA256.fullmatch(digest) else "-"
+            msg += f"\n{checksum}"
+            if request.headers.get("x-amz-checksum-sha256") != checksum:
+                raise GateHTTPError(
+                    403,
+                    "signature_mismatch",
+                    "the request's x-amz-checksum-sha256 is missing or not the one signed",
+                )
+        want = hmac.new(self._url_secret, msg.encode(), hashlib.sha256).hexdigest()
         # compare_digest refuses non-ASCII text: check first, so a mangled URL is a 403.
         if not sig.isascii() or not hmac.compare_digest(want, sig):
             raise GateHTTPError(403, "signature_mismatch", "the URL signature does not match")
@@ -4345,8 +4378,8 @@ class FakeGate:
                 403, "url_expired", "the URL has expired; ask the gate for a new one"
             )
 
-    def _exp(self) -> tuple[int, datetime]:
-        expires = self.now() + self.url_ttl
+    def _exp(self, ttl: timedelta | None = None) -> tuple[int, datetime]:
+        expires = self.now() + (self.url_ttl if ttl is None else ttl)
         return int(expires.timestamp()), datetime.fromtimestamp(int(expires.timestamp()), UTC)
 
     def create_artifact(self, who: Principal, req: m.ArtifactCreate) -> m.ArtifactUpload:
@@ -4507,13 +4540,15 @@ class FakeGate:
     ) -> m.StreamBlobUrls:
         """``POST /v1/jobs/{job_id}/stream/blobs`` (decisions I39): the job's seller's blobs
         for one poll's answer, scoped to the job. A digest stored for anything else is
-        refused (409 ``blob_scope``); one of this job's is ``exists``."""
+        refused (409 ``blob_scope``); one of this job's is ``exists``, with no URL; a new one
+        gets a PUT URL valid ``stream_url_ttl`` (a minute at most), signed for its length and
+        its ``x-amz-checksum-sha256`` as S3 signs a header."""
         job = self.job_for(job_id, who.party)
         if who.party != job.record.seller:
             raise GateHTTPError(403, "forbidden", "only the job's seller stores its stream")
         scope = (job.record.seller, job_id)
-        out: list[m.BlobUrl] = []
-        exp, expires_at = self._exp()
+        out: list[m.StreamBlobUrl] = []
+        exp, expires_at = self._exp(self.stream_url_ttl)
         for blob in req.blobs:
             if blob.size > MAX_BLOB_BYTES:
                 raise GateHTTPError(413, "too_large", f"a blob is at most {MAX_BLOB_BYTES} bytes")
@@ -4524,15 +4559,11 @@ class FakeGate:
                 raise GateHTTPError(409, "blob_scope", "this blob is another job's stream's")
             self.blob_scopes[blob.sha256] = scope
             if blob.sha256 in self.blobs:
-                url = self._sign_url("GET", f"/_blob/b/{blob.sha256}", None, exp)
-                out.append(
-                    m.BlobUrl(sha256=blob.sha256, url=url, exists=True, expires_at=expires_at)
-                )
+                out.append(m.StreamBlobUrl(sha256=blob.sha256, exists=True))  # no URL to mint
             else:
-                url = self._sign_url("PUT", f"/_blob/b/{blob.sha256}", blob.size, exp)
-                out.append(
-                    m.BlobUrl(sha256=blob.sha256, url=url, exists=False, expires_at=expires_at)
-                )
+                checksum = _checksum(blob.sha256)
+                url = self._sign_url("PUT", f"/_blob/b/{blob.sha256}", blob.size, exp, checksum)
+                out.append(m.StreamBlobUrl(sha256=blob.sha256, url=url, expires_at=expires_at))
         return m.StreamBlobUrls(blobs=out)
 
     async def read_stream_blob(self, job_id: str, sha256: str, size: int) -> bytes | None:

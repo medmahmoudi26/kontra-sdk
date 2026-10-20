@@ -2058,8 +2058,9 @@ with two prototypes whose results are below.
   "more_ready"}`, encoding `binary/kontra-stream` (*amended by I39:* `{"v": 2, "items":
   [{"topic", "offset", "size", "sha256"}...]}`, every item a reference to its blob, at most
   64 an answer; what follows about inline items, 256 KiB and 512 KiB is v1's). Each item is
-  the age ciphertext of its own `Payload` with its topic and offset sealed inside (`kontra-topic`, `kontra-offset`), so a
-  buyer checks both against the event and a gate cannot relabel or reorder items. A listed
+  the age ciphertext of its own `Payload` with its topic and offset sealed inside (`kontra-topic`, `kontra-offset`; *amended by
+  I39:* and its job, `kontra-job`), so a buyer checks them against the event and a gate cannot
+  relabel or reorder items, nor splice in another job's. A listed
   topic is sealed to the seller's recipient set and the job's buyer key and named in the clear;
   any other to the seller's set alone, its name `null`. Items above 256 KiB of ciphertext are
   claim-checked (or a stub without a blob store; the relay records a gap); the envelope stops at
@@ -2473,13 +2474,15 @@ the relay's rate, which the bound relies on, are #59's own rules (I30, Q10 and Q
   (`kontra/codec/stream.py`): `{"v": 2, "items": [{topic | null, offset, size, sha256 |
   null}], next_offset, more_ready}`, at most `STREAM_ITEMS_MAX` = 64 entries of at most
   `REF_ENTRY_MAX` = 209 bytes, `ENVELOPE_MAX` = 13,504 bytes in all (v1 carried up to 512 KiB
-  of ciphertext); a test builds the largest entry. Kontra's workflow interceptor cuts every
-  answer at 64 items (the contrib's own truncation). The item is sealed as before (I31: its
-  topic and offset inside, listed topics to the seller's set and the job's buyer key), and the
-  seller's codec stores the ciphertext in the claim-check bucket at encode time, scoped to the
-  job (`POST /v1/jobs/{job_id}/stream/blobs`, one call an answer, by the job's seller; readable
-  by that seller and the gate's own reader, 404 for anyone else), keyed by its sha256. History
-  holds no item ciphertext at all.
+  of ciphertext); a test builds the largest entry. The item is sealed as before (I31: listed
+  topics to the seller's set and the job's buyer key), with its topic, its offset and its job
+  inside (`kontra-topic`, `kontra-offset`, `kontra-job`), so a reader checks all three: a gate,
+  a bucket or a token holder cannot relabel, reorder or swap items, nor serve one job's item
+  as another's to a buyer who holds both jobs' keys. The seller's codec stores the ciphertext
+  in the claim-check bucket at encode time, scoped to the job (`POST
+  /v1/jobs/{job_id}/stream/blobs`, one call an answer, by the job's seller; readable by that
+  seller and the gate's own reader, 404 for anyone else), keyed by its sha256. History holds
+  no item ciphertext at all.
 * **Who writes, and when it fails.** The seller's worker, in `KontraCodec`, through a
   `StreamStore` (`GateBlobStore` in production). Uploads share **one budget per workflow-task
   completion** for all its answers together, the codec's `stream_upload_budget`
@@ -2493,12 +2496,26 @@ the relay's rate, which the bound relies on, are #59's own rules (I30, Q10 and Q
   than 2 s to reach the fake gate's bucket, and the heartbeat acceptance tests, which count
   every item, lost the rest as gaps. The stubs keep their own tests, with a budget below a
   second.
+  Each PUT URL is signed for the blob's length and its `x-amz-checksum-sha256`, as S3 signs a
+  header, and valid a minute at most (`STREAM_URL_TTL_MAX`); a blob stored already gets no URL
+  at all (`StreamBlobUrl`: the gate's relay is its only reader). A PUT the bucket refuses is
+  logged once for the answer, with its statuses and count, so a bucket that refuses every
+  upload shows in the seller's logs and not only as gaps at the buyer's.
 * **A re-read stores nothing new.** Items are **sealed deterministically per worker**: the age
   file key, ephemeral keys and nonce derive from `HMAC(seal_key, job, recipients, sealed
-  plaintext)`, `seal_key = HKDF(the worker's age identity)`. The same worker re-sealing an item
-  writes the same bytes, which the gate finds stored, whatever its cache (`BlobRefs`, 65,536
-  entries, per process) evicted; another worker writes another blob, once. It is not
-  convergent encryption: without the worker's secret no one can confirm a guess at an item.
+  plaintext)`, `seal_key = HKDF(the worker's age identity)`, and the sealed plaintext is
+  serialized deterministically (a `Payload`'s metadata map has no order of its own). So the
+  same identity re-sealing an item writes the same bytes, which the gate finds stored,
+  whatever its cache (`BlobRefs`, 65,536 entries, per process) evicted -- after a restart too,
+  or in another pod mounting the same key (a test seals in four processes); a worker with
+  another identity writes another blob, once. It is not convergent encryption: without the
+  worker's secret no one can confirm a guess at an item.
+* **A stream item is only ever a stream item.** Its digest is in every envelope a relay token
+  holder reads; named as an ordinary claim-check reference, or its ciphertext sent inline, the
+  seller's codec would fetch it with the seller's own rights and decode it as that payload.
+  `KontraCodec` refuses any payload that opens with a sealed item's keys; only a stream
+  envelope opens one. A seller codec with no blob store (the dev codec server) answers an
+  envelope as it is, its references in view, never as a poll result missing its items.
 * **The gate dereferences** (in `kontra._relay`, through the engine adapter's
   `stream_blobs`): each listed item's blob is fetched -- none above `stream_item_max` -- and
   kept only if it is exactly the size and sha256 its reference names and an age file;
@@ -2568,7 +2585,7 @@ the relay's rate, which the bound relies on, are #59's own rules (I30, Q10 and Q
   history counted with each of its workflow-task triples twice; since `3 W_s <= E_own`, under
   9,610 events suffices on that side. Each run of a
   continue-as-new chain is bounded alike: the update limits, the history limits and the poll
-  count are all per run. Preconditions: a stream Kontra's interceptor answers (a
+  count are all per run (tested). Preconditions: a stream Kontra's interceptor answers (a
   seller that replaces the poll handler takes its job out: the gate's relay stops at
   `protocol`, and without a validator its polls are unbounded, above); the request shape and
   the rate (the Authorizer, one frontend for the rate only); and **a worker that keeps up**:
@@ -2608,35 +2625,43 @@ bound); a lower `history.maxTotalUpdates` (bounds nothing alone; genuine streams
 polls took most of the task timeout on a loaded worker before the bounded work; after it, 500
 took up to 4.5 s at a load of nine, and longer in a worker sharing its process with the
 attack); a longer workflow task timeout (the gate's start options, and a seller's
-continue-as-new could set another: a rule on seller code again).
+continue-as-new could set another: a rule on seller code again); opening a job's items with
+that job's key alone (the job sealed inside each item already refuses another job's, and a key
+kept only in memory would stop reading).
 
 **Amends** I7 (every stream item claim-checked, job-scoped), I30 (the residual risk; the wire
-test; the bound relies on its Q10 and Q11), I31 (the envelope, the guard, OD2's reason, the
-answer budget kept unreached), the Authorizer's README and `docs/security.md`.
+test; the bound relies on its Q10 and Q11), I31 (the envelope and the job inside each item, the
+guard, OD2's reason, the answer budget kept unreached), the Authorizer's README and
+`docs/security.md`.
 
 Tested: the envelope's fixed sizes, references, stubs, a failing bucket, the shared upload
-budget, a re-read storing nothing new past the cache, per-worker sealing, swapped references,
-the replayed constant, the strict reader and `verified_item`
-(`tests/codec/test_stream_envelope.py`); the formula and the pins, Kontra's answer against the
-contrib's, the scan and the encoding bounded (`tests/serve/test_interceptors.py`); the poll
-budget exactly, refused polls writing nothing, a handler without a validator warned about once,
-its polls all accepted, busy refusals, six in flight with the seller's own update answered, an
+budget, a re-read storing nothing new past the cache and across processes, per-worker sealing,
+swapped references, another job's item refused (`open_item`, the seller's decode, and
+`job.stream()` skipping it), a stream item refused as any other payload, a codec without a
+store answering the envelope as it is, the replayed constant, the strict reader and
+`verified_item` (`tests/codec/test_stream_envelope.py`); a refused upload logged
+(`tests/codec/test_codec.py`); the formula and the pins, Kontra's answer against the contrib's,
+the scan and the encoding bounded (`tests/serve/test_interceptors.py`); the poll budget
+exactly, refused polls writing nothing, a handler without a validator warned about once, its
+polls all accepted, busy refusals, six in flight with the seller's own update answered, an
 early poll through the guard, a slow bucket never timing a task out (and failing if the budget
 were per answer), the cut at 64, every history replaying with nothing sealed or stored
 (`tests/serve/test_stream_hosting.py`); dereference and verification, the rate and busy waited
-on, own pacing (`tests/serve/test_relay.py`); the gate's scopes and `unavailable` gaps
+on, own pacing (`tests/serve/test_relay.py`); the gate's scopes, its checksum-signed,
+minute-long PUT URLs and no URL for a stored blob, and `unavailable` gaps
 (`tests/testing/test_stream_relay.py`); the adapter's reader (`tests/engine`); seam ⑤'s scans
-of the job's blobs and of history without ciphertext (`tests/serve/test_streams.py`); seam ②'s
-route and gap; and over the wire (`tests/temporal/test_relay_bound_wire.py`; the Authorizer's
-shape and rate cells are I30's): the relay, refused for its rate, waiting and reading on; and
-the owner's test -- the poll budget's and the bytes guard's terms at their most,
-and a long stream -- one attacked job a test, beside a twin doing the same work with nobody
+of the whole bucket and of history without ciphertext (`tests/serve/test_streams.py`); seam ②'s
+route and gap; and over the wire (`tests/temporal/test_relay_bound_wire.py`, the bucket double
+scoped as the gate scopes; the Authorizer's shape and rate cells are I30's): the relay, refused
+for its rate, waiting and reading on; and the owner's test, each term of the formula at its
+most, one attacked job a test, beside a twin doing the same work with nobody
 polling: every sample under both error limits and running, every job completed with no task
 failed or timed out, and replayed. Measured on the two-core machine at a load of about eight: A
 accepted exactly 250 polls and grew 1,180 events and 2,056,780 bytes (its worst sample 1,409
 events, 2,104,517 bytes), and after the restart its next task, the whole run replayed,
 completed in time (a cold Replayer: 2.6 s); B was stopped by the bytes guard after 171 polls,
 growing 839 events and 3,451,801 bytes (worst 1,123 events, 10,517,894 bytes, 50.2% of the
-limit); D accepted 250, and its history replayed cold in 2.5 s, its twin's in 0.45 s; the
-seller's own tasks were 50 to 57 a run, their triples at most 335 bytes; the legitimate relay
-read A's stream from 0 and was told the budget was spent; about three minutes in all.
+limit); C wrote 5.07 events a poll; D accepted 250, and its history replayed cold in 2.5 s, its
+twin's in 0.45 s; E accepted 250 polls in each run, growing 1,094 and 1,147 events; the
+seller's own tasks were 36 to 57 a run, their triples at most 335 bytes; the legitimate relay
+read A's stream from 0 and was told the budget was spent; about four and a half minutes in all.

@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict
 from temporalio.api.common.v1 import Payload
 
 from kontra.codec.age import encrypt, generate_identity
-from kontra.codec.stream import SEALED_OFFSET_KEY, SEALED_TOPIC_KEY
+from kontra.codec.stream import SEALED_JOB_KEY, SEALED_OFFSET_KEY, SEALED_TOPIC_KEY
 from kontra.gate_client import models as m
 from kontra.hire import JobStream, StreamInterrupted, StreamItemInvalid
 from kontra.hire._stream import open_event
@@ -45,13 +45,16 @@ class Event(BaseModel):
     n: int
 
 
-def sealed(topic: str, offset: int, data: bytes, *, to: str = ME[1], **meta: bytes) -> str:
-    """An item's ciphertext as the seller's codec seals it (topic and offset inside)."""
+def sealed(
+    topic: str, offset: int, data: bytes, *, to: str = ME[1], job: str = JOB, **meta: bytes
+) -> str:
+    """An item's ciphertext as the seller's codec seals it (topic, offset and job inside)."""
     p = Payload(
         metadata={
             "encoding": b"json/plain",
             SEALED_TOPIC_KEY: topic.encode(),
             SEALED_OFFSET_KEY: str(offset).encode(),
+            SEALED_JOB_KEY: job.encode(),
             **meta,
         },
         data=data,
@@ -63,7 +66,11 @@ def item(
     cursor: int, offset: int, data: bytes, *, topic: str = "events", **kw: Any
 ) -> m.StreamEvent:
     ct = kw.pop("ct", None) or sealed(
-        kw.pop("sealed_topic", topic), kw.pop("sealed_offset", offset), data, **kw
+        kw.pop("sealed_topic", topic),
+        kw.pop("sealed_offset", offset),
+        data,
+        job=kw.pop("sealed_job", JOB),
+        **kw,
     )
     return m.StreamEvent(
         cursor=cursor, kind=m.StreamEventKind.ITEM, at=NOW, topic=topic, offset=offset, ciphertext_b64=ct
@@ -149,7 +156,7 @@ async def test_duplicates_by_cursor_and_by_offset_are_skipped() -> None:
     assert await read(s) == [Event(n=0), Event(n=1)]  # a replay overlap; a re-read poll
 
 
-async def test_an_item_not_sealed_for_us_or_relabelled_is_skipped(
+async def test_an_item_not_sealed_for_us_relabelled_or_another_jobs_is_skipped(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     events = [
@@ -157,7 +164,10 @@ async def test_an_item_not_sealed_for_us_or_relabelled_is_skipped(
         item(2, 1, b'{"n": 1}', sealed_topic="private"),  # relabelled by a gate
         item(3, 2, b'{"n": 2}', sealed_offset=7),  # moved by a gate
         item(4, 3, b'{"n": 3}', ct="bm90IGFnZQ=="),  # not an age file at all
-        item(5, 4, b'{"n": 4}'),
+        # Another job's item, the same topic and offset, sealed to a key we hold too: a gate
+        # splicing one job's stream into another's.
+        item(5, 4, b'{"n": 99}', sealed_job="f" * 32),
+        item(6, 4, b'{"n": 4}'),
     ]
     s, _ = stream(events, Event)
     with caplog.at_level(logging.WARNING, "kontra.hire"):

@@ -77,6 +77,7 @@ __all__ = [
     "STREAM_JOB_BUDGET",
     "STREAM_LISTENERS_MAX",
     "STREAM_TOPIC_BUDGET",
+    "STREAM_URL_TTL_MAX",
     "USER_CODE_ALPHABET",
     "USER_CODE_PATTERN",
     "WEBAUTHN_JSON_MAX",
@@ -155,6 +156,7 @@ __all__ = [
     "ShareRefusalCode",
     "SharedJobKeys",
     "StartRequest",
+    "StreamBlobUrl",
     "StreamBlobUrls",
     "StreamBlobsCreate",
     "StreamEvent",
@@ -235,6 +237,10 @@ STREAM_ITEM_MAX = 256 * 1024
 #: The most blobs one ``POST /v1/jobs/{id}/stream/blobs`` creates: the items of one poll's
 #: answer (``kontra.codec.stream.STREAM_ITEMS_MAX``, decisions I39).
 STREAM_BLOBS_MAX = 64
+#: The longest a stream blob's PUT URL is valid: the codec spends at most 2 s uploading
+#: (``kontra.codec.stream.STREAM_UPLOAD_BUDGET``), so a URL that outlives a minute serves
+#: only whoever copied it.
+STREAM_URL_TTL_MAX = 60
 _STREAM_B64_MAX = 4 * -(-STREAM_ITEM_MAX // 3)
 #: Relayed ciphertext a gate stores per topic of a job, and per job; past either, one
 #: ``topic_budget`` or ``job_budget`` gap (the first item that did not fit), and nothing
@@ -1576,11 +1582,28 @@ class StreamBlobsCreate(_M):
     blobs: list[BlobCreate] = Field(min_length=1, max_length=STREAM_BLOBS_MAX)
 
 
-class StreamBlobUrls(_M):
-    """One :class:`BlobUrl` per blob asked for, in no promised order: a PUT URL (signed for
-    its length and its ``x-amz-checksum-sha256``) or, when stored already, ``exists``."""
+class StreamBlobUrl(_M):
+    """One blob of :class:`StreamBlobUrls`: a PUT URL, signed for the blob's length and its
+    ``x-amz-checksum-sha256`` and valid for :data:`STREAM_URL_TTL_MAX` at most; or, when the
+    blob is stored already, ``exists`` and no URL at all -- the job's stream blobs are read
+    by the gate's relay alone, so nothing is minted to read one with."""
 
-    blobs: list[BlobUrl] = Field(max_length=STREAM_BLOBS_MAX)
+    sha256: _Name
+    url: _Long | None = None
+    exists: bool = False
+    expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _url_unless_stored(self) -> StreamBlobUrl:
+        if self.exists != (self.url is None) or (self.url is None) != (self.expires_at is None):
+            raise ValueError("a stream blob is stored (exists, no URL) or has a PUT URL")
+        return self
+
+
+class StreamBlobUrls(_M):
+    """One :class:`StreamBlobUrl` per blob asked for, in no promised order."""
+
+    blobs: list[StreamBlobUrl] = Field(max_length=STREAM_BLOBS_MAX)
 
 
 # --------------------------------------------------------------------------- money

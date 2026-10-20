@@ -13,8 +13,8 @@ place (``<marker>-<offering>-<topic>-<where>-<run>-<i>``):
 
 Scanned: every run's history as Temporal stores it (publish signals, poll answers --
 references only, no item ciphertext at all (decisions I39) --, continue-as-new input), the
-job's stream blobs in the bucket (each an age file), the raw SSE bytes the buyer receives,
-the gate's store; and a misbehaving relay (asking for unlisted topics, or every topic) gets
+whole bucket -- the job's stream blobs and every claim-check, each an age file --, the raw
+SSE bytes the buyer receives, the gate's store; and a misbehaving relay (asking for unlisted topics, or every topic) gets
 unlisted items it cannot open and whose names it cannot read. The agent child's poll answers
 are sealed to the seller alone."""
 
@@ -90,6 +90,15 @@ class Job:
                 for d, (_, job) in gate.blob_scopes.items()
                 if job == self.job_id and d in gate.blobs
             }
+
+        return await self.mp.gate.run(get)
+
+    async def bucket(self) -> dict[str, bytes]:
+        """Everything in the gate's bucket, any job's or none's: the job's stream blobs, and
+        the claim-checks its workers stored (an agent child's answers encrypted whole)."""
+
+        async def get() -> dict[str, bytes]:
+            return dict(self.mp.gate.blobs)
 
         return await self.mp.gate.run(get)
 
@@ -250,7 +259,9 @@ async def _w(mp: Marketplace, acme: TestParty, bound: Any) -> None:
         ct = stored[item.sha256]
         with pytest.raises(AgeError):
             decrypt(ct, bob.identity)
-        sealed = s.open_item(ct, [acme.identity], topic=AUDIT, offset=item.offset)
+        sealed = s.open_item(
+            ct, [acme.identity], topic=AUDIT, offset=item.offset, job_id=job.job_id
+        )
         assert AUDIT in json.dumps(CONVERTER.from_payload(sealed))
 
     await mp.client(acme.namespace).get_workflow_handle(job.wf).signal("finish")
@@ -272,10 +283,13 @@ async def _w(mp: Marketplace, acme: TestParty, bound: Any) -> None:
                 )
                 assert b"YWdlLWVuY3J5cHRpb24" not in p.data
                 assert b"age-encryption" not in p.data
-    # The bucket: the job's stream blobs are age files, no marker, no unlisted topic's name.
+    # The bucket, the job's stream blobs and everything else in it: age files, no marker, no
+    # unlisted topic's name.
     blobs = await job.blobs()
     assert len(blobs) >= 16
-    for data in blobs.values():
+    everything = await job.bucket()
+    assert everything.keys() >= blobs.keys()
+    for data in everything.values():
         assert data.startswith(s.AGE_MAGIC)
         assert MARKER.encode() not in data
         assert AUDIT.encode() not in data
@@ -297,7 +311,7 @@ async def _w(mp: Marketplace, acme: TestParty, bound: Any) -> None:
         assert e.ciphertext_b64 is not None
         assert e.topic is not None
         assert e.offset is not None
-        p = s.open_item(base64.b64decode(e.ciphertext_b64), [bob.identity], topic=e.topic, offset=e.offset)  # fmt: skip
+        p = s.open_item(base64.b64decode(e.ciphertext_b64), [bob.identity], topic=e.topic, offset=e.offset, job_id=job.job_id)  # fmt: skip
         seen.append(json.dumps(CONVERTER.from_payload(p)))
     assert sum(f"{MARKER}-w-{LISTED}-" in v for v in seen) == 8
     assert any(f"{MARKER}-w-progress-heartbeat-" in v for v in seen)
@@ -359,7 +373,8 @@ async def test_a_bound_handlers_stream_leaks_nothing(dev_server: DevServer, tmp_
                 out = await handle.result()
                 raw = await asyncio.wait_for(sse, 120)
                 stored = json.dumps([e.model_dump(mode="json") for e in await job.stored()])
-                bucket = await job.blobs()
+                bucket = await job.bucket()
+                assert bucket.keys() >= (await job.blobs()).keys()
                 child = agent_workflow_id(hired.job_id)
                 child_runs = await histories(job.plain, child)
                 wrapper_runs = await histories(job.plain, job.wf)
@@ -376,7 +391,7 @@ async def test_a_bound_handlers_stream_leaks_nothing(dev_server: DevServer, tmp_
     replies = []
     for e in items:
         assert e.topic == "turn_events"
-        p = s.open_item(base64.b64decode(e.ciphertext_b64 or ""), [buyer_key], topic=e.topic, offset=e.offset or 0)  # fmt: skip
+        p = s.open_item(base64.b64decode(e.ciphertext_b64 or ""), [buyer_key], topic=e.topic, offset=e.offset or 0, job_id=job.job_id)  # fmt: skip
         event = json.loads(p.data)
         if event["event"]["type"] == "message_handler_end":
             replies.append(event["event"]["output"])

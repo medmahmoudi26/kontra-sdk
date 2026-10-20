@@ -534,7 +534,13 @@ async def test_heartbeats_reach_the_buyer_in_order_and_only_as_ciphertext(world:
         raw = base64.b64decode(e.ciphertext_b64)
         assert MARKER.encode() not in raw
         record = ProgressRecord.model_validate_json(
-            open_item(raw, [world.buyer.party.identity], topic=PROGRESS_TOPIC, offset=e.offset).data
+            open_item(
+                raw,
+                [world.buyer.party.identity],
+                topic=PROGRESS_TOPIC,
+                offset=e.offset,
+                job_id=hired.job_id,
+            ).data
         )
         seen.append((record.activity, record.details))
     assert [a for a, _ in seen] == ["beat"] * 100 + ["sync_beat"] * 3
@@ -545,6 +551,7 @@ async def test_heartbeats_reach_the_buyer_in_order_and_only_as_ciphertext(world:
         [world.seller.identity],
         topic=PROGRESS_TOPIC,
         offset=beats[0].offset or 0,
+        job_id=hired.job_id,
     )
     assert MARKER not in json.dumps([e.model_dump(mode="json") for e in events])
     stored = await _events(world, hired.job_id)

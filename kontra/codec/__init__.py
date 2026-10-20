@@ -93,7 +93,9 @@ import asyncio
 import base64
 import copy
 import json
+import logging
 import re
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from hashlib import sha256
 from typing import Any, Literal, Protocol, Self
@@ -120,6 +122,7 @@ from kontra.codec.stream import (
     OFFSET_MARK,
     POLL_MARK,
     REPLAYED_MARK,
+    SEALED_KEYS,
     STREAM_ENCODING,
     STREAM_MARK,
     STREAM_UPLOAD_BUDGET,
@@ -153,6 +156,8 @@ __all__ = [
     "check_sealed",
     "data_converter",
 ]
+
+log = logging.getLogger("kontra.codec")
 
 ENCODING = b"binary/kontra-age"
 CLAIM_CHECK_ENCODING = b"binary/kontra-claim-check"
@@ -257,7 +262,10 @@ class GateBlobStore:
         """One gate call for the URLs, then the PUTs not already stored, a few at once, each
         reported to ``done`` once the bucket took it. Every PUT names its digest
         (``x-amz-checksum-sha256``, which the gate signs into the URL), so a bucket refuses
-        bytes that are not the blob's."""
+        bytes that are not the blob's. A PUT the bucket refuses leaves its item a stub, and is
+        logged -- once for the answer, with the statuses and how many -- so a bucket that
+        refuses every upload (a header it was not signed for, say) is seen in the seller's
+        logs, not only as ``unavailable`` gaps at the buyer's."""
         if not blobs:
             return
         urls = await self._gate.create_stream_blobs(
@@ -266,12 +274,13 @@ class GateBlobStore:
         )
         by_digest = {u.sha256: u for u in urls.blobs}
         gate = asyncio.Semaphore(_PUT_CONCURRENCY)
+        refused: Counter[int] = Counter()
 
         async def put(digest: str, data: bytes) -> None:
             url = by_digest.get(digest)
             if url is None:
                 return  # the gate did not answer for it: a stub
-            if url.exists:
+            if url.exists or url.url is None:
                 done(digest)
                 return
             checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
@@ -283,10 +292,23 @@ class GateBlobStore:
                 )
             if resp.is_success:
                 done(digest)
+            else:
+                refused[resp.status_code] += 1
 
-        async with asyncio.TaskGroup() as tg:
-            for digest, data in blobs:
-                tg.create_task(put(digest, data))
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for digest, data in blobs:
+                    tg.create_task(put(digest, data))
+        finally:
+            if refused:
+                log.warning(
+                    "job %s: the bucket refused %d of %d stream item uploads (HTTP %s): "
+                    "those items are unavailable to the buyer",
+                    job_id,
+                    sum(refused.values()),
+                    len(blobs),
+                    ", ".join(f"{code} x{n}" for code, n in sorted(refused.items())),
+                )
 
     async def put(self, sha256: str, data: bytes) -> None:
         url = await self._gate.create_blob(m.BlobCreate(sha256=sha256, size=len(data)))
@@ -622,12 +644,30 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
             raise CodecError(f"cannot seal job {job_id}'s stream: {e}") from e
 
     async def _open_stream(self, p: Payload) -> Payload:
-        """A stream envelope as the poll result it was sealed from."""
-        if isinstance(self._context, NexusSerializationContext):
+        """A stream envelope as the poll result it was sealed from, its items checked to be
+        the job's whose workflow it was polled from. A codec with no blob store cannot fetch
+        the items: the envelope is answered as it is (its references in view), never as a
+        poll result with its items missing."""
+        ctx = self._context
+        if isinstance(ctx, NexusSerializationContext):
             raise InvalidPayload("a workflow-stream envelope is never a Nexus payload")
-        fetch = self._fetch_blob if self._blobs is not None else None
+        if self._blobs is None:
+            try:
+                _stream.parse_envelope(p)  # read strictly all the same: junk fails closed
+            except EnvelopeError as e:
+                raise InvalidPayload(f"cannot open a workflow-stream envelope: {e}") from e
+            return p
+        job_id = (
+            job_id_from_workflow_id(ctx.workflow_id)
+            if isinstance(ctx, WorkflowSerializationContext)
+            else None
+        )
+        if job_id is None:
+            raise InvalidPayload("a workflow-stream envelope outside its job's workflow")
         try:
-            return await _stream.open_poll(p, self._identities(), fetch_blob=fetch)
+            return await _stream.open_poll(
+                p, self._identities(), fetch_blob=self._fetch_blob, job_id=job_id
+            )
         except EnvelopeError as e:
             raise InvalidPayload(f"cannot open a workflow-stream envelope: {e}") from e
 
@@ -705,6 +745,10 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
             inner.ParseFromString(plain)
         except DecodeError as e:
             raise InvalidPayload(f"decrypted payload is not a Payload: {e}") from e
+        if not SEALED_KEYS.isdisjoint(inner.metadata):
+            # A job's stream item, named as a claim-check (its digest is in every envelope):
+            # opened only as a stream item, never as an input or a result of this worker's.
+            raise InvalidPayload("a sealed stream item is not a payload")
         return inner
 
     async def _maybe_claim_check(self, ciphertext: bytes) -> Payload:
