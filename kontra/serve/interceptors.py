@@ -14,14 +14,17 @@ payload keys are known.
   :func:`kontra._runtime.job_context` for the activity's duration (so
   ``Artifact.from_path`` uploads for the right job) and wraps the outbound interceptor so
   every ``activity.heartbeat(*details)`` -- before the SDK throttles it -- is offered to the
-  progress forwarder, then passed on unchanged. When the activity returns, the forwarder
+  progress forwarder, then passed on unchanged -- except Kontra's own turn activity's
+  (:data:`~kontra.serve.turn.TURN_ACTIVITY`), which heartbeats for liveness, not for the
+  buyer (:mod:`kontra.serve.turn`). When the activity returns, the forwarder
   gets a short, bounded chance to deliver the heartbeats that are due
   (:meth:`~kontra.serve.progress.ProgressForwarder.settle`), so the buyer sees them before
   the job closes; a slow or unreachable gate does not hold activities up.
 
 This module runs inside workflow code: it imports only temporalio, the standard library,
-:mod:`kontra.contract.names` and :mod:`kontra._runtime` (a context variable; no I/O,
-deterministic), and the workflow interceptor class is handed to the sandbox as an object.
+:mod:`kontra.contract.names`, :mod:`kontra._runtime` (a context variable; no I/O,
+deterministic) and the turn activity's name, and the workflow interceptor class is handed to
+the sandbox as an object.
 
 Known gap: a *descendant* workflow learns its job when its run method starts; an activity
 scheduled by a signal handler that runs before that (a signal in the very first activation)
@@ -54,6 +57,7 @@ from temporalio.worker import (
 
 from kontra import _runtime
 from kontra.contract.names import is_job_id, job_id_from_workflow_id
+from kontra.serve.turn import TURN_ACTIVITY
 
 __all__ = ["JOB_HEADER", "KontraInterceptor", "ProgressSink", "job_from_headers", "job_header"]
 
@@ -175,6 +179,8 @@ class _ActivityInbound(ActivityInboundInterceptor):
             kind = activity.info().activity_type
         except RuntimeError:
             kind = "activity"
+        if kind == TURN_ACTIVITY:
+            return  # Kontra's own liveness beat, not the seller's progress
         sink.offer(job_id, kind, details)
 
 

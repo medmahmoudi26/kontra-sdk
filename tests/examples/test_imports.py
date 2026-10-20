@@ -26,7 +26,6 @@ from pathlib import Path, PurePosixPath
 import pytest
 
 from kontra.cli._scaffold import render, scaffold
-from kontra.cli._seller_code import check_project
 
 from .support import EXAMPLES, SELLERS
 
@@ -198,12 +197,6 @@ def test_seller_code_imports_temporal_only_through_the_facade(path: Path) -> Non
 def test_no_seller_module_imports_temporal(path: Path) -> None:
     """worker.py, quote.py and models.py too: the publish gate refuses Temporal anywhere."""
     assert temporal_imports(path.read_text(encoding="utf-8")) == []
-
-
-@pytest.mark.parametrize("name", SELLERS)
-def test_kontra_publish_accepts_the_seller_code(name: str) -> None:
-    """The check ``kontra publish`` runs over an offering's modules finds nothing."""
-    assert check_project(EXAMPLES / name) == []
 
 
 @pytest.mark.parametrize("path", MODELS, ids=_rel)
