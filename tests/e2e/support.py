@@ -1,5 +1,6 @@
-"""Helpers for ``tests/e2e``: the ``kontra dev`` stack as the tests see it, parties logged
-in to it, sellers as ``kontra serve`` processes, and scans of everything Kontra stores.
+"""Helpers for ``tests/e2e``: the e2e stack (``compose.yaml``, :mod:`tests.e2e.stack`) as the
+tests see it, parties logged in to it, sellers as ``kontra serve`` processes, and scans of
+everything Kontra stores.
 
 Nothing here talks to Kontra in a way a seller or buyer could not: parties log in with the
 dev login, sellers are the ``kontra`` command, buyers are :class:`kontra.hire.Kontra`. The
@@ -108,16 +109,6 @@ async def until(
     return value
 
 
-def read_env_file(path: Path) -> dict[str, str]:
-    """KEY=VALUE lines (``dev.env``); comments and blank lines skipped."""
-    out: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").split("\n"):
-        name, sep, value = line.partition("=")
-        if sep and not name.lstrip().startswith("#"):
-            out[name.strip()] = value
-    return out
-
-
 # --------------------------------------------------------------------------- the stack
 
 
@@ -153,8 +144,8 @@ class ScanReport:
 
 @dataclass(frozen=True)
 class Stack:
-    """The running ``kontra dev`` stack: where its services answer and its credentials
-    (``$KONTRA_HOME/dev.env``)."""
+    """The running e2e stack: where its services answer and its credentials (the gate's
+    environment and ``.stack/stack.env``, :mod:`tests.e2e.stack`)."""
 
     home: Path
     gate_url: str
@@ -166,8 +157,8 @@ class Stack:
     s3_secret_key: str
     pg_user: str
     parties: Path
-    #: How long the session's ``kontra dev up`` took (the stack from nothing when the
-    #: session started from ``down --volumes``); acceptance 1 counts it.
+    #: How long the session's stack start took (``make e2e``'s ``stack-up``, from nothing
+    #: after a ``stack-down``); acceptance 1 counts it.
     up_seconds: float = 0.0
     #: The gate's ledger adapter for this session (``KONTRA_LEDGER``; acceptance 9 runs
     #: the suite once per adapter).

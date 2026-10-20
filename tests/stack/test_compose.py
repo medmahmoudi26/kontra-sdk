@@ -1045,3 +1045,16 @@ def test_grafana_loads_the_dashboards_and_the_collector_writes_where_it_reads() 
     [derived] = by_uid["loki"]["jsonData"]["derivedFields"]
     assert (derived["matcherRegex"], derived["datasourceUid"]) == ("trace_id", "tempo")
     assert by_uid["tempo"]["jsonData"]["tracesToLogsV2"]["datasourceUid"] == "loki"
+
+
+def test_the_e2e_suite_describes_the_stack_it_runs() -> None:
+    """``tests/e2e`` runs ``compose.yaml`` through ``tests/e2e/stack.py`` (``make stack-up``),
+    not ``kontra dev``: its prose names neither the old ``kontra dev up``/``down --volumes``
+    lifecycle nor ``$KONTRA_HOME/dev.env``, and it reads the stack's env file one way."""
+    e2e = REPO / "tests" / "e2e"
+    for path in e2e.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for stale in ("kontra dev down --volumes", "dev.env", "with ``kontra dev up``"):
+            assert stale not in text, f"{path.name} still says {stale!r}"
+    defined = [p.name for p in e2e.glob("*.py") if "def read_env_file(" in p.read_text("utf-8")]
+    assert defined == ["stack.py"]

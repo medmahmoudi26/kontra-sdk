@@ -1,10 +1,12 @@
-"""The ``kontra dev`` stack for ``tests/e2e`` (``make e2e``).
+"""The e2e stack for ``tests/e2e`` (``make e2e``): ``compose.yaml`` with the prod gate image.
 
-One session-scoped fixture brings the stack up with ``kontra dev up`` -- the command a seller
-runs, with the environment's settings: ``KONTRA_HOME``, the four ``KONTRA_DEV_*_PORT``
-host ports and the two images (``KONTRA_GATE_IMAGE``, ``KONTRA_TEMPORAL_IMAGE``) -- and takes
-it down with ``kontra dev down --volumes`` at the end, so every session starts from an empty
-catalog and ledger. ``KONTRA_E2E_KEEP=1`` leaves it up (and its data) for a look afterwards.
+One session-scoped fixture brings the stack up with :func:`tests.e2e.stack.up` -- what ``make
+stack-up`` runs (``python -m tests.e2e.stack up``), never ``kontra dev``, which runs no
+containers (decisions I34) -- with the environment's settings: the ``KONTRA_DEV_*_PORT`` host
+ports and the two images (``KONTRA_GATE_IMAGE``, ``KONTRA_TEMPORAL_IMAGE``). It takes the stack
+down with :func:`tests.e2e.stack.down` (``make stack-down``, volumes included) at the end, so
+every session starts from an empty catalog and ledger. ``KONTRA_E2E_KEEP=1`` leaves it up (and
+its data) for a look afterwards.
 
 Every test module here marks its tests ``e2e`` (deselected by default: ``addopts = -m 'not e2e'``). They are
 skipped, saying why, when Docker or either image is missing; ``make e2e`` checks the Temporal
@@ -22,7 +24,8 @@ from collections.abc import Iterator
 import pytest
 
 from . import stack as e2e_stack
-from .support import Stack, read_env_file
+from .stack import read_env_file
+from .support import Stack
 
 _GATE_IMAGE = "ghcr.io/medmahmoudi26/kontra-gate:dev"
 _TEMPORAL_IMAGE = "ghcr.io/medmahmoudi26/kontra-temporal:dev"
