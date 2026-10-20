@@ -1530,10 +1530,16 @@ changed, all deny to allow: two for the stream relay, ten for the worker control
   other token is judged by **the relay rule**. "Any permission" is any namespace key or system
   role, not any role bit: the default mapper creates a namespace's key even for a role it does
   not know (`acme:relay` gives `Namespaces{"acme": 0}`), so a new principal cannot be a role
-  string. Party tokens and the other two are disjoint twice: a party token always carries a
-  permission and the others never do, and a party's subject is a handle, which never contains
-  the `/` both other subjects contain. Neither test is a prefix test: the controller is equality
-  with a constant, the relay equality with a construction.
+  string. A permission string the mapper drops is no permission: `temporal-system:` with a role
+  it does not know (no role, no namespace key), an entry with no `:`, an entry that is not a
+  string, a `permissions` claim that is not a list; a token carrying only those is judged by its
+  subject (`TestWhatTheClaimMapperCountsAsAPermission`, and matrix cells for the controller's and
+  the relay's subject). So party tokens and the other two are told apart twice: the gate mints a
+  party token with a permission and the other two with none, and a party's subject is a handle,
+  which never contains the `/` both other subjects contain. The second holds whatever a token's
+  permissions say; the first as long as the gate writes no dropped permission into a relay's or
+  the controller's token. Neither test is a prefix test: the controller is equality with a
+  constant, the relay equality with a construction.
 * **The party allowlist is unchanged**: the same 40 WorkflowService calls, in the token's own
   namespace, each now justified in `authorizer.go`. A seller's worker token, a seller's API-key
   session (the gate has one Temporal mint, and I19's limits on keys are gate-side), a buyer and
@@ -1643,7 +1649,8 @@ the sentence above) and `docs/security.md`.
 - kontra-cloud must mint both credentials before either works (the tracking issue's text, on
   #59): `KeyRing.sign_relay(namespace, job_id, session_id)` and
   `KeyRing.sign_controller(session_id)`, one function per kind with no role parameter (a relay
-  or controller token that also carried a role would be judged a party token), each with a
+  or controller token that also carried a permission would be judged a party token, and one
+  carrying a permission string the mapper drops would still be judged by its subject), each with a
   `sid` and a 15-minute lifetime; a relay session per job relay, revoked when the job closes or
   the last SSE listener leaves; the relay dials the **public** frontend and makes only the two
   calls above; `kontra-system` registered through the internal frontend (a reserved handle, so
@@ -1658,16 +1665,39 @@ the sentence above) and `docs/security.md`.
   else. Each relay poll writes accepted and completed events to the seller's history and counts
   against its rate limits: one subscription per job, fanned out, only while a buyer listens.
   Topic filtering is the gate's (topics sit in the poll's payload, which the authorizer does not
-  read), and a poll's result is one ciphertext.
+  read), and a poll's result is one ciphertext. **A poll's outcome is stored in the history**
+  (`WorkflowExecutionUpdateCompletedEventAttributes.Outcome`), up to the stream's poll response
+  cap (`_MAX_POLL_RESPONSE_BYTES`, about 1 MB): a genuine relay doubles the stream's volume in
+  history (each item once in its publish signal, again in a poll outcome) and spends one of the
+  run's `history.maxTotalUpdates` (2,000, Temporal's default, not pinned) per poll. #52 polls
+  only from the tail, with topics, and has to plan for both.
 - Residual risk: a relay that presented another update's id would get that update's outcome
   (the server matches an update by id alone); update ids are random ids the relay never sees,
   and outcomes are ciphertext to the job's parties.
+- **Residual risk: a leaked relay token can end its job.** With only its two allowed calls, it
+  polls from offset 0 again and again, each time with a new update id, and so appends up to
+  `history.maxTotalUpdates` completed updates of up to about 1 MB each to job J's history. Past
+  `limit.historySize.error` (20 MiB, pinned) Temporal terminates the run
+  (`enforceHistorySizeCheck`, reason "Workflow history size exceeds limit."), and escrow refunds
+  the job as "seller workflow terminated", against the seller. Any stream above about 10.5 KB
+  (20 MiB / 2,000) is enough, and one of about 1 MB takes about twenty polls
+  (`test_relay_polls_alone_can_end_their_job`, over the wire). The session is revoked only when
+  the job closes or the last listener leaves, so a leaked token stays live while a buyer
+  listens. The Authorizer cannot bound this, because it does not read the payload. Mitigations,
+  recorded and **not adopted here** (the owner decides): handler workflows that host a stream
+  continue-as-new on `workflow.info().is_continue_as_new_suggested()` (escrow follows the pinned
+  chain, and the relay's empty run id follows the current run), which turns the termination
+  into churn; #52's relay polls only from the tail, with topics, which bounds a genuine relay's
+  cost but not a leaked token's, since that token picks its own offset; a per-namespace
+  `history.maxTotalUpdates` pin chosen with `limit.historySize.error` in mind, which bounds it
+  only together with continue-as-new (20 MiB at 1 MB a poll is about twenty updates, a cap a
+  genuine subscription would hit too).
 - #51 documents that a seller who turns on Worker Versioning gets no tasks.
 
 Tested: the Go deny matrix, every cell with its typed request, against Kontra's and Temporal's
-two authorizers (302 cells, 242 of them denials that Temporal's no-op authorizer allows); a
-sweep of all 191 surfaces against 21 kinds of caller, five namespaces and a favourable, a
-hostile and no request (80,220 decisions, the expected rule restated in the test); Temporal's own
-authorization interceptor handing the relay rule the decoded request; and `tests/temporal`
-over the wire against the real binary (55 tests), the relay, controller, self-access and escrow
-cells included.
+two authorizers (319 cells, 253 of them denials that Temporal's no-op authorizer allows; 957
+checks); a sweep of all 191 surfaces against 26 kinds of caller, five namespaces and a
+favourable, a hostile and no request (99,320 decisions, the expected rule restated in the
+test); Temporal's own authorization interceptor handing the relay rule the decoded request;
+and `tests/temporal` over the wire against the real binary (59 tests), the relay, controller,
+self-access and escrow cells included, and a relay ending its job by history size alone.

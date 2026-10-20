@@ -33,18 +33,28 @@ and every caller there presents a short-lived JWT verified by Temporal's default
 mapper against Kontra's JWKS. Three kinds of token mean anything there (`docs/decisions.md`
 I30), told apart in this order:
 
-1. a **party token** carries a permission, and the one that grants anything is
-   `"<namespace>:worker"`. A seller's worker token, a seller's API-key session, a buyer and
-   the dev party all hold this token; they are identical on the wire. A token with any
-   permission at all is judged by this rule alone, whatever its subject says;
+1. a **party token** carries a permission -- a permission string the default mapper turns
+   into a namespace key (any `"<namespace>:<role>"`, even an unknown role) or into a system
+   role it knows (`temporal-system:` with `read`, `write`, `admin` or `worker`) -- and the
+   one that grants anything is `"<namespace>:worker"`. A seller's worker token, a seller's
+   API-key session, a buyer and the dev party all hold this token; they are identical on the
+   wire. A token with a permission is judged by this rule alone, whatever its subject says;
 2. the **worker controller** (KON-15) carries no permission and the subject
    `platform/worker-controller` (`ControllerSubject`);
 3. the gate's **stream relay** carries no permission and the subject
    `relay/<namespace>/job-<32 hex>` (`RelaySubject`, the twin of
    `kontra.contract.names.relay_subject`).
 
-A party's subject is its handle, which never contains `/`; both other subjects do. So the
-three never overlap, on two independent counts.
+A permission string the mapper drops is no permission: `temporal-system:` with a role it
+does not know (no role, and no namespace key), an entry with no `:`, an entry that is not a
+string, a `permissions` claim that is not a list. A token carrying only those is judged by
+its subject, like one that carries none.
+
+So the kinds are told apart twice. The gate mints a party token with a permission and the
+other two with none (each principal has its own mint, with no role parameter); and a party's
+subject is its handle, which never contains `/`, while both other subjects do. The second
+holds whatever the token's permissions say; the first only as long as the gate writes no
+permission the mapper drops.
 
 | Caller (on the public frontend) | Allowed | Denied |
 |---|---|---|
@@ -53,7 +63,8 @@ three never overlap, on two independent counts.
 | **`worker` in A** (a party token: seller, buyer, API-key session, dev party) | the WorkflowService allowlist below, in namespace **A** only, including updates, queries, signals, cancel and terminate of A's own workflows | any namespace B, `temporal-system` and the platform namespace `kontra-system`; every OperatorService / AdminService call; the Nexus HTTP API (`DispatchNexusTask`, completions); namespace admin, batch, schedules, resets, deletes, pause, workflow options, worker deployments and versioning, compute config |
 | **stream relay** for job J of A (`sub = relay/A/job-J`, no permissions) | `UpdateWorkflowExecution` with update name `__temporal_workflow_stream_poll`, and `QueryWorkflow` with query type `__temporal_workflow_stream_offset`, on workflow `job-J` in namespace **A** only | every other API (`PollWorkflowExecutionUpdate`, describe, history, signal — the stream's publish signal included — start, `ExecuteMultiOperation`); any other update or query (`__stack_trace` included); any other workflow of A; job J's id in any other namespace |
 | **worker controller** (`sub = platform/worker-controller`, no permissions) | the 10 worker-deployment, task-queue and count calls in `ControllerAPIs`, in the platform namespace `kontra-system` only | every call in any other namespace; in `kontra-system`: polls, start, describe, signal, update, query, terminate, reset, delete, batch, schedules, `ListWorkerDeployments`, `CreateWorkerDeployment`, the three compute-config calls, versioning rules |
-| **any other role** (`admin`, `write`, `read`, an unknown role, `temporal-system:*`), even alongside `worker`, whatever the token's subject (a relay's or the controller's included) | nothing beyond what `worker` in A grants | everything those roles would grant on a stock Temporal — including all Operator/Admin APIs |
+| **any other role** (`admin`, `write`, `read`, an unknown role in a namespace, `temporal-system:read`/`write`/`admin`/`worker`), even alongside `worker`, whatever the token's subject (a relay's or the controller's included) | nothing beyond what `worker` in A grants | everything those roles would grant on a stock Temporal — including all Operator/Admin APIs |
+| **a permission the mapper drops** (`temporal-system:` with an unknown role, no `:`, not a string, a claim that is not a list) | no permission: the token is judged by its subject, so the controller's or a relay's subject gets exactly that principal's calls | as for that subject |
 | **buyer `worker` in C** | start/describe its own workflows and standalone Nexus operations in C; call any endpoint via Nexus | describe / query / list / signal / cancel / poll **anything** in a seller's namespace A, including the handler workflow its own job started |
 | **control plane** (internal frontend only) | everything: create namespaces and Nexus endpoints, watch jobs, history's Nexus dispatch and completions | — (only reachable on the private network) |
 
@@ -98,7 +109,10 @@ and callbacks are not read; callbacks are the callback guard's, which applies to
 the controller as to every other token. A relay needs nothing else: re-sending its Update
 with the same update id returns the outcome, and with an empty run id it follows a
 continue-as-new. `PollWorkflowExecutionUpdate` is denied because it names no update and
-would read any update's outcome by id.
+would read any update's outcome by id. Every completed poll's outcome (up to the stream's
+~1 MB response cap) is written to the job's history, so a leaked relay token, re-polling from
+offset 0, can push the job past `limit.historySize.error` and have Temporal terminate it;
+the authorizer reads no payload and cannot bound that (`docs/security.md`, decisions I30).
 
 The controller is `temporal-worker-controller` rolling out Kontra's own workers. It may make
 the 10 calls in `ControllerAPIs` (describe, promote, ramp, manage, annotate and retire worker
