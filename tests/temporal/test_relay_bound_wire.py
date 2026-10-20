@@ -243,8 +243,11 @@ def largest_task(history: WorkflowHistory) -> int:
 
 async def cold_replay(seller: Seller, history: WorkflowHistory) -> float:
     """Replays ``history`` as a worker that lost its cache does -- a fresh codec, nothing
-    remembered -- and returns the seconds it took: what one workflow task's timeout must
-    hold after a restart, a deploy or an eviction."""
+    remembered -- and returns the CPU seconds it took (this process, every thread: temporalio's
+    core included): the work one workflow task's timeout must hold after a restart, a deploy
+    or an eviction. CPU, not wall time: the work is what the polls add, and a loaded test box
+    stretches the wall clock without changing it (on a worker that keeps up, I39's
+    precondition, the two agree)."""
     codec = KontraCodec(
         SELLER_KEY[0], [SELLER_KEY[1]], role="seller", buyer_keys=_Keys(), blobs=seller.blobs
     )
@@ -253,9 +256,9 @@ async def cold_replay(seller: Seller, history: WorkflowHistory) -> float:
         interceptors=[seller.interceptor],
         data_converter=seller_data_converter(codec),
     )
-    began = time.monotonic()
+    began = time.process_time()
     result = await replayer.replay_workflow(history, raise_on_replay_failure=False)
-    took = time.monotonic() - began
+    took = time.process_time() - began
     assert result.replay_failure is None, result.replay_failure
     return took
 
@@ -707,7 +710,7 @@ async def test_a_token_holder_re_polling_from_offset_0_cannot_end_the_job(
     print(
         "relay bound A, measured:",
         json.dumps(measured, sort_keys=True),
-        f"attack {attack_secs:.1f} s, cold replay {replay_secs} s, cycles {b.driver.cycles}",
+        f"attack {attack_secs:.1f} s, cold replay {replay_secs} s CPU, cycles {b.driver.cycles}",
     )
 
 
@@ -781,7 +784,7 @@ async def test_a_long_stream_costs_a_poll_its_answer(cluster: Cluster, control: 
     print(
         "relay bound D, measured:",
         json.dumps(measured, sort_keys=True),
-        f"attack {attack_secs:.1f} s, cold replay {replay_secs} s (its twin {twin_secs} s)",
+        f"attack {attack_secs:.1f} s, cold replay {replay_secs} s CPU (its twin {twin_secs} s)",
     )
 
 
