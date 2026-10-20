@@ -61,6 +61,7 @@ import binascii
 import hashlib
 import json
 import logging
+import math
 import re
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Sequence
@@ -103,6 +104,7 @@ __all__ = [
     "PollFailure",
     "StreamStore",
     "buyer_topics",
+    "check_upload_budget",
     "envelope_bound",
     "offset_payload",
     "open_item",
@@ -157,6 +159,8 @@ STREAM_REFS_MAX = 65_536
 #: Seconds of uploads one workflow-task completion may spend on its answers' items, all of
 #: them together (temporalio encodes a completion's payloads one after another); past it, an
 #: answer's new items are stubs, so a slow bucket never holds a workflow task past its timeout.
+#: The production default of the codec's ``stream_upload_budget`` (and
+#: :class:`~kontra.plugin.KontraPlugin`'s): a fifth of Temporal's 10 s workflow task timeout.
 STREAM_UPLOAD_BUDGET = 2.0
 #: The failure types of a poll a job root refuses (or fails) itself: past its budget (stop),
 #: busy -- too many polls in flight, or an offset past the stream's end (wait, retry) --, any
@@ -205,6 +209,15 @@ class PollFailure(ApplicationError):
     def __init__(self, type: str) -> None:
         kind = type if type in _POLL_FAILURES else STREAM_ERROR
         super().__init__(_POLL_FAILURES[kind], type=kind, non_retryable=True)
+
+
+def check_upload_budget(seconds: float) -> float:
+    """``seconds`` as a stream upload budget (:data:`STREAM_UPLOAD_BUDGET`): a finite number
+    of seconds above 0, or :class:`ValueError`. A budget of 0 would make every item a stub,
+    and an unbounded one would let a slow bucket hold a workflow task past its timeout."""
+    if not (math.isfinite(seconds) and seconds > 0):
+        raise ValueError("stream_upload_budget must be a finite number of seconds above 0")
+    return float(seconds)
 
 
 @runtime_checkable

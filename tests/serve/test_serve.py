@@ -42,6 +42,7 @@ from kontra.serve import BoundOffering, Worker
 from kontra.serve.progress import INTERVAL_ENV
 from kontra.testing import Marketplace, TestParty
 from kontra.testing.devserver import DevServer
+from kontra.testing.marketplace import SERVE_UPLOAD_BUDGET
 from kontra.types import ProgressRecord
 
 from . import seller
@@ -548,6 +549,20 @@ async def test_heartbeats_reach_the_buyer_in_order_and_only_as_ciphertext(world:
     assert MARKER not in json.dumps([e.model_dump(mode="json") for e in events])
     stored = await _events(world, hired.job_id)
     assert MARKER not in json.dumps([e.model_dump(mode="json") for e in stored])
+
+
+async def test_the_marketplace_stores_stream_items_within_a_test_machines_budget(
+    world: World,
+) -> None:
+    """``mp.serve`` gives the worker's codec ``SERVE_UPLOAD_BUDGET`` (8 s) where ``kontra
+    serve`` gives 2 s: the heartbeat test above counts every item, and a loaded test machine
+    can take longer than 2 s to store an answer's 64 items in the fake gate's bucket (an item
+    not stored in time is a gap). The stubs keep their own tests, with a small budget
+    (``tests/codec/test_stream_envelope.py``, ``tests/serve/test_stream_hosting.py``)."""
+    plugin = world.worker.plugin
+    assert plugin is not None
+    assert plugin.codec is not None
+    assert plugin.codec.stream_upload_budget == SERVE_UPLOAD_BUDGET == 8.0
 
 
 def _payloads(node: Any, path: str = "") -> list[tuple[str, dict[str, Any]]]:

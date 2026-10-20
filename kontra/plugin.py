@@ -69,7 +69,7 @@ from kontra._compat import check_temporalio
 from kontra.auth import Session
 from kontra.codec import GateBlobStore, KontraCodec, KontraFailureConverter
 from kontra.codec.age import public_key_of
-from kontra.codec.stream import ENVELOPE_MAX
+from kontra.codec.stream import ENVELOPE_MAX, STREAM_UPLOAD_BUDGET, check_upload_budget
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
 from kontra.profile import KEY_FILE_ENV, NotLoggedIn, Profile, kontra_home
@@ -264,6 +264,13 @@ class KontraPlugin(SimplePlugin):
     closed by :meth:`aclose`). ``gate``: the gate client (default: the session's). Building
     the plugin does no I/O: a ``worker.py`` that builds one can be imported by
     ``kontra publish``.
+
+    ``stream_upload_budget``: the seconds one workflow task may spend storing its jobs' new
+    stream items in the bucket, all of its poll answers together (default
+    :data:`~kontra.codec.stream.STREAM_UPLOAD_BUDGET`, 2 s; :class:`~kontra.codec.KontraCodec`'s).
+    An item not stored within it reaches the buyer as a gap (``unavailable``): a slow or
+    failing bucket costs items, never a workflow task. Keep it well under the workflow task
+    timeout (Temporal's 10 s default).
     """
 
     def __init__(
@@ -272,12 +279,14 @@ class KontraPlugin(SimplePlugin):
         session: Session | None = None,
         home: str | Path | None = None,
         gate: GateClient | None = None,
+        stream_upload_budget: float = STREAM_UPLOAD_BUDGET,
     ) -> None:
         super().__init__(PLUGIN_NAME)
         self._offerings = check_offerings(offerings)
         self._session = session
         self._home = home
         self._gate = gate
+        self._upload_budget = check_upload_budget(stream_upload_budget)
         self._state: _Prepared | None = None
         self._stack: contextlib.AsyncExitStack | None = None
         self._lock: asyncio.Lock | None = None
@@ -293,6 +302,7 @@ class KontraPlugin(SimplePlugin):
         quote: QuoteFunction | None = None,
         home: str | Path | None = None,
         engine: str | None = None,
+        stream_upload_budget: float = STREAM_UPLOAD_BUDGET,
     ) -> KontraPlugin:
         """The plugin for ``offering.yaml`` beside the calling file bound to ``entry`` (a
         ``@workflow.defn`` class or an agent's ``@agent.accepts`` handler), priced by
@@ -301,7 +311,7 @@ class KontraPlugin(SimplePlugin):
         required: the contract, the task queue and the generated Nexus service all come
         from it, and the yaml names no code (D11). No activity is discovered: list them on
         your worker. ``engine``: as :func:`kontra.serve`'s (derived from the entry; an
-        explicit one must agree)."""
+        explicit one must agree). ``stream_upload_budget``: as the constructor's."""
         from kontra.serve._serve import OFFERING_FILE, _base, _default_quote
 
         caller = sys._getframe(1).f_globals
@@ -312,7 +322,7 @@ class KontraPlugin(SimplePlugin):
             quote=quote if quote is not None else _default_quote(caller, base),
             engine=engine,
         )
-        return cls(bound, home=home)
+        return cls(bound, home=home, stream_upload_budget=stream_upload_budget)
 
     # ------------------------------------------------------------------ introspection
 
@@ -424,6 +434,7 @@ class KontraPlugin(SimplePlugin):
             seller_keys=SellerKeyCache(gate),
             blobs=GateBlobStore(gate),
             services=[b.offering_id.service_name for b in self._offerings],
+            stream_upload_budget=self._upload_budget,
         )
         # Heartbeats are published on each job's own stream (decisions I31), with the
         # worker's client once a worker is configured (bind).

@@ -32,6 +32,7 @@ from temporalio.plugin import SimplePlugin
 from kontra import KontraPlugin
 from kontra.codec import KontraCodec, KontraFailureConverter
 from kontra.codec.age import generate_identity
+from kontra.codec.stream import STREAM_UPLOAD_BUDGET
 from kontra.plugin import PLUGIN_NAME
 from kontra.serve import ServeError, Worker
 from kontra.testing import Marketplace, TestParty
@@ -178,7 +179,38 @@ def test_a_worker_without_the_entry_class_is_not_kontras(tmp_path: Path) -> None
     assert plugin.configure_worker(dict(config)) == config
 
 
+def test_a_stream_upload_budget_that_bounds_nothing_is_refused(tmp_path: Path) -> None:
+    """The budget is a finite number of seconds above 0, checked when the plugin is built
+    (no I/O yet): 0 would stub every item, an infinite one hold a task on a slow bucket."""
+    bound = seller.bind(write_offering(tmp_path))
+    for bad in (0, -2.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="stream_upload_budget"):
+            KontraPlugin(bound, stream_upload_budget=bad)
+
+
 # --------------------------------------------------------------------------- on a running server
+
+
+@pytest.mark.temporal
+async def test_the_stream_upload_budget_is_the_codecs(
+    dev_server: DevServer, tmp_path: Path
+) -> None:
+    """The codec the plugin builds stores a workflow task's stream items within the plugin's
+    ``stream_upload_budget``: 2 s unless given (decisions I39)."""
+    async with Marketplace(dev_server=dev_server) as mp:
+        acme = await mp.party("acme")
+        bound = seller.bind(write_offering(tmp_path))
+        plugins = (
+            (KontraPlugin(bound, session=acme.session), STREAM_UPLOAD_BUDGET),
+            (KontraPlugin(bound, session=acme.session, stream_upload_budget=5), 5.0),
+        )
+        for plugin, budget in plugins:
+            await plugin.prepare()
+            try:
+                assert plugin.codec is not None
+                assert plugin.codec.stream_upload_budget == budget
+            finally:
+                await plugin.aclose()
 
 
 @pytest.mark.temporal

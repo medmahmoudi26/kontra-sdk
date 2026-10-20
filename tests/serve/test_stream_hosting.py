@@ -499,14 +499,13 @@ async def test_no_poll_waits_past_the_end_and_at_most_six_wait(rig: Rig) -> None
 
 
 async def test_a_slow_bucket_never_times_a_workflow_task_out(
-    rig: Rig, dev_server: DevServer, monkeypatch: pytest.MonkeyPatch
+    rig: Rig, dev_server: DevServer
 ) -> None:
     """The polls one workflow task answers share one upload budget: six polls on fresh
     windows of a stream, against a bucket that takes 0.2 s an item, completed in one task
-    whose timeout is 2 s. Each answer alone would spend the budget (0.5 s here) and the task
-    would time out; shared, the task completes in time, the late items are stubs, and later
-    reads store them."""
-    monkeypatch.setattr("kontra.codec.STREAM_UPLOAD_BUDGET", 0.5)
+    whose timeout is 2 s. Each answer alone would spend the budget (the codec's, 0.5 s here)
+    and the task would time out; shared, the task completes in time, the late items are
+    stubs, and later reads store them."""
     window = 8
     polls = interceptors.STREAM_PARKED_MAX
     n = window * polls
@@ -554,7 +553,14 @@ async def test_a_slow_bucket_never_times_a_workflow_task_out(
     ]
     await asyncio.sleep(1.0)
     slow = MemoryBlobs(delay=0.2)
-    slow_codec = KontraCodec(SELLER[0], [SELLER[1]], role="seller", buyer_keys=Keys(), blobs=slow)
+    slow_codec = KontraCodec(
+        SELLER[0],
+        [SELLER[1]],
+        role="seller",
+        buyer_keys=Keys(),
+        blobs=slow,
+        stream_upload_budget=0.5,
+    )
     config = dev_server.client.config()
     config["data_converter"] = seller_data_converter(slow_codec)
     slow_seller = Client(**config)

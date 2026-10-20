@@ -2482,11 +2482,17 @@ the relay's rate, which the bound relies on, are #59's own rules (I30, Q10 and Q
   holds no item ciphertext at all.
 * **Who writes, and when it fails.** The seller's worker, in `KontraCodec`, through a
   `StreamStore` (`GateBlobStore` in production). Uploads share **one budget per workflow-task
-  completion**, `STREAM_UPLOAD_BUDGET` = 2 s for all its answers together: temporalio encodes a
-  completion's payloads one after another, in one codec copy (`DataConverter.with_context`
-  per completion), so a per-answer deadline would multiply. Past the budget, or when the
-  bucket fails, an item is a **stub** (`sha256: null`, its size kept): the relay records a gap
-  `unavailable`, a later read stores it; a bucket outage costs items, never a workflow task.
+  completion** for all its answers together, the codec's `stream_upload_budget`
+  (`KontraPlugin`'s; `STREAM_UPLOAD_BUDGET` = 2 s by default, what `kontra serve` runs):
+  temporalio encodes a completion's payloads one after another, in one codec copy
+  (`DataConverter.with_context` per completion), so a per-answer deadline would multiply. Past
+  the budget, or when the bucket fails, an item is a **stub** (`sha256: null`, its size kept):
+  the relay records a gap `unavailable`, a later read stores it; a bucket outage costs items,
+  never a workflow task. `kontra.testing.Marketplace.serve` gives 8 s (`SERVE_UPLOAD_BUDGET`,
+  still under the 10 s task timeout): on a loaded test machine an answer's 64 items took longer
+  than 2 s to reach the fake gate's bucket, and the heartbeat acceptance tests, which count
+  every item, lost the rest as gaps. The stubs keep their own tests, with a budget below a
+  second.
 * **A re-read stores nothing new.** Items are **sealed deterministically per worker**: the age
   file key, ephemeral keys and nonce derive from `HMAC(seal_key, job, recipients, sealed
   plaintext)`, `seal_key = HKDF(the worker's age identity)`. The same worker re-sealing an item

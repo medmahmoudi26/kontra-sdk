@@ -836,11 +836,14 @@ the calling file, as `serve()` does; the entry is required, because the contract
 queue and the Nexus service come from it, and the yaml names no code. It discovers no
 activities: list them on your worker. Any other worker of the same client is left alone; the
 plugin claims a worker by the entry class in its `workflows`. `KontraPlugin(*offerings)` takes
-offerings bound with `offering(...)` instead, for several on one client. A client built from a
-service client, `Client(service_client, plugins=[...])`, skips the connection hook: `await
-kontra.prepare()` before it. `kontra publish` still reads the offering from `worker.py`, so
-keep one beside `main.py` (`worker = serve(EnrichFlow)`, never run by `main.py`); a `kontra
-dev` profile publishes at start without it.
+offerings bound with `offering(...)` instead, for several on one client. Both take
+`stream_upload_budget` (seconds, default 2): how long one workflow task may spend storing its
+jobs' new stream items in the bucket; an item not stored by then reaches the buyer as a gap
+(`unavailable`), never as a failed task, so keep it well under your workflow task timeout.
+A client built from a service client, `Client(service_client, plugins=[...])`, skips the
+connection hook: `await kontra.prepare()` before it. `kontra publish` still reads the offering
+from `worker.py`, so keep one beside `main.py` (`worker = serve(EnrichFlow)`, never run by
+`main.py`); a `kontra dev` profile publishes at start without it.
 
 Before `execute` starts your workflow, the handler checks the hold token offline (signature
 against the gate's keys, audience, expiry, your namespace, the offering, the contract hash),
@@ -882,7 +885,9 @@ async def lifecycle() -> None:
 
 The test `kontra init` writes does exactly this; read it for a full lifecycle, including a
 seller that never delivers and the refund at the deadline. Install with
-`pip install "kontra-sdk[testing]" pytest`.
+`pip install "kontra-sdk[testing]" pytest`. One setting differs from `kontra serve`: the
+worker's stream upload budget is 8 s, not 2, so a busy test machine stores every stream item;
+to see the gaps a slow bucket leaves, pass `mp.serve(worker, seller, stream_upload_budget=0.5)`.
 
 ## The graph: `kontra graph`
 

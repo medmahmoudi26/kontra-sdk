@@ -254,14 +254,13 @@ async def test_a_failing_bucket_costs_items_never_the_answer() -> None:
     assert all(i.sha256 is not None for i in s.parse_envelope(envelope).items)
 
 
-async def test_one_upload_budget_per_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_one_upload_budget_per_completion() -> None:
     """temporalio encodes a completion's payloads one after another, in one codec copy: the
-    copy's upload window is shared, so a slow bucket holds the completion at most
-    ``STREAM_UPLOAD_BUDGET``, whatever the number of answers. A new copy (the next
+    copy's upload window is shared, so a slow bucket holds the completion at most the codec's
+    ``stream_upload_budget``, whatever the number of answers. A new copy (the next
     completion) opens a new window, and stores what was a stub."""
-    monkeypatch.setattr("kontra.codec.STREAM_UPLOAD_BUDGET", 0.3)
     slow = Blobs(delay=0.2)  # per upload, one after another
-    copy = codec(blobs=slow)
+    copy = codec(blobs=slow, stream_upload_budget=0.3)
     loop = asyncio.get_running_loop()
     began = loop.time()
     answers = [
@@ -280,6 +279,16 @@ async def test_one_upload_budget_per_completion(monkeypatch: pytest.MonkeyPatch)
     )
     [late] = await again.encode([answers[-1]])
     assert any(i.sha256 is not None for i in s.parse_envelope(late).items)
+
+
+def test_the_upload_budget_is_the_codecs_to_set() -> None:
+    """2 s by default (``kontra serve``'s), any finite number of seconds above 0 given; 0, a
+    negative, an infinite or a NaN budget refused when the codec is built."""
+    assert codec().stream_upload_budget == s.STREAM_UPLOAD_BUDGET == 2.0
+    assert codec(stream_upload_budget=8).stream_upload_budget == 8.0
+    for bad in (0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="stream_upload_budget"):
+            codec(stream_upload_budget=bad)
 
 
 async def test_a_reread_stores_nothing_new() -> None:

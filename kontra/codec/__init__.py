@@ -77,9 +77,10 @@ seller's set alone, its name hidden), deterministically for this worker (a seed 
 :func:`kontra.codec.age.seal_key` of its identity), stores it in the claim-check bucket scoped
 to the job (a :class:`~kontra.codec.stream.StreamStore`: :class:`GateBlobStore`), and writes
 the stream envelope: references, the offsets in the clear. Uploads share one budget per
-workflow-task completion (temporalio makes one codec copy per completion it encodes):
-:data:`~kontra.codec.stream.STREAM_UPLOAD_BUDGET` seconds for all of its answers together,
-after which an item not stored is a stub, so a slow bucket costs items, never the task.
+workflow-task completion (temporalio makes one codec copy per completion it encodes): the
+codec's ``stream_upload_budget`` seconds for all of its answers together (default
+:data:`~kontra.codec.stream.STREAM_UPLOAD_BUDGET`, 2 s), after which an item not stored is a
+stub, so a slow bucket costs items, never the task.
 :meth:`KontraCodec.decode` fetches the references and turns the envelope back into the exact
 poll result. A marked offset answer (``offset/v1``) passes in plaintext: a log length. A
 marked payload anywhere but a seller's job workflow is refused, never encrypted some other
@@ -125,6 +126,7 @@ from kontra.codec.stream import (
     EnvelopeError,
     PollFailure,
     StreamStore,
+    check_upload_budget,
 )
 from kontra.contract.names import job_id_from_workflow_id
 from kontra.engine import AGE_MAGIC, NotSealed
@@ -350,6 +352,14 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
     every reply. Their ``execute`` input's claim-check is left for the handler to open
     (:meth:`open_deferred`), which :mod:`kontra.serve.handler` does after the hold check.
     ``max_claim_check``: the largest claim-checked payload this codec fetches.
+
+    ``stream_upload_budget`` (seller): the seconds one workflow-task completion may spend
+    storing its stream answers' new items in ``blobs``, all of its answers together (default
+    :data:`~kontra.codec.stream.STREAM_UPLOAD_BUDGET`, 2 s). An item not stored within it is
+    a stub (the buyer sees a gap, ``unavailable``): a slow or failing bucket costs items, never
+    a workflow task. It must stay well under the workflow task timeout (Temporal's 10 s
+    default; Kontra sets none). A test on a loaded machine may give more
+    (:meth:`kontra.testing.Marketplace.serve` does), and a test of the stubs less.
     """
 
     def __init__(
@@ -365,6 +375,7 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         services: Iterable[str] = (),
         max_claim_check: int = MAX_CLAIM_CHECK,
         extra_identities: Callable[[], Sequence[str]] | None = None,
+        stream_upload_budget: float = STREAM_UPLOAD_BUDGET,
     ) -> None:
         if role not in ("seller", "buyer"):
             raise ValueError("role must be 'seller' or 'buyer'")
@@ -386,6 +397,7 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
             raise ValueError("claim_check_threshold must be >= 0")
         if max_claim_check < 1:
             raise ValueError("max_claim_check must be >= 1")
+        budget = check_upload_budget(stream_upload_budget)
         if isinstance(services, str):
             raise TypeError("services is a collection of service names, not one name")
         generated = frozenset(services)
@@ -414,6 +426,8 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         #: Claim-checks fetched under this context: the input of one handled Nexus operation
         #: (temporalio makes a context, so a copy of this codec, per Nexus task).
         self._fetched = 0
+        #: Seconds of uploads one workflow-task completion may spend on its stream answers.
+        self._upload_budget = budget
         #: The end of this copy's upload window for stream items (event-loop time): one
         #: budget for every answer one workflow-task completion carries.
         self._uploads_until: float | None = None
@@ -426,6 +440,12 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
     def services(self) -> frozenset[str]:
         """The generated Nexus services whose ``quote``/``execute`` replies are plaintext."""
         return self._services
+
+    @property
+    def stream_upload_budget(self) -> float:
+        """Seconds of stream-item uploads one workflow-task completion may spend (see the
+        class docstring)."""
+        return self._upload_budget
 
     @property
     def claim_check_threshold(self) -> int | None:
@@ -448,12 +468,12 @@ class KontraCodec(PayloadCodec, WithSerializationContext):
         """When this copy's stream uploads must be done: temporalio makes a codec copy per
         workflow-task completion it encodes and encodes its payloads one after another, so
         the window opens at the copy's first stream answer and every later answer of the
-        completion shares it (:data:`~kontra.codec.stream.STREAM_UPLOAD_BUDGET` in all). A
-        copy still used long after its window closed (twice the budget) opens a new one."""
+        completion shares it (``stream_upload_budget`` in all). A copy still used long after
+        its window closed (twice the budget) opens a new one."""
         now = asyncio.get_running_loop().time()
         until = self._uploads_until
-        if until is None or now > until + STREAM_UPLOAD_BUDGET:
-            until = self._uploads_until = now + STREAM_UPLOAD_BUDGET
+        if until is None or now > until + self._upload_budget:
+            until = self._uploads_until = now + self._upload_budget
         return until
 
     # ------------------------------------------------------------------ recipients

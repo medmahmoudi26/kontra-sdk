@@ -283,6 +283,7 @@ class Worker:
         home: str | Path | None = None,
         runtime: temporalio.runtime.Runtime | None = None,
         interceptors: Sequence[temporalio.client.Interceptor] = (),
+        stream_upload_budget: float | None = None,
     ) -> None:
         """Connect and build the inner workers, without polling yet (the plugin's start
         checks -- JWKS, the hash lock -- run as they start).
@@ -297,7 +298,12 @@ class Worker:
         worker makes. They are how ``kontra serve --metrics`` / ``--otlp`` reach it, not a
         setting of ``worker.py`` (``Worker()`` takes neither). A ``client`` given has its
         own, so passing them with one is a ``TypeError``.
+
+        ``stream_upload_budget``: :class:`~kontra.plugin.KontraPlugin`'s (default: the
+        plugin's, 2 s). Like the first three, for tests:
+        :meth:`kontra.testing.Marketplace.serve` gives a loaded test machine more.
         """
+        from kontra.codec.stream import STREAM_UPLOAD_BUDGET
         from kontra.plugin import TARGET, KontraPlugin
 
         if self._stack is not None:
@@ -307,7 +313,15 @@ class Worker:
                 "runtime and interceptors are for the connection the worker makes; a client "
                 "passed in has its own (Client.connect(runtime=..., interceptors=...))"
             )
-        kontra = KontraPlugin(*self._offerings, session=session, home=home, gate=gate)
+        kontra = KontraPlugin(
+            *self._offerings,
+            session=session,
+            home=home,
+            gate=gate,
+            stream_upload_budget=(
+                STREAM_UPLOAD_BUDGET if stream_upload_budget is None else stream_upload_budget
+            ),
+        )
         stack = contextlib.AsyncExitStack()
         stack.push_async_callback(kontra.aclose)
         client_plugins, worker_plugins = self._routed()
@@ -358,6 +372,7 @@ class Worker:
         runtime: temporalio.runtime.Runtime | None = None,
         interceptors: Sequence[temporalio.client.Interceptor] = (),
         handle_signals: bool = True,
+        stream_upload_budget: float | None = None,
     ) -> None:
         """Start (see :meth:`prepare`) and serve until :meth:`shutdown`, SIGINT or SIGTERM
         (``handle_signals``, main thread only), then shut down gracefully (temporalio's
@@ -379,6 +394,7 @@ class Worker:
                 home=home,
                 runtime=runtime,
                 interceptors=interceptors,
+                stream_upload_budget=stream_upload_budget,
             )
             with self._signals(handle_signals):
                 try:
