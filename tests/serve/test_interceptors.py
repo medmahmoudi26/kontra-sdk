@@ -9,8 +9,9 @@ from typing import Any
 from temporalio.api.common.v1 import Payload
 from temporalio.testing import ActivityEnvironment
 
+from kontra.codec import stream as s
 from kontra.contract.names import new_job_id
-from kontra.serve import JOB_HEADER
+from kontra.serve import JOB_HEADER, interceptors
 from kontra.serve.interceptors import _ActivityInbound, job_from_headers, job_header
 from kontra.serve.turn import TURN_ACTIVITY
 
@@ -72,3 +73,31 @@ def test_the_turn_activitys_heartbeat_never_reaches_the_buyer() -> None:
     """``kontra.turn.v1.deliver`` heartbeats for liveness (kontra.serve.turn): Kontra's own,
     not the seller's progress, so the forwarder never sees it."""
     assert _offered(TURN_ACTIVITY) == []
+
+
+def test_the_guard_is_half_the_pinned_limits() -> None:
+    from pathlib import Path
+
+    import yaml
+
+    pinned = yaml.safe_load(
+        (
+            Path(__file__).resolve().parents[2] / "temporal/authorizer/dynamicconfig/kontra.yaml"
+        ).read_text()
+    )
+    assert pinned["limit.historyCount.error"][0]["value"] // 2 == interceptors.STREAM_HISTORY_EVENTS
+    assert pinned["limit.historySize.error"][0]["value"] // 2 == interceptors.STREAM_HISTORY_BYTES
+    assert pinned["limit.blobSize.warn"][0]["value"] >= s.ENVELOPE_MAX
+
+
+def test_the_hosted_stream_is_the_contribs_own_class() -> None:
+    """``WorkflowStream`` reads its caller's frame name: Kontra's subclass must be built from
+    an ``__init__``, and must stay the contrib's implementation."""
+    import inspect
+
+    from temporalio.contrib.workflow_streams import WorkflowStream
+
+    assert issubclass(interceptors._HostedStream, WorkflowStream)  # pyright: ignore[reportPrivateUsage]
+    source = inspect.getsource(WorkflowStream.__init__)
+    assert 'caller_name != "__init__"' in source
+    assert set(vars(interceptors._HostedStream)) <= {"__init__", "__module__", "__doc__", "__qualname__", "__firstlineno__", "__static_attributes__"}  # pyright: ignore[reportPrivateUsage]  # fmt: skip

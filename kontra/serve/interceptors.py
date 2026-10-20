@@ -1,4 +1,5 @@
-"""Worker interceptors: which job a piece of seller code is working for, and its heartbeats.
+"""Worker interceptors: which job a piece of seller code is working for, its heartbeats, and
+the job's workflow stream.
 
 A job is the handler workflow ``job-<id>`` *and everything it starts*: activities, local
 activities, child workflows, continue-as-new runs. Only the root knows its job from its
@@ -17,14 +18,42 @@ payload keys are known.
   progress forwarder, then passed on unchanged -- except Kontra's own turn activity's
   (:data:`~kontra.serve.turn.TURN_ACTIVITY`), which heartbeats for liveness, not for the
   buyer (:mod:`kontra.serve.turn`). When the activity returns, the forwarder
-  gets a short, bounded chance to deliver the heartbeats that are due
-  (:meth:`~kontra.serve.progress.ProgressForwarder.settle`), so the buyer sees them before
-  the job closes; a slow or unreachable gate does not hold activities up.
+  gets a short, bounded chance to publish the heartbeats that are due
+  (:meth:`~kontra.serve.progress.ProgressForwarder.settle`), so they are in the job's stream
+  before the job closes; a slow Temporal does not hold activities up.
 
-This module runs inside workflow code: it imports only temporalio, the standard library,
-:mod:`kontra.contract.names`, :mod:`kontra._runtime` (a context variable; no I/O,
-deterministic) and the turn activity's name, and the workflow interceptor class is handed to
-the sandbox as an object.
+**The job's workflow stream** (decisions I31). The gate's relay reaches ``job-<id>`` and
+nothing else, so the root hosts the stream (``temporalio.contrib.workflow_streams``):
+
+* **Host if absent.** When the root's run starts and its code built no ``WorkflowStream``
+  (no publish signal handler), Kontra builds one (:class:`_HostedStream`, the contrib's own
+  class). Publish signals that arrived first are buffered by temporalio and delivered then.
+* **Early handlers.** In a run's first activation, updates are applied before the workflow
+  is initialised; a poll then would be rejected and lost. :meth:`_WorkflowInbound.init`
+  registers placeholders (a poll that waits for the stream, an offset of 0), which the
+  stream replaces.
+* **Marking.** The answer of a poll (and of the offset query) on a root is handed to the
+  codec as a ``RawValue`` with Kontra's metadata -- the only channel from here to the codec,
+  which runs outside the sandbox -- with the topics the buyer may read: the offering's
+  ``streams`` (by task queue) and ``kontra.progress``. :mod:`kontra.codec.stream` seals it
+  item by item. Any other answer (a seller who replaced the handler) is left alone and
+  encrypted whole: the relay then stops, and nothing leaks.
+* **History guard.** A poll is refused at validation, ``KontraStreamFull``, once the run's
+  history is past half of Kontra's pinned limits (:data:`STREAM_HISTORY_EVENTS`,
+  :data:`STREAM_HISTORY_BYTES`). A rejected update is not written to history, so no poll --
+  a genuine relay's, or a leaked relay token's -- grows a job toward termination.
+* **Drain.** A relay sleeps between polls, so a job that publishes and returns would close
+  before the next poll. When the run returns or fails and any poll was seen in the chain,
+  the root waits (at most :data:`DRAIN_TIMEOUT`) for a poll to have answered up to the
+  stream's end. On continue-as-new it drains too, detaches the pollers, and carries the
+  stream's end to the next run in a plaintext header (:data:`STREAM_BASE_HEADER`), so
+  offsets stay monotonic across the chain; a stream the seller hosts follows the contrib's
+  own recipe (``prior_state``) instead.
+
+This module runs inside workflow code: what it calls there is temporalio, the standard
+library, :mod:`kontra.contract.names`, :mod:`kontra._runtime` (a context variable; no I/O,
+deterministic), the pure marking helpers of :mod:`kontra.codec.stream` and the turn
+activity's name, and the workflow interceptor class is handed to the sandbox as an object.
 
 Known gap: a *descendant* workflow learns its job when its run method starts; an activity
 scheduled by a signal handler that runs before that (a signal in the very first activation)
@@ -33,19 +62,32 @@ carries no job, so its heartbeats are not forwarded. The root is never affected.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
-from collections.abc import Mapping
+import re
+from collections.abc import Iterable, Mapping
+from datetime import timedelta
 from typing import Any, NoReturn, Protocol
 
 from temporalio import activity, workflow
 from temporalio.api.common.v1 import Payload
+from temporalio.common import RawValue
+from temporalio.contrib.workflow_streams import (
+    PollInput,
+    PollResult,
+    WorkflowStream,
+    WorkflowStreamState,
+)
+from temporalio.exceptions import ApplicationError, FailureError
 from temporalio.worker import (
     ActivityInboundInterceptor,
     ActivityOutboundInterceptor,
     ContinueAsNewInput,
     ExecuteActivityInput,
     ExecuteWorkflowInput,
+    HandleQueryInput,
+    HandleUpdateInput,
     Interceptor,
     StartActivityInput,
     StartChildWorkflowInput,
@@ -56,16 +98,51 @@ from temporalio.worker import (
 )
 
 from kontra import _runtime
-from kontra.contract.names import is_job_id, job_id_from_workflow_id
+from kontra.codec.stream import BUYER_TOPICS_KEY, POLL_MARK, STREAM_MARK, buyer_topics
+from kontra.codec.stream import offset_payload as _offset_payload
+from kontra.contract.names import (
+    STREAM_OFFSET_QUERY,
+    STREAM_POLL_UPDATE,
+    STREAM_PUBLISH_SIGNAL,
+    is_job_id,
+    job_id_from_workflow_id,
+)
 from kontra.serve.turn import TURN_ACTIVITY
 
-__all__ = ["JOB_HEADER", "KontraInterceptor", "ProgressSink", "job_from_headers", "job_header"]
+__all__ = [
+    "DRAIN_TIMEOUT",
+    "JOB_HEADER",
+    "STREAM_BASE_HEADER",
+    "STREAM_FULL",
+    "STREAM_HISTORY_BYTES",
+    "STREAM_HISTORY_EVENTS",
+    "STREAM_POLLED_HEADER",
+    "KontraInterceptor",
+    "ProgressSink",
+    "job_from_headers",
+    "job_header",
+]
 
 log = logging.getLogger("kontra.serve.interceptors")
 
 #: The Temporal header that carries the job id below the root handler workflow.
 JOB_HEADER = "kontra-job"
+#: On a root's continue-as-new: the end of the stream Kontra hosts (the next run's base
+#: offset), and that a poll was seen in the chain (the next run drains). Plain JSON: a log
+#: length is not secret.
+STREAM_BASE_HEADER = "kontra-stream-base"
+STREAM_POLLED_HEADER = "kontra-stream-polled"
+#: The longest a returning (or continuing) root waits for the relay to read its stream's end.
+DRAIN_TIMEOUT = timedelta(seconds=5)
+#: Half of Kontra's pinned ``limit.historyCount.error`` (20,480) and
+#: ``limit.historySize.error`` (20 MiB) (``temporal/authorizer/dynamicconfig/kontra.yaml``):
+#: past either, a root refuses polls.
+STREAM_HISTORY_EVENTS = 10_240
+STREAM_HISTORY_BYTES = 10 * 1024 * 1024
+#: The failure type of a poll refused past the history budget (``kontra._relay``).
+STREAM_FULL = "KontraStreamFull"
 _JSON_PLAIN = b"json/plain"
+_INT = re.compile(rb"0|[1-9][0-9]{0,18}", re.ASCII)
 
 
 class ProgressSink(Protocol):
@@ -99,16 +176,72 @@ def _with_job(headers: Mapping[str, Payload], job_id: str | None) -> Mapping[str
     return {**headers, JOB_HEADER: job_header(job_id)}
 
 
+def _int_header(headers: Mapping[str, Payload], name: str) -> int | None:
+    p = headers.get(name)
+    if p is None or p.metadata.get("encoding") != _JSON_PLAIN or _INT.fullmatch(p.data) is None:
+        return None
+    return int(p.data)
+
+
+def _int_payload(n: int) -> Payload:
+    return Payload(metadata={"encoding": _JSON_PLAIN}, data=str(n).encode("ascii"))
+
+
 # --------------------------------------------------------------------------- workflows
 
 
+class _HostedStream(WorkflowStream):
+    """The stream Kontra hosts on a root whose code hosts none: the contrib's own
+    implementation. ``WorkflowStream`` insists on being built from a function named
+    ``__init__`` (it reads its caller's frame); this is one."""
+
+    def __init__(self, prior_state: WorkflowStreamState | None = None) -> None:
+        super().__init__(prior_state)
+
+
 class _WorkflowInbound(WorkflowInboundInterceptor):
-    """Learns the workflow's job: its own id (the root ``job-<id>``) or the parent's header."""
+    """Learns the workflow's job: its own id (the root ``job-<id>``) or the parent's header;
+    on a root, hosts, marks, guards and drains the job's stream (module docstring)."""
+
+    #: The topics a buyer may read, by task queue (one queue per offering); set on the
+    #: subclass :class:`KontraInterceptor` hands the worker.
+    _listed: Mapping[str, frozenset[str]] = {}
 
     _header_job: str | None = None
+    _root: bool = False
+    #: The stream Kontra hosts on this run, if it hosts one.
+    _hosted: _HostedStream | None = None
+    #: The run's stream exists (hosted, or the seller's): early polls may go on.
+    _ready: bool = False
+    #: A poll was seen in this chain (this run, or a run before it: the polled header).
+    _polled: bool = False
+    _in_flight: int = 0
+    #: The largest ``next_offset`` of a poll answered with ``more_ready`` false.
+    _answered_to: int = 0
+    #: The headers of the continue-as-new this run raised (the base is rewritten there).
+    _can_headers: dict[str, Payload] | None = None
 
     def init(self, outbound: WorkflowOutboundInterceptor) -> None:
         super().init(_WorkflowOutbound(outbound, self))
+        # workflow.info() needs the instance's outbound, set only once init() returns; the
+        # outbound handed to us answers it.
+        self._root = job_id_from_workflow_id(outbound.info().workflow_id) is not None
+        if self._root:
+            # Before the workflow object exists: a poll in the run's first activation
+            # (applied before the workflow is initialised) finds a handler, waits for the
+            # stream, and is answered by it. The stream replaces both.
+            workflow.set_update_handler(STREAM_POLL_UPDATE, self._early_poll)
+            workflow.set_query_handler(STREAM_OFFSET_QUERY, self._early_offset)
+
+    async def _early_poll(self, payload: PollInput) -> PollResult:
+        await workflow.wait_condition(lambda: self._ready)
+        real = workflow.get_update_handler(STREAM_POLL_UPDATE)
+        if real is None or real == self._early_poll:  # the seller unset it: no stream
+            raise ApplicationError("this job hosts no workflow stream", non_retryable=True)
+        return await real(payload)
+
+    def _early_offset(self) -> int:
+        return 0
 
     @property
     def job_id(self) -> str | None:
@@ -118,7 +251,124 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
 
     async def execute_workflow(self, input: ExecuteWorkflowInput) -> Any:
         self._header_job = job_from_headers(input.headers)
-        return await super().execute_workflow(input)
+        if not self._root:
+            return await super().execute_workflow(input)
+        if workflow.get_signal_handler(STREAM_PUBLISH_SIGNAL) is None:
+            # The seller's __init__ has run: a stream it built is registered by now.
+            base = _int_header(input.headers, STREAM_BASE_HEADER) or 0
+            self._hosted = _HostedStream(WorkflowStreamState(base_offset=base) if base else None)
+        if _int_header(input.headers, STREAM_POLLED_HEADER) == 1:
+            self._polled = True
+        self._ready = True
+        try:
+            result = await super().execute_workflow(input)
+        except workflow.ContinueAsNewError:
+            await self._before_continue_as_new()
+            raise
+        except FailureError:
+            await self._drain()
+            raise
+        await self._drain()
+        return result
+
+    def _end(self) -> int | None:
+        end_of = workflow.get_query_handler(STREAM_OFFSET_QUERY)
+        if end_of is None or end_of == self._early_offset:
+            return None
+        end = end_of()
+        return end if isinstance(end, int) and not isinstance(end, bool) else None
+
+    async def _drain(self) -> None:
+        """Wait (bounded) for a poll to have answered up to the stream's end, when anyone
+        polled in this chain: what was published last reaches the relay before the job
+        closes. Nobody listening: no wait. No drain on cancellation."""
+        if not self._polled:
+            return
+        end = self._end()
+        if end is None:
+            return
+        try:
+            await workflow.wait_condition(lambda: self._answered_to >= end, timeout=DRAIN_TIMEOUT)
+        except TimeoutError:
+            log.debug("the job's stream was not read to its end within %s", DRAIN_TIMEOUT)
+
+    async def _before_continue_as_new(self) -> None:
+        """The seller continues-as-new: what the relay has not read of the stream Kontra
+        hosts would be lost with this run, so drain, detach the pollers (they follow the
+        chain), and carry the stream's end, as it is now, in the same headers the
+        continue-as-new command reads when the error reaches the top."""
+        hosted = self._hosted
+        if hosted is None:
+            return
+        if self._polled:
+            await self._drain()
+            hosted.detach_pollers()
+            with contextlib.suppress(TimeoutError):
+                await workflow.wait_condition(lambda: self._in_flight == 0, timeout=DRAIN_TIMEOUT)
+        headers = self._can_headers
+        end = self._end()
+        if headers is not None and end is not None:
+            headers[STREAM_BASE_HEADER] = _int_payload(end)
+
+    def stamp_continue_as_new(self, headers: Mapping[str, Payload]) -> Mapping[str, Payload]:
+        """The headers of this root's continue-as-new: the stream's end and whether anyone
+        polled, kept so :meth:`_before_continue_as_new` can rewrite the end."""
+        if self._hosted is None:
+            return headers
+        stamped = dict(headers)
+        end = self._end()
+        if end is not None:
+            stamped[STREAM_BASE_HEADER] = _int_payload(end)
+        if self._polled:
+            stamped[STREAM_POLLED_HEADER] = _int_payload(1)
+        self._can_headers = stamped
+        return stamped
+
+    def handle_update_validator(self, input: HandleUpdateInput) -> None:
+        if self._root and input.update == STREAM_POLL_UPDATE:
+            info = workflow.info()
+            if (
+                info.get_current_history_length() >= STREAM_HISTORY_EVENTS
+                or info.get_current_history_size() >= STREAM_HISTORY_BYTES
+            ):
+                # Rejected at validation: not written to history.
+                raise ApplicationError(
+                    "the job's history is past its stream budget: no more polls",
+                    type=STREAM_FULL,
+                    non_retryable=True,
+                )
+        super().handle_update_validator(input)
+
+    async def handle_update_handler(self, input: HandleUpdateInput) -> Any:
+        if not (self._root and input.update == STREAM_POLL_UPDATE):
+            return await super().handle_update_handler(input)
+        self._polled = True
+        self._in_flight += 1
+        try:
+            result = await super().handle_update_handler(input)
+        finally:
+            self._in_flight -= 1
+        if not isinstance(result, PollResult):
+            return result  # not the stream's answer: encrypted whole, the relay stops
+        if not result.more_ready:
+            self._answered_to = max(self._answered_to, result.next_offset)
+        [p] = workflow.payload_converter().to_payloads([result])
+        p.metadata[STREAM_MARK] = POLL_MARK
+        listed = self._listed.get(workflow.info().task_queue, frozenset[str]())
+        p.metadata[BUYER_TOPICS_KEY] = buyer_topics(sorted(listed))
+        return RawValue(p)
+
+    async def handle_query(self, input: HandleQueryInput) -> Any:
+        result = await super().handle_query(input)
+        if (
+            self._root
+            and input.query == STREAM_OFFSET_QUERY
+            and isinstance(result, int)
+            and not isinstance(result, bool)
+            and result >= 0
+        ):
+            return RawValue(_offset_payload(result))
+        return result
 
 
 class _WorkflowOutbound(WorkflowOutboundInterceptor):
@@ -143,7 +393,8 @@ class _WorkflowOutbound(WorkflowOutboundInterceptor):
         return await super().start_child_workflow(input)
 
     def continue_as_new(self, input: ContinueAsNewInput) -> NoReturn:
-        input.headers = _with_job(input.headers, self._inbound.job_id)
+        headers = _with_job(input.headers, self._inbound.job_id)
+        input.headers = self._inbound.stamp_continue_as_new(headers)
         super().continue_as_new(input)
 
 
@@ -199,10 +450,26 @@ class _ActivityOutbound(ActivityOutboundInterceptor):
 
 
 class KontraInterceptor(Interceptor):
-    """Registered first on every inner worker of :class:`kontra.serve.Worker`."""
+    """Registered first on every inner worker of :class:`kontra.serve.Worker`.
 
-    def __init__(self, progress: ProgressSink | None = None) -> None:
+    ``streams``: the topics a buyer may read of each offering's job stream, by the
+    offering's task queue (``offering.yaml`` ``streams:``). A job root on a queue not named
+    here shows its buyer ``kontra.progress`` alone."""
+
+    def __init__(
+        self,
+        progress: ProgressSink | None = None,
+        *,
+        streams: Mapping[str, Iterable[str]] | None = None,
+    ) -> None:
         self.progress = progress
+        listed = {queue: frozenset(topics) for queue, topics in (streams or {}).items()}
+        self.streams: Mapping[str, frozenset[str]] = listed
+
+        class _Inbound(_WorkflowInbound):
+            _listed = listed
+
+        self._inbound: type[_WorkflowInbound] = _Inbound
 
     def intercept_activity(self, next: ActivityInboundInterceptor) -> ActivityInboundInterceptor:
         return _ActivityInbound(next, self.progress)
@@ -210,4 +477,4 @@ class KontraInterceptor(Interceptor):
     def workflow_interceptor_class(
         self, input: WorkflowInterceptorClassInput
     ) -> type[WorkflowInboundInterceptor] | None:
-        return _WorkflowInbound
+        return self._inbound
