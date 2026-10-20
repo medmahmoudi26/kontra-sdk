@@ -12,6 +12,9 @@ strict subset (decisions I2):
   ``KontraArtifact`` with the body from ``spec/``;
 * auto-generated titles (``"Urls"``) are dropped and ``required`` is sorted, so the hash
   moves only when the contract does;
+* an enum or a constrained scalar pydantic names in ``$defs`` is written out where it is
+  used, its use site's constraints *conjoined* with its own, never overriding them
+  (:func:`inline_non_object_defs`);
 * what nexgen cannot lower identically in four languages (other unions, tuples, untyped
   ``dict``/``Any``, unsupported formats) is refused with a fix-it naming the field.
 
@@ -22,6 +25,7 @@ it lacks and the ``x-kontra`` facts, and is otherwise emitted unchanged.
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -36,7 +40,7 @@ from pydantic.json_schema import (
 from pydantic_core import core_schema
 
 from kontra.contract import spec as _spec
-from kontra.contract.canonical import seal
+from kontra.contract.canonical import canonical_json, seal
 from kontra.contract.errors import ROOT, ContractError, join_path
 from kontra.contract.facts import XKontra
 from kontra.contract.offering import OfferingSpec
@@ -205,32 +209,141 @@ def _is_named_type(body: Mapping[str, Any]) -> bool:
     return "$ref" in body and not (set(body) - {"$ref", "description", "title", "$comment"})
 
 
-def _substitute(node: Any, inline: Mapping[str, dict[str, Any]]) -> Any:
+#: A use site's annotations replace its definition's (a field's own ``description``, its
+#: ``default``): they say what the value means, not which values are valid.
+_REF_ANNOTATIONS = frozenset(
+    {
+        "title",
+        "description",
+        "examples",
+        "default",
+        "$comment",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+    }
+)
+#: Bounds both sides write: the conjunction is the tighter of the two.
+_UPPER_BOUNDS = frozenset(
+    {"maximum", "exclusiveMaximum", "maxLength", "maxItems", "maxContains", "maxProperties"}
+)
+_LOWER_BOUNDS = frozenset(
+    {"minimum", "exclusiveMinimum", "minLength", "minItems", "minContains", "minProperties"}
+)
+
+
+def _same(a: Any, b: Any) -> bool:
+    """Equal as JSON values: ``1`` is ``1.0``, ``true`` is not ``1``."""
+    return canonical_json(a) == canonical_json(b)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _conjoin(key: str, defined: Any, used: Any, *, name: str, path: str) -> Any:
+    """One keyword both a definition (``name``) and its use site (``path``) assert, as one
+    value that asserts exactly what the two do; or a refusal naming both values."""
+    if _same(defined, used):
+        return copy.deepcopy(defined)
+    unsatisfiable = ContractError(
+        path,
+        f"no value satisfies both: {name} says {key} {defined!r} and this field says {key} "
+        f"{used!r}, and a $ref and its siblings both hold. Fix one of the two",
+    )
+    if key in _UPPER_BOUNDS and _is_number(defined) and _is_number(used):
+        return min(defined, used)
+    if key in _LOWER_BOUNDS and _is_number(defined) and _is_number(used):
+        return max(defined, used)
+    if key == "type" and isinstance(defined, str) and isinstance(used, str):
+        if {defined, used} == {"integer", "number"}:
+            return "integer"
+        raise unsatisfiable
+    if key == "enum" and isinstance(defined, list) and isinstance(used, list):
+        both = [
+            copy.deepcopy(v)
+            for v in cast(list[Any], defined)
+            if any(_same(v, u) for u in cast(list[Any], used))
+        ]
+        if not both:
+            raise unsatisfiable
+        return both  # in the definition's order
+    if key == "const":
+        raise unsatisfiable
+    if key == "multipleOf" and _is_positive_int(defined) and _is_positive_int(used):
+        return math.lcm(cast(int, defined), cast(int, used))
+    if key == "uniqueItems" and isinstance(defined, bool) and isinstance(used, bool):
+        return True  # one of them is true, and false asserts nothing
+    raise ContractError(
+        path,
+        f"re-constrains {name}: {name} says {key} {defined!r} and this field says {key} "
+        f"{used!r}. Both hold (a $ref and its siblings are conjoined), and nexgen's subset "
+        f"cannot write the two as one; constrain it in one place, on {name} or on the field",
+    )
+
+
+def _write_out(
+    name: str, use: Mapping[str, Any], body: Mapping[str, Any], path: str
+) -> dict[str, Any]:
+    """The definition ``name`` written out at a use site (``use``, its ``$ref`` and
+    siblings): the use site's annotations replace the definition's, every other keyword
+    both write is conjoined (:func:`_conjoin`), and the rest of each is kept."""
+    merged = {k: copy.deepcopy(v) for k, v in body.items() if k != "title"}
+    for key, value in use.items():
+        if key == "$ref":
+            continue
+        if key in _REF_ANNOTATIONS or key not in merged:
+            merged[key] = value
+        else:
+            merged[key] = _conjoin(key, merged[key], value, name=name, path=path)
+    return merged
+
+
+def _substitute(
+    node: Any, inline: Mapping[str, dict[str, Any]], path: str, chain: tuple[str, ...] = ()
+) -> Any:
     if isinstance(node, list):
-        return [_substitute(v, inline) for v in cast(list[Any], node)]
+        return [
+            _substitute(v, inline, join_path(path, i), chain)
+            for i, v in enumerate(cast(list[Any], node))
+        ]
     if not isinstance(node, dict):
         return node
     src = cast(dict[str, Any], node)
+    out = {k: _substitute(v, inline, join_path(path, k), chain) for k, v in src.items()}
     ref = src.get("$ref")
     if isinstance(ref, str) and ref.startswith("#/$defs/") and ref[8:] in inline:
-        merged = copy.deepcopy(inline[ref[8:]])
-        merged.pop("title", None)
-        merged.update({k: _substitute(v, inline) for k, v in src.items() if k != "$ref"})
-        return merged
-    return {k: _substitute(v, inline) for k, v in src.items()}
+        name = ref[8:]
+        if name in chain:
+            raise ContractError(
+                path,
+                f"{name} refers to itself ({' -> '.join((*chain, name))}) and is not a model, so "
+                "it cannot be written out where it is used; make it a model with a field",
+            )
+        body = _substitute(inline[name], inline, join_path("$defs", name), (*chain, name))
+        return _write_out(name, out, body, path)
+    return out
 
 
 def inline_non_object_defs(defs: Mapping[str, Any]) -> dict[str, Any]:
     """nexgen names only objects and unions; an enum or a constrained scalar that pydantic
-    put in ``$defs`` (``class Color(Enum)``) is written out where it is used instead.
-    Siblings at the use site (a field's ``default``, ``description``) win."""
-    out = dict(defs)
-    for _ in range(len(out) + 1):  # an inlined body may itself reference a scalar def
-        inline = {n: cast(dict[str, Any], b) for n, b in out.items() if not _is_named_type(b)}
-        if not inline:
-            break
-        out = {n: _substitute(b, inline) for n, b in out.items() if n not in inline}
-    return out
+    put in ``$defs`` (``class Color(Enum)``, a ``RootModel`` of a string) is written out
+    where it is used instead. JSON Schema asserts a ``$ref``'s definition and the members
+    beside it both, so the result must assert what the two did (decisions I38): the use
+    site's annotations (a field's own ``description`` or ``default``) replace the
+    definition's; a keyword both constrain is conjoined -- the tighter bound, the common
+    ``enum`` values, ``integer`` within ``number``, the least common ``multipleOf`` -- and
+    one that cannot be written as one value (two different patterns, an empty ``enum``
+    intersection) is refused, naming the field and both values, rather than published
+    looser than the seller's model validates."""
+    inline = {n: cast(dict[str, Any], b) for n, b in defs.items() if not _is_named_type(b)}
+    return {
+        n: _substitute(b, inline, join_path("$defs", n)) for n, b in defs.items() if n not in inline
+    }
 
 
 # --------------------------------------------------------------------------- derive
