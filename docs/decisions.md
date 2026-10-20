@@ -1920,7 +1920,10 @@ the sentence above) and `docs/security.md`.
 - Residual risk: a relay that presented another update's id would get that update's outcome
   (the server matches an update by id alone); update ids are random ids the relay never sees,
   and outcomes are ciphertext to the job's parties.
-- **Residual risk: a leaked relay token can end its job.** With only its two allowed calls, it
+- **Residual risk: a leaked relay token can end its job** (*amended by I31*: a job root now
+  refuses polls at validation once its history is past half of the pinned limits, and a
+  refused poll is not written to history, so the guard bounds a leaked relay token too; what
+  follows is the risk before it). With only its two allowed calls, it
   polls from offset 0 again and again, each time with a new update id, and so appends up to
   `history.maxTotalUpdates` completed updates of up to about 1 MB each to job J's history. Past
   `limit.historySize.error` (20 MiB, pinned) Temporal terminates the run
@@ -1949,3 +1952,177 @@ and `tests/temporal` over the wire against the real binary (58 tests), the relay
 self-access and escrow cells included. What a relay's polls cost a job's history is stated
 above and in `docs/security.md`, not pinned by a wire test: that test would be a ready-made
 recipe in a public repository.
+
+## I31. Streams cross the boundary through the job's own workflow stream, sealed per item (kontra-sdk#52; decisions 5, 6 of #50)
+
+Nexus does not stream. A seller already streams with Temporal's own API
+(`temporalio.contrib.workflow_streams`: a log in workflow state, written by a publish signal,
+read by a poll Update and an offset Query), and a buyer holds no Temporal client. So a job's
+stream reaches its buyer the way #59's relay credential allows (I30), and it **replaces** the
+bespoke progress channel rather than adding a second one. Checked against temporalio 1.34.0
+(`contrib/workflow_streams`, `worker/_workflow_instance.py`) and server 1.32 (CLI 1.9.1),
+with two prototypes whose results are below.
+
+* **The rule.** A topic the offering lists reaches the buyer; nothing else does.
+  `offering.yaml` gains `streams:` -- topic names, data, never code (D11): at most 8 distinct
+  names matching `[A-Za-z][A-Za-z0-9_.-]{0,63}`, `kontra.` reserved in any case
+  (`kontra.progress` is relayed for every job), stored sorted. `kontra.contract.offering`
+  (`check_streams`) is the one validator and `spec/offering-streams.v1.json` states the same
+  rule language-neutrally (the same vectors run through both). It is **not an `x-kontra`
+  fact**: not in the contract hash, every golden unchanged. It travels as catalog data beside
+  the document, as `recipients` does (I7): `PublishRequest.streams`, `CatalogEntry.streams`.
+  It is **fixed per version** (owner, OD5): the gate refuses a republish of a version with
+  other streams (409 `streams_fixed`) and `KontraPlugin`'s hash lock refuses to start code
+  whose list differs from the catalog's. Per-topic item schemas in the contract are later
+  (OD11): `job.stream(type=)` takes the buyer's own model.
+* **Why the codec seals each item.** The contrib encodes a poll's answer as one payload and
+  runs the codec once on it (its own docstrings say so). Encrypted whole, the relay could read
+  no topic or offset; encrypted whole to the buyer, a gate that asked for every topic would
+  hand the buyer the seller's private ones. The codec runs outside the sandbox and knows only
+  the serialization context (one worker serves several offerings, and every job id looks
+  alike), so the only channel from the workflow to the codec is the payload's own metadata.
+  Kontra's workflow interceptor therefore marks the answer of a poll on a job root -- a
+  `RawValue` with `kontra-stream: poll/v1` and the topics the buyer may read (the offering's
+  `streams`, by task queue, and `kontra.progress`); `CompositePayloadConverter` passes a
+  `RawValue` through untouched -- and `KontraCodec` turns it into the **stream envelope**
+  (`kontra/codec/stream.py`): `{"v": 1, "items": [{"topic", "offset", "ct"}...], "next_offset",
+  "more_ready"}`, encoding `binary/kontra-stream`. Each item is the age ciphertext of its own
+  `Payload` with its topic and offset sealed inside (`kontra-topic`, `kontra-offset`), so a
+  buyer checks both against the event and a gate cannot relabel or reorder items. A listed
+  topic is sealed to the seller's recipient set and the job's buyer key and named in the clear;
+  any other to the seller's set alone, its name `null`. Items above 256 KiB of ciphertext are
+  claim-checked (or a stub without a blob store; the relay records a gap); the envelope stops at
+  512 KiB with `next_offset`/`more_ready` set exactly as the contrib's own truncation does, so
+  every subscriber just polls again. Offsets and the log's length are in the clear: the
+  platform reads them from history sizes anyway. Decoding restores the exact `PollResult`, so
+  the seller's stock `WorkflowStreamClient`, its console and replay are unchanged. The offset
+  query's answer is marked too and passes in plaintext. A mark anywhere but a seller's job
+  workflow is refused (`CodecError`), never encrypted another way. `KontraPlugin` refuses
+  external storage at or below the envelope's 512 KiB (plus framing): the relay must read it.
+* **Who hosts.** The relay reaches `job-<id>` and nothing else (I30), so the job root hosts the
+  stream. **Host if absent:** when a root's run starts and its code built no `WorkflowStream`,
+  Kontra builds the contrib's own (`_HostedStream`, a subclass whose `__init__` satisfies the
+  contrib's caller-frame check), after the seller's `__init__` ran; publish signals that came
+  first are buffered by temporalio. **Early handlers:** in a run's first activation updates are
+  applied before the workflow is initialised, and the prototype got `Update handler for
+  '__temporal_workflow_stream_poll' expected but not found`; the interceptor's `init` registers
+  placeholders (a poll that waits for the stream, an offset of 0), which the stream replaces.
+  **Drain:** a relay sleeps between polls, and the prototype lost 5 of 6 items of every short
+  job; when a run returns or fails and any poll was seen in the chain, the root waits (5 s at
+  most, OD9) for a poll to have answered up to the stream's end, then answers the polls still
+  waiting (no "unfinished update handlers" warning on every listened job). 6 of 6 with it.
+  **Continue-as-new:** for a stream Kontra hosts, it drains, detaches the pollers and carries
+  the stream's end to the next run in a plaintext header (`kontra-stream-base`, rewritten in the
+  same dict the command reads when the error reaches the top), so offsets stay monotonic across
+  the chain (a 3-run chain relayed offsets 0..5, all six); a stream the seller hosts follows the
+  contrib's recipe (`prior_state`), which `docs/sellers.md` states. Every prototype history
+  replayed clean.
+* **Bound handlers: mirroring, under the same names.** A bound handler's events are published
+  by the agent child (`job-<id>/agent`), whose payloads are the seller's alone and which the
+  relay cannot reach. The turn activity already reads the child's stream, so it mirrors the
+  listed topics onto the job's stream, each item's `Payload` untouched, flushed every half
+  second and before it returns the reply, and checkpointed in its heartbeat details so a
+  retried attempt mirrors from where the last flush got (a lost worker re-publishes at most
+  one flush window; the test counts every event once). Unlisted topics are never copied.
+  **Naming rule: identity** (owner, OD3): `streams: [turn_events]` relays the harness's own
+  `turn_events`; there is no `agent` alias -- the PRD's and the issue's `streams: [agent]`
+  was illustrative. One sentence covers both entry kinds, no alias table couples Kontra to a
+  pre-1.0 harness, and #54's renderer reads `turn_events` by one name in dev and prod.
+* **The relay** (`kontra/_relay.py`), written once: the FakeGate relays with it and
+  kontra-cloud imports it. The strict wire shape of I30 -- only `UpdateWorkflowExecution` of the
+  poll (run id empty, `first_execution_run_id` once pinned, wait policy COMPLETED, the same
+  update id re-sent until it carries an outcome) and, for a tail start, the offset
+  `QueryWorkflow` -- with every failure classified (`StreamDraining`, `TruncatedOffset`,
+  `AcceptedUpdateCompletedWorkflow`, `KontraStreamFull`, other rejections, RPC errors),
+  `RelayBatch`es whose `next_offset` the caller persists after storing their items, and pacing
+  (`MIN_INTERVAL` 2 s, `pace_for` from the job's history size). It imports no
+  `temporalio.contrib`; `parse_envelope` refuses any `ct` that is not an age file, so plaintext
+  never reaches a gate's storage, and a worker without #52 (whole ciphertext) stops it with
+  `protocol`. **Amends the issue's "FakeGate relays from a real `WorkflowStreamClient`":** the
+  stock client uses `PollWorkflowExecutionUpdate` and `DescribeWorkflowExecution`, which
+  production denies (I30), and `kontra dev up` runs no Authorizer to show it.
+* **When the relay runs** (owner, OD2, **changed from the design's tail start**): one relay per
+  job, started once escrow has pinned the chain **and** its first listener attaches, **from
+  offset 0, once per job**; nothing polls while nobody ever listened. The gate keeps a
+  monotonic per-job cursor and stores what it relays (the caps below), so a later listener
+  replays from the gate's store with `after` or `Last-Event-ID`, as progress replayed before;
+  each item is still polled once. A listener leaving pauses the relay after 30 s, the offset
+  kept; a buyer's resume never moves it (a buyer-chosen offset would hand every buyer the
+  leaked-token amplification of I30). `kontra._relay` keeps `start="tail"` for a gate that
+  wants it.
+* **Seam ②** (owner, OD4: a hard cut in this 0.x release). `POST` and `GET
+  /v1/jobs/{id}/progress`, `ProgressPost` and `ProgressEvent` are gone. `GET
+  /v1/jobs/{id}/stream` (the job's buyer or seller) serves SSE of `StreamEvent{cursor, kind:
+  item | gap | history, ...}`: `topic` (repeatable; each in the version's `streams` or
+  `kontra.progress`, else 422 `unknown_topic`), `history`, `after` or `Last-Event-ID`; it ends
+  once the job is closed and its relay finished. History events are the platform's liveness
+  summary, unchanged in content. Caps (owner, OD7): 256 KiB per relayed item
+  (`gap{too_large}` with its size), 16 MiB per topic and 64 MiB per job stored
+  (`gap{topic_budget|job_budget}`), 8 listeners per job (429 `too_many_listeners`); no rate
+  drop -- items wait in the workflow's log while the relay paces itself.
+* **The buyer.** `job.stream(topic, type=T)` -> `JobStream[T]`: decrypt with the job's key,
+  check the sealed topic and offset, validate as `T` (`dict` for leniency), dedupe by cursor
+  (a replay) and by offset (a gate that re-read), resume through `.cursor`. Not sealed for us,
+  or relabelled: logged and skipped. A gap with an offset is logged; one without (the relay
+  stopped) raises `StreamInterrupted`; an invalid item `StreamItemInvalid`. `job.progress()`
+  keeps its public shape, as sugar over the `kontra.progress` topic (items are
+  `kontra.types.ProgressRecord{v, at, activity, details}`) plus history events; the MCP
+  `status` tool and `kontra job --progress` are unchanged, and `kontra job <id> --stream TOPIC`
+  prints decrypted items as JSON lines.
+* **History budget** (owner, OD1, OD8). Heartbeats now cost the seller's history: one publish
+  signal is about four events, a relayed poll about five more (measured: 20 activity publish
+  batches cost 95 events, 192 with a relay polling). Against Kontra's pinned
+  `limit.historyCount.error` (20,480), yesterday's one-a-second forwarding with a listening
+  relay would terminate a job, refunded against the seller, in about 52 minutes. Adopted:
+  **the job's poll guard** -- a root refuses a poll at validation (`KontraStreamFull`) once
+  its history is past half of the pinned limits (10,240 events or 10 MiB; a test pins `==
+  error // 2`); a rejected update is not written to history, so no poll, whether a genuine
+  relay's or a leaked relay token's, grows the job further, and the relay stops with
+  `gap{history_budget}` -- and **a budgeted ProgressForwarder**: the latest details at most
+  every 5 s (`KONTRA_PROGRESS_INTERVAL` still overrides; 0 publishes every heartbeat, batched),
+  the interval doubling every 360 items up to 300 s, at most 1,000 items per job (about 4,000
+  events, a fifth of the limit), then one log line and nothing more; an activity's latest
+  heartbeat is published when it returns, whatever the interval. **Amends I30's residual risk
+  "a leaked relay token can end its job":** polls past the guard are refused and not stored, so
+  the remaining bound is the guard plus the polls in flight (Temporal's
+  `maxInFlightUpdates`, 10, of at most 512 KiB each), below the termination limits.
+* **Delivery semantics.** Live: a buyer who never listens before the job closes gets nothing
+  of its stream but history events (a relay attaching after a short job closed reads nothing;
+  items published before a continue-as-new of a Kontra-hosted stream nobody polled are not
+  carried). At-least-once transport from the gate, deduplicated by the buyer. An activity
+  retry re-publishes (the turn mirror is checkpointed; a seller's own activities are theirs).
+* **Not in v1.** Client publish signals are not sealed per item (owner, OD6): a publish
+  signal, like a continue-as-new input, stays one payload encrypted to the buyer and the
+  seller, so an unlisted topic is private in what is *relayed*, not in what the buyer's key
+  could open if it ever read the seller's history (it cannot: the buyer has no Temporal access
+  to the seller's namespace). Harness-internal activities' heartbeats are forwarded as any
+  seller activity's are (owner, OD10, asked on #52). Item schemas in the contract (OD11).
+* **The authorizer: no new cell.** The relay's two calls are #59's; the forwarder's and the
+  turn mirror's publish signal and the seller's own subscriptions are the party allowlist on
+  its own job; the gate's pacing reads the internal frontend. The relay loop's wire test
+  (`tests/temporal/test_relay_loop_wire.py`) belongs to this change, not to #59's branch.
+
+**Rejected.** A Kontra-owned poll update (it duplicates the contrib's long-poll and changes
+the authorizer's handler names); one whole ciphertext per poll with the item list in the clear
+beside it (the gate would decide what the buyer can open); encrypting items at publish time (a
+workflow's publish runs in the sandbox, without keys or I/O, and converters are synchronous);
+a buyer-reported relay offset (every buyer gets the leaked-token amplification); a relay subject
+for the agent child (it breaks I30's one-split proof, and the child's payloads are the
+seller's); an `agent` alias; `streams:` in `x-kontra` (a hashed document with unhashed members).
+
+**Amends** I3 and I30 (the relay's stop, its cost, the residual risk above), I7 (the stream
+envelope; a plaintext log length; external storage above the envelope limit), I29 (the turn
+activity mirrors; Kontra hosts a stream on every job root), and `docs/security.md`.
+**Supersedes** the bespoke progress channel (PRD §8.4's `POST .../progress`).
+
+Tested: the envelope and the codec branches (`tests/codec/test_stream_envelope.py`); the
+streams rule through the code and the spec (`tests/contract/test_offering_streams.py`); hosting,
+early handlers, the drain, a continue-as-new chain, the guard and replay
+(`tests/serve/test_stream_hosting.py`); every relay classification, the same update id
+re-sent, a look-alike chain refused and no contrib import (`tests/serve/test_relay.py`); the
+forwarder (`tests/serve/test_progress.py`); the mirror and its checkpoint
+(`tests/serve/test_turn.py`); the FakeGate's relay, caps, resume and listener rules
+(`tests/testing/test_stream_relay.py`); `job.stream()` (`tests/hire/test_stream.py`); seam ⑤'s
+marker scans of every run's history, the raw SSE and the gate's store, with a misbehaving
+relay, for a workflow entry and a bound handler (`tests/serve/test_streams.py`); and the loop
+over the wire with a relay token (`tests/temporal/test_relay_loop_wire.py`).

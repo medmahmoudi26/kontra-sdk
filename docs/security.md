@@ -34,7 +34,7 @@ What that means concretely, and what enforces it:
 | One seller forges another seller's Nexus result | the callback guard (below) |
 | A buyer reads, signals or cancels a seller's handler workflow | the Authorizer: a buyer's token has no call in the seller's namespace, including the job it paid for |
 | A seller resets or deletes a workflow, or a buyer deletes its call records or shortens their retention, to change what escrow sees | the Authorizer: resets, deletes, namespace updates, batch operations and schedules are denied to every token |
-| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as ciphertext and cannot publish to it. It **can end that job**: every poll's result is written to the job's history, and enough polls push the job past Temporal's history size limit, which terminates it, a refund against the seller ([the stream relay](#the-stream-relay)) |
+| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as ciphertext -- each item sealed on its own, an unlisted topic's to the seller alone and its name hidden -- and cannot publish to it. It cannot end that job either: the job refuses polls once its history is past half of Temporal's limits, and a refused poll is not written to history ([the stream relay](#the-stream-relay)) |
 | The worker controller's credential leaks | rollouts of Kontra's own workers in the platform namespace: no seller namespace, no workflow start, no compute config |
 | A buyer forges or alters a hold token (amount, seller, expiry, contract) | ES256 signature checked offline by the seller's handler, with audience, expiry, seller namespace, offering and contract hash |
 | A buyer replays a hold token | the handler workflow id is built from the job id and started with reject-duplicate: one execution per hold; a cancel before the job started occupies that id, so the refunded hold cannot start it either |
@@ -85,7 +85,7 @@ assigns. Ciphertext is standard age, so a party can decrypt what it received wit
 |---|---|
 | job inputs, results and failure messages (including stack traces) | a quote's answer: price, currency, a refusal's reason, a busy ETA (it must lock the price) |
 | a quote's input (relayed byte for byte) | who hired which offering, when, at what price, and the job's state; the reason a buyer gives for rejecting a delivery (it is a gate call, not a payload) |
-| the seller's heartbeat details (progress is encrypted to the buyer) | workflow metadata in Temporal: workflow ids, task queues, activity names, timers, timestamps, states, event counts, payload sizes; each task queue's backlog, rates and pollers (a worker's identity, `pid@host` by default, build id, and the SDK name and version its heartbeat names), which `kontra status --workers` shows the seller |
+| the seller's heartbeat details and every item of a job's workflow stream (each sealed on its own to the job's parties; a topic the offering does not list, to the seller alone, its name hidden) | workflow metadata in Temporal: workflow ids, task queues, activity names, timers, timestamps, states, event counts, payload sizes; a job stream's listed topic names (catalog data), its items' positions and sizes, and its length; each task queue's backlog, rates and pollers (a worker's identity, `pid@host` by default, build id, and the SDK name and version its heartbeat names), which `kontra status --workers` shows the seller |
 | artifacts and claim-checked payloads, including the plaintext sha256 an `Artifact` reference carries (it travels inside the encrypted delivery) | the size and sha256 of each ciphertext (age's overhead is fixed, so plaintext sizes follow) and each artifact's content type |
 | any private key: every key is generated on the machine that holds it -- a buyer's per job, a seller's per deployment -- and leaves it only encrypted to one of the account's own devices (a job key's copies, decisions I25) | public keys (the seller's recipient set, the job's buyer key, the account's device keys and labels), contract documents, offering facts, balances |
 
@@ -280,31 +280,37 @@ relay never sends the publish signal, so it cannot inject events, and is denied 
 queries (`__stack_trace`) that would show a workflow's internals. A stream must be hosted by
 the job's handler workflow itself: the relay reaches `job-<id>` and nothing else.
 
-**What the relay's polls cost the job.** Every poll the relay completes is written to the job's
-history: Temporal stores a completed Update's outcome in the history
-(`WorkflowExecutionUpdateCompleted`), and a poll's outcome is the batch of stream items it
-returns, up to the stream's response cap of about 1 MB. A genuine relay therefore doubles a
-stream's volume in history (each item once in the publish signal that wrote it, and again in
-the poll that read it) and spends one of the run's updates per poll (`history.maxTotalUpdates`,
-Temporal's default of 2,000; Kontra does not pin it). A leaked relay token can spend them on
-purpose. Polling from offset 0 again and again, each time with a new update id, it appends up
-to 2,000 completed updates of up to about 1 MB each, and once the history passes
-`limit.historySize.error` (20 MiB, pinned in `dynamicconfig/kontra.yaml`) Temporal terminates
-the run. Escrow then refunds the job as "seller workflow terminated", against the seller. Any
-stream above about 10.5 KB is enough; one of about 1 MB takes about twenty polls
-(`tests/temporal`: `test_relay_polls_alone_can_end_their_job`). The token stays live while a
-buyer listens, because its session is revoked only when the job closes or the last listener
-leaves.
+**What the relay reads.** A poll's answer, as Kontra's codec writes it into the job's history,
+is the stream envelope (decisions I31): the positions and the log's length in the clear, and
+each item sealed on its own, its topic and position inside the ciphertext. A topic the offering
+lists (`offering.yaml` `streams:`, catalog data) and `kontra.progress` are sealed to the
+seller's recipients and the job's buyer key and named; any other topic to the seller's
+recipients alone, its name `null`. So a relay that asks for every topic -- a misbehaving gate,
+or a leaked token -- gets the unlisted items as ciphertext the buyer's key does not open and
+names it cannot read. The relay's reader (`kontra._relay`, which the gate imports) refuses
+anything that is not age ciphertext before it stores a byte, and the buyer's SDK checks each
+item's sealed topic and position against what the gate says, so a gate cannot relabel or
+reorder items; it could still forge one outright (age has no sender authentication), as it
+could forge progress before. A bound handler's agent child is never relayed: the turn
+activity copies the listed topics onto the job's own stream. Publish signals and
+continue-as-new inputs stay whole payloads encrypted to the buyer and the seller (sealing them
+per item is not in v1): an unlisted topic is the seller's alone in what is relayed.
 
-The Authorizer cannot bound this, because it does not read payloads. Three mitigations are
-recorded and none is adopted yet (decisions I30). A handler workflow that hosts a stream can
-continue-as-new when `workflow.info().is_continue_as_new_suggested()`: that turns the
-termination into churn, because escrow follows the pinned chain and the relay's empty run id
-follows its current run. The gate's relay (#52) polls only from the tail, with topics: that
-keeps a genuine relay's share of history to what its buyer reads, but does nothing against a
-leaked token, which picks its own offset. A per-namespace `history.maxTotalUpdates` pin bounds
-it only together with continue-as-new: 20 MiB at 1 MB a poll is about twenty updates, which
-would also cap a genuine subscription's polls per run.
+**What the relay's polls cost the job, and the guard.** Every poll the relay completes is
+written to the job's history: Temporal stores a completed Update's outcome
+(`WorkflowExecutionUpdateCompleted`), up to the envelope's 512 KiB, and every relay poll
+spends one of the run's updates (`history.maxTotalUpdates`, Temporal's default of 2,000). A
+genuine relay doubles the listed topics' volume in history. Before #52 a leaked relay token
+could spend that on purpose -- polling from offset 0 again and again until the history passed
+`limit.historySize.error` (20 MiB, pinned in `dynamicconfig/kontra.yaml`) and Temporal
+terminated the run, refunded against the seller. Now every job root refuses a poll at
+validation (`KontraStreamFull`) once its history is past half of the pinned limits (10,240
+events or 10 MiB), and Temporal writes nothing to history for a refused update. Neither a
+genuine relay nor a leaked token can push a job past that point; the overshoot is bounded by
+the polls in flight (`maxInFlightUpdates`, 10, of at most 512 KiB each), below the termination
+limits. The gate's relay paces itself from the job's history size too (`kontra._relay.pace_for`)
+and stops at the same half. The seller's own publishing, and Kontra's progress forwarder (at
+most 1,000 items a job), are the seller's to keep within the limits.
 
 ### The worker controller
 

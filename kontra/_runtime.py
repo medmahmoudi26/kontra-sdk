@@ -3,7 +3,7 @@ activity) which job we are working for.
 
 ``kontra.plugin.KontraPlugin`` installs one when its worker starts (``kontra.serve.Worker``
 and ``serve()`` build that plugin); ``kontra.hire.Kontra`` installs one when it is created.
-``Artifact`` methods and the progress forwarder read it. Seller workflow and activity code
+``Artifact`` methods read it. Seller workflow and activity code
 never touch it directly (decisions I29: they import no ``kontra``).
 """
 

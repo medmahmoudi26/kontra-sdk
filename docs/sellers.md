@@ -12,6 +12,7 @@ login to a paid job, is [`examples/hello`](../examples/hello).
 - [The workflow and activities](#the-workflow-and-activities)
 - [Files: `Artifact`](#files-artifact)
 - [Progress](#progress)
+- [Streaming to the buyer](#streaming-to-the-buyer)
 - [Many activities](#many-activities)
 - [Throughput: one heartbeating activity](#throughput-one-heartbeating-activity)
 - [Agents](#agents)
@@ -240,17 +241,81 @@ automatically; use `Artifact` for anything that is a file.
 ## Progress
 
 Nothing to write. Kontra derives progress from what Temporal already records (state, the
-activities running, how many completed) and forwards your activities' heartbeats, encrypted
-to the buyer:
+activities running, how many completed) and forwards your activities' heartbeats, encrypted to
+the job's parties:
 
 ```python
 activity.heartbeat({"percent": 40.0, "message": "400 of 1,000 urls"})
 ```
 
 Details that are a mapping with `percent` or `message` render as such; anything else renders
-as "alive, in `<activity>`, at `<time>`". Heartbeats are forwarded at most once a second per
-job, latest wins (`KONTRA_PROGRESS_INTERVAL` changes the interval). Forwarding is best effort:
-it never raises into, or blocks, your activity.
+as "alive, in `<activity>`, at `<time>`". A forwarded heartbeat is an item on the
+`kontra.progress` topic of the job's own workflow stream (below), so it costs your job's
+history like any publish: about four events. So forwarding is budgeted per job: the latest
+details at most every 5 s (`KONTRA_PROGRESS_INTERVAL` changes it; 0 forwards every heartbeat,
+batched), the interval doubling every 360 forwarded items up to 5 minutes, and at most 1,000
+items per job, after which the worker logs once and forwards no more (history keeps showing
+the job alive). When an activity returns, its latest heartbeat is forwarded then, whatever the
+interval: the buyer sees the last word. Forwarding is best effort: it never raises into, or
+blocks, your activity.
+
+## Streaming to the buyer
+
+Publish with Temporal's own workflow streams (`temporalio.contrib.workflow_streams`), as you
+would without Kontra, and list in `offering.yaml` the topics your buyer may read:
+
+```yaml
+# offering.yaml
+streams: [events]        # topic names; kontra.* is reserved; at most 8
+```
+
+```python
+# activities.py -- vanilla Temporal
+from temporalio import activity
+from temporalio.contrib.workflow_streams import WorkflowStreamClient
+
+
+@activity.defn
+async def fetch(urls: list[str]) -> int:
+    stream = WorkflowStreamClient.from_within_activity()
+    async with stream:
+        for url in urls:
+            ...
+            stream.topic("events").publish({"url": url, "status": 200})
+            stream.topic("debug").publish({"url": url, "raw": "..."})  # not listed: stays yours
+    return len(urls)
+```
+
+The buyer reads `events` with `job.stream("events", type=...)`; `debug` never leaves your side.
+What happens on the way (`docs/decisions.md` I31):
+
+- **The job hosts the stream.** Kontra hosts one on your job's workflow (`job-<id>`) when your
+  code builds none. If your workflow builds its own `WorkflowStream()` in `@workflow.init`,
+  Kontra uses yours. Publish from activities (`from_within_activity()`, as above) or from the
+  workflow (`self.stream.topic(...).publish(...)` on your own stream).
+- **Sealed item by item.** When the gate's relay reads the stream, each item is encrypted on its
+  own: a listed topic to you and the job's buyer, named in the clear; any other topic to you
+  alone, its name hidden. Your own subscribers (`WorkflowStreamClient.subscribe`) read every
+  topic, unchanged.
+- **Live.** The gate relays a job's stream once its buyer listens, from the start of the log,
+  and keeps what it relayed for later listeners. A buyer who never listens before the job
+  ends sees none of it. Items above 256 KiB reach the buyer as a gap with their size.
+- **Fixed per version.** `streams:` is catalog data, not part of the contract hash, but a
+  published version keeps its list: change it, and `kontra serve` refuses to start until you
+  publish a new version.
+- **Bound handlers.** For `serve(Agent.handler)`, list the agent's topics:
+  `streams: [turn_events]` relays the harness's events (its replies, tool calls, token
+  deltas) to the buyer under the same name. Kontra copies the listed topics from the agent's
+  stream onto the job's; nothing unlisted is copied.
+- **Continue-as-new.** A stream Kontra hosts keeps its offsets across your workflow's
+  continue-as-new by itself (the log does not carry over: what nobody read before it is not
+  relayed). A stream you host follows Temporal's recipe: pass `stream.get_state()` as
+  `prior_state` (`await self.stream.continue_as_new(lambda state: [...])`), or its offsets
+  restart at 0.
+- **Cost.** Every publish signal and every relay poll is written to your job's history (about
+  four and five events). The job refuses relay polls once its history is past half of
+  Temporal's limits, so a relay never pushes it into termination; your own publishing is
+  yours to keep within them.
 
 ## Many activities
 
@@ -433,9 +498,11 @@ async def probe_all(hosts: list[str]) -> int:
     return hits
 ```
 
-Three history events in all, whatever the count; a retry resumes at the last heartbeat (give
-the activity a `heartbeat_timeout`); scale by running several of them, one per slice. Nothing
-here is Kontra's: `activity.heartbeat` and `activity.info` are Temporal's. A real one reads its hosts
+A handful of history events, whatever the count: the activity's three, and the heartbeats
+Kontra forwards as the buyer's progress, which its budget bounds (at most one every 5 s, at
+most 1,000 per job: [Progress](#progress)). A retry resumes at the last heartbeat (give the
+activity a `heartbeat_timeout`); scale by running several of them, one per slice. Nothing here
+is Kontra's: `activity.heartbeat` and `activity.info` are Temporal's. A real one reads its hosts
 from a page source rather than its input, which, like any input, must fit a payload.
 
 ## Agents
