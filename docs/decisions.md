@@ -1510,6 +1510,9 @@ ways:
 
 ## I30. The authorizer after the narrowing: three token kinds, one rule that reads a request (kontra-sdk#59)
 
+_Q1–Q9 below were decided by the implementer in the owner's place, as kontra-sdk#50 directs (no
+step waits on an answer); each is listed on #59 for the owner to confirm or overturn._
+
 kontra-sdk#50 narrows the seller SDK to native Temporal (its decision 1): sellers write
 `temporalio` and emit whatever it allows -- updates, queries, workflow streams, signals between
 their own workflows, schedules, outward Nexus, Worker Versioning. What constrains them is the
@@ -1568,7 +1571,7 @@ changed, all deny to allow: two for the stream relay, ten for the worker control
   topics: an offering's eight streams named with 64 characters and `kontra.progress`; the
   largest offset; a 32-character namespace; the pinned run id; a pid@hostname identity), so
   4 KiB is over four times a genuine poll, and the offset query is about 110 bytes. A
-  party's own requests are not capped. **Strict wire shape (owner, Q1):** the relay
+  party's own requests are not capped. **Strict wire shape (Q1):** the relay
   makes only those two calls; it re-sends its Update with the same update id and wait policy
   COMPLETED until the answer carries the outcome (the server finds an update by its id), with an
   empty run id so it follows a continue-as-new; `StreamDraining` is retried after a cooldown with
@@ -1582,12 +1585,12 @@ changed, all deny to allow: two for the stream relay, ten for the worker control
   (`ControllerAPIs`: describe, set current, set ramping, set manager, update metadata and delete
   of worker deployments and versions, `DescribeTaskQueue`, `CountWorkflowExecutions`), **in the
   platform namespace only**. **The platform namespace is `kontra-system`, a constant** in the
-  public policy (`PlatformNamespace`, `names.PLATFORM_NAMESPACE`; owner, Q2) and a reserved
+  public policy (`PlatformNamespace`, `names.PLATFORM_NAMESPACE`; Q2) and a reserved
   handle, so no party can register it. **No `StartWorkflowExecution` or
-  `DescribeWorkflowExecution`** there: rollout gate workflows are not supported (owner, Q3; the
+  `DescribeWorkflowExecution`** there: rollout gate workflows are not supported (Q3; the
   owner may revisit), because a stolen controller credential could otherwise start any platform
   workflow with any input. **Kontra's own workers** in `kontra-system` use ordinary
-  `kontra-system:worker` tokens on the public frontend (owner, Q4): the party rule, no change
+  `kontra-system:worker` tokens on the public frontend (Q4): the party rule, no change
   here; minting them is kontra-cloud's.
 * **The denials escrow depends on**, for every token: `ResetWorkflowExecution` (a reset revives
   a terminated pinned run inside the same chain, its callbacks included -- the reset run's first
@@ -1603,17 +1606,17 @@ changed, all deny to allow: two for the stream relay, ten for the worker control
   the server would provision and invoke workers on a cloud provider with its own identity),
   denied to the controller too. Pause, workflow options, activity operations, standalone
   activities and workflow rules stay denied for want of a consumer. **Seller Worker Versioning
-  stays denied in v1** (owner, Q5): a seller who turns on `use_worker_versioning` gets no tasks.
+  stays denied in v1** (Q5): a seller who turns on `use_worker_versioning` gets no tasks.
   **Seller operations calls** (`ListWorkers`, describe and update of workers, pause and reset of
-  activities, `UpdateTaskQueueConfig`) stay denied until a seller tool needs one (owner, Q6).
-* **Run ids are left to the gate** (owner, Q7): every run of `job-<id>` is the seller's own, and
+  activities, `UpdateTaskQueueConfig`) stay denied until a seller tool needs one (Q6).
+* **Run ids are left to the gate** (Q7): every run of `job-<id>` is the seller's own, and
   escrow ignores runs outside the pinned chain; once escrow has pinned the chain the gate sets
   `first_execution_run_id` on the relay's Update, and Temporal refuses a look-alike chain
   (NOT_FOUND, measured).
 * **The PRD's "only the gate starts or steers a workflow there [prod]"** describes the console
   and buyers, not the authorizer: a seller can always steer its own job, because it runs the
-  code (owner, Q8: to confirm on the issue).
-* **Names** (owner, Q9): the subjects `relay/<ns>/job-<32 hex>` and
+  code (Q8: to confirm on the issue).
+* **Names** (Q9): the subjects `relay/<ns>/job-<32 hex>` and
   `platform/worker-controller`; `AllowedAPIs` keeps its name (no rename churn), with a
   justification on every entry.
 
