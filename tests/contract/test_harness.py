@@ -64,7 +64,8 @@ def _found(differences: tuple[Difference, ...]) -> set[tuple[str, str, str]]:
 
 
 def _open(*models: str) -> set[tuple[str, str, str]]:
-    """``open`` on both sides for each model: the contract closes it, the harness does not."""
+    """``open`` on both sides for each model: the contract closes it, and the harness's
+    schema says ``additionalProperties: true`` (``extra="allow"``)."""
     return {
         (side, f"$defs.{m}.additionalProperties", "open")
         for m in models
@@ -109,43 +110,25 @@ def test_the_harness_says_why_it_gives_no_schema() -> None:
 
 
 @pytest.mark.parametrize(
-    ("agent", "handler", "expected"),
+    ("agent", "handler"),
     [
-        (agents.ReconAgent, "sweep", {
-            ("input", "$defs.Sweep.additionalProperties", "open"),
-            ("output", "$defs.Report.additionalProperties", "open"),
-        }),
-        (agents.NeedsData, "sweep", {
-            ("input", "$defs.Sweep.additionalProperties", "open"),
-            ("output", "$defs.Report.additionalProperties", "open"),
-        }),
-        (agents.MayHaveData, "sweep", {
-            ("input", "$defs.Sweep.additionalProperties", "open"),
-            ("output", "$defs.Report.additionalProperties", "open"),
-        }),
-        (agents.SlowAgent, "sweep", {
-            ("input", "$defs.Sweep.additionalProperties", "open"),
-            ("output", "$defs.Report.additionalProperties", "open"),
-        }),
-        (agents.HopAgent, "hop", {
-            ("input", "$defs.Hop.additionalProperties", "open"),
-            ("output", "$defs.Hopped.additionalProperties", "open"),
-        }),
+        (agents.ReconAgent, "sweep"),
+        (agents.NeedsData, "sweep"),
+        (agents.MayHaveData, "sweep"),
+        (agents.SlowAgent, "sweep"),
+        (agents.HopAgent, "hop"),
     ],
-)  # fmt: skip
+)
 def test_the_test_agents(
-    enrich_spec: OfferingSpec,
-    schemas: dict[type, dict[str, Any]],
-    agent: type,
-    handler: str,
-    expected: set[tuple[str, str, str]],
+    enrich_spec: OfferingSpec, schemas: dict[type, dict[str, Any]], agent: type, handler: str
 ) -> None:
-    """The only differences are the models the contract closes. ``Sweep.fail``'s default is
-    on the input, which both describe in validation mode; ``HopAgent``'s aliases are the
-    keys on both sides."""
+    """No difference at all. Their models keep pydantic's default ``extra="ignore"``, which
+    the contract closes by policy (no ``open``); ``Sweep.fail``'s default is on the input,
+    which both describe in validation mode; ``HopAgent``'s aliases are the keys on both
+    sides."""
     declared = getattr(agent, AGENT_HANDLERS)[handler]
     doc = derive_document(enrich_spec, declared.input_type, declared.output_type)
-    assert _found(h.compare_handler(doc, schemas[agent], handler)) == expected
+    assert h.compare_handler(doc, schemas[agent], handler) == ()
 
 
 def test_a_bound_handlers_document_is_what_is_compared(
@@ -158,68 +141,66 @@ def test_a_bound_handlers_document_is_what_is_compared(
     bound = offering(yaml, entry=agents.MayHaveData.sweep, quote=agents.quote)
     schema = schemas[agents.MayHaveData]
     assert schema["init_data"] == {"data": {"$ref": "#/$defs/Data"}, "required": False}
-    found = h.compare_handler(bound.document(), schema, "sweep")
-    assert _found(found) == {
-        ("input", "$defs.Sweep.additionalProperties", "open"),
-        ("output", "$defs.Report.additionalProperties", "open"),
-    }
-    assert not any("Data" in d.path for d in found)
+    assert h.compare_handler(bound.document(), schema, "sweep") == ()
 
 
 # --------------------------------------------------------------------------- the model zoo
 
-#: Per handler of the zoo: the models in its closure the contract closes and the harness
-#: leaves open (``open`` on both sides), and every other difference. ``serialization`` is
-#: Kontra deriving the output in validation mode while the job's result is its serialization
-#: (decisions I33 reports it for the owner).
-ZOO: dict[str, tuple[tuple[str, ...], set[tuple[str, str, str]]]] = {
-    "defaults": (("Defaults",), {("output", "$defs.Defaults.required", "defaults")}),
-    "optionals": (("Optionals",), {("output", "$defs.Optionals.required", "defaults")}),
-    "aliases": (("Aliases",), set()),
-    "split_alias": (("SplitAlias",), {
+#: Per handler of the zoo: every difference. A model with pydantic's default
+#: ``extra="ignore"`` is closed by the contract alone, which is Kontra's policy and no
+#: difference; ``Allow`` (``extra="allow"``), the harness's ``additionalProperties: true``,
+#: is ``open`` on both sides, alone or nested. ``serialization`` is Kontra deriving the
+#: output in validation mode while the job's result is its serialization (decisions I33
+#: reports it for the owner).
+ZOO: dict[str, set[tuple[str, str, str]]] = {
+    "defaults": {("output", "$defs.Defaults.required", "defaults")},
+    "optionals": {("output", "$defs.Optionals.required", "defaults")},
+    "aliases": set(),
+    "split_alias": {
         ("output", "$defs.SplitAlias.properties.in_a", "serialization"),
         ("output", "$defs.SplitAlias.properties.out_a", "serialization"),
         ("output", "$defs.SplitAlias.required", "serialization"),
-    }),
-    "camel": (("Camel",), {("output", "$defs.Camel.required", "defaults")}),
-    "choices": (("Choices",), set()),
-    "nested": (("Leaf", "Nested"), {
+    },
+    "camel": {("output", "$defs.Camel.required", "defaults")},
+    "choices": set(),
+    "nested": {
         ("output", "$defs.Leaf.required", "defaults"),
         ("output", "$defs.Nested.required", "defaults"),
-    }),
-    "enums": (("Enums",), {("output", "$defs.Enums.required", "defaults")}),
-    "literals": (("Literals",), {("output", "$defs.Literals.required", "defaults")}),
-    "constrained": (("Constrained",), set()),
-    "collections": (("Collections",), {("output", "$defs.Collections.required", "defaults")}),
-    "times": (("Times",), set()),
+    },
+    "enums": {("output", "$defs.Enums.required", "defaults")},
+    "literals": {("output", "$defs.Literals.required", "defaults")},
+    "constrained": set(),
+    "collections": {("output", "$defs.Collections.required", "defaults")},
+    "times": set(),
     # KontraArtifact is closed on both sides.
-    "files": (("Files",), {("output", "$defs.Files.required", "defaults")}),
-    "tagged": (("Cat", "Dog", "Tagged"), {("output", "$defs.Dog.required", "defaults")}),
-    "titled": (("Titled",), set()),
-    "tree": (("Tree",), {("output", "$defs.Tree.required", "defaults")}),
-    "forbid": ((), set()),
-    "allow": (("Allow",), set()),
-    "computed": (("Computed",), {
+    "files": {("output", "$defs.Files.required", "defaults")},
+    "tagged": {("output", "$defs.Dog.required", "defaults")},
+    "titled": set(),
+    "tree": {("output", "$defs.Tree.required", "defaults")},
+    "forbid": set(),
+    "allow": _open("Allow"),
+    "outer": _open("Allow"),
+    "computed": {
         ("output", "$defs.Computed.properties.area", "serialization"),
         ("output", "$defs.Computed.required", "serialization"),
-    }),
-    "excluded": (("Excluded",), {
+    },
+    "excluded": {
         ("output", "$defs.Excluded.properties.secret", "serialization"),
         ("output", "$defs.Excluded.required", "serialization"),
-    }),
-    "serialized": (("Serialized",), {
+    },
+    "serialized": {
         ("output", "$defs.Serialized.properties.at.format", "serialization"),
         ("output", "$defs.Serialized.properties.at.type", "serialization"),
-    }),
+    },
     # The harness writes {$ref: Code, maxLength: 10}, both asserted (at most 5); the contract
     # keeps the use site's 10 (decisions I33, for the owner). Drift on both sides.
-    "overlap": ((), {
+    "overlap": {
         (side, f"$defs.Overlap.properties.{field}.{key}", "drift")
         for side in ("input", "output")
         for field in ("code", "maybe.oneOf[0]")
         for key in ("allOf", "maxLength", "type")
-    }),
-}  # fmt: skip
+    },
+}
 
 
 def test_the_zoo_covers_every_handler(schemas: dict[type, dict[str, Any]]) -> None:
@@ -231,17 +212,16 @@ def test_the_model_zoo(
     enrich_spec: OfferingSpec, schemas: dict[type, dict[str, Any]], handler: str
 ) -> None:
     model = zoo.MODELS[handler]
-    opened, others = ZOO[handler]
     doc = derive_document(enrich_spec, model, model)
-    assert _found(h.compare_handler(doc, schemas[zoo.Zoo], handler)) == _open(*opened) | others
+    assert _found(h.compare_handler(doc, schemas[zoo.Zoo], handler)) == ZOO[handler]
 
 
 def test_the_zoo_s_differences_say_what_differs(
     enrich_spec: OfferingSpec, schemas: dict[type, dict[str, Any]]
 ) -> None:
     """The values behind a few verdicts: defaults the output requires, a serializer's type,
-    a computed field, the closed model that agrees, and a constraint on both a type and its
-    use."""
+    a computed field, the closed model that agrees, the harness's ``true`` against the
+    contract's ``false``, and a constraint on both a type and its use."""
 
     def compare(handler: str) -> dict[tuple[str, str], tuple[Any, Any]]:
         model = zoo.MODELS[handler]
@@ -263,6 +243,9 @@ def test_the_zoo_s_differences_say_what_differs(
         {"type": "integer"},
     )
     assert compare("forbid") == {}
+    assert compare("outer") == {
+        (side, "$defs.Allow.additionalProperties"): (False, True) for side in ("input", "output")
+    }
     # The contract accepts a 10-character code the model refuses; the harness says both.
     assert compare("overlap")[("input", "$defs.Overlap.properties.code.allOf")] == (
         h.ABSENT,
@@ -316,25 +299,33 @@ def _contract(root: Path, home: Path) -> Result:
 def test_kontra_contract_warns_where_they_differ(tmp_path: Path) -> None:
     """On stderr: one warning naming the offering and the handler, a line per difference and
     what each kind means. The document on stdout is unchanged, and the command succeeds."""
-    result = _contract(_project(tmp_path / "p", "ReconAgent.sweep", "quote"), tmp_path / "home")
+    root = _project(tmp_path / "p", "Zoo.allow", "allow_quote", module="tests.contract.harness_zoo")
+    result = _contract(root, tmp_path / "home")
     assert result.exit_code == 0, result.output
     info = validate_document(from_yaml(result.stdout))
     assert info.offering.key == "acme/recon@1.0.0"
     lines = result.stderr.splitlines()
-    assert lines[0].startswith("warning: acme/recon@1.0.0 (ReconAgent.sweep): the contract ")
+    assert lines[0].startswith("warning: acme/recon@1.0.0 (Zoo.allow): the contract ")
     assert "in 2 places" in lines[0]
     assert lines[1:] == [
-        "  input  $defs.Sweep.additionalProperties: contract false, harness (absent)",
-        "  output $defs.Report.additionalProperties: contract false, harness (absent)",
+        "  input  $defs.Allow.additionalProperties: contract false, harness true",
+        "  output $defs.Allow.additionalProperties: contract false, harness true",
         f"  (open) {h.NOTES['open']}",
     ]
 
 
-def test_kontra_contract_says_nothing_when_they_agree(tmp_path: Path) -> None:
-    root = _project(
-        tmp_path / "p", "Zoo.forbid", "forbid_quote", module="tests.contract.harness_zoo"
-    )
-    result = _contract(root, tmp_path / "home")
+@pytest.mark.parametrize(
+    ("entry", "quote", "module"),
+    [
+        # pydantic's default models (extra="ignore"): the contract closes them by policy.
+        ("ReconAgent.sweep", "quote", "tests.serve.harness_agents"),
+        ("Zoo.forbid", "forbid_quote", "tests.contract.harness_zoo"),
+    ],
+)
+def test_kontra_contract_says_nothing_when_they_agree(
+    tmp_path: Path, entry: str, quote: str, module: str
+) -> None:
+    result = _contract(_project(tmp_path / "p", entry, quote, module=module), tmp_path / "home")
     assert result.exit_code == 0, result.output
     assert result.stderr == ""
 

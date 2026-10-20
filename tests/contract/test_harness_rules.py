@@ -437,13 +437,33 @@ def test_null_inside_a_conjunction(enrich_spec: OfferingSpec) -> None:
 
 
 class Open(BaseModel):
-    """pydantic's default: other keys ignored, so its schema is open."""
+    """pydantic's default, ``extra="ignore"``: other keys dropped on input and never
+    emitted, and its schema says nothing of them."""
 
     host: str
     hops: int = 1
 
 
+class Allowed(BaseModel):
+    """``extra="allow"``: other keys kept and serialized, so its schema says
+    ``additionalProperties: true``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    host: str
+    hops: int = 1
+
+
+class Holder(BaseModel):
+    """pydantic's default, around both."""
+
+    allowed: Allowed
+    ignored: Open
+
+
 def _open(**extra: Any) -> dict[str, Any]:
+    """``Open`` as ``agent_schema`` writes it, or ``Allowed`` with
+    ``additionalProperties=True``."""
     return {
         "properties": {"host": {"type": "string"}, "hops": {"type": "integer", "default": 1}},
         "required": ["host"],
@@ -452,22 +472,81 @@ def _open(**extra: Any) -> dict[str, Any]:
     }
 
 
-def test_an_open_model_and_defaults_the_output_requires(enrich_spec: OfferingSpec) -> None:
-    """The two semantic differences every harness agent shows: the contract closes every
-    model (``open``), and the harness's output schema requires a field with a default
-    (``defaults``, its serialization mode). ``additionalProperties: true`` is open too."""
-    defs = {
-        "Open-Input": _open(additionalProperties=True),
-        "Open-Output": _open(required=["hops", "host"]),
-    }
+def test_the_contract_closes_models_by_policy(enrich_spec: OfferingSpec) -> None:
+    """Kontra closes every model (decisions I2, section 11.3) and the harness's schema
+    writes no ``additionalProperties`` for pydantic's default ``extra="ignore"``, which
+    drops other keys on input and never emits one: no value exchanged differs, so neither
+    side reports it. What does differ still is: the harness's output schema requires a
+    field with a default (``defaults``, its serialization mode)."""
+    defs = {"Open-Input": _open(), "Open-Output": _open(required=["hops", "host"])}
     found = compare_handler(
         _doc(enrich_spec, Open), _harness("Open-Input", "Open-Output", defs), "run"
     )
     assert [(d.side, d.path, d.contract, d.harness, d.kind) for d in found] == [
-        ("input", "$defs.Open.additionalProperties", False, ABSENT, "open"),
-        ("output", "$defs.Open.additionalProperties", False, ABSENT, "open"),
         ("output", "$defs.Open.required", ["host"], ["hops", "host"], "defaults"),
     ]
+
+
+@pytest.mark.parametrize("model", [Allowed, Holder])
+def test_additional_properties_true_is_open(enrich_spec: OfferingSpec, model: type[Any]) -> None:
+    """``extra="allow"``: the harness's ``additionalProperties: true`` is kept, at the root
+    as nested, and against the contract's ``false`` is ``open`` on both sides, with both
+    values. The ``extra="ignore"`` models around and beside it are not."""
+    defs = {
+        "Allowed": _open(additionalProperties=True),
+        "Open": _open(),
+        "Holder": {
+            "properties": {
+                "allowed": {"$ref": "#/$defs/Allowed"},
+                "ignored": {"$ref": "#/$defs/Open"},
+            },
+            "required": ["allowed", "ignored"],
+            "type": "object",
+        },
+    }
+    name = model.__name__
+    found = compare_handler(_doc(enrich_spec, model), _harness(name, name, defs), "run")
+    assert [(d.side, d.path, d.contract, d.harness, d.kind) for d in found] == [
+        ("input", "$defs.Allowed.additionalProperties", False, True, "open"),
+        ("output", "$defs.Allowed.additionalProperties", False, True, "open"),
+    ]
+
+
+def _extra(contract: Any, harness: Any) -> list[tuple[Any, Any, str]]:
+    """The input differences between two objects that differ only in their
+    ``additionalProperties`` (each a value, or :data:`ABSENT` for none)."""
+
+    def node(value: Any) -> dict[str, Any]:
+        return {"type": "object"} | ({} if value is ABSENT else {"additionalProperties": value})
+
+    walk = h._Walk("input", {}, {})
+    walk.run(node(contract), node(harness), "x")
+    return [(d.contract, d.harness, d.kind) for d in walk.found]
+
+
+@pytest.mark.parametrize(
+    ("contract", "harness", "found"),
+    [
+        # The contract closes models by policy.
+        (False, ABSENT, []),
+        (False, False, []),
+        # true asserts nothing: it is the member's absence, on either side ...
+        (True, ABSENT, []),
+        (ABSENT, True, []),
+        (True, True, []),
+        # ... except against the contract's false, where it is kept: extra="allow".
+        (False, True, [(False, True, "open")]),
+        (True, False, [(True, False, "drift")]),
+        (ABSENT, False, [(ABSENT, False, "drift")]),
+        # A schema (typed extras) is no true: compared like any other member.
+        (False, {"type": "integer"}, [(False, {"type": "integer"}, "drift")]),
+        ({"type": "integer"}, {"type": "integer"}, []),
+    ],
+)
+def test_additional_properties_pair_by_pair(contract: Any, harness: Any, found: list[Any]) -> None:
+    """Each pair of ``additionalProperties``, the contract's against the harness's: ``true``
+    survives the canonical form on both sides, and only the comparison reads it."""
+    assert _extra(contract, harness) == found
 
 
 def test_other_differences_are_serialization_on_the_output_and_drift_on_the_input(
@@ -546,15 +625,18 @@ def test_a_handler_the_harness_does_not_have_is_an_error(enrich_spec: OfferingSp
 
 
 def test_describe_says_each_difference_then_what_each_kind_means(enrich_spec: OfferingSpec) -> None:
-    defs = {"Open-Input": _open(), "Open-Output": _open(required=["hops", "host"])}
+    defs = {
+        "Allowed-Input": _open(additionalProperties=True),
+        "Allowed-Output": _open(additionalProperties=True, required=["hops", "host"]),
+    }
     found = compare_handler(
-        _doc(enrich_spec, Open), _harness("Open-Input", "Open-Output", defs), "run"
+        _doc(enrich_spec, Allowed), _harness("Allowed-Input", "Allowed-Output", defs), "run"
     )
     lines = h.describe(found)
     assert lines[:3] == [
-        "input  $defs.Open.additionalProperties: contract false, harness (absent)",
-        "output $defs.Open.additionalProperties: contract false, harness (absent)",
-        'output $defs.Open.required: contract ["host"], harness ["hops","host"]',
+        "input  $defs.Allowed.additionalProperties: contract false, harness true",
+        "output $defs.Allowed.additionalProperties: contract false, harness true",
+        'output $defs.Allowed.required: contract ["host"], harness ["hops","host"]',
     ]
     assert lines[3] == f"(open) {h.NOTES['open']}"
     assert lines[4] == f"(defaults) {h.NOTES['defaults']}"

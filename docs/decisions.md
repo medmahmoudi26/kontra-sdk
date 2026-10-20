@@ -2013,8 +2013,8 @@ and `kontra contract` warn where they differ, and seam ③ asserts the verdict.
   | optionals | `oneOf: [T, null]` against `anyOf: [T, null]`; `default: null` | representational when `T` cannot be null; null is no default (I2) |
   | list and dict defaults | dropped by Kontra, kept by the harness | representational: annotation-only, and nexgen materialises only scalar defaults (I2) |
   | tagged unions | OpenAPI `discriminator` kept by the harness | representational: not a 2020-12 assertion; the `const` tags select the branch |
-  | `extra="allow"` | `additionalProperties: true` | representational against the harness's own absence of it; `open` against the contract |
-  | every model not `extra="forbid"` | contract `additionalProperties: false`, harness open | **semantic, `open`**: the contract closes every model (§11.3), pydantic's `extra="ignore"` leaves its schema open |
+  | every model with pydantic's default `extra="ignore"` | contract `additionalProperties: false`, harness none | **policy, not reported** (the owner's decision, below): the contract closes every model (§11.3); pydantic drops other keys on input and never emits one, so no value exchanged differs |
+  | `extra="allow"` | contract `additionalProperties: false`, harness `true` | **semantic, `open`**: the model accepts keys the contract forbids, and serializes them into its reply |
   | a constraint on a named type and again where it is used (`Annotated[Code, Field(max_length=10)]` over `class Code(RootModel[Annotated[str, StringConstraints(max_length=5)]])`; `Field(json_schema_extra={"enum": ["a", "z"]})` over an enum of `a`, `b`) | harness `{$ref: Code, maxLength: 10}`, both asserted (at most 5, as pydantic validates); contract `{maxLength: 10, type: string}`, the use site's value only | **semantic, `drift` on both sides**: the contract accepts `"abcdefg"`, and `"z"`, which the model refuses (for the owner, below) |
   | output fields with a default (scalar, factory, `= None`, nested) | harness `required` lists them, the contract does not | **semantic, `defaults`**: the reply always carries them; the contract lets them be absent |
   | output `@computed_field` | harness has the property (and requires it), the contract does not | **semantic, `serialization`** |
@@ -2034,23 +2034,42 @@ and `kontra contract` warn where they differ, and seam ③ asserts the verdict.
   [definition, use site]`, which an `anyOf` with `null` still reads as `oneOf` when a branch of
   it cannot be null; `title`,
   `description`, `examples`, `$comment`, `deprecated`, `readOnly`, `writeOnly` and
-  `discriminator` dropped; `required` sorted, empty `required` and `additionalProperties:
-  true` absent; `anyOf: [T, {type: null}]` read as `oneOf` when `T` cannot be null (a `type`
+  `discriminator` dropped; `required` sorted, and empty `required` absent; the contract's
+  `additionalProperties: false` against the harness's none no difference (the contract
+  closes models by policy, below), and `additionalProperties: true` absent on either side,
+  except against the contract's `false`, where it is kept and reported `open`;
+  `anyOf: [T, {type: null}]` read as `oneOf` when `T` cannot be null (a `type`
   without `null`, a non-null `const`, an `enum` without `null`, a reference to such, or a
   union of such; unsure is no); a `null`, list or object `default` dropped; values compared as
   RFC 8785 canonical JSON. A **scalar default is compared**, although JSON Schema calls it an
   annotation: a buyer's generated code fills it in, so a different one would change what an
   absent field means. `enum` and union branches are compared in order: both emitters write
   declaration order, and a reorder would be reported, which over-reports and never hides.
-- **What is reported**, each difference with a kind: `open` (an `additionalProperties` the
-  contract closes and the harness leaves open), `defaults` (an output `required` the harness
-  extends with declared fields only), `serialization` (any other output difference) and `drift`
-  (any other input difference: unexplained; and, on either side, every difference at a use
-  site left beside its definition, which is the emitters disagreeing, not the serialization). `open` and `defaults` are semantic -- they change
-  which values are valid -- and reported, not normalised: the warning is the seller's to act
-  on (`model_config = ConfigDict(extra="forbid")` silences `open`, and makes the agent refuse
-  unknown keys from every caller, as the gate does), and the test agents in
-  `tests/serve/harness_agents.py` show exactly their models' `open` rows.
+- **What is reported**, each difference with a kind: `open` (an `additionalProperties: true`,
+  `extra="allow"`, where the contract says `false`), `defaults` (an output `required` the
+  harness extends with declared fields only), `serialization` (any other output difference)
+  and `drift` (any other input difference: unexplained; and, on either side, every difference
+  at a use site left beside its definition, which is the emitters disagreeing, not the
+  serialization). `open` and `defaults` are semantic -- they change which values are valid --
+  and reported, not normalised: the warning is the seller's to act on (dropping
+  `extra="allow"` silences `open`), and the zoo's `allow` and `outer` handlers show `open` at
+  a model's root and nested. The test agents in `tests/serve/harness_agents.py` keep
+  pydantic's default `extra="ignore"` and show no difference at all.
+- **The contract closes models by policy: no difference (the owner's decision).** As first
+  built, `open` was also the contract's `additionalProperties: false` against the harness's
+  absence of it, so it fired on nearly every handler: Kontra closes every model (I2, §11.3)
+  whatever its `extra`, and pydantic's default, `extra="ignore"`, writes nothing. The owner
+  decided that the warning must not fire on every handler, or sellers learn to ignore it, and
+  with it the rows it exists for. For an `extra="ignore"` model the difference changes no
+  value actually exchanged -- pydantic drops other keys on input and never emits one on
+  output -- so it is Kontra's closing policy, not drift, and the canonical form sets it aside
+  (`kontra.contract.harness._closed_alike`, tested pair by pair). `extra="allow"` is still
+  `open`: the harness's schema says `additionalProperties: true` there, the model accepts keys
+  the contract forbids and serializes them into its reply, so that `true` is kept against the
+  contract's `false` (anywhere else `true` is its absence, as JSON Schema has it). An
+  `additionalProperties` with a schema (typed extras, `__pydantic_extra__: dict[str, int]`)
+  is no `true` and is compared as any other member. Nothing asks a seller for
+  `extra="forbid"`.
 - **The publish-time warning.** `kontra publish` (before contacting the gate) and `kontra
   contract` print, on stderr, one warning per bound-handler offering whose two schemas differ:
   the offering and handler, one line per difference, and a sentence per kind present. Nothing
@@ -2093,8 +2112,10 @@ and `kontra contract` warn where they differ, and seam ③ asserts the verdict.
 - **Rejected.** Calling `agent_schema` in-process (`sys.modules` or an import): Kontra would
   depend on a Python API of the harness and break I29's rule, for the same document the CLI
   prints. Canonicalising the harness's document with Kontra's lowering (`lower_schema`): the
-  lowering is Kontra's derivation, not a canonical form -- it closes every model, so `open`
-  would vanish, and it would refuse what it cannot lower instead of reporting it. Refusing to
+  lowering is Kontra's derivation, not a canonical form -- it closes every model, so
+  `extra="allow"`'s `open` would vanish, and it would refuse what it cannot lower instead of
+  reporting it. Reporting `open` for every model not `extra="forbid"` (as first built): a
+  warning on nearly every handler, for a difference no value exchanged shows. Refusing to
   publish on a difference: the harness's schema is not what is sold. Finding the console script
   on `PATH`. Comparing descriptions: the reserved `KontraArtifact` text differs from
   `Artifact`'s docstring by design, and a description changes no valid value.
@@ -2102,9 +2123,11 @@ and `kontra contract` warn where they differ, and seam ③ asserts the verdict.
   `examples/recon-harness`: `tests/contract/test_harness.py` finds every example whose
   `worker.py` uses the harness and asserts that its golden `contract.yaml` is what the binding
   derives and equals the harness's schema for its handler with no difference at all, so that
-  example should declare its models `extra="forbid"` and keep defaults off its output.
+  example must not declare `extra="allow"` (pydantic's default or `"forbid"` both agree) and
+  should keep defaults off its output.
 - **Checked by** `tests/contract/test_harness_rules.py` (each rule of the canonical form, each
-  kind, a use site folded into its definition or left beside it, the envelope left out, the
+  kind, the contract's closing policy and `additionalProperties` pair by pair, a use site
+  folded into its definition or left beside it, the envelope left out, the
   errors, and the subprocess's own refusal, its timeout, its flooded standard error read from
   the end and its oversized document refused; no harness needed)
   and `tests/contract/test_harness.py` (seam ③: the harness's CLI, name and members against the

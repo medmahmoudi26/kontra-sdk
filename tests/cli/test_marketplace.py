@@ -168,15 +168,15 @@ async def test_publish_warns_where_a_handlers_contract_and_the_harness_schema_di
 ) -> None:
     """Decisions I33 through the CLI: one handler of a harness agent publishes like any
     offering, after one warning on stderr naming where the contract buyers get and the
-    harness's schema for that handler differ (``tests/contract/test_harness.py`` has the
-    comparison itself)."""
+    harness's schema for that handler differ: here an ``extra="allow"`` model, which the
+    contract closes (``tests/contract/test_harness.py`` has the comparison itself)."""
     pytest.importorskip("temporal_agent_harness", reason="the dev group's temporal-agent-harness")
     project = shop.root / "recon"
     project.mkdir()
     facts = {
         "name": f"{shop.party}/recon",
         "version": "1.0.0",
-        "description": "Sweeps a host, one turn of an agent",
+        "description": "Echoes an open model, one turn of an agent",
         "max_duration": "10m",
         "review_window": "1h",
         "max_output_bytes": "1MB",
@@ -187,19 +187,19 @@ async def test_publish_warns_where_a_handlers_contract_and_the_harness_schema_di
     )
     (project / "worker.py").write_text(
         "from kontra import serve\n"
-        "from tests.serve.harness_agents import ReconAgent, quote\n\n"
-        "serve(ReconAgent.sweep, quote=quote)\n"
+        "from tests.contract.harness_zoo import Zoo, allow_quote\n\n"
+        "serve(Zoo.allow, quote=allow_quote)\n"
     )
     result = await shop.seller.ok("publish", "--dir", str(project))
     assert f"published {shop.party}/recon@1.0.0" in result.stdout
     warning, *lines = result.stderr.splitlines()
     assert warning.startswith(
-        f"warning: {shop.party}/recon@1.0.0 (ReconAgent.sweep): the contract differs from "
+        f"warning: {shop.party}/recon@1.0.0 (Zoo.allow): the contract differs from "
         "temporal-agent-harness's schema for this handler in 2 places."
     )
     assert lines[:2] == [
-        "  input  $defs.Sweep.additionalProperties: contract false, harness (absent)",
-        "  output $defs.Report.additionalProperties: contract false, harness (absent)",
+        "  input  $defs.Allow.additionalProperties: contract false, harness true",
+        "  output $defs.Allow.additionalProperties: contract false, harness true",
     ]
 
 

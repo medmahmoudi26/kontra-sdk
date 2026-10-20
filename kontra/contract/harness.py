@@ -28,20 +28,29 @@ by a rule I33 lists and ``tests/contract/test_harness_rules.py`` tests:
 * annotations are dropped: ``title``, ``description``, ``examples``, ``$comment``,
   ``deprecated``, ``readOnly``, ``writeOnly``; so is the OpenAPI ``discriminator`` (the
   branches' ``const`` tags select the branch);
-* ``required`` is a set (sorted; empty is absent), ``additionalProperties: true`` is its
-  absence, and values are compared as RFC 8785 canonical JSON (key order, ``1`` and ``1.0``);
+* ``required`` is a set (sorted; empty is absent), and values are compared as RFC 8785
+  canonical JSON (key order, ``1`` and ``1.0``);
+* the contract closes models by policy: its ``additionalProperties: false`` against the
+  harness's none is no difference. Kontra closes every model (decisions I2, section 11.3),
+  and a model the harness's schema leaves without one has pydantic's default
+  ``extra="ignore"``, which drops other keys on input and never emits one on output, so no
+  value exchanged differs. ``additionalProperties: true`` is its absence, on either side,
+  except against the contract's ``false``: there it is ``extra="allow"`` (the model keeps
+  other keys and serializes them), kept, and reported. A schema there (typed extras) is no
+  ``true``, and is compared like any other member;
 * ``anyOf: [T, {type: null}]`` is ``oneOf: [T, {type: null}]`` when ``T`` cannot be null;
 * a ``default`` of ``null``, a list or an object is no default (decisions I2: null is the
   absence of one, and nexgen materialises only scalar defaults). A scalar default is compared:
   a buyer's generated code fills it in.
 
 What remains is reported, each :class:`Difference` with a :data:`Kind`: ``open`` (the contract
-closes every model, section 11.3, and the harness leaves this one open), ``defaults`` (on the
-output, the harness's serialization-mode schema requires fields that have a default; the reply
-always carries them), ``serialization`` (any other output difference: the harness describes the
-model as serialized -- computed and excluded fields, serialization aliases, serializers -- and
-the contract as validated) and ``drift`` (any other input difference, and a use site written
-beside its definition on either side: the emitters disagree).
+closes every model, section 11.3, and the harness's schema says ``additionalProperties: true``,
+as ``extra="allow"`` does), ``defaults`` (on the output, the harness's serialization-mode
+schema requires fields that have a default; the reply always carries them), ``serialization``
+(any other output difference: the harness describes the model as serialized -- computed and
+excluded fields, serialization aliases, serializers -- and the contract as validated) and
+``drift`` (any other input difference, and a use site written beside its definition on either
+side: the emitters disagree).
 
 The harness's schema comes from its own CLI, ``temporal-agent-harness schema module:Class``,
 run by :func:`harness_schema` as a subprocess of this interpreter: the same document
@@ -262,8 +271,9 @@ Side = Literal["input", "output"]
 NOTES: Final[Mapping[Kind, str]] = {
     "open": (
         "the contract closes every model (no keys but its fields) and the harness's schema "
-        'leaves this one open, as pydantic\'s default extra="ignore" does; '
-        'model_config = ConfigDict(extra="forbid") on the model makes both say so'
+        'leaves this one open, as extra="allow" does: the model keeps other keys, and '
+        'serializes them into the reply; pydantic\'s default (extra="ignore", which drops '
+        'them) or extra="forbid" on the model makes the two agree'
     ),
     "defaults": (
         "the harness's output schema (serialization mode) requires the fields that have a "
@@ -348,6 +358,8 @@ _ONE = frozenset(
 _MAP = frozenset({"properties", "patternProperties", "dependentSchemas"})
 _LIST = frozenset({"oneOf", "anyOf", "allOf", "prefixItems"})
 _DEFS_REF = "#/$defs/"
+#: The member Kontra's contract writes ``false`` on every model (section 11.3).
+_EXTRA = "additionalProperties"
 _NULL: Mapping[str, Any] = {"type": "null"}
 #: What a ``$ref``'s use site writes over its definition's: annotations, which assert nothing
 #: (a field's own ``description`` or ``default`` over its type's).
@@ -472,6 +484,19 @@ def _rejects_null(node: Any, defs: Mapping[str, Any], depth: int = 0) -> bool:
     return False
 
 
+def _closed_alike(c: Any, h: Any) -> bool:
+    """Whether the contract's ``additionalProperties`` ``c`` and the harness's ``h`` (either
+    :data:`ABSENT`) admit the same values exchanged. ``true`` is no assertion, so it is the
+    member's absence; and the contract's ``false`` against the harness's absence is Kontra's
+    policy, not a difference: the contract closes every model (section 11.3), and a model
+    pydantic writes without one (its default ``extra="ignore"``) drops other keys on input
+    and never emits one on output. ``false`` against ``true`` (``extra="allow"``: the model
+    keeps other keys and serializes them) is not alike, and a schema is compared as any."""
+    if c is False and h is ABSENT:
+        return True
+    return (c is True or c is ABSENT) and (h is True or h is ABSENT)
+
+
 def _same(c: Any, h: Any) -> bool:
     """Equal as RFC 8785 canonical JSON; a value with no canonical form (an integer past
     2^53, a NaN the harness wrote) equals nothing."""
@@ -487,8 +512,6 @@ def _canonical(node: Mapping[str, Any], defs: Mapping[str, Any]) -> dict[str, An
     default = out.get("default", ABSENT)
     if default is None or isinstance(default, dict | list):
         del out["default"]
-    if out.get("additionalProperties") is True:
-        del out["additionalProperties"]
     required = out.get("required")
     if isinstance(required, list):
         if required:
@@ -559,6 +582,8 @@ class _Walk:
         for key in sorted(set(c) | set(h)):
             cv, hv = c.get(key, ABSENT), h.get(key, ABSENT)
             where = join_path(path, key)
+            if key == _EXTRA and _closed_alike(cv, hv):
+                continue
             if cv is ABSENT or hv is ABSENT:
                 shown = self._shown(cv, key), self._shown(hv, key, harness=True)
                 self._differ(where, key, *shown, c, kind=kind)
@@ -627,7 +652,7 @@ class _Walk:
         self.found.append(Difference(self.side, path, c, h, found))
 
     def _kind(self, key: str, c: Any, h: Any, parent: Mapping[str, Any]) -> Kind:
-        if key == "additionalProperties" and c is False and h is ABSENT:
+        if key == _EXTRA and c is False and h is True:
             return "open"
         if self.side == "input":
             return "drift"

@@ -5,7 +5,10 @@ writes, each taking and returning the same model, so one agent shows how Kontra'
 
 An importable module, as the harness's ``schema`` command and Temporal's sandbox require:
 vanilla temporalio and the harness, and ``kontra.types.Artifact``, as a seller's models.py
-may use it. ``Forbid`` is the one model both describe identically: closed, no defaults."""
+may use it. ``Forbid`` is a model both describe identically: closed, no defaults. A model
+with pydantic's default ``extra="ignore"`` is closed only by the contract, which is Kontra's
+policy and no difference; ``Allow`` (``extra="allow"``), alone or nested in ``Outer``, is the
+one the harness's schema leaves open."""
 
 from __future__ import annotations
 
@@ -225,6 +228,15 @@ class Allow(BaseModel):
     x: int
 
 
+class Outer(BaseModel):
+    """pydantic's default (``extra="ignore"``) around ``Allow``: only the nested model is
+    open."""
+
+    inner: Allow
+    many: list[Allow]
+    maybe: Allow | None
+
+
 class Computed(BaseModel):
     """A computed field: in the serialization, not in the validation."""
 
@@ -372,6 +384,11 @@ class Zoo:
         return req
 
     @agent.accepts
+    async def outer(self, req: Outer) -> Outer:
+        """Echo."""
+        return req
+
+    @agent.accepts
     async def computed(self, req: Computed) -> Computed:
         """Echo."""
         return req
@@ -412,6 +429,7 @@ MODELS: dict[str, type[BaseModel]] = {
     "tree": Tree,
     "forbid": Forbid,
     "allow": Allow,
+    "outer": Outer,
     "computed": Computed,
     "excluded": Excluded,
     "serialized": Serialized,
@@ -420,4 +438,8 @@ MODELS: dict[str, type[BaseModel]] = {
 
 
 async def forbid_quote(req: Forbid) -> Quote:
+    return Quote(price=Decimal("0.01"))
+
+
+async def allow_quote(req: Allow) -> Quote:
     return Quote(price=Decimal("0.01"))
