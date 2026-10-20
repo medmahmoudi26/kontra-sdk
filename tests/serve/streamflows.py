@@ -7,6 +7,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 
+from pydantic import BaseModel, Field, TypeAdapter
 from temporalio import activity, workflow
 
 with workflow.unsafe.imports_passed_through():
@@ -18,6 +19,9 @@ with workflow.unsafe.imports_passed_through():
 
 LISTED = "events"
 UNLISTED = "private"
+#: The unlisted topic of the seam ⑤ seller (``tests/serve/test_streams.py``): its name must
+#: be nowhere in the clear.
+AUDIT = "private_audit"
 
 
 @dataclass
@@ -120,3 +124,76 @@ class ChainJob:
         if rounds > 1:
             workflow.continue_as_new(args=[rounds - 1, per_round])
         return "ok"
+
+
+# --------------------------------------------------------------------------- an offering
+
+
+class StreamOrder(BaseModel):
+    """The seam ⑤ seller's input: ``n`` items per topic and place, ``rounds`` runs (it
+    continues-as-new between them, its stream's state carried in ``resume``)."""
+
+    marker: str = Field(max_length=200)
+    n: int = Field(default=2, ge=1, le=20)
+    rounds: int = Field(default=2, ge=1, le=3)
+    resume: str | None = Field(default=None, max_length=1_000_000)
+
+
+class StreamOut(BaseModel):
+    published: int
+
+
+_STATE = TypeAdapter(WorkflowStreamState)
+
+
+@activity.defn
+async def publish_both(order: StreamOrder) -> int:
+    """Listed and unlisted items from an activity, and heartbeats: every one with a marker
+    unique to its place."""
+    client = WorkflowStreamClient.from_within_activity(batch_interval=timedelta(milliseconds=50))
+    async with client:
+        for i in range(order.n):
+            run = activity.info().workflow_run_id
+            client.topic(LISTED).publish({"s": f"{order.marker}-w-{LISTED}-activity-{run}-{i}"})
+            client.topic(AUDIT).publish({"s": f"{order.marker}-w-{AUDIT}-activity-{run}-{i}"})
+            activity.heartbeat({"message": f"{order.marker}-w-progress-heartbeat-{run}-{i}"})
+    return 2 * order.n
+
+
+@workflow.defn
+class SellerStreamJob:
+    """Hosts its own stream (``prior_state`` across continue-as-new, the contrib's recipe),
+    publishes from the workflow and from an activity, then waits for ``finish``."""
+
+    @workflow.init
+    def __init__(self, order: StreamOrder) -> None:
+        state = _STATE.validate_json(order.resume) if order.resume else None
+        self.stream = WorkflowStream(state)
+        self.done = False
+
+    @workflow.run
+    async def run(self, order: StreamOrder) -> StreamOut:
+        run = workflow.info().run_id
+        for i in range(order.n):
+            self.stream.topic(LISTED).publish(
+                {"s": f"{order.marker}-w-{LISTED}-workflow-{run}-{i}"}
+            )
+            self.stream.topic(AUDIT).publish({"s": f"{order.marker}-w-{AUDIT}-workflow-{run}-{i}"})
+        published = await workflow.execute_activity(
+            publish_both, order, start_to_close_timeout=timedelta(minutes=1)
+        )
+        if order.rounds > 1:
+            nxt = order.rounds - 1
+            await self.stream.continue_as_new(
+                lambda st: [
+                    order.model_copy(
+                        update={"rounds": nxt, "resume": _STATE.dump_json(st).decode()}
+                    )
+                ]
+            )
+        await workflow.wait_condition(lambda: self.done)
+        return StreamOut(published=published)
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.done = True
