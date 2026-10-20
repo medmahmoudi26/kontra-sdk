@@ -21,7 +21,8 @@ from collections.abc import Iterator
 
 import pytest
 
-from .support import Stack, kontra_argv, read_env_file
+from . import stack as e2e_stack
+from .support import Stack, read_env_file
 
 _GATE_IMAGE = "ghcr.io/medmahmoudi26/kontra-gate:dev"
 _TEMPORAL_IMAGE = "ghcr.io/medmahmoudi26/kontra-temporal:dev"
@@ -30,7 +31,7 @@ _TEMPORAL_IMAGE = "ghcr.io/medmahmoudi26/kontra-temporal:dev"
 def _missing() -> str | None:
     """Why the stack cannot come up here, or None."""
     if shutil.which("docker") is None:
-        return "tests/e2e need Docker (kontra dev runs the stack with docker compose)"
+        return "tests/e2e need Docker with the compose plugin (make stack-up runs compose.yaml)"
     for var, default, how in (
         ("KONTRA_TEMPORAL_IMAGE", _TEMPORAL_IMAGE, "`make temporal` builds kontra-temporal:dev"),
         ("KONTRA_GATE_IMAGE", _GATE_IMAGE, "kontra-cloud's `make image` builds kontra-gate:dev"),
@@ -44,34 +45,22 @@ def _missing() -> str | None:
     return None
 
 
-def _kontra(*args: str, timeout: float) -> str:
-    proc = subprocess.run(
-        kontra_argv(*args), capture_output=True, text=True, check=False, timeout=timeout
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"kontra {' '.join(args)} failed ({proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
-        )
-    return proc.stdout
-
-
 @pytest.fixture(scope="session")
 def stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
     reason = _missing()
     if reason is not None:
         pytest.skip(reason)
-    from kontra.cli._dev import _config, _gate_env, dev_env
     from kontra.profile import kontra_home
 
     home = kontra_home()
     try:
         started = time.monotonic()
-        _kontra("dev", "up", timeout=900)
+        e2e_stack.up()  # idempotent: `make e2e` already started it
         # The stack's start, for acceptance 1: `make e2e` brings it up before the session
         # and says how long that took; otherwise this `up` started it (or found it up).
         up_seconds = float(os.environ.get("KONTRA_E2E_UP_SECONDS") or (time.monotonic() - started))
-        settings = read_env_file(dev_env(home))
-        gate = _gate_env(_config(()))
+        settings = read_env_file(e2e_stack.stack_env())
+        gate = e2e_stack.gate_env(e2e_stack.config())
         yield Stack(
             home=home,
             gate_url=gate["KONTRA_PUBLIC_URL"].rstrip("/"),
@@ -88,4 +77,4 @@ def stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
         )
     finally:
         if os.environ.get("KONTRA_E2E_KEEP") != "1":
-            _kontra("dev", "down", "--volumes", timeout=300)
+            e2e_stack.down()

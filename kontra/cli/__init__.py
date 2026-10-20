@@ -9,7 +9,7 @@ kontra keys create|list|revoke                 API keys for programs (KONTRA_API
 kontra recipients add|list|revoke              keys others encrypt to you (I7)
 kontra devices list|add [--new-key]|remove      machines and browsers that read your jobs (I25)
 kontra init <name> [--party P]                 scaffold an offering (§6.1)
-kontra dev [up|down|status|logs]               the local stack (compose.yaml)
+kontra dev [up|down|status|logs]               the local stack (no containers)
 kontra publish | serve | contract [--dir D]    sell worker.py's offerings (§11.4, §6.5)
 kontra graph [--dir D] [--runs N] [--mermaid|--json]
                                                worker.py's workflows as a graph, from mock

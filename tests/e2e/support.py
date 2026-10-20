@@ -38,7 +38,7 @@ EXAMPLES = ROOT / "examples"
 #: Offerings written for these tests only; each test copies one into a temporary directory
 #: and writes its offering.yaml there.
 OFFERINGS = Path(__file__).resolve().parent / "offerings"
-PROJECT = "kontra-dev"
+PROJECT = "kontra-e2e"
 #: Environment variables a party's processes keep from ours (every other KONTRA_* is the
 #: stack's or the test run's, not the party's).
 _KEEP = frozenset({"KONTRA_TEMPORAL_CLI"})
@@ -181,11 +181,6 @@ class Stack:
         env = {k: v for k, v in os.environ.items() if not k.startswith("KONTRA_") or k in _KEEP}
         env.update(KONTRA_HOME=str(home), PYTHONUNBUFFERED="1", **extra)
         return env
-
-    def dev_env(self, home: Path) -> dict[str, str]:
-        """For ``kontra dev`` from another home: every stack setting of ours (ports, images)
-        but that home."""
-        return {**os.environ, "KONTRA_HOME": str(home), "PYTHONUNBUFFERED": "1"}
 
     # ------------------------------------------------------------------ parties
 

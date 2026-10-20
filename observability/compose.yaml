@@ -1,0 +1,258 @@
+# The observability stack `kontra dev up --observability` runs (decisions I34, §7): Prometheus
+# and its agent, Grafana, an OpenTelemetry Collector, Loki and Tempo. It is shipped in the wheel
+# (kontra/_dev/observability/compose.yaml) and run as its own project with `-p
+# kontra-dev-observability -f <this file>` and nothing a user chooses -- no `--env-file`, no extra
+# `-f`, no profiles -- so it cannot become a back door to the prod gate. It names no gate, no
+# Temporal image and no image of ours: the dev gate and Temporal are the in-process host's, not
+# containers.
+#
+# Prometheus's agent runs in the host's network namespace and scrapes, on the host's loopback,
+# the dev server's metrics (KONTRA_DEV_TEMPORAL_METRICS_PORT, 9463) and every `kontra serve
+# --metrics 127.0.0.1:PORT` on 9464-9473, then remote-writes to Prometheus's published port.
+# Prometheus itself scrapes the dev server through host.docker.internal for Docker Desktop, where
+# the host network namespace does not reach the host's loopback. Its config (which must follow
+# KONTRA_DEV_TEMPORAL_METRICS_PORT, and Prometheus expands no variables in a mounted file) is
+# written to a tmpfs by its entrypoint, as the agent's is. Configuration files sit beside this
+# one (./grafana, ./otelcol.yaml, ./loki.yaml, ./tempo.yaml) and the dashboards one directory up
+# (../docs/dashboards): the relative paths hold in a checkout and in the wheel.
+
+name: kontra-dev-observability
+
+services:
+  prometheus:
+    # prom/prometheus:v3.15.0
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    # Its config is written to the tmpfs before Prometheus starts (as the agent's is), so it can
+    # follow KONTRA_DEV_TEMPORAL_METRICS_PORT; not a mounted `configs` file, which cannot.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        printf '%s' "$$KONTRA_PROM_CONFIG" > /tmp/prometheus.yml && exec /bin/prometheus "$$@"
+      - prometheus
+    command:
+      - --config.file=/tmp/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      # What prometheus-agent remote-writes from the host's loopback arrives here.
+      - --web.enable-remote-write-receiver
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      # Prometheus's own scrape of the dev server, for Docker Desktop (where the host network
+      # namespace does not reach the host's loopback). JSON, which is YAML: one line.
+      KONTRA_PROM_CONFIG: >-
+        {"global": {"scrape_interval": "10s"},
+        "scrape_configs": [{"job_name": "temporal", "static_configs": [{"targets": [
+        "host.docker.internal:${KONTRA_DEV_TEMPORAL_METRICS_PORT:-9463}"]}]}]}
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    ports:
+      - "127.0.0.1:${KONTRA_DEV_PROMETHEUS_PORT:-9090}:9090"
+    tmpfs:
+      - /prometheus:size=512m,uid=65534
+      - /tmp:size=1m,uid=65534
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [observability]
+
+  prometheus-agent:
+    # prom/prometheus:v3.15.0 (Prometheus's image in agent mode: keep it in step with the service
+    # above)
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        printf '%s' "$$KONTRA_AGENT_CONFIG" > /tmp/agent.yml && exec /bin/prometheus "$$@"
+      - prometheus-agent
+    command:
+      - --agent
+      - --config.file=/tmp/agent.yml
+      - --storage.agent.path=/prometheus
+      - --web.listen-address=127.0.0.1:0
+    # The host's network namespace: the one way to the host's loopback.
+    network_mode: host
+    environment:
+      # The dev server's metrics (job temporal) beside every `kontra serve --metrics` on 9464 to
+      # 9473 (a port no worker serves is a target that is down), written to Prometheus's port.
+      KONTRA_AGENT_CONFIG: >-
+        {"global": {"scrape_interval": "10s"},
+        "scrape_configs": [
+        {"job_name": "temporal", "static_configs": [{"targets": [
+        "127.0.0.1:${KONTRA_DEV_TEMPORAL_METRICS_PORT:-9463}"]}]},
+        {"job_name": "kontra-serve", "static_configs": [{"targets": [
+        "127.0.0.1:9464", "127.0.0.1:9465", "127.0.0.1:9466", "127.0.0.1:9467",
+        "127.0.0.1:9468", "127.0.0.1:9469", "127.0.0.1:9470", "127.0.0.1:9471",
+        "127.0.0.1:9472", "127.0.0.1:9473"]}]}],
+        "remote_write": [{"url":
+        "http://127.0.0.1:${KONTRA_DEV_PROMETHEUS_PORT:-9090}/api/v1/write"}]}
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    tmpfs:
+      - /prometheus:size=64m,uid=65534
+      - /tmp:size=1m,uid=65534
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      prometheus:
+        condition: service_started
+    restart: unless-stopped
+
+  grafana:
+    # grafana/grafana:13.2.3
+    image: grafana/grafana:13.2.3@sha256:b28bae15e219c998fb0e0424ed724930cc61b1f61fb404d47c862f9a23f9e572
+    environment:
+      # Anyone on this machine's loopback uses it anonymously, as an Editor (the graph page's
+      # Logs and Trace links open Explore, which needs datasources:explore). No sign-in at all,
+      # every data source provisioned read-only, alerting and external snapshots off, nothing
+      # fetched from the internet.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_UNIFIED_ALERTING_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/temporal-core-sdks-otel.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_SNAPSHOTS_EXTERNAL_ENABLED: "false"
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    configs:
+      - source: grafana-datasources
+        target: /etc/grafana/provisioning/datasources/kontra.yaml
+      - source: grafana-dashboards
+        target: /etc/grafana/provisioning/dashboards/kontra.yaml
+      - source: temporal-sdk-dashboard
+        target: /etc/grafana/dashboards/temporal-core-sdks-otel.json
+      - source: temporal-server-dashboard
+        target: /etc/grafana/dashboards/server-general.json
+    tmpfs:
+      - /var/lib/grafana:size=64m,uid=472
+      - /tmp:size=16m
+    ports:
+      - "127.0.0.1:${KONTRA_DEV_GRAFANA_PORT:-3000}:3000"
+    user: "472"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: 0
+    networks: [observability, telemetry]
+
+  otelcol:
+    # otel/opentelemetry-collector-contrib:0.163.1 (the contrib build: the core one has no
+    # exporter Loki takes)
+    image: otel/opentelemetry-collector-contrib:0.163.1@sha256:1175b03003053962012f5a231f5567f66a3e8fdb960c7835c0e48f7aa1555806
+    command: ["--config=/etc/otelcol/config.yaml"]
+    configs:
+      - source: otelcol
+        target: /etc/otelcol/config.yaml
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    ports:
+      # What `kontra serve --otlp http://127.0.0.1:PORT` sends to: OTLP over gRPC.
+      - "127.0.0.1:${KONTRA_DEV_OTLP_PORT:-4317}:4317"
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+    networks: [telemetry]
+
+  loki:
+    # grafana/loki:3.7.8
+    image: grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193
+    command: ["-config.file=/etc/loki/kontra.yaml"]
+    configs:
+      - source: loki
+        target: /etc/loki/kontra.yaml
+    volumes:
+      - loki:/loki
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [telemetry]
+
+  tempo:
+    # grafana/tempo:3.1.0
+    image: grafana/tempo:3.1.0@sha256:3076b8dcdfb32fd6bc5ccef85e7b7313e6199b9cb84366257fc17ecb696db5fd
+    command: ["-config.file=/etc/tempo/kontra.yaml"]
+    configs:
+      - source: tempo
+        target: /etc/tempo/kontra.yaml
+    volumes:
+      - tempo:/var/tempo
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [telemetry]
+
+volumes:
+  loki:
+  tempo:
+
+# Mounted read-only; the paths are relative to this file, in a checkout and in the wheel.
+configs:
+  grafana-datasources:
+    file: ./grafana/datasources.yaml
+  grafana-dashboards:
+    file: ./grafana/dashboards.yaml
+  temporal-sdk-dashboard:
+    file: ../docs/dashboards/temporal-core-sdks-otel.json
+  temporal-server-dashboard:
+    file: ../docs/dashboards/server-general.json
+  otelcol:
+    file: ./otelcol.yaml
+  loki:
+    file: ./loki.yaml
+  tempo:
+    file: ./tempo.yaml
+
+networks:
+  observability:
+  telemetry:

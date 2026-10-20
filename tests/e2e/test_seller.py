@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import re
 import sys
 import time
@@ -89,24 +88,32 @@ def hire_with(k: Kontra, change: Callable[[m.HireView], m.HireView]) -> None:
 
 
 @pytest.mark.timeout(1800)
-async def test_ac01_init_dev_serve_yields_a_hireable_offering(stack: Stack, tmp_path: Path) -> None:
-    """``kontra init && kontra dev && kontra serve`` from a new home on this machine, timed;
-    the scaffold's own test passes; a buyer then hires the offering through the CLI and
-    accepts the delivery. The home is new but for the stack's ``dev.env`` (its credentials),
-    so ``kontra dev`` finds the stack that is running instead of starting a second one."""
+async def test_ac01_init_login_serve_hire_against_the_platform_gate(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """A new home logs in to the e2e stack's prod gate with dev login, then ``kontra init``,
+    the scaffold's own test, ``kontra serve`` and a CLI hire with ``--accept`` -- acceptance
+    1's prod-gate half (the hold lock, the Authorizer and JWKS polling run here and only here).
+    The no-container half is ``tests/cli/test_dev_stack.py``."""
     timings: dict[str, float] = {}
     started = time.monotonic()
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
-    (home / "dev.env").write_bytes((stack.home / "dev.env").read_bytes())
-    os.chmod(home / "dev.env", 0o600)
     seller_handle = handle("ac01")
 
     t = time.monotonic()
-    up = await run_kontra("dev", "--handle", seller_handle, env=stack.dev_env(home), within=900)
-    timings["kontra dev"] = time.monotonic() - t
+    up = await run_kontra(
+        "login",
+        "--dev",
+        "--gate",
+        stack.gate_url,
+        "--handle",
+        seller_handle,
+        env=stack.party_env(home),
+        within=900,
+    )
+    timings["kontra login --dev"] = time.monotonic() - t
     assert up.returncode == 0, up.stdout + up.stderr
-    assert f"logged in as {seller_handle}" in up.stdout
 
     seller = Party(seller_handle, home, Profile.load(home), stack)
     work = tmp_path / "work"
@@ -178,14 +185,13 @@ async def test_ac01_init_dev_serve_yields_a_hireable_offering(stack: Stack, tmp_
         )
     finally:
         await k.aclose()
-    # On a fresh machine `kontra dev` also starts the stack, which here the session did
-    # first (`make e2e`'s `kontra dev up`, from nothing after a `down --volumes`): that
-    # time counts too. Pulling the images does not (they are local).
+    # The e2e stack's start counts for acceptance 1 (`make e2e`'s `make stack-up`, from nothing
+    # after a `down`); pulling the images does not (they are local).
     with_stack = total + stack.up_seconds
     print(
         "\n[acceptance 1] "
         + ", ".join(f"{step} {secs:.1f}s" for step, secs in timings.items())
-        + f"; total {total:.1f}s; with the session's `kontra dev up` "
+        + f"; total {total:.1f}s; with the session's `make stack-up` "
         f"({stack.up_seconds:.1f}s) {with_stack:.1f}s"
     )
     assert with_stack < 3600
