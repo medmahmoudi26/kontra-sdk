@@ -839,7 +839,9 @@ plugin claims a worker by the entry class in its `workflows`. `KontraPlugin(*off
 offerings bound with `offering(...)` instead, for several on one client. Both take
 `stream_upload_budget` (seconds, default 2): how long one workflow task may spend storing its
 jobs' new stream items in the bucket; an item not stored by then reaches the buyer as a gap
-(`unavailable`), never as a failed task, so keep it well under your workflow task timeout.
+(`unavailable`), never as a failed task, so keep it well under your workflow task timeout
+(at most 8). `kontra serve` and `python worker.py` read it from `KONTRA_STREAM_UPLOAD_BUDGET`
+when set.
 A client built from a service client, `Client(service_client, plugins=[...])`, skips the
 connection hook: `await kontra.prepare()` before it. `kontra publish` still reads the offering
 from `worker.py`, so keep one beside `main.py` (`worker = serve(EnrichFlow)`, never run by

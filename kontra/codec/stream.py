@@ -63,9 +63,10 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -99,6 +100,8 @@ __all__ = [
     "STREAM_POLLS_MAX",
     "STREAM_REFS_MAX",
     "STREAM_UPLOAD_BUDGET",
+    "STREAM_UPLOAD_BUDGET_MAX",
+    "UPLOAD_BUDGET_ENV",
     "BlobRefs",
     "Envelope",
     "EnvelopeError",
@@ -116,6 +119,7 @@ __all__ = [
     "parse_offset",
     "replayed_payload",
     "seal_poll",
+    "upload_budget_from_env",
     "verified_item",
 ]
 
@@ -232,6 +236,28 @@ def check_upload_budget(seconds: float) -> float:
             f"{STREAM_UPLOAD_BUDGET_MAX:g}"
         )
     return float(seconds)
+
+
+#: The environment variable a worker reads its stream upload budget from, when none is given
+#: (``kontra serve``, ``python worker.py``): seconds, as :func:`check_upload_budget` takes.
+UPLOAD_BUDGET_ENV = "KONTRA_STREAM_UPLOAD_BUDGET"
+
+
+def upload_budget_from_env(env: Mapping[str, str] | None = None) -> float:
+    """``$KONTRA_STREAM_UPLOAD_BUDGET`` in seconds (above 0, at most
+    :data:`STREAM_UPLOAD_BUDGET_MAX`), else :data:`STREAM_UPLOAD_BUDGET`; a value that is not
+    one is logged and the default used, as ``$KONTRA_PROGRESS_INTERVAL`` is."""
+    raw = (env if env is not None else os.environ).get(UPLOAD_BUDGET_ENV)
+    if not raw:
+        return STREAM_UPLOAD_BUDGET
+    try:
+        return check_upload_budget(float(raw))
+    except ValueError:
+        log.warning(
+            "%s=%r is not a number of seconds above 0 and at most %g; using %g",
+            UPLOAD_BUDGET_ENV, raw, STREAM_UPLOAD_BUDGET_MAX, STREAM_UPLOAD_BUDGET,
+        )  # fmt: skip
+        return STREAM_UPLOAD_BUDGET
 
 
 @runtime_checkable

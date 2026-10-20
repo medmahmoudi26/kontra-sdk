@@ -358,6 +358,23 @@ async def test_one_upload_budget_per_completion() -> None:
     assert any(i.sha256 is not None for i in s.parse_envelope(late).items)
 
 
+def test_a_worker_takes_its_upload_budget_from_the_environment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``$KONTRA_STREAM_UPLOAD_BUDGET`` for a worker given none (a seller run as its own
+    process): unset or empty is the 2 s default; a valid number of seconds is taken; anything
+    else is logged and the default used, never a budget past the cap."""
+    env = s.UPLOAD_BUDGET_ENV
+    assert env == "KONTRA_STREAM_UPLOAD_BUDGET"
+    assert s.upload_budget_from_env({}) == s.upload_budget_from_env({env: ""}) == 2.0
+    assert s.upload_budget_from_env({env: "8"}) == s.upload_budget_from_env({env: "8.0"}) == 8.0
+    assert s.upload_budget_from_env({env: "0.5"}) == 0.5
+    for bad in ("0", "-1", "9", "inf", "nan", "two"):
+        caplog.clear()
+        assert s.upload_budget_from_env({env: bad}) == s.STREAM_UPLOAD_BUDGET
+        assert env in caplog.text
+
+
 def test_the_upload_budget_is_the_codecs_to_set() -> None:
     """2 s by default (``kontra serve``'s), any number of seconds above 0 and at most 8 given;
     0, a negative, one past 8 (under the 10 s task timeout), an infinite or a NaN budget

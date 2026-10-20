@@ -299,11 +299,12 @@ class Worker:
         setting of ``worker.py`` (``Worker()`` takes neither). A ``client`` given has its
         own, so passing them with one is a ``TypeError``.
 
-        ``stream_upload_budget``: :class:`~kontra.plugin.KontraPlugin`'s (default: the
-        plugin's, 2 s). Like the first three, for tests:
-        :meth:`kontra.testing.Marketplace.serve` gives a loaded test machine more.
+        ``stream_upload_budget``: :class:`~kontra.plugin.KontraPlugin`'s (default:
+        ``$KONTRA_STREAM_UPLOAD_BUDGET``, else the plugin's 2 s). Like the first three, for
+        tests: :meth:`kontra.testing.Marketplace.serve` gives a loaded test machine more, and
+        a seller run as its own process (``python worker.py``) takes it from the environment.
         """
-        from kontra.codec.stream import STREAM_UPLOAD_BUDGET
+        from kontra.codec.stream import upload_budget_from_env
         from kontra.plugin import TARGET, KontraPlugin
 
         if self._stack is not None:
@@ -319,7 +320,7 @@ class Worker:
             home=home,
             gate=gate,
             stream_upload_budget=(
-                STREAM_UPLOAD_BUDGET if stream_upload_budget is None else stream_upload_budget
+                upload_budget_from_env() if stream_upload_budget is None else stream_upload_budget
             ),
         )
         stack = contextlib.AsyncExitStack()
