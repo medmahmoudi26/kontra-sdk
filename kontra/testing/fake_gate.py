@@ -807,8 +807,6 @@ class _Job:
     settled: bool = False
     pending_stop: EffectKind | None = None
     pending_stop_reason: str = ""
-    #: A workflow stop is being carried out: the sweeper does not issue it a second time.
-    stopping: bool = False
     delivery: bytes | None = None
     split: Split | None = None
     resolution_note: str = ""
@@ -4089,21 +4087,13 @@ class FakeGate:
         """Carry out a stop through the job's engine, as :data:`kontra.engine.STOPS` maps
         escrow's effect: ``TERMINATE_RUN`` (a cancel's) ends the pinned lineage only (a run
         outside it is never stopped by a cancel); what it achieved for the money is read
-        back from the pinned lineage by the caller, never assumed. A stop already being
-        carried out is not issued again: the sweeper's next pass retries it only if it
-        failed."""
-        if job.stopping:
-            return
-        job.stopping = True
-        try:
-            bound = self._bound(job)
-            if bound is not None:
-                engine, handle = bound
-                stop, pinned = STOPS[kind]
-                pin = _pin(job.record.pin) if pinned else None
-                await engine.cancel(handle, stop=stop, pin=pin, reason=reason)
-        finally:
-            job.stopping = False
+        back from the pinned lineage by the caller, never assumed."""
+        bound = self._bound(job)
+        if bound is not None:
+            engine, handle = bound
+            stop, pinned = STOPS[kind]
+            pin = _pin(job.record.pin) if pinned else None
+            await engine.cancel(handle, stop=stop, pin=pin, reason=reason)
         if job.pending_stop is kind:
             job.pending_stop, job.pending_stop_reason = None, ""
 
