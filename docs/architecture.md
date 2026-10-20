@@ -3,14 +3,14 @@
 Kontra is a thin layer around Temporal: sellers run plain Temporal workers on their own
 hardware, buyers reach them through Nexus, and Kontra adds identity, a catalog, escrow and the
 Temporal frontend. This document describes how the code is cut so that the layer stays thin:
-the deployables, the five seams, and the rules that keep each seam honest. The design is the
+the deployables, the six seams, and the rules that keep each seam honest. The design is the
 PRD (`kontra-cloud/PRD.md`); where implementing it required a choice, the choice is in
 [decisions.md](decisions.md).
 
 - [What runs where](#what-runs-where)
 - [Two repositories, one direction](#two-repositories-one-direction)
 - [The package](#the-package)
-- [The five seams](#the-five-seams)
+- [The six seams](#the-six-seams)
 - [Names: constructed, never parsed](#names-constructed-never-parsed)
 - [A job, end to end](#a-job-end-to-end)
 - [One environment definition](#one-environment-definition)
@@ -84,14 +84,15 @@ is what lets a ledger adapter be swapped and keeps a future split into services 
 | `kontra.hire` | the buyer's `Kontra` client, `service()` for workflows, the hire worker |
 | `kontra.mcp` | `kontra mcp`, the eight agent tools and a seller's `workers`, built on `kontra.hire` |
 | `kontra.cli` | the `kontra` command; no business rule lives here |
-| `kontra.ledger`, `kontra.escrow` | the `Ledger` Protocol; the job and escrow rules as pure functions |
+| `kontra.ledger`, `kontra.escrow` | the `Ledger` Protocol; the job and escrow rules as pure functions, engine-neutral (a job's lineage is an opaque `pin`) |
+| `kontra.engine` | seam ⑥ (decisions I32): the gate↔engine Protocol and its types -- an opaque job handle, a pin, sealed-only content (`Sealed`, `SealedPayload`), `STOPS` mapping escrow's effects; imports no `temporalio`. `kontra.engine.temporal`: `TemporalEngine`, the only adapter, over `kontra._control` and `kontra._relay`, with the Workers view as its Temporal-only extension |
 | `kontra.workers` | the Workers view's verdict, as pure functions of what `DescribeTaskQueue` reports |
 | `kontra.graph` | a run's history read back as a graph (decisions I26): nodes, causal edges and status, the union of mock runs and a live run painted on it, Temporal UI and Grafana links, Mermaid; no payload without a codec, and the standard library only at import |
 | `kontra._relay` | the gate's stream relay (decisions I31): a job's workflow stream read with the poll Update and the offset Query only, on a relay token; the fake gate and the platform gate both use it, and it imports no `temporalio.contrib` |
-| `kontra._control` | the control-plane calls on Temporal's internal frontend (the Workers view's `DescribeTaskQueue` and `ListWorkers` among them), shared by the real and the fake gate |
-| `kontra.testing` | a fake for every seam: `fake_ledger`, `fake_gate`, a dev server with standalone Nexus, `Marketplace` |
+| `kontra._control` | the Temporal adapter's calls on the internal frontend (the Workers view's `DescribeTaskQueue` and `ListWorkers` among them), shared by the real and the fake gate |
+| `kontra.testing` | a fake for every seam: `fake_ledger`, `fake_gate`, `fake_engine` (`FakeEngine`), a dev server with standalone Nexus, `Marketplace`; and the contracts every adapter passes: `ledger_contract`, `engine_contract` |
 
-## The five seams
+## The six seams
 
 A seam is a boundary where one side cannot know the other's code, only its contract. Each has
 one contract and one test in CI, and **a change that crosses a seam updates that seam's test in
@@ -104,6 +105,16 @@ the same pull request.**
 | ③ | Contract document | the offering, seller to buyer: its types and facts (spec v2: `uses_hosted_model` when true, and no key) | `kontra/contract` + `spec/` | `tests/contract`; the golden `examples/*/contract.yaml`, reproduced byte for byte | `seams` |
 | ④ | Ledger | money state | the `Ledger` Protocol (`kontra/ledger.py`) | `kontra.testing.ledger_contract` (the §9.3 invariants, 10,000 random interleavings) against every adapter | `seams` |
 | ⑤ | Codec | plaintext to ciphertext | `kontra/codec` | round trips, plus scans of Temporal history, the bucket, a worker's metrics and exported spans (`tests/codec/test_codec_telemetry.py`) and the dev graph page's routes (`tests/codec/test_codec_console.py`) for a known plaintext marker | `seams` |
+| ⑥ | Engine | gate to engine (decisions I32): a party's isolated home and credential; an offering's route; the quote call; a job's handle, start, observation (status, provenance, pin, sealed result), liveness, stops, fence, and the stream relay | the `Engine` Protocol (`kontra/engine/__init__.py`) | `kontra.testing.engine_contract` and its teeth (`tests/engine/broken_engines.py`) against `FakeEngine` and against `TemporalEngine` on a dev server (`tests/engine`); isolation and the relay credential over the wire (`tests/temporal/test_engine_isolation_wire.py`) | `seams` (+ `deny-matrix` for the wire half) |
+
+Seam ⑥ is between the gate and an engine, and only there. Between a seller and its engine
+there is no abstraction: seller code is native `temporalio` (decisions I29), and the façade
+that once sat there is never rebuilt. The engine is a property of an offering version, fixed
+at publish (`PublishRequest.engine`, beside the contract hash, never shown to a buyer), and
+the gate dispatches every job op to that version's adapter. `kontra.engine.temporal` is the
+only adapter (Nexus, namespaces and task queues are its implementation detail); the Protocol
+was designed against Golem too, so no Temporal concept is in its types, and it never grows a
+workflow-authoring member (`MEMBERS` is pinned by a test).
 
 Every seam has a fake in `kontra.testing`, so each side can be built and tested without the
 other: a seller runs a full lifecycle, timeout and refund included, in a unit test with no
@@ -115,8 +126,9 @@ Rules that keep the seams real:
   canonicalises, hashes or validates a contract; `publish`, `serve` and the gate all call it.
   `kontra/escrow.py` is the only statement of who gets paid when; the real and the fake gate
   both run it. `kontra/workers.py` is the only code that turns a task queue's numbers into a
-  verdict; the real and the fake gate both run it too. `kontra._control` is the only code that
-  talks to the internal frontend.
+  verdict; the real and the fake gate both run it too. `kontra.engine.temporal`, over
+  `kontra._control`, is the only way a gate reaches Temporal (seam ⑥); `kontra._control` is the
+  only code that talks to the internal frontend.
 - **Sellers write native Temporal** (decisions I29, superseding D1/I20). Seller
   `workflows.py` and `activities.py` import `temporalio` directly and nothing from `kontra`, so
   without `worker.py` they run on any Temporal worker (all but `Artifact` I/O, which needs the
@@ -171,6 +183,12 @@ a trailing newline. So every Temporal identifier is built in one place,
   ASCII-only `fullmatch` patterns and length limits, never stripped or normalised first.
 - The one inverse that exists, workflow id to job id, is construct-and-compare: a candidate is
   accepted only if rebuilding the workflow id from it reproduces the input exactly.
+- A job's engine handle (seam ⑥, decisions I32) is opaque bytes the adapter minted at hire and
+  the gate stores verbatim. Only that adapter reads it -- strictly, before any I/O: its prefix and
+  size, exactly its keys, each field by its own anchored validator, and the bytes rebuilt from
+  the fields must be the input -- and then *constructs* the namespaces, workflow id and service
+  from those fields with `names.py`. It is never shown to a party and never authorizes anything:
+  provenance is the engine's records against the gate's own holds.
 
 ## A job, end to end
 
@@ -180,8 +198,9 @@ a trailing newline. So every Temporal identifier is built in one place,
    handler, which runs `quote`. The answer comes back in plaintext (the gate must read the
    price) and the gate records it as a quote with an expiry.
 2. **Hire.** The buyer's client makes the job's own age key and sends its public half with
-   the hire; the gate locks the price in the ledger against a new job id and signs a hold
-   token that names that key (`buyer_key`), never one of the buyer party's. The buyer's
+   the hire; the gate locks the price in the ledger against a new job id, binds the job to the
+   version's engine (an opaque handle, seam ⑥) and signs a hold token that names that key
+   (`buyer_key`), never one of the buyer party's. The buyer's
    client starts `execute` as a standalone Nexus operation **in the buyer's own namespace**,
    with the token in the `kontra-hold` header and the job's `max_duration` as its
    schedule-to-close timeout. (A buyer workflow is itself the Nexus caller; clients without
@@ -196,8 +215,10 @@ a trailing newline. So every Temporal identifier is built in one place,
    each item sealed to the job's parties on its own, and merges them with liveness it reads
    from history metadata into the job's stream (`GET /v1/jobs/{id}/stream`, decisions I31).
 5. **Delivery.** The result is encrypted to the job's key (and every recipient of the
-   seller's) and travels back through Nexus; the gate, watching `job-<id>` through the
-   internal frontend, records the delivery and its hash and opens the review window.
+   seller's) and travels back through Nexus; the gate, observing the job through its engine's
+   adapter (`job-<id>` through the internal frontend), records the delivery and its hash and
+   opens the review window. The adapter hands the gate only the codec's sealed envelope: a
+   completion that is not one is no delivery, refunded against the seller (decisions I32).
 6. **Settlement.** Accept, or silence until the window closes, releases the hold to the seller
    minus the platform fee; reject opens a dispute. A failure, a missed deadline or a cancel
    refunds. A cancel of a job whose run the gate has seen terminates that run first and

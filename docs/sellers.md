@@ -739,7 +739,10 @@ Temporal name are refused, naming both: rename one (`@activity.defn(name=...)`).
 through verbatim: `workflows=[Child]` registers further workflows, unbound, for the children
 `Flow` starts; `activities=[...]` adds to what was found (methods decorated as activities need
 their instance: `activities=[obj.method]`); `plugins=[...]` adds Temporal plugins. `quote=`
-passes another quote function.
+passes another quote function. `engine=` names the engine the offering runs on, which serve()
+already derives from the entry -- your code is `temporalio`, so `temporal` -- and may only say
+the same: it is published beside the contract, never in its hash, and fixed per version
+(decisions I32).
 
 **Plugins.** A plugin that is also a client plugin -- any `temporalio.plugin.SimplePlugin`:
 Temporal's `OpenAIAgentsPlugin`, the agent harness's `AgentHarnessPlugin`,

@@ -205,7 +205,7 @@ What Kontra can and cannot see, the threat model, and the limits: [docs/security
 | [docs/sellers.md](docs/sellers.md) | writing, testing, publishing and serving an offering |
 | [docs/buyers.md](docs/buyers.md) | hiring from the CLI, a script, a workflow, or an agent |
 | [docs/security.md](docs/security.md) | threat model, encryption and the Authorizer |
-| [docs/architecture.md](docs/architecture.md) | the five seams, the one-way rule, how names are built |
+| [docs/architecture.md](docs/architecture.md) | the six seams, the one-way rule, how names are built |
 | [docs/decisions.md](docs/decisions.md) | implementation decisions, checked against Temporal and nexgen |
 | [spec/](spec/README.md) | the contract document's `x-kontra` extension and reserved types |
 | [temporal/authorizer](temporal/authorizer/README.md) | the Temporal server, its policy and its configuration |

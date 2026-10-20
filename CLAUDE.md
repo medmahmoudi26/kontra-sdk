@@ -29,6 +29,7 @@ crosses a seam updates that seam's test **in the same PR**.
 | ③ | Contract document | `kontra/contract` + `spec/` | golden `examples/*/contract.yaml` reproduced byte for byte |
 | ④ | Ledger | `kontra/ledger.py` Protocol | `kontra.testing.ledger_contract` against every adapter |
 | ⑤ | Codec | `kontra/codec` | round trips + the marker-string scan of bucket, history, a worker's metrics endpoint and its exported spans, the dev graph page's routes, and a job's stream: the stream envelope in history, the relayed SSE bytes and the gate's stream store (`tests/serve/test_streams.py`) |
+| ⑥ | Engine | the `kontra.engine` Protocol (gate↔engine only; never a workflow-authoring surface, `docs/decisions.md` I32) | `kontra.testing.engine_contract` against every adapter (`FakeEngine`; `TemporalEngine` on the dev server, `tests/engine`; isolation and the relay credential over the wire, `tests/temporal`) |
 
 ## Rules that keep the design honest
 
@@ -39,6 +40,13 @@ crosses a seam updates that seam's test **in the same PR**.
   assigned by the catalog; nothing derives an offering from one or authorizes by its shape
   (`docs/decisions.md` I1, I3). Validate typed input with anchored `fullmatch`, never `re.match`.
 - `kontra/escrow.py` holds the job rules as pure functions; both gates (real and fake) use it.
+- The gate reaches an engine only through `kontra.engine` (seam ⑥): the engine is a property of
+  the offering version, fixed at publish (`PublishRequest.engine`, beside the contract hash, never
+  in a buyer's view). The Protocol never grows a workflow-authoring member (`MEMBERS` is pinned by
+  a test; `engine.execute_activity(...)` is the façade crawling back), names no Temporal concept
+  in its types, and hands the gate content only as `Sealed`/`SealedPayload`. A job handle is
+  opaque bytes only its adapter parses, strictly, before any I/O; it never authorizes anything.
+  `kontra.engine.temporal` is the only adapter; seller code stays native `temporalio`.
 - Seller `workflows.py` and `activities.py` are vanilla Temporal (`docs/decisions.md` I29): they import
   `temporalio` directly and nothing from `kontra`, so deleting `worker.py` leaves code that runs on any
   Temporal worker, unmodified. `worker.py` is the one file of an offering that imports `kontra`

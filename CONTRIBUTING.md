@@ -36,7 +36,7 @@ order, so a green `make check` is a green pull request:
 | `lint` | `make lint` | `ruff check`, `ruff format --check`, and `.github/scripts/check_docs.py` |
 | `typecheck` | `make typecheck` | `pyright`, strict, over `kontra/` |
 | `test` | `make test` | the unit tests (pytest), with a real Temporal dev server |
-| `seams` | `make seams` | the seam tests ② to ⑤: gate API, contract and golden files, ledger, codec |
+| `seams` | `make seams` | the seam tests ② to ⑥: gate API, contract and golden files, ledger, codec, engine |
 | `deny-matrix` | `make deny-matrix` | seam ①: `go vet` and `go test` in `temporal/authorizer`, then `tests/temporal` over the wire against the locally built server |
 
 Notes:
@@ -78,8 +78,8 @@ it, end to end and below, with the last full run.
 
 ## Rules every change keeps
 
-- **Seams.** A change that crosses one of the five seams updates that seam's test in the same
-  pull request (table in [docs/architecture.md](docs/architecture.md#the-five-seams)). A golden
+- **Seams.** A change that crosses one of the six seams updates that seam's test in the same
+  pull request (table in [docs/architecture.md](docs/architecture.md#the-six-seams)). A golden
   contract that changes is a contract change: regenerate it with
   `UPDATE_GOLDEN=1 pytest tests/examples/test_golden.py` and explain the diff in the PR.
 - **The one-way rule.** This package never imports the platform; it speaks HTTP to the gate

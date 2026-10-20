@@ -360,8 +360,9 @@ upgrades.
 ## Escrow and the hold token
 
 Money moves by pure functions (`kontra/escrow.py`), the same in the real gate and the fake
-one, over three kinds of fact: the state of the seller's handler workflow `job-<id>` as the
-gate reads it from Temporal, the clock, and the buyer's accept, reject and cancel calls. No
+one, over three kinds of fact: the state of the job's run as the gate reads it through its
+engine's adapter (seam ⑥; on Temporal the seller's handler workflow `job-<id>`), the clock,
+and the buyer's accept, reject and cancel calls. No
 party's report moves money. The ledger is double-entry; every event's postings sum to zero,
 and the §9.3 invariants are a property test every ledger adapter must pass.
 
@@ -372,6 +373,41 @@ it in the `kontra-hold` Nexus header. The seller's handler verifies it with the 
 (fetched at start, re-fetched only for an unknown key id, at a bounded rate), so no gate call
 sits on the job-start path. A start after the expiry is refused, which refunds the job by the
 deadline rule.
+
+## Seam ⑥: what an engine adapter must prove before it ships
+
+The gate reaches every engine through `kontra.engine` (decisions I32). Temporal is the only
+adapter (`kontra.engine.temporal`); a second one ships only once it proves, with
+`kontra.testing.engine_contract` run unchanged against it and over the wire where it applies:
+
+- **Isolation (`isolate`).** A party's credential reaches its own jobs and nothing of any other
+  party's, and holds no control power: it cannot provision a home, expose a route, fence a job
+  or stop a lineage it does not own. Untrusted code runs with it. On Temporal this is the
+  Authorizer's party rule (I3, I30), proven by E18 over the wire on Kontra's server; a dev
+  server proves nothing here, and the contract reports E18 skipped there.
+- **END is irreversible by the seller.** Once a lineage is ended, no party's credential can
+  bring it back or have another run speak for it (E6). On Temporal, Reset is denied to every
+  token (I30) and an observation of the pinned chain never reports a run outside it; on an
+  engine whose stop is resumable (Golem's `interrupt`), END must also delete or withhold resume.
+- **Provenance only from engine-written records.** A run counts for the buyer only when records
+  no party can write after the fact say the buyer's start began it, carrying a hold the gate
+  issued (I15; E9). Nothing the seller's code returns decides it.
+- **Sealed outputs only, sealed on the seller's side.** A delivery leaves an adapter only as
+  `SealedPayload` (the codec's envelope) and a stream item only as `Sealed` (an age file), both
+  checked when the value is built; a completion that is not sealed is `UNSEALED`, its bytes
+  dropped by the adapter, refunded against the seller (OD3; E12). Sealing happens in the
+  seller's codec, never in the gate-side adapter, which would otherwise hold plaintext. The one
+  plaintext that crosses is a quote's answer, a price. (The check is structural: the gate holds
+  no key to prove the age file is one to the buyer; the seller who seals to the wrong key has
+  only failed its own delivery.)
+- **The relay credential's scope.** The credential `stream` uses is minted inside the adapter,
+  confined to one job's stream and revocable by its session; it is never handed to a party. On
+  Temporal it is I30's relay principal (`relay/<namespace>/job-<id>`, no permission), proven by
+  E14 over the wire.
+- **The handle authorizes nothing.** A job handle is opaque bytes stored on the job row and
+  parsed only by the adapter that minted it, strictly and before any I/O (E3). Its integrity is
+  the gate database's, as for every job column: a well-formed handle written there by someone
+  with database access would be acted on, which is why provenance never trusts it.
 
 ## Contracts and input
 
