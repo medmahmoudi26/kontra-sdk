@@ -6,12 +6,17 @@ policy (PRD §10.4, `docs/decisions.md` I3). It is the blocking Phase 0 isolatio
 (PRD §15): if a cell of the deny matrix could not be enforced, this package would say so.
 Every cell can be enforced.
 
-- `authorizer.go` — the policy, a `temporal.authorization.Authorizer`. Under 170 lines, no
-  string parsing, no request-body inspection; decisions are exact string equality and set
-  membership only.
+- `authorizer.go` — the policy, a `temporal.authorization.Authorizer`. Every allow justified
+  in a comment, no string parsing; decisions are exact string equality and set membership
+  only. One rule reads the request: the stream relay's, which takes two typed fields of the
+  message Temporal already decoded and compares each, whole, with a value it constructs, then
+  compares the whole message's encoded size with `RelayRequestMax` (4 KiB), one integer
+  comparison, then its payloads' count and metadata with the one shape the gate's relay sends
+  (nothing decoded), and holds the relay subject to `RelayRate` requests a second, the policy's
+  only state (decisions I30).
 - `callbackguard/` — the one check the Authorizer cannot make: a Nexus completion callback
   token may only complete the operation it was issued for (see below). Separate on
-  purpose: it reads request bodies, the policy never does.
+  purpose: it validates what a request carries, the policy decides who may make a call.
 - `revocation/` — refuses the worker tokens of sessions the gate revoked (see below): a
   wrapper around Temporal's default claim mapper that only ever refuses more.
 - `cmd/kontra-temporal` — the server binary (`serve`, `setup-schema`, `register-namespace`).
@@ -28,15 +33,41 @@ Two listeners. The **internal frontend** is never published; Temporal maps every
 there to its own internal principal (the gate, and Temporal itself), which may do anything.
 The **public frontend** is the only one reachable from outside (behind Kontra's TLS proxy),
 and every caller there presents a short-lived JWT verified by Temporal's default claim
-mapper against Kontra's JWKS. The one permission that means anything on the public frontend
-is `"<namespace>:worker"`.
+mapper against Kontra's JWKS. Three kinds of token mean anything there (`docs/decisions.md`
+I30), told apart in this order:
+
+1. a **party token** carries a permission -- a permission string the default mapper turns
+   into a namespace key (any `"<namespace>:<role>"`, even an unknown role) or into a system
+   role it knows (`temporal-system:` with `read`, `write`, `admin` or `worker`) -- and the
+   one that grants anything is `"<namespace>:worker"`. A seller's worker token, a seller's
+   API-key session, a buyer and the dev party all hold this token; they are identical on the
+   wire. A token with a permission is judged by this rule alone, whatever its subject says;
+2. the **worker controller** (KON-15) carries no permission and the subject
+   `platform/worker-controller` (`ControllerSubject`);
+3. the gate's **stream relay** carries no permission and the subject
+   `relay/<namespace>/job-<32 hex>` (`RelaySubject`, the twin of
+   `kontra.contract.names.relay_subject`).
+
+A permission string the mapper drops is no permission: `temporal-system:` with a role it
+does not know (no role, and no namespace key), an entry with no `:`, an entry that is not a
+string, a `permissions` claim that is not a list. A token carrying only those is judged by
+its subject, like one that carries none.
+
+So the kinds are told apart twice. The gate mints a party token with a permission and the
+other two with none (each principal has its own mint, with no role parameter); and a party's
+subject is its handle, which never contains `/`, while both other subjects do. The second
+holds whatever the token's permissions say; the first only as long as the gate writes no
+permission the mapper drops.
 
 | Caller (on the public frontend) | Allowed | Denied |
 |---|---|---|
 | **No token** | `Health/Check`, `GetSystemInfo`, `GetClusterInfo` | everything else |
 | **Malformed token** (expired, unknown `kid`, `alg:none`, HS256-with-public-key, wrong or missing audience, a gate API token) | — | everything (rejected at claim-mapping, before the authorizer) |
-| **`worker` in A** (seller or buyer) | the WorkflowService allowlist below, in namespace **A** only | any namespace B; every OperatorService / AdminService call; the Nexus HTTP API (`DispatchNexusTask`, completions); namespace admin, batch, schedules, resets, deletes, deployments |
-| **any other role** (`admin`, `write`, `read`, `temporal-system:*`), even alongside `worker` | nothing beyond what `worker` in A grants | everything those roles would grant on a stock Temporal — including all Operator/Admin APIs |
+| **`worker` in A** (a party token: seller, buyer, API-key session, dev party) | the WorkflowService allowlist below, in namespace **A** only, including updates, queries, signals, cancel and terminate of A's own workflows | any namespace B, `temporal-system` and the platform namespace `kontra-system`; every OperatorService / AdminService call; the Nexus HTTP API (`DispatchNexusTask`, completions); namespace admin, batch, schedules, resets, deletes, pause, workflow options, worker deployments and versioning, compute config |
+| **stream relay** for job J of A (`sub = relay/A/job-J`, no permissions) | `UpdateWorkflowExecution` with update name `__temporal_workflow_stream_poll`, and `QueryWorkflow` with query type `__temporal_workflow_stream_offset`, on workflow `job-J` in namespace **A** only, each request at most `RelayRequestMax` (4 KiB) encoded, shaped as the gate's relay builds it (a poll's one `json/plain` argument, no header; the query none), at most `RelayRate` (10) a second | every other API (`PollWorkflowExecutionUpdate`, describe, history, signal — the stream's publish signal included — start, `ExecuteMultiOperation`); any other update or query (`__stack_trace` included); any other workflow of A; job J's id in any other namespace; a poll or offset query over 4 KiB, whatever field (topics, identity, header, arguments) makes it so; any other argument shape or a header; past its rate |
+| **worker controller** (`sub = platform/worker-controller`, no permissions) | the 10 worker-deployment, task-queue and count calls in `ControllerAPIs`, in the platform namespace `kontra-system` only | every call in any other namespace; in `kontra-system`: polls, start, describe, signal, update, query, terminate, reset, delete, batch, schedules, `ListWorkerDeployments`, `CreateWorkerDeployment`, the three compute-config calls, versioning rules |
+| **any other role** (`admin`, `write`, `read`, an unknown role in a namespace, `temporal-system:read`/`write`/`admin`/`worker`), even alongside `worker`, whatever the token's subject (a relay's or the controller's included) | nothing beyond what `worker` in A grants | everything those roles would grant on a stock Temporal — including all Operator/Admin APIs |
+| **a permission the mapper drops** (`temporal-system:` with an unknown role, no `:`, not a string, a claim that is not a list) | no permission: the token is judged by its subject, so the controller's or a relay's subject gets exactly that principal's calls | as for that subject |
 | **buyer `worker` in C** | start/describe its own workflows and standalone Nexus operations in C; call any endpoint via Nexus | describe / query / list / signal / cancel / poll **anything** in a seller's namespace A, including the handler workflow its own job started |
 | **control plane** (internal frontend only) | everything: create namespaces and Nexus endpoints, watch jobs, history's Nexus dispatch and completions | — (only reachable on the private network) |
 
@@ -56,12 +87,69 @@ here. Without it `temporal task-queue describe` fails for sellers and KEDA's Tem
 scaler, which calls exactly this RPC, cannot scale workers against Kontra's frontend. It
 sits in the same class as `DescribeNamespace` and `CountWorkflowExecutions`.
 
+A party steers its own workflows: updates, queries and signals (between its own workflows
+too), cancel and terminate. Escrow reads nothing these can write: a job's facts are the
+server-recorded status of its pinned run chain, provenance from the buyer's own records, the
+clock and the buyer's gate calls, and a seller that stops its own job is refunded against.
+What escrow does depend on is denied to every token: a reset (it can revive a terminated
+pinned run, completion callbacks included), deletes of workflows and Nexus operations and
+namespace updates (a buyer's missing record turns a delivery into a refund), batch
+operations and schedules (they act as Temporal's internal principal, past this policy and
+the callback guard), and compute config (the server would provision and invoke workers on a
+cloud provider itself).
+
+### The stream relay and the worker controller
+
+The relay's rule is the only one that reads a request. For an `UpdateWorkflowExecutionRequest`
+under `UpdateWorkflowExecution`, or a `QueryWorkflowRequest` under `QueryWorkflow` — any
+other request type, none (a stream), or a type under another API's name is denied — it takes
+the workflow id and the update name or query type from the typed message Temporal already
+decoded, requires the handler name to equal its constant, and compares the token's subject,
+whole, with `RelaySubject(request namespace, request workflow id)`. Nothing is split or
+unescaped: a namespace is a handle and a job's workflow id is `job-<32 hex>`, neither holds
+a `/`, so only the job the subject was built from rebuilds it. Run ids, update ids, the data
+of payloads and callbacks are not read, only counted: next, a request whose encoded size
+(`proto.Size` of the whole message) is over `RelayRequestMax`, 4 KiB, is denied. The largest
+the gate's relay builds is 898 bytes (`TestRelayRequestMax`); the cap keeps what a relay token's requests can
+add to one workflow task of its job far below Temporal's 4 MiB gRPC message limit, and does
+not apply to a party's own requests. Callbacks are the callback guard's, which applies to the
+relay and the controller as to every other token. A relay needs nothing else: re-sending its
+Update with the same update id returns the outcome, and with an empty run id it follows a
+continue-as-new. `PollWorkflowExecutionUpdate` is denied because it names no update and
+would read any update's outcome by id. Every completed poll's outcome is written to the job's
+history, so a leaked relay token's polls spend it; the size cap holds requests, not answers,
+and the authorizer never sees an answer, so it cannot bound that: the job's side does
+(`docs/security.md`, decisions I30).
+
+Then the request's shape: a poll's one argument with metadata exactly `{encoding: json/plain}`
+and no header, the offset query neither (`relayShaped`; the count and metadata are compared,
+a payload's data is never read). Every payload of a request is decoded by the seller's worker
+(Kontra's codec, temporalio's external storage) before the job's validator can refuse it, and
+one it cannot decode — a Kontra ciphertext, a claim-check reference it would fetch — fails the
+job's workflow task on every attempt, so only the shape the gate's relay sends may reach it
+(deploy the rule before, or with, the first relay token a gate mints). Last, the rate: each
+relay subject is held to `RelayRate` (10) requests a second (`RelayBurst` 20, per frontend
+process; Kontra runs one), refused past it with `RelayRateReason`, on which a relay waits
+instead of stopping. Only a request every other check allowed spends the rate, and the
+authorization interceptor runs before Temporal's namespace rate limiter, so a relay token
+spends at most 5% of its namespace's 200 requests a second. The rate slows what a leaked relay
+token's polls add to its job's history; it does not bound it. Both were decided in the owner's
+place and are listed on #59 (decisions I30, Q10 and Q11).
+
+The controller is `temporal-worker-controller` rolling out Kontra's own workers. It may make
+the 10 calls in `ControllerAPIs` (describe, promote, ramp, manage, annotate and retire worker
+deployments and versions, check their queues for pollers, count pinned workflows still
+running), in the platform namespace `PlatformNamespace` (`kontra-system`, a reserved handle
+no party can take) only. It cannot start or describe a workflow (rollout gate workflows are
+not supported), and no token may touch compute config. Kontra's own workers in that
+namespace hold ordinary `kontra-system:worker` party tokens.
+
 ### Why there is no publisher role
 
 The PRD's `publisher` role — a token allowed to create a Nexus endpoint whose name started
-with its namespace — is gone (`docs/decisions.md` I3). It was the only rule that had to read
-a request body and parse a name, and endpoint names are now opaque random strings that mean
-nothing (I1). Publishing is a gate call with a fresh human session; the gate then creates the
+with its namespace — is gone (`docs/decisions.md` I3). It was a prefix test of a name an
+attacker chooses, and endpoint names are now opaque random strings that mean nothing (I1).
+(The relay's rule is the opposite: whole-string equality with a string it builds.) Publishing is a gate call with a fresh human session; the gate then creates the
 endpoint itself through the internal frontend. So **no JWT ever reaches an Operator or Admin
 API**, with no exception, and the authorizer has no name-parsing rule to get wrong.
 
@@ -216,9 +304,16 @@ a Docker client's proxy settings into every container.
 ## Tests
 
 - `GOFLAGS=-p=1 go test ./...` — the deny matrix (every cell against Kontra's authorizer,
-  Temporal's no-op authorizer and Temporal's default authorizer), a full sweep of every
-  frontend API against every kind of caller, a check that every listed API is a real unary
-  gRPC method, the callback guard (every carrier, every header spelling, every URL), the config /
+  Temporal's no-op authorizer and Temporal's default authorizer, each with the typed request
+  Temporal would hand it), a full sweep of every frontend API (both reflection versions and
+  the Nexus HTTP routes included) against every kind of caller, namespace and a favourable,
+  an oversized and hostile requests, the relay's size cap at its edge, the relay's request
+  shape and its rate (`TestRelayRate`: a bucket per subject, refilled on a fake clock, safe
+  under concurrent calls; full buckets swept), a check that every
+  listed API is a real unary gRPC method and that no
+  allowlist holds a call escrow depends on, the relay subject's golden vectors shared with
+  the Python twin (`testdata/principals.json`) and its injectivity, Temporal's own
+  interceptor handing the authorizer the decoded request, the callback guard (every carrier, every header spelling, every URL), the config /
   dynamic-config checks (including the pins holding at runtime), and one real server start
   with the internal frontend bound to `127.0.0.2` (skipped under `-short`, or where that
   address cannot be bound).
