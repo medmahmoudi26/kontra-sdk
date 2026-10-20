@@ -3,27 +3,34 @@
 One host process (``python -m kontra.devgate``) runs :class:`~kontra.devgate.gate.DevGate` under
 uvicorn on its main loop and a :class:`~kontra.devgate.temporal.TemporalChild` as its child. An
 ASGI wrapper checks the ``Host`` header on every request (a page that rebinds a name to 127.0.0.1
-is refused) and answers three control routes outside the seam ② table -- ``GET /_devgate/ready``,
+is refused) and answers control routes outside the seam ② table -- ``GET /_devgate/ready``,
 ``POST /_devgate/config``, ``POST /_devgate/stop`` -- which need the bearer token (stdin only,
-constant-time compare) and no ``Origin``. The gate stands in for the platform and never holds a
-party's key, so the codec server stays its own process (started by the CLI, not here).
+constant-time compare) and no ``Origin``. ``GET /_devgate/hello?nonce=N`` needs no token: it is
+how the host proves it holds one (:func:`~kontra.devgate.state.hello_proof`) before the CLI
+sends it to a port that a stale record names. The gate stands in for the platform and never
+holds a party's key, so the codec server stays its own process (started by the CLI, not here).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import json
 import logging
+import re
 import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qs
 
 import uvicorn
 
+from kontra.devgate import store
 from kontra.devgate.gate import DevGate, platform_defaults
+from kontra.devgate.state import hello_proof
 from kontra.devgate.temporal import TemporalChild
 from kontra.gate_client import models as m
 
@@ -31,11 +38,15 @@ if TYPE_CHECKING:
     from kontra._control import Control
     from kontra.devgate.state import Ports
 
-__all__ = ["CONTROL_PREFIX", "DevStack", "StackConfig"]
+__all__ = ["CONTROL_PREFIX", "PERSIST_EVERY", "DevStack", "StackConfig"]
 
 CONTROL_PREFIX = "/_devgate/"
+#: Seconds between ``--persist`` passes (a crash loses at most this much, §5.4).
+PERSIST_EVERY = 10.0
 _OPEN_STATES = frozenset({m.JobState.SUBMITTED, m.JobState.WORKING})
+_NONCE = re.compile(r"[0-9a-f]{32,128}", re.ASCII)
 _access = logging.getLogger("kontra.devgate.access")
+_log = logging.getLogger("kontra.devgate")
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +87,9 @@ class DevStack:
         self._server: uvicorn.Server | None = None
         self._serving: asyncio.Task[None] | None = None
         self._persist_task: asyncio.Task[None] | None = None
+        self._persist_stop: asyncio.Event | None = None
+        self._last_digest: str | None = None
+        self._blobs: store.BlobFiles | None = None
         self.gate: DevGate = None  # type: ignore[assignment]  # set in __aenter__
 
     @property
@@ -83,10 +97,19 @@ class DevStack:
         assert self._temporal is not None
         return self._temporal.http_base
 
+    @property
+    def temporal_http_port(self) -> int:
+        """The Temporal HTTP API's kernel-chosen port (what ``stack.json`` records)."""
+        assert self._temporal is not None
+        return self._temporal.http_port
+
     # ------------------------------------------------------------------ lifecycle
 
     async def __aenter__(self) -> DevStack:
-        from kontra._control import Control
+        """Start Temporal, then the gate. Whatever fails after the Temporal child started (the
+        connect, a refused ``--persist`` state, a taken gate port) stops it before the error
+        propagates: ``__aexit__`` does not run when ``__aenter__`` raises, and an orphaned
+        child would keep the Temporal port."""
         from kontra.devgate import state
 
         self._loop = asyncio.get_running_loop()
@@ -104,8 +127,19 @@ class DevStack:
             metrics_port=p.temporal_metrics if self._metrics else None,
         )
         await self._temporal.start()
+        try:
+            await self._open()
+        except BaseException:
+            await self._shutdown(quiet=True)
+            raise
+        return self
+
+    async def _open(self) -> None:
         from temporalio.client import Client
 
+        from kontra._control import Control
+
+        assert self._temporal is not None
         client = await Client.connect(self.temporal_address)
         self._control = Control(client, self._temporal.http_base)
         self.gate = DevGate(
@@ -122,24 +156,36 @@ class DevStack:
             self._snapshot_now()
         await self._start_serving()
         if self._persist:
-            self._persist_task = self._loop.create_task(
-                self._persist_loop(), name="devgate-persist"
-            )
-        return self
+            self._start_persisting()
 
     async def __aexit__(self, *exc: object) -> None:
-        if self._persist_task is not None:
-            self._persist_task.cancel()
-        if self._persist:
-            self._snapshot_now()
-        if self._server is not None:
-            self._server.should_exit = True
-        if self._serving is not None:
-            await self._serving
-        if self._temporal is not None:
-            await self._temporal.stop()
-        if self._control is not None:
-            await self._control.aclose()
+        try:
+            await self._stop_persisting()
+            if self._persist:
+                self._snapshot_now()
+        finally:
+            await self._shutdown(quiet=False)
+
+    async def _shutdown(self, *, quiet: bool) -> None:
+        """Stop serving, then the Temporal child, then the control client -- each even when an
+        earlier step fails. ``quiet``: a server that never started cleanly is not re-raised
+        (the caller is already raising the startup error)."""
+        try:
+            if self._server is not None:
+                self._server.should_exit = True
+            if self._serving is not None:
+                if quiet:
+                    with contextlib.suppress(BaseException):
+                        await self._serving
+                else:
+                    await self._serving
+        finally:
+            try:
+                if self._temporal is not None:
+                    await self._temporal.stop()
+            finally:
+                if self._control is not None:
+                    await self._control.aclose()
 
     async def wait_closed(self) -> None:
         if self._serving is not None:
@@ -178,7 +224,9 @@ class DevStack:
 
     async def reconfigure(self, *, ui: bool, metrics: bool, persist: bool) -> dict[str, Any]:
         """Apply a ``POST /_devgate/config``: restart the Temporal child only when ``ui`` or
-        ``metrics`` changed; snapshot at once when ``persist`` turns on."""
+        ``metrics`` changed; snapshot at once when ``persist`` turns on. Turned off, nothing is
+        written again (the loop is stopped) and the snapshot is deleted: the state is in memory
+        from now, and a crash cannot bring back what was kept before."""
         assert self._temporal is not None
         restarted = False
         if ui != self._ui or metrics != self._metrics:
@@ -187,14 +235,14 @@ class DevStack:
             self._temporal.metrics_port = self.config.ports.temporal_metrics if metrics else None
             await self._temporal.restart()
             restarted = True
-        turning_on = persist and not self._persist
-        self._persist = persist
-        if turning_on:
-            if self._persist_task is None and self._loop is not None:
-                self._persist_task = self._loop.create_task(
-                    self._persist_loop(), name="devgate-persist"
-                )
+        if persist and not self._persist:
+            self._persist = True
             self._snapshot_now()
+            self._start_persisting()
+        elif not persist and self._persist:
+            self._persist = False
+            await self._stop_persisting()
+            self._forget_snapshot()
         return {
             "ui": self._ui,
             "metrics": self._metrics,
@@ -209,35 +257,68 @@ class DevStack:
 
         return state.data_dir(self.config.home) / "gate.json"
 
-    def _restore(self) -> None:
-        from kontra.devgate import store
+    def _blob_files(self) -> store.BlobFiles:
+        if self._blobs is None:
+            self._blobs = store.BlobFiles(self._store_path().parent / "blobs")
+        return self._blobs
 
+    def _restore(self) -> None:
         doc = store.read_doc(self._store_path())  # 0600 and ours, or refused
         if doc is not None:
-            store.restore(self.gate, doc)
+            store.restore(self.gate, doc, self._blob_files())
 
     def _snapshot_now(self) -> None:
-        from kontra.devgate import store
+        self._last_digest = store.write_snapshot(self.gate, self._store_path(), self._blob_files())
 
-        store.write_snapshot(self.gate, self._store_path())
+    def _forget_snapshot(self) -> None:
+        self._store_path().unlink(missing_ok=True)
+        self._blob_files().discard()
+        self._last_digest = None
 
-    async def _persist_loop(self) -> None:
-        from kontra.devgate import store
+    def _start_persisting(self) -> None:
+        if self._persist_task is None and self._loop is not None:
+            self._persist_stop = asyncio.Event()
+            self._persist_task = self._loop.create_task(
+                self._persist_loop(self._persist_stop), name="devgate-persist"
+            )
 
-        last = ""
+    async def _stop_persisting(self) -> None:
+        """Stop the loop and wait for it: a pass in flight finishes (never half a write)."""
+        task, self._persist_task = self._persist_task, None
+        if task is None:
+            return
+        if self._persist_stop is not None:
+            self._persist_stop.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def _persist_loop(self, stop: asyncio.Event) -> None:
         while True:
             try:
-                await asyncio.sleep(10)
-            except asyncio.CancelledError:
+                await asyncio.wait_for(stop.wait(), PERSIST_EVERY)
+                return  # asked to stop
+            except TimeoutError:
+                pass
+            if not self._persist:
                 return
             try:
-                doc = await self.gate.run(lambda: _wrap(store.snapshot(self.gate)))
-                raw = json.dumps(doc)
-                if raw != last:
-                    store.write_doc(self._store_path(), raw)
-                    last = raw
+                await self._persist_pass()
             except Exception:  # keep snapshotting: the next pass may succeed, `down` retries
-                logging.getLogger("kontra.devgate").exception("a --persist snapshot failed")
+                _log.exception("a --persist snapshot failed")
+
+    async def _persist_pass(self) -> None:
+        """One pass: the snapshot on the gate's loop (big byte strings by digest, hashed once
+        each), the JSON dump and the writes off it; written only when its digest changed."""
+        files = self._blob_files()
+        collected = files.collect()
+        doc = await self.gate.run(lambda: _wrap(store.snapshot(self.gate, collected)))
+        raw = await asyncio.to_thread(json.dumps, doc)
+        files.remember(collected)
+        digest = store.digest(raw)
+        if digest == self._last_digest or not self._persist:
+            return
+        await asyncio.to_thread(files.commit, self._store_path(), raw, collected.refs)
+        self._last_digest = digest
 
     # ------------------------------------------------------------------ the ASGI wrapper
 
@@ -254,6 +335,9 @@ class DevStack:
             return
         path: str = scope["path"]
         if path.startswith(CONTROL_PREFIX):
+            if path == f"{CONTROL_PREFIX}hello" and "origin" not in headers:
+                await self._hello(scope, send)
+                return
             given = headers.get("authorization", "").encode()
             ok = "origin" not in headers and hmac.compare_digest(
                 given, f"Bearer {self._token}".encode()
@@ -264,6 +348,21 @@ class DevStack:
             await self._control_route(path[len(CONTROL_PREFIX) :], scope, receive, send)
             return
         await self._logged(scope, receive, send)
+
+    async def _hello(self, scope: dict[str, Any], send: Any) -> None:
+        """``GET /_devgate/hello?nonce=<32-128 hex>``: ``{"proof": hello_proof(token, nonce)}``
+        and nothing else -- no pid, no state. The one control route without the token: it
+        proves this host holds it, to a CLI that will not send the token before it knows."""
+        if scope["method"] != "GET":
+            await _plain(send, 404, b"no such control route")
+            return
+        query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+        nonce = query.get("nonce", [""])
+        if len(nonce) != 1 or _NONCE.fullmatch(nonce[0]) is None:
+            await _plain(send, 400, b"a nonce of 32-128 lowercase hex digits is expected")
+            return
+        body = json.dumps({"proof": hello_proof(self._token, nonce[0])}).encode()
+        await _plain(send, 200, body, b"application/json")
 
     async def _logged(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         """Pass through to the gate, logging one access line with the query string dropped

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import signal
 import subprocess
 import time
@@ -19,7 +20,16 @@ from pathlib import Path
 
 from kontra.testing.devserver import DYNAMIC_CONFIG
 
-__all__ = ["TemporalChild"]
+__all__ = ["READY_TIMEOUT", "RESTART_SECONDS", "STOP_GRACE", "TemporalChild"]
+
+#: Seconds :meth:`TemporalChild.stop` waits after SIGTERM before SIGKILL, then for the exit.
+STOP_GRACE = 10.0
+_KILL_WAIT = 5.0
+#: Seconds :meth:`TemporalChild.start` waits for the frontend to answer.
+READY_TIMEOUT = 60.0
+#: The longest a ``--ui``/``--observability`` toggle (a :meth:`TemporalChild.restart`) takes:
+#: what ``POST /_devgate/config`` may need before it answers.
+RESTART_SECONDS = STOP_GRACE + _KILL_WAIT + READY_TIMEOUT
 
 
 @dataclass
@@ -38,6 +48,12 @@ class TemporalChild:
     #: Bound only with ``--observability``; otherwise the CLI picks its own metrics port.
     metrics_port: int | None = None
     _proc: subprocess.Popen[bytes] | None = field(default=None, init=False, repr=False)
+    #: The verified binary as it was when the host took it: every start (a ``--ui`` restart
+    #: too) runs it only if it is still that file.
+    _cli_id: tuple[int, int, int, int] | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._cli_id = _identity(self.cli)
 
     @property
     def address(self) -> str:
@@ -77,12 +93,19 @@ class TemporalChild:
             argv += ["--metrics-port", str(self.metrics_port)]
         return argv
 
-    async def start(self, *, ready_timeout: float = 60.0) -> None:
+    async def start(self, *, ready_timeout: float = READY_TIMEOUT) -> None:
         """Spawn the child (inheriting the host's process group) and wait until its frontend
         answers ``GetSystemInfo``. Raises :class:`RuntimeError` with the tail of the log if the
-        child exits first or does not come up in ``ready_timeout`` seconds."""
+        CLI is no longer the file the host took, or the child exits first or does not come up
+        in ``ready_timeout`` seconds -- a child that never came up is killed, never left
+        holding the port."""
         if self._proc is not None and self._proc.poll() is None:
             return
+        if _identity(self.cli) != self._cli_id:
+            raise RuntimeError(
+                f"{self.cli} is not the Temporal CLI this stack started with (replaced since); "
+                "refusing to run it: `kontra dev down`, then `kontra dev up` verifies it again"
+            )
         log = self.log_path.open("ab")
         try:
             self._proc = subprocess.Popen(  # noqa: S603, ASYNC220 -- fixed argv, no shell; Popen does not block
@@ -90,7 +113,20 @@ class TemporalChild:
             )
         finally:
             log.close()
-        await self._wait_ready(ready_timeout)
+        try:
+            await self._wait_ready(ready_timeout)
+        except BaseException:
+            self._kill()
+            raise
+
+    def _kill(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_KILL_WAIT)
 
     async def _wait_ready(self, ready_timeout: float) -> None:
         from temporalio.api.workflowservice.v1 import GetSystemInfoRequest
@@ -115,7 +151,7 @@ class TemporalChild:
                     ) from None
                 await asyncio.sleep(0.2)
 
-    async def stop(self, *, grace: float = 10.0) -> None:
+    async def stop(self, *, grace: float = STOP_GRACE) -> None:
         """SIGTERM the child, SIGKILL it after ``grace`` seconds."""
         proc, self._proc = self._proc, None
         if proc is None or proc.poll() is not None:
@@ -128,9 +164,9 @@ class TemporalChild:
                 break
             await asyncio.sleep(0.1)
         with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=5)
+            proc.wait(timeout=_KILL_WAIT)
 
-    async def restart(self, *, ready_timeout: float = 60.0) -> None:
+    async def restart(self, *, ready_timeout: float = READY_TIMEOUT) -> None:
         """Stop and start on the same db file (keeps namespaces, runs and workers)."""
         await self.stop()
         await self.start(ready_timeout=ready_timeout)
@@ -142,3 +178,12 @@ class TemporalChild:
             return f"(no {self.log_path})"
         tail = text.strip().splitlines()[-lines:]
         return " / ".join(tail) if tail else "(no output)"
+
+
+def _identity(path: Path) -> tuple[int, int, int, int] | None:
+    """``(st_dev, st_ino, st_size, st_mtime_ns)`` of ``path``, or None when it cannot be read."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)

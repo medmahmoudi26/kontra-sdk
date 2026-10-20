@@ -17,11 +17,15 @@ This module never imports FastAPI or uvicorn: ``down``, ``status`` and ``logs`` 
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
 import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
+import tempfile
 from collections.abc import Generator, Mapping
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -40,12 +44,14 @@ __all__ = [
     "StackRecord",
     "data_dir",
     "dev_dir",
+    "hello_proof",
     "ignored_env",
     "joined_path",
     "lock",
     "logs_dir",
     "port_holder",
     "port_taken",
+    "private_dir",
     "read_settings",
     "read_stack_record",
     "register_port",
@@ -117,9 +123,27 @@ def ignored_env() -> list[str]:
 
 
 def dev_dir(home: Path | None = None) -> Path:
-    """``$KONTRA_HOME/dev`` (created 0700)."""
-    d = (home or kontra_home()) / "dev"
+    """``$KONTRA_HOME/dev`` (created 0700; :func:`private_dir`)."""
+    return private_dir((home or kontra_home()) / "dev")
+
+
+def private_dir(d: Path) -> Path:
+    """``d``, created 0700 if absent. An existing one must be this user's own real directory:
+    ``KONTRA_HOME`` (or ``XDG_STATE_HOME``) may be shared, and a ``dev/`` another user made
+    first would hold what they planted and receive every write of ours. One of ours that
+    others may write is tightened to 0700; anything else is refused (:class:`ProfileError`)."""
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not hasattr(os, "getuid"):
+        return d
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise ProfileError(
+            f"{d} is not a directory of yours (another user made it, or it is a link); "
+            "kontra dev keeps its state, tokens and keys there, so it refuses it. Remove it, "
+            "or point KONTRA_HOME (XDG_STATE_HOME for dev-gates/) at a directory only you can write"
+        )
+    if st.st_mode & 0o022:
+        d.chmod(0o700)
     return d
 
 
@@ -136,15 +160,11 @@ def joined_path(home: Path | None = None) -> Path:
 
 
 def data_dir(home: Path | None = None) -> Path:
-    d = dev_dir(home) / "data"
-    d.mkdir(mode=0o700, exist_ok=True)
-    return d
+    return private_dir(dev_dir(home) / "data")
 
 
 def logs_dir(home: Path | None = None) -> Path:
-    d = dev_dir(home) / "logs"
-    d.mkdir(mode=0o700, exist_ok=True)
-    return d
+    return private_dir(dev_dir(home) / "logs")
 
 
 @contextlib.contextmanager
@@ -232,7 +252,8 @@ class StackRecord(BaseModel):
     format: int = STACK_FORMAT
     pid: int
     pgid: int
-    #: The control-route bearer, on stdin only at spawn; proves the port answers *this* host.
+    #: The control-route bearer, on stdin only at spawn. Never sent to a port before that port
+    #: proves it holds it (:func:`hello_proof`): a stale record's port may be anyone's now.
     token: str
     started_at: str
     sdk_version: str
@@ -278,14 +299,34 @@ def remove_stack_record(home: Path | None = None) -> None:
 def registry_path(gate_port: int) -> Path:
     """``$XDG_STATE_HOME/kontra-sdk/dev-gates/<gate port>``: the home that owns the stack on
     that gate port, so another home of this user joins it rather than colliding."""
+    return _registry_dir() / str(gate_port)
+
+
+def _registry_dir() -> Path:
     base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
-    d = Path(base) / "kontra-sdk" / "dev-gates"
-    d.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return d / str(gate_port)
+    return private_dir(Path(base) / "kontra-sdk" / "dev-gates")
+
+
+@contextlib.contextmanager
+def _registry_lock() -> Generator[None, None, None]:
+    """``flock`` on ``dev-gates/.lock``: a compare-and-delete of an entry is one step for every
+    home of this user (best-effort where there is no ``fcntl``, as :func:`lock`)."""
+    fd = os.open(_registry_dir() / ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        yield
+    finally:
+        os.close(fd)
 
 
 def register_port(gate_port: int, home: Path) -> None:
-    _atomic_private(registry_path(gate_port), json.dumps({"home": str(home)}).encode())
+    with _registry_lock():
+        _atomic_private(registry_path(gate_port), json.dumps({"home": str(home)}).encode())
 
 
 def registry_owner(gate_port: int) -> Path | None:
@@ -302,8 +343,31 @@ def registry_owner(gate_port: int) -> Path | None:
     return Path(home) if isinstance(home, str) else None
 
 
-def unregister_port(gate_port: int) -> None:
-    registry_path(gate_port).unlink(missing_ok=True)
+def unregister_port(gate_port: int, home: Path) -> bool:
+    """Forget the entry for ``gate_port`` only if it names ``home``, compared and removed under
+    the registry's lock: a port this home once used may be another home's stack now (a
+    crash, a reboot), and deleting that home's entry would keep everyone after from joining
+    it (OD7). Whether it was removed."""
+    with _registry_lock():
+        if registry_owner(gate_port) != home:
+            return False
+        registry_path(gate_port).unlink(missing_ok=True)
+        return True
+
+
+# --------------------------------------------------------------------------- the host proves it
+
+
+#: What a host's proof of its token is bound to: never a bearer, never a proof of anything else.
+_HELLO = b"kontra-devgate-hello\x00"
+
+
+def hello_proof(token: str, nonce: str) -> str:
+    """What ``GET /_devgate/hello?nonce=<nonce>`` answers: HMAC-SHA256(token, context +
+    nonce), hex. The CLI checks it (constant-time) against a fresh nonce before it sends the
+    token anywhere: whatever holds the port of a stale record (any local user, after a
+    reboot) cannot answer it, and learns nothing it could answer the next one with."""
+    return hmac.new(token.encode(), _HELLO + nonce.encode(), hashlib.sha256).hexdigest()
 
 
 # --------------------------------------------------------------------------- ports in use
@@ -352,13 +416,15 @@ def port_holder(port: int) -> str | None:
 
 
 def _atomic_private(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` as a 0600 file, atomically (temp file, fsync, rename)."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{socket.gethostname()[:8]}")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Write ``data`` to ``path`` as a 0600 file, atomically (temp file, fsync, rename). The
+    temp file is ``mkstemp``'s (``O_EXCL``, a random name), never a predictable name a
+    planted link could turn into a write of somewhere else."""
+    private_dir(path.parent)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-")
+    tmp = Path(name)
     f: IO[bytes]
     try:
-        with os.fdopen(fd, "wb") as f:
+        with os.fdopen(fd, "wb") as f:  # mkstemp's file is 0600
             f.write(data)
             f.flush()
             os.fsync(f.fileno())

@@ -13,6 +13,7 @@ import pytest
 
 from kontra.devgate import state
 from kontra.devgate.state import Ports
+from kontra.profile import ProfileError
 
 
 @pytest.fixture(autouse=True)
@@ -94,8 +95,80 @@ def test_the_registry_maps_a_port_to_its_home() -> None:
     state.register_port(8080, home)
     assert state.registry_owner(8080) == home
     assert stat.S_IMODE(state.registry_path(8080).stat().st_mode) == 0o600
-    state.unregister_port(8080)
+    assert state.unregister_port(8080, home) is True
     assert state.registry_owner(8080) is None
+
+
+def test_a_home_never_unregisters_another_homes_stack(tmp_path: Path) -> None:
+    """After a crash or a reboot, home A's stale record may name the gate port that home B
+    has started on since: A's cleanup must leave B's entry, or no home can join B (OD7)."""
+    home_a, home_b = tmp_path / "homeA", tmp_path / "homeB"
+    state.register_port(18556, home_b)
+    assert state.unregister_port(18556, home_a) is False
+    assert state.registry_owner(18556) == home_b
+    assert state.unregister_port(18556, home_b) is True
+    assert state.registry_owner(18556) is None
+
+
+def test_hello_proof_binds_the_token_and_the_nonce() -> None:
+    nonce = "ab" * 16
+    proof = state.hello_proof("t" * 40, nonce)
+    assert proof == state.hello_proof("t" * 40, nonce)
+    assert proof != state.hello_proof("u" * 40, nonce)
+    assert proof != state.hello_proof("t" * 40, "cd" * 16)
+    assert "t" * 40 not in proof  # a proof, never the token
+
+
+# --------------------------------------------------------------------------- shared directories
+
+
+def _victim(tmp_path: Path) -> Path:
+    victim = tmp_path / "victim"
+    victim.write_text("the user's own file\n")
+    return victim
+
+
+def test_a_planted_link_at_the_old_temp_name_is_never_written_through(tmp_path: Path) -> None:
+    """The temp file of every state write is ``mkstemp``'s (``O_EXCL``, random): a link
+    planted at the predictable ``.NAME.<pid>.<host8>`` the review used is not followed."""
+    home = Path(os.environ["KONTRA_HOME"])
+    victim = _victim(tmp_path)
+    host8 = socket.gethostname()[:8]
+    registry = state.registry_path(8080)
+    (registry.parent / f".{registry.name}.{os.getpid()}.{host8}").symlink_to(victim)
+    settings = state.settings_path(home)
+    (settings.parent / f".{settings.name}.{os.getpid()}.{host8}").symlink_to(victim)
+    state.register_port(8080, home)
+    state.write_settings(state.Settings(persist=True), home)
+    assert victim.read_text() == "the user's own file\n"
+    assert state.registry_owner(8080) == home
+    assert state.read_settings(home).persist is True
+
+
+def test_a_dev_directory_others_may_write_is_made_private() -> None:
+    home = Path(os.environ["KONTRA_HOME"])
+    (home / "dev" / "data").mkdir(parents=True)
+    (home / "dev").chmod(0o777)
+    (home / "dev" / "data").chmod(0o777)
+    state.data_dir(home)
+    assert stat.S_IMODE((home / "dev").stat().st_mode) == 0o700
+    assert stat.S_IMODE((home / "dev" / "data").stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="needs root to chown")
+def test_a_dev_directory_another_user_made_is_refused(tmp_path: Path) -> None:
+    """The review's reproduction: ``$KONTRA_HOME/dev`` (or ``dev-gates/``) pre-created by
+    another user is not adopted -- every write of ours would land where they choose."""
+    home = Path(os.environ["KONTRA_HOME"])
+    (home / "dev").mkdir(parents=True)
+    os.chown(home / "dev", 65534, 65534)
+    with pytest.raises(ProfileError, match="not a directory of yours"):
+        state.write_settings(state.Settings(persist=True), home)
+    gates = tmp_path / "state" / "kontra-sdk" / "dev-gates"
+    gates.mkdir(parents=True)
+    os.chown(gates, 65534, 65534)
+    with pytest.raises(ProfileError, match="not a directory of yours"):
+        state.register_port(8080, home)
 
 
 def test_the_flock_is_held_and_released() -> None:

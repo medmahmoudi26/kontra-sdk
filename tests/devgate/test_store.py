@@ -148,6 +148,92 @@ def test_a_state_file_others_may_write_is_refused(tmp_path: Path) -> None:
     assert "kontra login" not in str(e.value)
 
 
+# --------------------------------------------------------------------------- blob files
+
+
+def test_big_byte_strings_are_files_written_once(tmp_path: Path) -> None:
+    """§5.4: a claim-check blob (or an artifact part) of :data:`store.BLOB_MIN` or more is
+    ``blobs/<sha256>``, 0600, named by digest in ``gate.json`` (no base64 of it there); it
+    round-trips; a blob the gate let go of is removed at the next snapshot."""
+    import hashlib
+
+    gate = DevGate(None)
+    big, small = b"b" * (1 << 20), b"s" * 10
+    big_sha = hashlib.sha256(big).hexdigest()
+    gate.blobs[big_sha] = big
+    gate.blobs[hashlib.sha256(small).hexdigest()] = small
+    path = tmp_path / "data" / "gate.json"
+    files = store.BlobFiles(path.parent / "blobs")
+    store.write_snapshot(gate, path, files)
+    raw = path.read_text()
+    assert len(raw) < 64 * 1024
+    assert f'{{"$blob": "{big_sha}"}}' in raw
+    blob = path.parent / "blobs" / big_sha
+    assert blob.read_bytes() == big
+    assert (blob.stat().st_mode & 0o777) == 0o600
+    other = DevGate(None)
+    doc = store.read_doc(path)
+    assert doc is not None
+    restore(other, doc, files)
+    assert other.blobs == gate.blobs
+    inode = blob.stat().st_ino
+    store.write_snapshot(gate, path, files)
+    assert blob.stat().st_ino == inode  # written once
+    del gate.blobs[big_sha]
+    store.write_snapshot(gate, path, files)
+    assert not blob.exists()
+
+
+def test_a_blob_file_is_hashed_once_while_the_gate_holds_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot every 10 s must not re-hash a 50 MiB blob each time."""
+    import hashlib
+
+    hashed: list[int] = []
+    real = hashlib.sha256
+
+    def counting(data: bytes = b"") -> Any:
+        if len(data) >= store.BLOB_MIN:
+            hashed.append(len(data))
+        return real(data)
+
+    gate = DevGate(None)
+    gate.blobs["x" * 64] = b"q" * (1 << 20)
+    files = store.BlobFiles(Path("/nonexistent"))
+    monkeypatch.setattr(store.hashlib, "sha256", counting)
+    for _ in range(3):
+        collected = files.collect()
+        store.snapshot(gate, collected)
+        files.remember(collected)
+    assert hashed == [1 << 20]
+
+
+@pytest.mark.parametrize("damage", ["missing", "tampered", "others may write"])
+def test_a_damaged_blob_file_is_refused(tmp_path: Path, damage: str) -> None:
+    import hashlib
+
+    gate = DevGate(None)
+    big = b"d" * (64 * 1024)
+    sha = hashlib.sha256(big).hexdigest()
+    gate.blobs[sha] = big
+    path = tmp_path / "gate.json"
+    store.write_snapshot(gate, path)
+    blob = tmp_path / "blobs" / sha
+    if damage == "missing":
+        blob.unlink()
+    elif damage == "tampered":
+        blob.write_bytes(b"e" * len(big))
+    else:
+        blob.chmod(0o666)
+    doc = store.read_doc(path)
+    assert doc is not None
+    other = DevGate(None)
+    with pytest.raises(ValueError, match="`kontra dev down --reset` discards it"):
+        restore(other, doc, store.BlobFiles(tmp_path / "blobs"))
+    assert other.blobs == {}  # refused before the gate was touched
+
+
 # --------------------------------------------------------------------------- the census
 
 #: What each kept store holds: the roots of the census. A test below checks every runtime

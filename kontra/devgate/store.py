@@ -5,6 +5,9 @@ A snapshot is one JSON document whose values carry a type tag (``$dt``, ``$dec``
 (:data:`ALLOWED`): a state file that could name any callable would be code execution at the next
 ``up``. Only the durable state is kept (:data:`KEPT`); quotes, device flows, links, ceremonies,
 rate counters, the outbox, locks and relay tasks are transient and start empty (:data:`TRANSIENT`).
+Under ``--persist`` every ``bytes`` value of :data:`BLOB_MIN` or more (claim-check blobs, artifact
+parts) is a file ``data/blobs/<sha256>`` written once (:class:`BlobFiles`), named in ``gate.json``
+by its digest (``$blob``), so a snapshot neither re-encodes nor re-writes a big blob (§5.4).
 
 The drift guard is ``tests/devgate/test_store.py``: a full lifecycle through ``Marketplace``,
 snapshot, restore into a fresh gate, every view compared, and a class the census finds but
@@ -17,11 +20,15 @@ import asyncio
 import base64
 import dataclasses
 import enum
+import hashlib
 import importlib
 import json
 import os
-import socket
+import re
+import shutil
+import tempfile
 from collections import deque
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -29,11 +36,15 @@ from typing import Any, cast
 
 __all__ = [
     "ALLOWED",
+    "BLOB_MIN",
     "FORMAT",
     "KEPT",
     "LEDGER_KEPT",
     "TRANSIENT",
+    "BlobFiles",
+    "Collected",
     "dec",
+    "digest",
     "enc",
     "read_doc",
     "restore",
@@ -79,6 +90,11 @@ TRANSIENT = (
     "_ceremonies", "_magic_rate", "outbox", "_party_locks", "engines",
 )  # fmt: skip
 
+#: A ``bytes`` value at least this long is kept under ``--persist`` as its own file (written
+#: once, :class:`BlobFiles`); a shorter one stays inline as ``$b64``.
+BLOB_MIN = 4096
+_SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)
+
 #: Transient object types dropped field-by-field (a running task, a lock, a wake event).
 _SKIP_TYPES: tuple[type, ...] = (
     asyncio.Event,
@@ -109,7 +125,9 @@ def _cls(path: str) -> type:
         raise ValueError(f"a dev state file names {path}, which does not exist here: {e}") from None
 
 
-def enc(value: Any) -> Any:
+def enc(value: Any, blobs: Collected | None = None) -> Any:
+    """``value`` as tagged JSON. With ``blobs``, a ``bytes`` of :data:`BLOB_MIN` or more is
+    ``{"$blob": <sha256>}`` and ``blobs`` holds its bytes for :meth:`BlobFiles.commit`."""
     if (
         value is None
         or isinstance(value, bool)
@@ -125,25 +143,27 @@ def enc(value: Any) -> Any:
     if isinstance(value, Decimal):
         return {"$dec": str(value)}
     if isinstance(value, (bytes, bytearray)):
+        if blobs is not None and type(value) is bytes and len(value) >= BLOB_MIN:
+            return {"$blob": blobs.put(value)}
         return {"$b64": base64.b64encode(bytes(value)).decode()}
     if isinstance(value, (set, frozenset)):
-        return {"$set": sorted((enc(x) for x in value), key=json.dumps)}
+        return {"$set": sorted((enc(x, blobs) for x in value), key=json.dumps)}
     if isinstance(value, deque):
-        return {"$deque": [enc(x) for x in value]}
+        return {"$deque": [enc(x, blobs) for x in value]}
     if isinstance(value, tuple):
-        return {"$tuple": [enc(x) for x in value]}
+        return {"$tuple": [enc(x, blobs) for x in value]}
     if isinstance(value, list):
-        return [enc(x) for x in value]
+        return [enc(x, blobs) for x in value]
     if isinstance(value, dict):
         if all(isinstance(k, str) for k in value):
-            return {"$map": {k: enc(x) for k, x in value.items()}}
-        return {"$pairs": [[enc(k), enc(x)] for k, x in value.items()]}
+            return {"$map": {k: enc(x, blobs) for k, x in value.items()}}
+        return {"$pairs": [[enc(k, blobs), enc(x, blobs)] for k, x in value.items()]}
     path = f"{type(value).__module__}.{type(value).__qualname__}"
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         _cls(path)  # refuse to WRITE what could not be read back
         drop = _DROP_FIELDS.get(path, frozenset())
         fields = {
-            f.name: enc(getattr(value, f.name))
+            f.name: enc(getattr(value, f.name), blobs)
             for f in dataclasses.fields(value)
             if f.init and f.name not in drop and not isinstance(getattr(value, f.name), _SKIP_TYPES)
         }
@@ -154,9 +174,10 @@ def enc(value: Any) -> Any:
     raise TypeError(f"cannot store {path}")
 
 
-def dec(value: Any) -> Any:
+def dec(value: Any, load: Callable[[str], bytes] | None = None) -> Any:
+    """Tagged JSON back to its value; ``load`` reads a ``$blob`` (:meth:`BlobFiles.load`)."""
     if isinstance(value, list):
-        return [dec(x) for x in value]
+        return [dec(x, load) for x in value]
     if not isinstance(value, dict):
         return value
     tags = [k for k in value if isinstance(k, str) and k.startswith("$")]
@@ -171,18 +192,22 @@ def dec(value: Any) -> Any:
         return Decimal(value["$dec"])
     if tag == "$b64":
         return base64.b64decode(value["$b64"], validate=True)
+    if tag == "$blob":
+        if load is None:
+            raise ValueError("a dev state document names a blob file, but no blob directory")
+        return load(str(value["$blob"]))
     if tag == "$set":
-        return {dec(x) for x in value["$set"]}
+        return {dec(x, load) for x in value["$set"]}
     if tag == "$deque":
-        return deque(dec(x) for x in value["$deque"])
+        return deque(dec(x, load) for x in value["$deque"])
     if tag == "$tuple":
-        return tuple(dec(x) for x in value["$tuple"])
+        return tuple(dec(x, load) for x in value["$tuple"])
     if tag == "$map":
-        return {k: dec(x) for k, x in value["$map"].items()}
+        return {k: dec(x, load) for k, x in value["$map"].items()}
     if tag == "$pairs":
-        return {dec(k): dec(x) for k, x in value["$pairs"]}
+        return {dec(k, load): dec(x, load) for k, x in value["$pairs"]}
     if tag == "$dc":
-        return _cls(value["$dc"])(**{k: dec(x) for k, x in value["f"].items()})
+        return _cls(value["$dc"])(**{k: dec(x, load) for k, x in value["f"].items()})
     if tag == "$pd":
         return _cls(value["$pd"]).model_validate(value["v"])
     if tag is not None:
@@ -190,8 +215,9 @@ def dec(value: Any) -> Any:
     return value
 
 
-def snapshot(gate: Any) -> dict[str, Any]:
-    """``gate``'s durable state as a :data:`FORMAT` document (call on the gate's loop)."""
+def snapshot(gate: Any, blobs: Collected | None = None) -> dict[str, Any]:
+    """``gate``'s durable state as a :data:`FORMAT` document (call on the gate's loop); with
+    ``blobs``, big byte strings are named by digest rather than inlined (:func:`enc`)."""
     from cryptography.hazmat.primitives import serialization
 
     key_pem = gate.keys._key.private_bytes(
@@ -205,14 +231,16 @@ def snapshot(gate: Any) -> dict[str, Any]:
         "signing_key": {"pem": key_pem, "kid": gate.keys.kid},
         "url_secret": enc(gate._url_secret),
         "job_key_proof_key": enc(gate.job_key_proof_key),
-        "gate": {name: enc(getattr(gate, name)) for name in KEPT},
-        "ledger": {name: enc(getattr(gate.ledger, name)) for name in LEDGER_KEPT},
+        "gate": {name: enc(getattr(gate, name), blobs) for name in KEPT},
+        "ledger": {name: enc(getattr(gate.ledger, name), blobs) for name in LEDGER_KEPT},
     }
 
 
-def restore(gate: Any, doc: dict[str, Any]) -> None:
+def restore(gate: Any, doc: dict[str, Any], blobs: BlobFiles | None = None) -> None:
     """Load a :data:`FORMAT` document into ``gate`` (a port change keeps the state: old tokens
-    are refused on issuer and clients refresh transparently, §5.4). Refuses an unknown format."""
+    are refused on issuer and clients refresh transparently, §5.4), reading its ``$blob`` s
+    from ``blobs``. Refuses an unknown format, and a blob file that is missing, not ours, or
+    not the bytes its name says."""
     import jwt.algorithms
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -227,8 +255,17 @@ def restore(gate: Any, doc: dict[str, Any]) -> None:
     unknown = (set(doc["gate"]) - set(KEPT)) | (set(doc["ledger"]) - set(LEDGER_KEPT))
     if unknown:
         raise ValueError(f"a dev state file may not set {sorted(unknown)}")
-    kept = {name: dec(value) for name, value in doc["gate"].items()}
-    ledger = {name: dec(value) for name, value in doc["ledger"].items()}
+    read: dict[str, bytes] = {}
+
+    def load(sha: str) -> bytes:
+        if blobs is None:
+            raise ValueError("a dev state document names a blob file, but no blob directory")
+        if sha not in read:
+            read[sha] = blobs.load(sha)
+        return read[sha]
+
+    kept = {name: dec(value, load) for name, value in doc["gate"].items()}
+    ledger = {name: dec(value, load) for name, value in doc["ledger"].items()}
     url_secret = dec(doc["url_secret"])
     proof_key = dec(doc["job_key_proof_key"])
     key = serialization.load_pem_private_key(doc["signing_key"]["pem"].encode(), password=None)
@@ -248,10 +285,22 @@ def restore(gate: Any, doc: dict[str, Any]) -> None:
         setattr(gate.ledger, name, value)
 
 
-def write_snapshot(gate: Any, path: Path) -> None:
+def write_snapshot(gate: Any, path: Path, files: BlobFiles | None = None) -> str:
+    """Snapshot ``gate`` (on its loop) to ``path``, its big byte strings to ``files`` (default
+    ``path``'s ``blobs/`` beside it); the :func:`digest` of what was written."""
+    files = files if files is not None else BlobFiles(path.parent / "blobs")
+    collected = files.collect()
     # No ``default=``: :func:`enc` yields JSON values only, and anything else must fail loudly
     # rather than be written as a string that no longer decodes to what it was.
-    write_doc(path, json.dumps(snapshot(gate)))
+    raw = json.dumps(snapshot(gate, collected))
+    files.commit(path, raw, collected.refs)
+    files.remember(collected)
+    return digest(raw)
+
+
+def digest(raw: str) -> str:
+    """What the persist loop compares a pass by (it keeps this, never the document)."""
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def read_doc(path: Path) -> dict[str, Any] | None:
@@ -278,18 +327,106 @@ def read_doc(path: Path) -> dict[str, Any] | None:
 
 def write_doc(path: Path, raw: str) -> None:
     """Write ``raw`` to ``path`` as a 0600 file, atomically (temp, fsync, rename)."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{socket.gethostname()[:8]}")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    _write_private(path, raw.encode())
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """``data`` as ``path``, 0600, atomically, through ``mkstemp`` (``O_EXCL``, a random name)
+    in a directory of ours (:func:`~kontra.devgate.state.private_dir`): never a predictable
+    temp name that a planted link would turn into a write of somewhere else."""
+    from kontra.devgate.state import private_dir
+
+    private_dir(path.parent)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-")
+    tmp = Path(name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(raw)
+        with os.fdopen(fd, "wb") as f:  # mkstemp's file is 0600
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+# --------------------------------------------------------------------------- blob files
+
+
+class Collected:
+    """The byte strings one snapshot names by digest, filled by :func:`enc` on the gate's loop
+    (:meth:`BlobFiles.collect`). A ``bytes`` object's digest is reused while the gate holds
+    that same object (bytes are immutable), so a 50 MiB blob is hashed once, not every pass."""
+
+    def __init__(self, known: dict[int, tuple[bytes, str]]) -> None:
+        self._known = known
+        self.seen: dict[int, tuple[bytes, str]] = {}
+        self.refs: dict[str, bytes] = {}
+
+    def put(self, data: bytes) -> str:
+        hit = self.seen.get(id(data)) or self._known.get(id(data))
+        sha = hit[1] if hit is not None and hit[0] is data else hashlib.sha256(data).hexdigest()
+        self.seen[id(data)] = (data, sha)
+        self.refs[sha] = data
+        return sha
+
+
+class BlobFiles:
+    """``data/blobs/<sha256>`` (0700, its files 0600): every byte string a ``--persist``
+    snapshot names by digest, each written once."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._known: dict[int, tuple[bytes, str]] = {}
+
+    def collect(self) -> Collected:
+        return Collected(self._known)
+
+    def remember(self, collected: Collected) -> None:
+        """Keep ``collected``'s digests for the next pass (and only those: what the gate let
+        go of is not held here)."""
+        self._known = collected.seen
+
+    def commit(self, path: Path, raw: str, refs: Mapping[str, bytes]) -> None:
+        """Write each of ``refs`` not on disk yet, then ``raw`` as ``path`` (so ``gate.json``
+        never names a missing file), then remove the blob files nothing names any more. Only
+        immutable bytes are touched: safe off the event loop."""
+        from kontra.devgate.state import private_dir
+
+        private_dir(self.root)
+        for sha, data in refs.items():
+            blob = self.root / sha
+            if not blob.is_file():
+                _write_private(blob, data)
+        write_doc(path, raw)
+        for entry in self.root.iterdir():
+            if _SHA256.fullmatch(entry.name) and entry.name not in refs:
+                entry.unlink(missing_ok=True)
+
+    def load(self, sha: str) -> bytes:
+        """The blob file ``sha``, refused unless it is this user's private file holding
+        exactly the bytes that hash to its name."""
+        from kontra.profile import ProfileError, _read_private
+
+        reset = "`kontra dev down --reset` discards it"
+        if not _SHA256.fullmatch(sha):
+            raise ValueError(f"a dev state file names a blob {sha!r}; {reset}")
+        try:
+            data = _read_private(self.root / sha)
+        except FileNotFoundError:
+            raise ValueError(
+                f"the dev state names blob {sha}, which {self.root} lacks; {reset}"
+            ) from None
+        except ProfileError:
+            raise ValueError(
+                f"the blob {self.root / sha} is not this user's private file; {reset}"
+            ) from None
+        if hashlib.sha256(data).hexdigest() != sha:
+            raise ValueError(f"the blob {self.root / sha} is not the bytes it names; {reset}")
+        return data
+
+    def discard(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
 
 
 def _sdk_version() -> str:

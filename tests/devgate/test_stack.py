@@ -210,6 +210,27 @@ async def test_ready_says_who_the_host_is(tmp_path: Path) -> None:
         assert (await http.get("/_devgate/nope", headers=_bearer())).status_code == 404
 
 
+async def test_hello_proves_the_token_without_being_given_it(tmp_path: Path) -> None:
+    """The CLI sends the token nowhere before the port proves it holds it: ``hello`` answers
+    HMAC(token, nonce) for the CLI's fresh nonce, with no token asked and nothing else told."""
+    stack, temporal = _stack(tmp_path)
+    nonce = "0f" * 16
+    async with _client(stack) as http:
+        r = await http.get("/_devgate/hello", params={"nonce": nonce})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"proof": state.hello_proof(TOKEN, nonce)}
+        assert r.headers["cache-control"] == "no-store"
+        # From a page (any Origin), with a bad nonce, or by another method: no proof.
+        page = await http.get(
+            "/_devgate/hello", params={"nonce": nonce}, headers={"Origin": "http://evil.example"}
+        )
+        assert page.status_code == 403
+        for bad in ("", "0f", "XYZ" * 16, "0f" * 65):
+            assert (await http.get("/_devgate/hello", params={"nonce": bad})).status_code == 400
+        assert (await http.post("/_devgate/hello", params={"nonce": nonce})).status_code == 404
+    assert temporal.restarts == []
+
+
 async def test_stop_asks_the_server_to_stop(tmp_path: Path) -> None:
     stack, _ = _stack(tmp_path)
     stopped: list[bool] = []
@@ -242,6 +263,107 @@ async def test_config_restarts_temporal_only_when_ui_or_metrics_change(tmp_path:
     assert len(temporal.restarts) == 2
     if stack._persist_task is not None:
         stack._persist_task.cancel()
+
+
+async def test_persist_turned_off_stops_writing_and_drops_the_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``kontra dev up --no-persist`` on a running stack: the loop stops, ``gate.json`` (the
+    signing key, every session) and its blobs go, and nothing writes them again -- a crash
+    later cannot bring back the state kept before."""
+    monkeypatch.setattr(stack_module, "PERSIST_EVERY", 0.05)
+    stack, _ = _stack(tmp_path)
+    stack._loop = asyncio.get_running_loop()
+    snapshot = state.data_dir(stack.config.home) / "gate.json"
+    blobs = snapshot.parent / "blobs"
+    await stack.reconfigure(ui=False, metrics=False, persist=True)
+    stack.gate.blobs["ab" * 32] = b"x" * (64 * 1024)
+    await asyncio.sleep(0.3)  # a few passes: the blob is a file now
+    assert snapshot.exists()
+    assert len(list(blobs.iterdir())) == 1
+    assert stack._persist_task is not None
+    done = await stack.reconfigure(ui=False, metrics=False, persist=False)
+    assert done["persist"] is False
+    assert stack._persist_task is None
+    assert not snapshot.exists()
+    assert not blobs.exists()
+    stack.gate.blobs["cd" * 32] = b"y" * 10  # the state changes; nothing persists it
+    await asyncio.sleep(0.3)
+    assert not snapshot.exists()
+
+
+async def test_a_persist_pass_writes_each_blob_once_and_only_on_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§5.4: blobs are ``data/blobs/<sha256>``, written once, named by digest in ``gate.json``;
+    a pass rewrites ``gate.json`` only when its digest changed."""
+    monkeypatch.setattr(stack_module, "PERSIST_EVERY", 0.05)
+    stack, _ = _stack(tmp_path)
+    stack._loop = asyncio.get_running_loop()
+    big = b"z" * (1 << 20)
+    stack.gate.blobs["ef" * 32] = big
+    await stack.reconfigure(ui=False, metrics=False, persist=True)
+    snapshot = state.data_dir(stack.config.home) / "gate.json"
+    (blob,) = list((snapshot.parent / "blobs").iterdir())
+    first = (blob.stat().st_ino, blob.stat().st_mtime_ns, snapshot.stat().st_mtime_ns)
+    assert snapshot.stat().st_size < 64 * 1024  # the MiB is not in it
+    assert stat.S_IMODE(blob.stat().st_mode) == 0o600
+    await asyncio.sleep(0.3)  # passes with nothing changed: nothing rewritten
+    assert (blob.stat().st_ino, blob.stat().st_mtime_ns, snapshot.stat().st_mtime_ns) == first
+    await stack.reconfigure(ui=False, metrics=False, persist=False)
+
+
+@pytest.mark.parametrize("failure", ["refused state", "gate port taken"])
+async def test_a_failed_start_stops_the_temporal_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """``__aexit__`` does not run when ``__aenter__`` raises: whatever fails after the
+    Temporal child started must stop it, or it is orphaned holding the Temporal port."""
+    events: list[str] = []
+
+    class Child:
+        def __init__(self, **_: Any) -> None:
+            self.http_base, self.http_port, self.pid = "http://127.0.0.1:1", 1, 4243
+
+        async def start(self) -> None:
+            events.append("start")
+
+        async def stop(self) -> None:
+            events.append("stop")
+
+    async def connect(*_: Any, **__: Any) -> object:
+        return object()
+
+    from temporalio.client import Client
+
+    def gate(_control: object, **options: Any) -> DevGate:
+        return DevGate(None, base_url=options["base_url"], dev=True)
+
+    monkeypatch.setattr(stack_module, "TemporalChild", Child)
+    monkeypatch.setattr(stack_module, "DevGate", gate)
+    monkeypatch.setattr(Client, "connect", connect)
+    home = tmp_path / "home"
+    held = socket.socket()
+    held.bind(("127.0.0.1", 0))
+    held.listen()
+    gate_port = held.getsockname()[1] if failure == "gate port taken" else _free()
+    if failure == "refused state":
+        refused = state.data_dir(home) / "gate.json"
+        refused.write_text('{"format": "kontra-devgate/0"}')
+        refused.chmod(0o600)
+    config = StackConfig(
+        home=home,
+        ports=Ports(gate=gate_port, temporal=_free(), ui=_free(), codec=_free()),
+        cli=tmp_path / "temporal",
+        persist=failure == "refused state",
+    )
+    try:
+        with pytest.raises((ValueError, OSError)):
+            async with DevStack(config, token=TOKEN):
+                pytest.fail("the stack should not have started")
+    finally:
+        held.close()
+    assert events == ["start", "stop"]
 
 
 async def test_the_access_log_drops_query_strings(
@@ -321,3 +443,26 @@ async def test_a_real_stack_restarts_its_temporal_on_the_same_db_and_stops(
     assert not _listening(ports.gate)
     assert not _listening(ports.temporal)
     assert (state.logs_dir(config.home) / "temporal.log").exists()
+
+
+@pytest.mark.temporal
+async def test_a_real_stack_that_fails_to_start_leaves_no_temporal(tmp_path: Path) -> None:
+    """The review's case, for real: a refused ``--persist`` state after the Temporal child is
+    up. The error propagates and nothing holds the Temporal port afterwards."""
+    from kontra.devgate import temporal_cli
+
+    try:
+        cli = temporal_cli.ensure()
+    except temporal_cli.TemporalCLIError as e:
+        pytest.skip(f"no Temporal CLI: {e}")
+    home = tmp_path / "home"
+    refused = state.data_dir(home) / "gate.json"
+    refused.write_text('{"format": "kontra-devgate/0"}')
+    refused.chmod(0o600)
+    ports = Ports(gate=_free(), temporal=_free(), ui=_free(), codec=_free())
+    config = StackConfig(home=home, ports=ports, cli=cli, persist=True)
+    with pytest.raises(ValueError, match="kontra dev down --reset"):
+        async with DevStack(config, token=TOKEN):
+            pytest.fail("the stack should not have started")
+    assert not _listening(ports.temporal)
+    assert not _listening(ports.gate)
