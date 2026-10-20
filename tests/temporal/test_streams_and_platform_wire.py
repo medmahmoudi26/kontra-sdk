@@ -549,13 +549,25 @@ async def test_relay_is_denied_everything_else(cluster: Cluster, cell: str) -> N
     await assert_denied(f"relay-J/{cell}", RELAY_DENIED[cell](cluster, relay, job_id))
 
 
-@pytest.mark.parametrize("permissions", [[f"{SELLER}:read"], [f"{SELLER}:relay"], []])
+@pytest.mark.parametrize(
+    ("permissions", "is_permission"),
+    [
+        ([f"{SELLER}:read"], True),
+        ([f"{SELLER}:relay"], True),  # an unknown role still sets the namespace's key
+        (["temporal-system:read"], True),  # a system role is a permission too
+        ([], False),
+        (["temporal-system:relay"], False),  # a system role the mapper does not know: dropped
+        (["relay"], False),  # no ":": dropped
+    ],
+)
 async def test_relay_subject_with_a_role_is_only_a_party_token(
-    cluster: Cluster, permissions: list[str]
+    cluster: Cluster, permissions: list[str], is_permission: bool
 ) -> None:
-    """A token that carries any permission is a party token, whatever its subject: the
-    relay's subject with a role gets that role's calls (none) and never the relay's. An
-    empty ``permissions`` claim is no permission: that token is the relay."""
+    """A token that carries a permission is a party token, whatever its subject: the
+    relay's subject with a role gets that role's calls (none) and never the relay's. A
+    permission the claim mapper drops is no permission: an empty ``permissions`` claim, a
+    ``temporal-system:`` role it does not know, an entry with no ``:``. That token is judged
+    by its subject, here the relay's (decisions I30)."""
     job_id = names.new_job_id()
     workflow_id = names.job_workflow_id(job_id)
     relay = await connect_public(
@@ -568,7 +580,7 @@ async def test_relay_subject_with_a_role_is_only_a_party_token(
         _query(SELLER, workflow_id, names.STREAM_OFFSET_QUERY)
     )
     shape = f"permissions={permissions}"
-    if permissions:
+    if is_permission:
         await assert_denied(f"relay-J/{shape}/Update(poll)@J", poll)
         await assert_denied(f"relay-J/{shape}/Query(offset)@J", offset)
     else:
@@ -895,11 +907,17 @@ async def test_controller_is_denied_on_seller_namespaces(cluster: Cluster) -> No
     }
     for name, (rpc, request) in platform_denied.items():
         await assert_denied(f"controller/{name}(kontra-system)", getattr(ctl, rpc)(request))
-    # The controller's subject with a role is a party token: a platform worker at most.
+    # The controller's subject with a role is a party token: a platform worker at most. A
+    # system role is a permission too.
     with_role = await connect_public(
         cluster,
         PLATFORM,
         api_key=cluster.signer.controller(permissions=[f"{PLATFORM}:worker"]),
+    )
+    with_system_role = await connect_public(
+        cluster,
+        PLATFORM,
+        api_key=cluster.signer.controller(permissions=["temporal-system:admin"]),
     )
     platform_worker = await connect_public(
         cluster, PLATFORM, api_key=cluster.signer.platform_worker()
@@ -908,6 +926,7 @@ async def test_controller_is_denied_on_seller_namespaces(cluster: Cluster) -> No
     rpc, request = _controller_calls(PLATFORM)["SetWorkerDeploymentCurrentVersion"]
     for who, client in (
         ("controller+kontra-system:worker", with_role),
+        ("controller+temporal-system:admin", with_system_role),
         ("kontra-system:worker", platform_worker),
         ("acme:worker", seller),
     ):
@@ -920,6 +939,23 @@ async def test_controller_is_denied_on_seller_namespaces(cluster: Cluster) -> No
         "controller/acme:worker/SetWorkerDeploymentCurrentVersion(acme)",
         getattr(seller.workflow_service, rpc)(request),
     )
+    # A permission the claim mapper drops (a system role it does not know, an entry with no
+    # ":") is no permission: the token is judged by its subject, the controller's, and gets
+    # the controller's calls and nothing more (decisions I30).
+    rpc, request = _controller_calls(PLATFORM)["DescribeWorkerDeployment"]
+    for dropped in ("temporal-system:bogus", PLATFORM):
+        client = await connect_public(
+            cluster, PLATFORM, api_key=cluster.signer.controller(permissions=[dropped])
+        )
+        who = f"controller+{dropped} (dropped)"
+        await assert_authorized(
+            f"controller/{who}/DescribeWorkerDeployment(kontra-system)",
+            getattr(client.workflow_service, rpc)(request),
+        )
+        await assert_denied(
+            f"controller/{who}/StartWorkflow(kontra-system)",
+            client.workflow_service.start_workflow_execution(_start(PLATFORM, "rollout-gate")),
+        )
 
 
 # --- a party steers its own jobs ---------------------------------------------------------
