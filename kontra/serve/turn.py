@@ -79,9 +79,53 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.contrib.workflow_streams import WorkflowStreamClient
 
     from kontra.contract.names import agent_workflow_id, job_id_from_workflow_id
+    from kontra.serve._agent_events import (
+        AGENT_ACCEPTS,
+        AGENT_HANDLERS,
+        AGENT_INIT_DATA,
+        CALLBACK_REQUESTED,
+        CLOSE_SIGNAL,
+        EVENT,
+        EVENT_MESSAGE,
+        EVENT_MESSAGE_ID,
+        EVENT_OUTPUT,
+        EVENT_TURN_ID,
+        EVENT_TYPE,
+        MESSAGE_HANDLER_END,
+        MESSAGE_HANDLER_ERROR,
+        MESSAGE_PAYLOAD,
+        MESSAGE_TYPE,
+        REPLY_FIELDS,
+        SEND_AGENT_MESSAGE_UPDATE,
+        TOOL_APPROVAL_REQUESTED,
+        TURN_END,
+        TURN_EVENTS_TOPIC,
+    )
 
 __all__ = [
+    # The harness wire names this module uses and re-exports from _agent_events (OD8), so
+    # ``kontra.serve.turn`` stays their import site for tests and for offering.py.
+    "AGENT_ACCEPTS",
+    "AGENT_HANDLERS",
+    "AGENT_INIT_DATA",
+    "CALLBACK_REQUESTED",
+    "CLOSE_SIGNAL",
+    "EVENT",
+    "EVENT_MESSAGE",
+    "EVENT_MESSAGE_ID",
+    "EVENT_OUTPUT",
+    "EVENT_TURN_ID",
+    "EVENT_TYPE",
+    "MESSAGE_HANDLER_END",
+    "MESSAGE_HANDLER_ERROR",
+    "MESSAGE_PAYLOAD",
+    "MESSAGE_TYPE",
+    "REPLY_FIELDS",
+    "SEND_AGENT_MESSAGE_UPDATE",
+    "TOOL_APPROVAL_REQUESTED",
     "TURN_ACTIVITY",
+    "TURN_END",
+    "TURN_EVENTS_TOPIC",
     "TURN_WORKFLOW",
     "StreamEnded",
     "TurnActivities",
@@ -98,39 +142,11 @@ TURN_WORKFLOW = "kontra.turn.v1"
 #: The activity that delivers the one message and reads its reply.
 TURN_ACTIVITY = "kontra.turn.v1.deliver"
 
-# --------------------------------------------------------------------------- the wire shape
-#
-# temporal-agent-harness's protocol, as Kontra relies on it (0.6.0 and 0.7.0 are identical
-# here). Constants only: Kontra must never import the harness.
-
-#: The update that admits one message: ``{type: <handler name>, payload: <input JSON>}``.
-SEND_AGENT_MESSAGE_UPDATE = "send_agent_message"
-#: The message envelope's fields.
-MESSAGE_TYPE = "type"
-MESSAGE_PAYLOAD = "payload"
-#: The fields of the update's reply (``AgentMessageReply``).
-REPLY_FIELDS = ("turn_number", "turn_id", "message_id", "disposition", "accepted_offset")
-#: The signal that ends the agent's session; its ``run`` returns once in-flight turns drain.
-CLOSE_SIGNAL = "close"
-#: The workflow-stream topic the agent publishes its events on.
-TURN_EVENTS_TOPIC = "turn_events"
-#: Event types (``AgentEventType``) Kontra acts on.
-MESSAGE_HANDLER_END = "message_handler_end"
-MESSAGE_HANDLER_ERROR = "message_handler_error"
-TURN_END = "turn_end"
-TOOL_APPROVAL_REQUESTED = "tool_approval_requested"
-CALLBACK_REQUESTED = "callback_requested"
-#: The event envelope's fields (``AgentEvent``) and the event body's.
-EVENT_MESSAGE_ID = "message_id"
-EVENT_TURN_ID = "turn_id"
-EVENT = "event"
-EVENT_TYPE = "type"
-EVENT_OUTPUT = "output"
-EVENT_MESSAGE = "message"
-#: What ``@agent.accepts`` stamps on the handler, and ``@agent.defn`` on the class.
-AGENT_ACCEPTS = "__agent_accepts__"
-AGENT_HANDLERS = "__agent_handlers__"
-AGENT_INIT_DATA = "__agent_init_data__"
+# The harness's wire shape -- the update/signal names, the message envelope and reply fields,
+# the stream topic, the event types and envelope fields, and the decorator markers -- lives in
+# :mod:`kontra.serve._agent_events` (imported above), shared with the dev console's session
+# pane and checked against the harness in one place (``docs/decisions.md`` I36, OD8). Kontra
+# never imports the harness; both readers agree on the wire by construction.
 
 # --------------------------------------------------------------------------- the job
 
