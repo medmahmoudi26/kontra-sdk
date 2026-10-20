@@ -194,7 +194,14 @@ def test_the_page_runs_its_own_script_and_style_alone(serve: Serve) -> None:
         assert len(tags) == 2
         assert all(attrs == f' nonce="{nonce}"' for _, attrs in tags)
         assert "__NONCE__" not in r.text
+        assert "__SESSION__" not in r.text
     assert first.headers["Content-Security-Policy"] != second.headers["Content-Security-Policy"]
+    # The POST routes' token (I36): this console's, the same in every page it serves, and
+    # another console's differs.
+    token = re.compile(r'const SESSION_TOKEN = "([A-Za-z0-9_-]{32,})"')
+    [mine], [again] = token.findall(first.text), token.findall(second.text)
+    [theirs] = token.findall(_get(serve(), "/graph").text)
+    assert mine == again != theirs
 
 
 def test_the_page_needs_nothing_its_policy_refuses() -> None:
@@ -223,7 +230,11 @@ def test_the_page_needs_nothing_its_policy_refuses() -> None:
         "/api/session",
         "/api/events",
         "/api/io",
+        "/api/approve",
+        "/api/callback",
+        "/api/pull",
         "X-Kontra-Console",
+        "X-Kontra-Session",
     ):
         assert route in script.group(1), route
 
@@ -287,16 +298,26 @@ async def test_a_handler_offering_s_runs_say_they_have_no_static_graph(
     serve: Serve, worker: tuple[Client, str]
 ) -> None:
     """A handler offering's job (``kontra.turn.v1``) and the agent it starts have no static
-    graph (decisions I35): told by the types Temporal reports, the job's and its parent's."""
+    graph (decisions I35): told by the types Temporal reports, the job's and its root's. It is
+    the one classification OD7 reads (I36 §7): the session pane says the same runs are a
+    hired turn's, never the console's to answer, and a workflow offering's run is neither."""
     client, queue = worker
     srv = serve()
     wf = f"console-{uuid.uuid4().hex}"
     await (await client.start_workflow(TurnLike.run, "hi", id=wf, task_queue=queue)).result()
+    plain, _ = await _finished(client, queue)
     job = (await asyncio.to_thread(_get, srv, f"/api/graph?w={wf}")).json()
     agent = (await asyncio.to_thread(_get, srv, f"/api/graph?w={wf}-agent")).json()
     for g in (job, agent):
         assert (g["static_graph"], g["handler"]) == (False, True)
     assert agent["workflow"]["type"] == "AgentLike"
+    for w, turn in ((wf, True), (f"{wf}-agent", True), (plain, False)):
+        both = (
+            await asyncio.to_thread(_get, srv, f"/api/session?w={w}", **{"X-Kontra-Console": "1"})
+        ).json()
+        said = both["session"]["agent"]
+        assert (both["graph"]["handler"], said["hired"]) == (turn, turn), w
+        assert said["interactive"] is False
 
 
 def test_the_page_tells_no_one_to_run_anything_but_kontra_serve() -> None:
@@ -564,6 +585,134 @@ async def test_a_batch_child_s_history_is_kept_once_it_closed(tmp_path: Path) ->
     assert [h[child[0]] for h in seen] == [opened, scheduled, closed, closed, closed]
     assert fetched == [child] * 3
     assert list(console._children) == [child]
+
+
+async def test_a_run_of_a_hired_turn_opened_by_its_own_id_is_never_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OD7 by Temporal's record of the run, not by the viewed run's type: a turn job's agent
+    child (its root is the job) or a subagent of it (on a server that records no root, its
+    parents lead to the job), opened by its own id, is read-only, and ``POST /api/approve`` is
+    refused (403) with no Update sent. An agent that is its own root is answered."""
+    from types import SimpleNamespace
+
+    from temporalio.api.common.v1 import WorkflowExecution
+    from temporalio.api.workflow.v1 import WorkflowExecutionInfo
+    from temporalio.client import WorkflowExecutionStatus
+
+    from kontra.contract import names
+
+    job = names.new_job_id()
+    root, child = names.job_workflow_id(job), names.agent_workflow_id(job)
+    sub, alone = "cert-checker-subagent-1", "recon-entry-1"
+    run = "5f0c6a7e-0000-4000-8000-000000000001"
+
+    def described(
+        wid: str, kind: str, *, root_of: str | None = None, parent: str | None = None
+    ) -> Any:
+        info = WorkflowExecutionInfo()
+        if root_of is not None:
+            info.root_execution.CopyFrom(WorkflowExecution(workflow_id=root_of, run_id=run))
+        if parent is not None:
+            info.parent_execution.CopyFrom(WorkflowExecution(workflow_id=parent, run_id=run))
+        raw = SimpleNamespace(workflow_execution_info=info, pending_activities=[])
+        return SimpleNamespace(
+            id=wid, run_id=run, workflow_type=kind, task_queue="q",
+            status=WorkflowExecutionStatus.RUNNING, raw_description=raw,
+        )  # fmt: skip
+
+    runs = {
+        root: described(root, "kontra.turn.v1", root_of=root),
+        child: described(child, "ReconHarnessAgent", root_of=root, parent=root),
+        sub: described(sub, "CertChecker", parent=child),  # no root recorded: walk up
+        alone: described(alone, "ReconHarnessAgent", root_of=alone),
+    }
+    sent: list[tuple[str, str]] = []
+
+    class Handle:
+        def __init__(self, wid: str) -> None:
+            self.wid = wid
+
+        async def describe(self) -> Any:
+            return runs[self.wid]
+
+        async def execute_update(self, name: str, arg: Any, **kwargs: Any) -> Any:
+            sent.append((self.wid, name))
+            return {"accepted": True}
+
+    class FakeClient:
+        def get_workflow_handle(self, wid: str, *, run_id: str | None = None) -> Handle:
+            return Handle(wid)
+
+    client: Any = FakeClient()
+    items = [
+        (0, {"event": {"type": "turn_started"}, "turn_id": "t", "turn_number": 1}),
+        (
+            1,
+            {
+                "event": {
+                    "type": "tool_approval_requested",
+                    "tool_id": "call_1",
+                    "tool_name": "post",
+                },
+                "turn_id": "t",
+            },
+        ),
+    ]
+
+    async def given(*args: Any) -> Any:
+        return items
+
+    async def nothing(*args: Any, **kwargs: Any) -> Any:
+        return ({}, {}) if "watched" in kwargs else {}
+
+    console = Console(tmp_path, _codec)
+    monkeypatch.setattr(console._reader, "items", given)
+    for name in ("tool_links", "subagents", "input_types", "answered"):
+        monkeypatch.setattr(console._reader, name, nothing)
+    answered: dict[str, Any] = {}
+    try:
+        for target in (child, sub, alone):
+            agent = await console._reader.agent_of(client, runs[target], {"events": []})
+            session, _ = await console._session_of(client, runs[target], agent, {}, [])
+            snap = console_module._Snapshot(
+                {"workflow": {"workflow_id": target, "run_id": run}, "nodes": []},
+                {}, ("k",), False, False, session=session,
+            )  # fmt: skip
+
+            async def view(*args: Any, snap: Any = snap) -> Any:
+                return snap
+
+            async def write() -> Any:
+                return client
+
+            monkeypatch.setattr(console, "_view", view)
+            monkeypatch.setattr(console, "_write_client", write)
+            request = console_module._request(
+                "/api/approve", {"offset": 1, "tool_id": "call_1", "approved": True}
+            )
+            try:
+                answered[target] = await console._answer(target, None, request)
+            except console_module.ConsoleError as e:
+                answered[target] = (e.status, e.message, session["agent"]["hired"])
+    finally:
+        console.close()
+    for target in (child, sub):
+        assert answered[target] == (
+            403,
+            "this run's requests are not the console's to answer (it is part of a hired turn)",
+            True,
+        )
+    assert answered[alone] == {"accepted": True}
+    assert sent == [(alone, "tool_approval")]  # nothing went into the hired job's tree
+
+
+def test_a_cut_tool_id_is_never_pending_for_an_answer() -> None:
+    row = {"offset": 1, "tool_id": "x" * 999 + "…", "label": "approval.requested", "pending": True}
+    session = {"turns": [{"rows": [row]}]}
+    assert console_module._pending(session, 1, row["tool_id"], "approval.requested")
+    row["id_capped"] = True
+    assert not console_module._pending(session, 1, row["tool_id"], "approval.requested")
 
 
 async def test_a_session_the_renderer_cannot_take_is_an_empty_one_not_a_failed_graph(

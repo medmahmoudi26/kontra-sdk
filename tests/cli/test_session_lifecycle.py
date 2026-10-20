@@ -20,6 +20,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import textwrap
 import threading
 import uuid
@@ -237,6 +238,12 @@ async def test_a_hired_turn_is_read_from_its_agent_child_drawn_nested(
                 assert got.status_code == 200, got.text
                 view = got.json()
                 frames = _frames(await asyncio.to_thread(_stream, srv, f"/api/events?w={root}"))
+                plan = _row(view["session"], "tool.call", "plan")
+                refused = await asyncio.to_thread(
+                    _post, srv, "/api/approve",
+                    {"w": root, "offset": plan["offset"], "tool_id": plan["tool_id"], "approved": True},
+                    **{"X-Kontra-Session": _token(srv)},
+                )  # fmt: skip
                 g, session = view["graph"], view["session"]
                 seller = mp.client(acme.namespace)
                 agent_wf = agent_workflow_id(job.job_id)
@@ -324,6 +331,9 @@ async def test_a_hired_turn_is_read_from_its_agent_child_drawn_nested(
         1,
     )
     assert stat["history_length"] > len(agent_history["events"])
+    # A hired turn's requests are not the console's to answer (OD7): refused, nothing sent.
+    assert refused.status_code == 403
+    assert "it is part of a hired turn" in refused.json()["error"]
 
 
 async def test_bodies_reach_the_page_through_io_alone(
@@ -395,7 +405,7 @@ async def test_an_agent_that_hosts_its_stream_is_read_once_its_stream_is_polled(
     """ReconHarnessAgent run as a workflow of its own (case b): its events are in its
     in-memory log until something polls them, so the pane says so (OD1); once its seller's
     client has read the stream, the rows are there, linked to the run's own tool nodes, and
-    the approval it waits on is pending -- read-only here (OD7)."""
+    the approval it waits on is pending."""
     with load_worker(_project(tmp_path / "p")) as worker:
         [bound] = worker.offerings
         async with Marketplace(dev_server=dev_server) as mp:
@@ -451,7 +461,7 @@ async def test_an_agent_that_hosts_its_stream_is_read_once_its_stream_is_polled(
     view = after.json()
     session, g = view["session"], view["graph"]
     assert session["agent"]["status"] == "running"
-    assert session["agent"]["interactive"] is False  # OD7: answered by the seller here
+    assert session["agent"]["interactive"] is True  # a running agent hosting its stream (OD7)
     for tool in ("plan", "probe"):
         call = _row(session, "tool.call", tool)
         assert call["node"] == tool  # the run's own activity node: nothing nested
@@ -465,3 +475,245 @@ async def test_an_agent_that_hosts_its_stream_is_read_once_its_stream_is_polled(
     )
     assert approval["hint"].startswith("to: slack #sec")
     assert all("parent" not in n for n in g["nodes"])
+
+
+# --------------------------------------------------------------------------- answers (dev only)
+
+
+def _token(srv: CodecServer) -> str:
+    """This console's token, as its page carries it (the one place it is)."""
+    page = _get(srv, "/graph").text
+    found = re.search(r'const SESSION_TOKEN = "([^"]+)"', page)
+    assert found is not None
+    return found.group(1)
+
+
+def _post(srv: CodecServer, path: str, body: dict[str, Any], **headers: str) -> httpx.Response:
+    origin = f"http://127.0.0.1:{srv.port}"
+    sent = {
+        "Content-Type": "application/json",
+        "Origin": origin,
+        "Sec-Fetch-Site": "same-origin",
+        "X-Kontra-Console": "1",
+        **headers,
+    }
+    with httpx.Client(trust_env=False, timeout=60) as http:
+        return http.post(
+            f"http://127.0.0.1:{srv.port}{path}", content=json.dumps(body), headers=sent
+        )
+
+
+def _updates(history: dict[str, Any], name: str) -> int:
+    return sum(
+        1
+        for e in history["events"]
+        if (e.get("workflowExecutionUpdateAcceptedEventAttributes") or {})
+        .get("acceptedRequest", {})
+        .get("input", {})
+        .get("name")
+        == name
+    )
+
+
+async def _until(check: Callable[[], Any], what: str, within: float = 60.0) -> Any:
+    for _ in range(int(within * 5)):
+        if got := await check():
+            return got
+        await asyncio.sleep(0.2)
+    raise AssertionError(f"not within {within:.0f} s: {what}")
+
+
+async def test_the_console_pulls_once_then_answers_an_approval_and_a_callback(
+    dev_server: DevServer,
+    tmp_path: Path,
+    console_for: Callable[[Marketplace, TestParty], CodecServer],
+) -> None:
+    """Case b, dev only: a run nobody polled offers ``[Pull once]`` (OD1), one poll from seq 0;
+    then the approval it waits on is answered from the console -- the harness's
+    ``tool_approval`` Update to that run, once, refused for a request that is not pending --
+    and so is the callback after it (``provide_callback_result``); the turn then completes."""
+    with load_worker(_project(tmp_path / "p")) as worker:
+        [bound] = worker.offerings
+        async with Marketplace(dev_server=dev_server) as mp:
+            acme = await mp.party("acme")
+            async with mp.serve(worker, acme):
+                config = mp.client(acme.namespace).config()
+                config["data_converter"] = seller_data_converter(_codec(acme)())
+                seller = Client(**config)
+                agent_wf = f"recon-{uuid.uuid4().hex[:8]}"
+                handle = await seller.start_workflow(
+                    "ReconHarnessAgent", {}, id=agent_wf, task_queue=bound.key,
+                    execution_timeout=timedelta(minutes=5),
+                )  # fmt: skip
+                try:
+                    payload = {
+                        "domains": ["a.example", "b.example"],
+                        "want_approval": True,
+                        "want_callback": True,
+                    }
+                    await handle.execute_update(
+                        ae.SEND_AGENT_MESSAGE_UPDATE,
+                        {"type": "sweep", "payload": payload},
+                        result_type=dict,
+                    )
+
+                    async def waiting(on: str) -> bool:
+                        status = await handle.query("agent_status", result_type=dict)
+                        return bool(status.get(on))
+
+                    await _until(lambda: waiting("pending_approvals"), "the approval pending")
+                    srv = console_for(mp, acme)
+                    token = _token(srv)
+                    w = {"w": agent_wf}
+
+                    def session() -> dict[str, Any]:
+                        got = _get(srv, f"/api/session?w={agent_wf}", **PAGE)
+                        assert got.status_code == 200, got.text
+                        return got.json()["session"]
+
+                    before = await asyncio.to_thread(session)
+                    assert (before["reason"], before["can_pull"]) == ("not-in-history", True)
+                    pulled = await asyncio.to_thread(
+                        _post, srv, "/api/pull", w, **{"X-Kontra-Session": token}
+                    )
+                    assert pulled.status_code == 200, pulled.text
+                    view = await asyncio.to_thread(session)
+                    assert view["empty"] is False
+                    assert view["agent"]["interactive"] is True
+                    again = await asyncio.to_thread(
+                        _post, srv, "/api/pull", w, **{"X-Kontra-Session": token}
+                    )
+                    assert again.status_code == 409  # its events are in history now: once is all
+                    approval = _row(view, "approval.requested")
+                    assert approval["pending"] is True
+                    ask = {
+                        **w,
+                        "offset": approval["offset"],
+                        "tool_id": approval["tool_id"],
+                        "approved": True,
+                    }
+                    [history] = await _histories(seller, agent_wf)
+                    assert _updates(history, ae.TOOL_APPROVAL_UPDATE) == 0
+                    # Refused, and nothing sent: another tool_id, another offset, a callback's
+                    # answer to an approval, another console's token.
+                    for wrong, path, extra in (
+                        ("another tool_id", "/api/approve", {"tool_id": "call-nope-0"}),
+                        ("another offset", "/api/approve", {"offset": approval["offset"] + 1}),
+                        ("the wrong kind", "/api/callback", {"result": "yes"}),
+                    ):
+                        r = await asyncio.to_thread(
+                            _post, srv, path, {**ask, **extra}, **{"X-Kontra-Session": token}
+                        )
+                        assert r.status_code == 409, (wrong, r.text)
+                    r = await asyncio.to_thread(
+                        _post, srv, "/api/approve", ask, **{"X-Kontra-Session": "x" + token}
+                    )
+                    assert r.status_code == 403
+                    [history] = await _histories(seller, agent_wf)
+                    assert _updates(history, ae.TOOL_APPROVAL_UPDATE) == 0
+                    # Allowed: one Update; the row is answered from history at once (the
+                    # stream's own resolution is not read yet), so a second press sends none.
+                    ok = await asyncio.to_thread(
+                        _post, srv, "/api/approve", ask, **{"X-Kontra-Session": token}
+                    )
+                    assert (ok.status_code, ok.json()) == (200, {"accepted": True})
+                    answered = _row(await asyncio.to_thread(session), "approval.requested")
+                    assert (answered["pending"], answered["resolution"]) == (False, "allowed")
+                    twice = await asyncio.to_thread(
+                        _post, srv, "/api/approve", ask, **{"X-Kontra-Session": token}
+                    )
+                    assert twice.status_code == 409
+                    [history] = await _histories(seller, agent_wf)
+                    assert _updates(history, ae.TOOL_APPROVAL_UPDATE) == 1
+
+                    # The callback, once its request is in history (a seller client reading the
+                    # stream, as its own UI would).
+                    await _until(lambda: waiting("pending_callbacks"), "the callback pending")
+
+                    async def read_stream() -> None:
+                        stream = WorkflowStreamClient.create(seller, agent_wf)
+                        async for item in stream.subscribe(
+                            topics=[ae.TURN_EVENTS_TOPIC], from_offset=0, result_type=dict,
+                            poll_cooldown=timedelta(milliseconds=50),
+                        ):  # fmt: skip
+                            if item.data[ae.EVENT][ae.EVENT_TYPE] == ae.TURN_END:
+                                return
+
+                    reader = asyncio.create_task(read_stream())
+
+                    async def callback_row() -> dict[str, Any] | None:
+                        rows = _rows(await asyncio.to_thread(session))
+                        return next((r for r in rows if r["label"] == "callback.requested"), None)
+
+                    callback = await _until(callback_row, "the callback row")
+                    assert (callback["tool_name"], callback["pending"]) == ("confirm", True)
+                    # The page sends the value as the type the callback declares (a str here);
+                    # a value of another type is the harness's to refuse, in its own words.
+                    assert callback["result_type"] == "string"
+                    wrong = await asyncio.to_thread(
+                        _post, srv, "/api/callback",
+                        {**w, "offset": callback["offset"], "tool_id": callback["tool_id"], "result": {"ok": True}},
+                        **{"X-Kontra-Session": token},
+                    )  # fmt: skip
+                    assert wrong.status_code == 409, wrong.text
+                    said = wrong.json()["error"]
+                    assert said.startswith("the agent refused it: ")
+                    assert "has no more" not in said  # the harness's own words, not a kind
+                    sent = await asyncio.to_thread(
+                        _post, srv, "/api/callback",
+                        {**w, "offset": callback["offset"], "tool_id": callback["tool_id"], "result": "ship it"},
+                        **{"X-Kontra-Session": token},
+                    )  # fmt: skip
+                    assert (sent.status_code, sent.json()) == (200, {"accepted": True})
+                    await asyncio.wait_for(reader, 60)
+                    final = await asyncio.to_thread(session)
+                    assert (
+                        _row(final, "callback.requested")["resolution"],
+                        final["turns"][0]["status"],
+                    ) == (
+                        "ok",
+                        "completed",
+                    )
+                    response = _row(final, "response")
+                    body = await asyncio.to_thread(
+                        _get, srv, f"/api/io?w={agent_wf}&event={response['offset']}", **PAGE
+                    )
+                    assert body.json()["body"]["output"]["confirmed"] == "ship it"
+                    assert body.json()["body"]["output"]["posted"] == "posted to slack #sec"
+                finally:
+                    await handle.terminate("the test is done")
+
+
+def test_a_non_dev_profile_s_console_answers_nothing(tmp_path: Path) -> None:
+    """``connect_dev`` refuses a login that is not a dev one (FORBIDDEN): the whole console
+    answers 403, every POST included, before any Update. A connect that raises so stands in
+    for that profile (connect_dev's own refusal is ``tests/cli/test_console.py``'s)."""
+    from http import HTTPStatus
+
+    from kontra.cli._console import ConsoleError
+    from kontra.codec.age import generate_identity
+
+    async def refuse() -> Connected:
+        raise ConsoleError(HTTPStatus.FORBIDDEN, "a login that is not a dev one: no console")
+
+    secret, public = generate_identity()
+
+    def codec() -> KontraCodec:
+        return KontraCodec(secret, [public], role="seller")
+
+    console = Console(tmp_path, codec, connect=refuse)
+    srv = CodecServer(0, codec=codec, origins=["http://localhost:8233"], token="t", console=console)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        token = _token(srv)
+        body = {"w": "recon-x", "offset": 0, "tool_id": "call-post_findings-0", "approved": True}
+        for path in ("/api/approve", "/api/callback", "/api/pull"):
+            r = _post(srv, path, {**body, "result": "x"}, **{"X-Kontra-Session": token})
+            assert r.status_code == 403, (path, r.text)
+        assert _get(srv, "/api/session?w=recon-x", **PAGE).status_code == 403
+    finally:
+        console.close()
+        srv.shutdown()
+        srv.server_close()
+        thread.join(5)

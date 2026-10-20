@@ -1214,14 +1214,23 @@ Any other row opens its event's body in the pane, decoded here.
 The footer counts the events and gives the last `seq`: an event's offset on the stream, the
 one counter it has, and the one the pane dedupes by. The rows and their short summaries come
 from the same snapshot as the graph, through the same header-gated route as a step's payloads;
-the live stream only says that something changed. An approval or a callback the agent waits
-on shows as its row, answered here by you as the seller (a hired turn ends the job on one: one
-hire is one turn).
+the live stream only says that something changed. **Replay** shows the rows again from seq 0 at
+ten times their pace, and the graph as it stood at each, from what the page already has (Esc
+returns to the live tail).
+
+An approval or a callback the agent waits on is its row. For an agent you run as its own
+workflow, while it runs, the row has **Allow** and **Deny** (a callback: a value and **Send**):
+the console sends the harness's `tool_approval` or `provide_callback_result` Update to that run,
+as your dev party, once per request (see `docs/security.md` for what the route checks); a
+callback's value is sent as the type the tool declares (text for a `str`, JSON otherwise). A hired
+turn ends the job on an approval or a callback (one hire is one turn), so there the row is
+informational; a console under any profile but a dev one answers nothing.
 
 **Where the events come from.** An agent publishes its events into its workflow's in-memory
 stream; they are in history only once something reads it. A hired turn's wrapper reads its
 agent for the whole turn, so its session is always there. An agent you run as its own workflow
-shows "not in history yet" until a client of yours has read its `turn_events`.
+shows "not in history yet" until a client of yours has read its `turn_events`, with **Pull once**:
+one read from seq 0, as your dev party (the pane never reads on its own).
 
 **The schema the console understands** is `temporal-agent-harness/0.6`: the harness's
 `AgentEvent` (`agent_id`, `turn_id`, `turn_number`, `message_id`, `timestamp`, and the typed

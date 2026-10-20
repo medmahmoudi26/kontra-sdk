@@ -173,6 +173,13 @@ h1 .off{color:var(--accent)}
 .appr .to{font:12.5px/1.35 var(--mono);color:var(--ink);overflow-wrap:anywhere}
 .appr .act{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .appr .note{color:var(--mute);font-size:11.5px;line-height:1.35}
+.appr button{font:600 12px/1 var(--sans);padding:6px 14px;border-radius:6px;border:1px solid var(--line);cursor:pointer;background:var(--panel);color:var(--ink)}
+.appr button.allow{border-color:var(--ok);color:var(--ok)}
+.appr button.deny{border-color:var(--bad);color:var(--bad)}
+.appr button:disabled{opacity:.5;cursor:not-allowed}
+.appr input.cb{font:12px/1 var(--mono);padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--ink);min-width:0;flex:1 1 140px}
+.sess-empty button{margin-top:10px;font:500 13px/1 var(--sans);padding:7px 12px;border:1px solid var(--accent);border-radius:6px;background:var(--panel);color:var(--accent);cursor:pointer}
+.sess-empty .note{color:var(--mute);font-size:11.5px;margin-top:6px}
 .sfooter{display:flex;flex-wrap:wrap;gap:4px 14px;padding:10px 14px;border-top:1px solid var(--line);color:var(--mute);font:11.5px/1.45 var(--mono)}
 .sfooter .key{font-variant-numeric:tabular-nums;color:var(--ink)}
 .sess-empty{padding:14px;color:var(--mute);font-size:13px}
@@ -233,6 +240,9 @@ h1 .off{color:var(--accent)}
 "use strict";
 (() => {
 const START = "start", END = "end";
+// This console's token, minted into this page alone: a POST echoes it in X-Kontra-Session, so a
+// tab of an earlier console, or another home's codec server, is refused.
+const SESSION_TOKEN = "__SESSION__";
 const SVGNS = "http://www.w3.org/2000/svg";
 const H = 54, R = 20, GX = 60, GY = 20;
 // A child drawn nested (the agent child): its header band, and the padding round its own graph.
@@ -256,6 +266,17 @@ const api = window.KONTRA_CONSOLE || {
   session(w, r) { return this.json(`/api/session?${this.qs(w, r)}`, { "X-Kontra-Console": "1" }); },
   io(w, r, node) { return this.json(`/api/io?${this.qs(w, r, { node })}`, { "X-Kontra-Console": "1" }); },
   ioEvent(w, r, offset) { return this.json(`/api/io?${this.qs(w, r, { event: String(offset) })}`, { "X-Kontra-Console": "1" }); },
+  // The dev-only answers: same-origin, JSON, the header and the token (decisions I36).
+  async post(path, w, r, body) {
+    const res = await fetch(path, { method: "POST", cache: "no-store", body: JSON.stringify({ w, r, ...body }),
+      headers: { "Content-Type": "application/json", Accept: "application/json", "X-Kontra-Console": "1", "X-Kontra-Session": SESSION_TOKEN } });
+    const got = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(got.error || `${res.status} ${res.statusText}`);
+    return got;
+  },
+  approve(w, r, body) { return this.post("/api/approve", w, r, body); },
+  callback(w, r, body) { return this.post("/api/callback", w, r, body); },
+  pull(w, r) { return this.post("/api/pull", w, r, {}); },
   subscribe(w, r, on) {
     // A change signal only: each session-stat sends the page back to /api/session.
     const es = new EventSource(`/api/events?${this.qs(w, r)}`);
@@ -330,14 +351,28 @@ let S = null, curW = null, curR = null, streamOpen = false, fetching = null, aga
 // The graph as drawn (G, and a placeholder for a tool call waiting on an approval), and the
 // node each pending approval's row links to.
 let D = null, needs = new Map(), subs = new Set();
+// Replay: how many rows are shown (null: live), its timer, the view a stat brought meanwhile,
+// and the replay clock (ms) the graph is painted at.
+let replaying = null, replayTimer = null, held = null, replayAt = null;
 
 function stateOf(n) {
   if (n.reached === false) return running ? "pending" : "unreached";
+  if (replayAt != null && !n.placeholder) {
+    // Replay: where the step was at the replay clock, from its own scheduled/started/closed times.
+    const t = n.t || {}, sch = ms(t.scheduled), st = ms(t.started), cl = ms(t.closed);
+    if (sch != null || st != null) {
+      if ((sch ?? st) > replayAt) return "pending";
+      if (cl != null && cl <= replayAt) return n.status || "completed";
+      return st != null && st <= replayAt ? "running" : "scheduled";
+    }
+  }
   return n.status || "pending";
 }
 // Every row of the session, nested ones included, in the order the pane draws them.
 function allRows(rows) { return (rows || []).flatMap(r => [r, ...allRows(r.children)]); }
 function sessionRows() { return S && !S.empty ? S.turns.flatMap(t => allRows(t.rows)) : []; }
+// The rows a replay has revealed so far (all of them, live).
+function shownRows() { const rows = sessionRows(); return replaying == null ? rows : rows.slice(0, replaying); }
 // The child nodes a handoff row links to: the subagents' own.
 function subagentNodes() { return new Set(sessionRows().filter(r => r.label === "handoff" && r.node).map(r => r.node)); }
 // A tool call waiting on its approval (the wireframe's "needs ✓"): the agent's node of that
@@ -351,7 +386,7 @@ function agentLayer(g) { // the agent's own steps: inside its child (case a), el
 function needsOf(g) {
   const out = new Map(), layer = agentLayer(g);
   if (layer === undefined) return out;
-  for (const row of sessionRows()) {
+  for (const row of shownRows()) {
     if (row.label !== "approval.requested" || !row.pending || !row.tool_id) continue;
     const drawn = g.nodes.find(n => (n.parent ?? null) === layer && n.name === row.tool_name && n.status !== "completed" && n.status !== "failed");
     out.set(row.tool_id, drawn ? drawn.id : `needs ✓ ${row.tool_id}`);
@@ -555,11 +590,12 @@ function drawLayout(L, into, box, g) {
   for (const id of [START, END]) {
     if (!L.pos.has(id)) continue;
     const p = L.pos.get(id);
-    const done = id === START || (G.workflow && G.workflow.status === "completed") || (L.parentStatus === "completed");
+    const closed = replayAt == null || (ms(((G.workflow || {}).t || {}).closed) ?? Infinity) <= replayAt;
+    const done = id === START || (closed && G.workflow && G.workflow.status === "completed") || (closed && L.parentStatus === "completed");
     layer.node.append(sv("g", { class: `term${done ? " done" : ""}`, transform: `translate(${p.x},${p.y})` },
       sv("circle", { r: R }), sv("text", { "text-anchor": "middle", y: 3.5 }, id)));
   }
-  const now = api.now(), faces = { name: font("name"), meta: font("meta") };
+  const now = replayAt ?? api.now(), faces = { name: font("name"), meta: font("meta") };
   for (const [id, n] of L.byId) {
     if (!L.pos.has(id)) continue;
     const p = L.pos.get(id), st = stateOf(n), s = L.size(id), inner = L.inner.get(id);
@@ -863,18 +899,54 @@ function rowEl(row, nested) {
   }
   return r;
 }
-// An approval or a callback the agent asked for. Here the seller answers it (OD7): the row says
-// so, and offers nothing to press.
+// An approval or a callback the agent asked for. Answered from here only for an agent hosting its
+// own stream, while it runs (the dev party's Update); a hired turn ends on it (OD7), so its row
+// says so and offers nothing to press; a replay never sends.
 function gate(row, agent) {
   const panel = el("div", { class: "appr" });
+  const callback = row.label === "callback.requested";
   panel.append(el("div", { class: "to" }, row.hint ? `${row.tool_name || row.summary} → ${row.hint}` : row.tool_name || row.summary || "tool"));
-  let note;
+  const live = agent.interactive && agent.status === "running" && row.pending && !row.id_capped && replaying == null;
+  let note = null;
   if (!row.pending) note = `answered · ${row.resolution || "resolved"}${row.auto ? ` · auto: ${row.auto}` : ""}`;
-  else if (agent.case === "a") note = "informational: a hired turn ends on it (one hire is one turn)";
+  else if (replaying != null) note = "replaying · nothing is sent";
+  else if (live) {
+    const act = el("div", { class: "act" });
+    const said = el("div", { class: "note" }, `dev only · sent as an Update to ${shortId(agent.workflow_id)}`);
+    if (callback) {
+      // The value goes as the type the callback declares (its output_schema): text for a str.
+      const kind = row.result_type, text = !kind || kind === "string";
+      const input = el("input", { class: "cb", type: "text", placeholder: text ? "the result (text)" : `the result (JSON ${kind})`, "aria-label": "Callback result" });
+      const send = el("button", { class: "allow", type: "button" }, "Send");
+      send.addEventListener("click", () => {
+        let result = input.value;
+        if (!text) {
+          try { result = JSON.parse(input.value); } catch (_) { said.textContent = `not sent: the result is JSON (${kind})`; return; }
+        }
+        answer(panel, said, () => api.callback(curW, curR, { offset: row.offset, tool_id: row.tool_id, result }));
+      });
+      act.append(input, send);
+    } else {
+      const allow = el("button", { class: "allow", type: "button" }, "Allow");
+      const deny = el("button", { class: "deny", type: "button" }, "Deny");
+      allow.addEventListener("click", () => answer(panel, said, () => api.approve(curW, curR, { offset: row.offset, tool_id: row.tool_id, approved: true })));
+      deny.addEventListener("click", () => answer(panel, said, () => api.approve(curW, curR, { offset: row.offset, tool_id: row.tool_id, approved: false })));
+      act.append(allow, deny);
+    }
+    panel.append(act, said);
+  } else if (agent.hired) note = "informational: a hired turn ends on it (one hire is one turn)";
   else if (agent.status !== "running") note = "run ended · unanswered";
+  else if (row.id_capped) note = "its tool_id is too long to answer from here";
   else note = `waiting on the seller${row.auto ? ` · auto: ${row.auto}` : ""}`;
-  panel.append(el("div", { class: "note" }, note));
+  if (note) panel.append(el("div", { class: "note" }, note));
   return panel;
+}
+function shortId(id) { const s = String(id || "the agent"); return s.length > 28 ? `${s.slice(0, 12)}…${s.slice(-12)}` : s; }
+function answer(panel, said, send) {
+  panel.querySelectorAll("button, input").forEach(b => { b.disabled = true; });
+  said.textContent = "sending…";
+  send().then(() => { said.textContent = "sent · the row updates from history"; refresh(); })
+    .catch(err => { said.textContent = `refused: ${err.message}`; panel.querySelectorAll("button, input").forEach(b => { b.disabled = false; }); });
 }
 function emptyState(session) {
   const msg = { "no-agent": "This offering has no agent session (its entry is not an agent).",
@@ -882,26 +954,39 @@ function emptyState(session) {
     "not-in-history": "This run's events are not in history yet: nobody has read its turn_events stream.",
     "in-bucket": "This job's events are in the bucket, by reference: the codec server holds no gate session to fetch them.",
     "undecodable": "This run's agent events could not be rendered: the codec server's log says why." }[session.reason] || "No agent session.";
-  return el("div", { class: "sess-empty" }, el("p", {}, msg));
+  const box = el("div", { class: "sess-empty" }, el("p", {}, msg));
+  if (session.can_pull) {
+    // OD1: the one write the pane makes on its own, and only when asked to.
+    const pull = el("button", { type: "button" }, "Pull once");
+    const said = el("p", { class: "note" }, "dev only · one poll of turn_events from seq 0, as the dev party");
+    pull.addEventListener("click", () => {
+      pull.disabled = true; said.textContent = "polling…";
+      api.pull(curW, curR).then(() => refresh()).catch(err => { pull.disabled = false; said.textContent = `refused: ${err.message}`; });
+    });
+    box.append(pull, said);
+  }
+  return box;
 }
-function rowsOf(wrap, rows, agent, depth) {
+function rowsOf(wrap, rows, agent, depth, budget) {
   for (const row of rows) {
+    if (budget.left != null && budget.left-- <= 0) return; // a replay shows the rows it reached
     if (row.type === "truncated") { wrap.append(el("div", { class: "subnote" }, row.summary)); continue; }
     wrap.append(rowEl(row, depth));
     // A handoff's own rows under it, a subagent's subagents' under theirs (OD5: at most 3 deep).
-    rowsOf(wrap, row.children || [], agent, Math.min(3, depth + 1));
+    rowsOf(wrap, row.children || [], agent, Math.min(3, depth + 1), budget);
     if (row.note) wrap.append(el("div", { class: "subnote" }, row.note));
     if (row.link) wrap.append(el("div", { class: "subnote" }, el("a", { href: api.href(row.link), target: "_blank", rel: "noopener noreferrer" }, "open the subagent ↗"), ` · ${row.link_reason || ""}`));
     if (!depth && (row.label === "approval.requested" || row.label === "callback.requested")) wrap.append(gate(row, agent));
   }
 }
-function renderSession(session) {
+function renderSession(session, limit) {
   S = session;
   const card = $("session-card"), box = $("session"), foot = $("session-footer");
   // A run that is no agent has no session card: its page is the graph page it always was.
   card.hidden = session.empty && session.reason === "no-agent";
   if (card.hidden) return;
   const agent = session.agent || {};
+  $("replay").hidden = !!session.empty;
   $("strm").hidden = false;
   $("strm").textContent = `stream ${session.stream || "turn_events"}`;
   if (session.empty) { box.replaceChildren(emptyState(session)); foot.hidden = true; return; }
@@ -919,9 +1004,11 @@ function renderSession(session) {
     else if (Date.now() - Number(wrap.dataset.user || 0) < 1500) wrap.dataset.tail = "0";
   }, { passive: true });
   lastRt = null;
+  const budget = { left: limit ?? null };
   for (const turn of session.turns) {
+    if (budget.left != null && budget.left <= 0) break;
     wrap.append(turnHead(turn));
-    rowsOf(wrap, turn.rows, agent, 0);
+    rowsOf(wrap, turn.rows, agent, 0, budget);
   }
   if (old) rowsSeen.unobserve(old);
   box.replaceChildren(wrap);
@@ -929,6 +1016,13 @@ function renderSession(session) {
   rowsSeen.observe(wrap); // and again whenever the box is resized (the node pane, the column)
   const f = session.footer || {};
   foot.hidden = false;
+  if (limit != null) {
+    // seq is this stream's offset: a nested row's own is its subagent's, so its handoff's counts.
+    const at = sessionRows().slice(0, limit).filter(r => !r.nested).pop();
+    foot.replaceChildren(el("span", { class: "key" }, `replay · seq ${at && at.offset != null ? at.offset : "—"} / ${f.last_offset ?? "—"}`),
+      el("span", {}, `at 10× from seq 0 · a gap past ${REPLAY_GAP_MAX * 10 / 1000} s is cut to ${REPLAY_GAP_MAX / 1000} s · nothing is sent · Esc for live`));
+    return;
+  }
   foot.replaceChildren(el("span", { class: "key" }, `${f.count || 0} events`), el("span", { class: "key" }, `seq ${f.last_offset ?? "—"}`),
     el("span", {}, "dedupe by seq (the stream offset)"), el("span", {}, `decrypted with ${f.decrypted || "this machine's dev key"}`));
   highlightRows();
@@ -945,8 +1039,44 @@ function fitColumn() {
   col.style.height = on ? `${Math.max(320, innerHeight - ($("split").getBoundingClientRect().top + scrollY) - 12)}px` : "";
 }
 
+// ---- replay: the stored rows again from seq 0 at 10×, and the graph as it stood at each; in this
+// page alone, it never sends ----
+const REPLAY_GAP_MAX = 1200; // ms: the design's clamp, said in the footer
+function replayStep() {
+  const rows = sessionRows(), at = replaying > 0 ? rows[replaying - 1].at : null;
+  const first = rows.find(r => typeof r.at === "number");
+  // The replay clock: the latest row shown's time (before the first, just before it).
+  replayAt = typeof at === "number" ? at * 1000 : first ? first.at * 1000 - 1 : null;
+  renderSession(S, replaying);
+  draw(G); pane();
+}
+function startReplay() {
+  const rows = sessionRows();
+  if (!rows.length) return;
+  $("replay").textContent = "■ Live";
+  replaying = 0; replayStep();
+  const step = () => {
+    replaying += 1;
+    replayStep();
+    if (replaying >= rows.length) { replayTimer = setTimeout(endReplay, 1200); return; }
+    const a = rows[replaying - 1].at, b = rows[replaying].at;
+    const gap = typeof a === "number" && typeof b === "number" ? (b - a) * 1000 / 10 : 120;
+    replayTimer = setTimeout(step, Math.min(REPLAY_GAP_MAX, Math.max(16, gap)));
+  };
+  replayTimer = setTimeout(step, 300);
+}
+function endReplay() {
+  if (replayTimer) clearTimeout(replayTimer);
+  replayTimer = null;
+  if (replaying == null) return;
+  replaying = null; replayAt = null;
+  $("replay").textContent = "↺ Replay";
+  if (held) { const view = held; held = null; paint(view); } else if (S) { renderSession(S); draw(G); pane(); }
+}
+
 // ------------------------------------------------------------------ views
 function paint(view) {
+  if (replaying != null) { held = view; return; } // the live view waits for the replay to end
   const g = view.graph;
   G = g; S = view.session || null;
   needs = needsOf(g);
@@ -988,7 +1118,7 @@ async function graphView(w, r) {
 }
 async function runsView() {
   $("graph-view").hidden = true;
-  curW = null; curR = null; S = null; $("ind").hidden = true;
+  curW = null; curR = null; S = null; $("ind").hidden = true; $("replay").hidden = true;
   $("sess-queue").replaceChildren(); $("sess-run").replaceChildren();
   $("wf-type").textContent = "Recent runs"; $("wf-id").textContent = ""; $("wf-status").hidden = true; $("wf-time").textContent = "";
   let runs;
@@ -1010,10 +1140,12 @@ function fail(err) {
   note.hidden = false;
 }
 addEventListener("resize", () => { if (G) { fitColumn(); draw(G); } });
+$("replay").addEventListener("click", () => { if (replaying != null) endReplay(); else startReplay(); });
+addEventListener("keydown", ev => { if (ev.key === "Escape" && replaying != null) endReplay(); });
 // While the run is open, its clocks keep moving between events.
 setInterval(() => { if (G && running && !document.hidden) { header(G); draw(G); } }, 1000);
 if (api.query.w) graphView(api.query.w, api.query.r); else runsView();
-window.KONTRA_CONSOLE_OPEN = (w, r) => { selected = null; shownEvent = null; ioCache.clear(); if (w) graphView(w, r); else runsView(); };
+window.KONTRA_CONSOLE_OPEN = (w, r) => { endReplay(); selected = null; shownEvent = null; ioCache.clear(); if (w) graphView(w, r); else runsView(); };
 })();
 </script>
 </body>

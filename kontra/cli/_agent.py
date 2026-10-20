@@ -15,6 +15,12 @@ The agent of a viewed run is (names constructed, never parsed -- I1):
 * case ``b``, any other run: the run itself, an agent when it hosts the stream (a harness
   agent's ``send_agent_message`` front door is in its history, or a poll read ``turn_events``).
 
+Either is ``hired`` when the viewed run is a handler offering's, part of a hired turn
+(:meth:`Reader.hired`): a ``kontra.turn.v1`` job, or a run under one opened by its own id (a
+turn job's agent child, a subagent of it), as Temporal's record of the run's root, or of its
+parents, says. That is the console's one classification of a turn run: the graph's
+``handler`` notice (I35) and OD7's refusal both read it.
+
 Items are in history only as stream-poll Update outcomes (I31): a ``kontra.turn.v1`` job's
 turn activity polls its agent child for the whole turn, a subagent's parent's turn activity
 polls the subagent; a case-``b`` run nobody polled has its events in its in-memory log alone.
@@ -60,6 +66,8 @@ TURN_WORKFLOW = "kontra.turn.v1"
 #: Subagent nesting bounds (OD5): how deep, and how many subagent histories one view reads.
 SUBAGENT_DEPTH = 3
 SUBAGENT_HISTORIES = 16
+#: The parents walked to a run's root on a server that records no root of its own.
+_PARENTS = 8
 #: A stream item's base64 over this is not shown: #52's per-item cap (``STREAM_ITEM_MAX``).
 _ITEM_B64_MAX = (STREAM_ITEM_MAX + 2) // 3 * 4
 #: What a reader remembers of what history made final.
@@ -85,6 +93,10 @@ class AgentRun:
     desc: WorkflowExecutionDescription | None = None
     #: Not started yet: a turn job whose history has not started its agent child.
     started: bool = True
+    #: The viewed run is part of a hired turn (:meth:`Reader.hired`): a handler offering's,
+    #: drawn with no static graph (I35) and never the console's to answer (OD7). Always true
+    #: in case ``a``.
+    hired: bool = False
 
     @property
     def status(self) -> str:
@@ -146,6 +158,8 @@ class Reader:
         self._batch: OrderedDict[tuple[str, str | None, int], Any] = OrderedDict()
         #: Each agent run's handlers' input types (its ``agent_interface``), asked once.
         self._interfaces: OrderedDict[tuple[str, str | None], dict[str, str]] = OrderedDict()
+        #: Whether a run is part of a hired turn (its root and parents never change).
+        self._hired: OrderedDict[tuple[str, str], bool] = OrderedDict()
 
     # ------------------------------------------------------------------ the agent
 
@@ -153,19 +167,53 @@ class Reader:
         self, client: Client, desc: WorkflowExecutionDescription, history: dict[str, Any]
     ) -> AgentRun:
         """The viewed run's agent: its ``kontra.turn.v1`` job's agent child (case ``a``),
-        else the run itself (case ``b``)."""
+        else the run itself (case ``b``); ``hired`` as :meth:`hired` says of the viewed run."""
+        hired = await self.hired(client, desc)
         job_id = job_id_from_workflow_id(desc.id)
         if desc.workflow_type != TURN_WORKFLOW or job_id is None:
-            return AgentRun(desc.id, desc.run_id, "b", history, desc)
+            return AgentRun(desc.id, desc.run_id, "b", history, desc, hired=hired)
         workflow_id = agent_workflow_id(job_id)
         started = started_children(history).get(workflow_id)
         if started is None or started[1] is None:  # the wrapper has not started it yet
-            return AgentRun(workflow_id, None, "a", started=False)
+            return AgentRun(workflow_id, None, "a", started=False, hired=hired)
         run_id = started[1]
         child = await client.get_workflow_handle(workflow_id, run_id=run_id).describe()
-        return AgentRun(
-            workflow_id, run_id, "a", await self.history(client, workflow_id, run_id), child
-        )
+        read = await self.history(client, workflow_id, run_id)
+        return AgentRun(workflow_id, run_id, "a", read, child, hired=hired)
+
+    async def hired(self, client: Client, desc: WorkflowExecutionDescription) -> bool:
+        """Whether the run is a handler offering's, part of a hired turn: it is a
+        ``kontra.turn.v1`` job, or its root, as Temporal recorded it -- or, on a server that
+        records none, one of its parents -- is one. The console's one answer to "is this a turn
+        run": the graph's ``handler`` field (no static graph is drawn for one, I35) and OD7's
+        refusal (never the console's to answer) both read it, through :attr:`AgentRun.hired`.
+        Told by the types Temporal reports (``DescribeWorkflowExecution``, an authoritative
+        lookup), never by a reading of an id; remembered per run."""
+        if _a_turn(desc):
+            return True
+        key = (desc.id, desc.run_id)
+        found = self._hired.get(key)
+        if found is not None:
+            return found
+        info = desc.raw_description.workflow_execution_info
+        found = False
+        if info.HasField("root_execution") and info.root_execution.workflow_id:
+            root = info.root_execution
+            if (root.workflow_id, root.run_id) != key:
+                found = _a_turn(await _described(client, root.workflow_id, root.run_id))
+        else:
+            parent = info.parent_execution if info.HasField("parent_execution") else None
+            for _ in range(_PARENTS):
+                if parent is None or not parent.workflow_id:
+                    break
+                above = await _described(client, parent.workflow_id, parent.run_id)
+                if _a_turn(above):
+                    found = True
+                    break
+                up = above.raw_description.workflow_execution_info
+                parent = up.parent_execution if up.HasField("parent_execution") else None
+        _remember(self._hired, key, found)
+        return found
 
     async def history(self, client: Client, workflow_id: str, run_id: str) -> dict[str, Any]:
         """One run's history; a closed one is final, so it is remembered."""
@@ -350,6 +398,46 @@ class Reader:
             items = values[0].get("items") if values and isinstance(values[0], dict) else None
             _remember(self._batch, key, len(items) if isinstance(items, list) else None)
         return self._batch[key]
+
+    async def answered(
+        self, workflow_id: str, run_id: str | None, history: Mapping[str, Any]
+    ) -> dict[str, dict[str, Any]]:
+        """Each request ``history`` shows answered: a ``tool_approval`` or
+        ``provide_callback_result`` Update the agent accepted and completed, by its
+        ``tool_id`` -> ``{"kind", "approved"}`` (an approval) or ``{"kind", "error"}`` (a
+        callback), its argument opened with this machine's codec. So a row is answered as
+        soon as its Update is, before the stream's own resolution event is read."""
+        names = {ae.TOOL_APPROVAL_UPDATE: "approval", ae.PROVIDE_CALLBACK_RESULT_UPDATE: "callback"}
+        accepted: dict[int, tuple[str, object]] = {}
+        done: set[int] = set()
+        for event in history.get("events") or []:
+            event_id = _int(event.get("eventId"))
+            attrs = event.get("workflowExecutionUpdateAcceptedEventAttributes")
+            if isinstance(attrs, dict) and event_id is not None:
+                request = (attrs.get("acceptedRequest") or {}).get("input") or {}
+                if request.get("name") in names:
+                    accepted[event_id] = (names[request["name"]], request.get("args"))
+            attrs = event.get("workflowExecutionUpdateCompletedEventAttributes")
+            if isinstance(attrs, dict) and "success" in (attrs.get("outcome") or {}):
+                done.add(_int(attrs.get("acceptedEventId")) or 0)
+        out: dict[str, dict[str, Any]] = {}
+        for event_id, (kind, args) in accepted.items():
+            if event_id not in done:
+                continue
+            key = (workflow_id, run_id, -event_id)  # beside the tool ids, never one of them
+            found = self._tool_ids.get(key)
+            if found is None:
+                found = [json.dumps(v) for v in await _decode_inputs(self._codec(), args)]
+                _remember(self._tool_ids, key, found)
+            arg = json.loads(found[0]) if found else None
+            if isinstance(arg, dict) and isinstance(arg.get(ae.APPROVAL_TOOL_ID), str):
+                answer: dict[str, Any] = {"kind": kind}
+                if kind == "approval":
+                    answer["approved"] = arg.get(ae.APPROVAL_APPROVED) is True
+                else:
+                    answer["error"] = arg.get(ae.CALLBACK_ERROR) is not None
+                out[arg[ae.APPROVAL_TOOL_ID]] = answer
+        return out
 
     @staticmethod
     def in_bucket(history: Mapping[str, Any]) -> bool:
@@ -537,6 +625,17 @@ def _decode_item(b64: str) -> object:
     payload = Payload()
     payload.ParseFromString(base64.b64decode(b64))
     return PayloadConverter.default.from_payloads([payload])[0]
+
+
+async def _described(
+    client: Client, workflow_id: str, run_id: str | None
+) -> WorkflowExecutionDescription:
+    return await client.get_workflow_handle(workflow_id, run_id=run_id or None).describe()
+
+
+def _a_turn(desc: WorkflowExecutionDescription) -> bool:
+    """A bound handler's job: the turn wrapper, by the type Temporal reports alone."""
+    return desc.workflow_type == TURN_WORKFLOW
 
 
 def _continued(history: Mapping[str, Any]) -> str | None:

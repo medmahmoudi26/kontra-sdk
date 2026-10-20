@@ -509,6 +509,56 @@ adapter (`kontra.engine.temporal`); a second one ships only once it proves, with
   `KONTRA_MCP_DOWNLOADS`), never inside a hidden directory, owned by you all the way down, with
   files named by their gate-assigned key and an inert extension, mode 0600.
 
+## The dev console's answers: approve, callback, pull
+
+`kontra dev up --ui`'s codec server serves the graph page and its agent session pane
+(decisions I28, I36) on loopback. Three of its routes change state: `POST /api/approve` and
+`POST /api/callback` send the harness's `tool_approval` and `provide_callback_result` Updates,
+and `POST /api/pull` (`[Pull once]`) sends one stream poll. Each runs as the dev party, with its
+worker token and this machine's key, so a request that reaches one acts as you. A web page in
+your browser can reach a loopback port, and a name it controls can rebind to 127.0.0.1; so each
+`POST` is refused, before any Update, unless all of these hold:
+
+- **`Host`** is the codec server's own (`127.0.0.1:P` or `localhost:P`): a rebound name is
+  refused.
+- **`Origin`** is present and is the console's own origin. A browser sends `Origin` with every
+  `POST`, and another page cannot set it. A missing one is refused too, which also refuses a
+  local program that is not a browser unless it says it is the page.
+- **`Sec-Fetch-Site`**, when the browser sends one, is `same-origin` (not `same-site`, not a
+  navigation).
+- **`Content-Type: application/json`**: an HTML form cannot send it, and a page sending it
+  cross-origin needs a preflight, which the codec server refuses for every console route.
+- **`X-Kontra-Console: 1`**, the header the page's reads need too, which no other origin can send
+  without that refused preflight.
+- **`X-Kontra-Session`** is this console's token: minted per codec-server process, injected into
+  its page alone, and compared in constant time. A tab left open from an earlier console, or the
+  page of another `KONTRA_HOME`'s codec server on the same machine, is refused. It is not the
+  token on standard input that stops the server, which never reaches a page.
+- **The body** is at most 64 KiB of JSON naming the run (`w`, `r`), the row's `offset` and its
+  `tool_id`.
+
+Then the console answers only what its own snapshot of the run says is pending: a row at that
+offset, of that `tool_id` and kind, in a run the console may answer (an agent hosting its own
+stream, while it runs). It never answers a `kontra.turn.v1` job's request: the wrapper ends the
+turn on one, and the buyer, not the console, is that job's other party (one hire is one turn;
+sessions are #60). Nor a request of any run of such a job opened by its own id -- its agent
+child, a subagent of that child, which the pane links to: whether a run belongs to a hired turn
+is Temporal's own record of the run's type, or of its root's (`DescribeWorkflowExecution`), or of
+its parents' on a server that records no root, being `kontra.turn.v1` -- never the type of the
+agent viewed, nor a reading of its id -- and it is the one classification the graph page's
+"handler" notice reads too. A
+`tool_id` the pane shows cut (over 1000 characters) is never answered. The Update goes to the snapshot's agent workflow and run -- built from the
+job id, or the viewed run itself, never a workflow id the request names -- with an id fixed per
+request (`kontra-console:<kind>:<run>:<tool_id>`), so a second press sends nothing new, and the
+row reads as answered from the Update in history before the stream's own resolution event is
+read. `[Pull once]` is offered only for a run whose events are in no history event yet, one at a
+time, and sends one poll from offset 0, a read that consumes nothing. Replay re-reveals the rows
+and the graph's painting already in the page and sends nothing.
+
+A non-dev profile gets no console at all (the codec server refuses its login, so every route
+answers 403), and the page shows no controls where the console may not answer: "waiting on the
+seller", or, on a hired turn, that the turn ends there.
+
 ## Known limits
 
 - **`kontra dev` runs no Authorizer.** Its Temporal is the CLI's dev server (pinned and

@@ -2945,7 +2945,10 @@ command #42's (merged as #46).
    offering's entry is a handler, so only what this run did is drawn" -- `/api/graph` gains
    `handler`, true when the run's type is `kontra.turn.v1` or its parent's is (the agent the
    job started; one `DescribeWorkflowExecution` of the parent, remembered), read from the
-   types Temporal reports, never from an id. The tooltips of a step this run did not reach
+   types Temporal reports, never from an id. (Amended by I36 §7: `handler` is the session
+   pane's one classification of a turn run, OD7's, so a run whose root -- or, with no root
+   recorded, a parent -- is a `kontra.turn.v1` job is one too, a subagent of the agent child
+   included.) The tooltips of a step this run did not reach
    read "the mock runs `kontra serve` drew the graph from". No string of the page or its
    server names `kontra graph` (a test; code comments and docstrings aside).
 
@@ -2991,9 +2994,9 @@ command #42's (merged as #46).
    it started that child, whose turn activity polls it for the whole turn; else (case **b**) the
    run itself. A case-b run nobody polled has its events in its in-memory log alone: the pane says
    so (**OD1: opt-in** -- a one-shot dev-party poll from offset 0, `[Pull once]`, offered in that
-   empty state alone, lands with the approvals, item 7). A job root's stream items are in the
-   bucket by reference (I39), which the console, holding no gate session, does not fetch: its
-   pane says that. No harness import (`kontra/cli/_agent.py`
+   empty state alone, item 7). A job root's stream items are in the bucket by reference (I39),
+   which the console, holding no gate session, does not fetch: its pane says that. No harness
+   import (`kontra/cli/_agent.py`
    reads, `kontra/cli/_session.py` renders, pure), no second server or connection.
 
 3. **One fetch for both panes (OD2).** `/api/graph/events` is renamed `/api/events` and carries
@@ -3041,11 +3044,32 @@ command #42's (merged as #46).
    `items=`'s length, or the items of the pages fetched so far, shown `≥N` while more may come --
    else what it scheduled. An open batch run is in the snapshot's key, as an agent child is.
 
-7. **Approvals and callbacks (OD7).** No live Allow/Deny on a `kontra.turn.v1` job: its wrapper
-   ends the turn on an approval or a callback (one hire is one turn; sessions are #60), so its row
-   is informational and says so. Live controls, dev-only Updates to the agent workflow behind the
-   full set of protections `docs/security.md` lists, and replay (client-side, from seq 0 at 10×,
-   never re-sending) are the second half of #54.
+7. **Approvals and callbacks, dev only (OD7).** No live Allow/Deny on a `kontra.turn.v1` job: its
+   wrapper ends the turn on an approval or a callback (one hire is one turn; sessions are #60), so
+   its row is informational and says so, and the routes refuse it -- and so for any run of a
+   hired turn opened by its own id (its agent child, a subagent of it): Temporal's record of the
+   run's root, or of its parents, says so, never the type of the viewed agent or a reading of an
+   id. That is the console's one classification of a turn run (`kontra.cli._agent.Reader.hired`:
+   the run's own type, its root's, or a parent's is `kontra.turn.v1`): the graph's `handler`
+   field and its notice (I35 §7) read it too, so the page never tells a turn run apart twice.
+   For an agent hosting its own stream, while it runs, the row offers Allow/Deny (a callback: a
+   value and Send), sent by the
+   console as the dev party: `POST /api/approve` and `/api/callback` become the harness's
+   `tool_approval` and `provide_callback_result` Updates to the snapshot's agent workflow and run
+   (constructed, or the viewed run; never one the page names), with an id fixed per request. Every
+   `POST` needs the console's `Host`, its own `Origin` (present), `Sec-Fetch-Site: same-origin`
+   when sent, `Content-Type: application/json`, `X-Kontra-Console` and a per-console token minted
+   into the page and compared in constant time (`docs/security.md`); the request must be pending
+   in the snapshot; anything else is refused with no Update sent. An answered Update closes its
+   row from history before the stream's own resolution is read. A callback's value goes as the
+   type its tool declares (`output_schema`: text for a `str`), and a refusal says the harness's
+   own words. **OD1** lands here too:
+   `[Pull once]`, offered only in the not-in-history empty state, sends one poll from offset 0.
+   **Replay** is the page's alone: the rows already fetched, nested ones one by one, from seq 0
+   at 10× (a gap is cut to 1.2 s, and the footer says so), the graph painted as it stood at each
+   row's time from its nodes' own scheduled/started/closed times, controls off, and it never
+   sends. (The spec said "plays the stored rows"; the wireframe "re-plays the stored history":
+   the graph's painting is that history.)
 
 8. **Bounds.** Every string read from an event is capped (120 characters; an id at 1000,
    Temporal's limit, and a row whose `tool_id` was cut is not answerable); an item over 256 KiB

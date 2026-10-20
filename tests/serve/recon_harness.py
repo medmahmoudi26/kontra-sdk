@@ -123,9 +123,10 @@ async def post_findings(to: str, expired: int, weak: int) -> str:
     return f"posted to {to}"
 
 
-@agent.callback_tool_defn(timeout=timedelta(minutes=10))
+@agent.callback_tool_defn(inherently_safe=True, timeout=timedelta(minutes=10))
 async def confirm(prompt: str) -> str:
-    """Ask whoever drives the agent to confirm, and wait for their answer."""
+    """Ask whoever drives the agent to confirm, and wait for their answer: asking is safe (no
+    approval first), what comes back is a value, not a yes or no."""
     ...
 
 

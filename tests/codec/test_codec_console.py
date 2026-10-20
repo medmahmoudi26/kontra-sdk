@@ -23,6 +23,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -118,6 +119,11 @@ def _preflight(srv: CodecServer, path: str, origin: str) -> httpx.Response:
                 "Access-Control-Request-Headers": "x-kontra-console",
             },
         )
+
+
+def _post(srv: CodecServer, path: str, body: str, **headers: str) -> httpx.Response:
+    with httpx.Client(trust_env=False, timeout=60) as http:
+        return http.post(f"http://127.0.0.1:{srv.port}{path}", content=body, headers=headers)
 
 
 def _stream(srv: CodecServer, path: str) -> bytes:
@@ -320,6 +326,63 @@ async def test_the_graph_page_shows_payloads_through_its_io_route_alone(
         pre = _preflight(server, io, origin)
         assert pre.status_code == 403, origin
         assert "Access-Control-Allow-Origin" not in pre.headers
+
+    # The dev-only POST routes (decisions I36): state-changing on loopback, so every check is
+    # tested alone, each refusing before any Update -- and LeakFlow, no agent, has none.
+    token = re.search(r'const SESSION_TOKEN = "([^"]+)"', seen[f"/graph?w={wf}"])  # type: ignore[arg-type]
+    assert token is not None
+    own = f"http://127.0.0.1:{server.port}"
+    good = {
+        "Content-Type": "application/json",
+        "Origin": own,
+        "Sec-Fetch-Site": "same-origin",
+        "X-Kontra-Console": "1",
+        "X-Kontra-Session": token.group(1),
+    }
+    body = json.dumps(
+        {"w": wf, "r": run, "offset": 0, "tool_id": "x", "approved": True, "result": 1}
+    )
+
+    def but(**changed: str | None) -> dict[str, str]:
+        out = {**good, **changed}
+        return {k: v for k, v in out.items() if v is not None}
+
+    post_refusals = {
+        "no Origin": (but(Origin=None), 403),
+        "another site": (but(Origin="https://evil.example"), 403),
+        "the UI's origin": (but(Origin=UI), 403),
+        "an opaque origin": (but(Origin="null"), 403),
+        "a rebound name": (but(Host=f"evil.example:{server.port}"), 403),
+        "another port": (but(Host="127.0.0.1:1"), 403),
+        "a cross-site fetch": (but(**{"Sec-Fetch-Site": "cross-site"}), 403),
+        "a same-site fetch": (but(**{"Sec-Fetch-Site": "same-site"}), 403),
+        "a navigation": (but(**{"Sec-Fetch-Site": "none"}), 403),
+        "no header": (but(**{"X-Kontra-Console": None}), 403),
+        "another value": (but(**{"X-Kontra-Console": "true"}), 403),
+        "no token": (but(**{"X-Kontra-Session": None}), 403),
+        "another console's token": (but(**{"X-Kontra-Session": token.group(1)[:-1] + "x"}), 403),
+        "a form": (but(**{"Content-Type": "application/x-www-form-urlencoded"}), 415),
+        "a text body": (but(**{"Content-Type": "text/plain"}), 415),
+    }
+    for route in ("/api/approve", "/api/callback", "/api/pull"):
+        for why, (headers, status) in post_refusals.items():
+            r = _post(server, route, body, **headers)
+            assert r.status_code == status, (route, why, r.status_code, r.text)
+            _assert_clean(f"{route} {why}", r.text, sealed)
+        big = _post(server, route, json.dumps({"pad": "x" * (64 * 1024)}), **good)
+        assert big.status_code == 413, route
+        # Every check passed: still refused, LeakFlow being no agent the console may answer.
+        answered = _post(server, route, body, **good)
+        assert answered.status_code in (403, 409), (route, answered.text)
+        _assert_clean(f"{route} with every check", answered.text, sealed)
+        for origin in (own, UI, "https://evil.example"):
+            pre = _preflight(server, route, origin)
+            assert pre.status_code == 403, (route, origin)
+            assert "Access-Control-Allow-Origin" not in pre.headers
+    after = await client.get_workflow_handle(wf).fetch_history()
+    assert not any(
+        e.HasField("workflow_execution_update_accepted_event_attributes") for e in after.events
+    )
 
 
 async def test_what_this_machine_cannot_open_is_shown_as_a_placeholder(

@@ -37,8 +37,10 @@ __all__ = [
     "SUMMARY_MAX",
     "TOO_LARGE",
     "VERSION",
+    "apply_answers",
     "build",
     "events_in_poll_result",
+    "has_update",
     "nested_rows",
     "stream_poll_outcomes",
 ]
@@ -199,6 +201,29 @@ def build(
         seen.add(offset)
         builder.feed(offset, event)
     return builder.result()
+
+
+def apply_answers(session: Mapping[str, Any], answers: Mapping[str, Mapping[str, Any]]) -> None:
+    """Fold into ``session`` the requests history shows answered by an Update (``answers``:
+    ``tool_id`` -> ``{"kind": "approval", "approved"}`` or ``{"kind": "callback", "error"}``),
+    for a row whose own resolution event the stream has not delivered yet: it is no longer
+    pending, and says how it was answered."""
+    labels = {"approval": "approval.requested", "callback": "callback.requested"}
+    for turn in session.get("turns") or []:
+        for row in turn.get("rows") or []:
+            answer = answers.get(row.get("tool_id") or "")
+            if (
+                answer is None
+                or not row.get("pending")
+                or row.get("label") != labels.get(answer.get("kind") or "")
+            ):
+                continue
+            row["pending"] = False
+            if answer["kind"] == "approval":
+                row["resolution"] = "allowed" if answer.get("approved") else "denied"
+            else:
+                row["resolution"] = "error" if answer.get("error") else "ok"
+            row["state"] = "completed" if row["resolution"] in ("allowed", "ok") else "failed"
 
 
 def nested_rows(session: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -745,6 +770,12 @@ def _emit_row(
         state = "working"
         extra["pending"] = True
         extra["resolution"] = None
+        if kind == ae.CALLBACK_REQUESTED:  # what the answer must be: its tool's result type
+            schema = body.get("output_schema")
+            named = (
+                schema.get("type") or schema.get("title") if isinstance(schema, Mapping) else None
+            )
+            extra["result_type"] = _cap(named) if isinstance(named, str) else None
     elif kind == ae.SUBAGENT_STARTED:
         key = _str(body.get("agent_key")) or _str(body.get("subagent_id")) or "subagent"
         summary = f"→ {key}"

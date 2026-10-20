@@ -228,6 +228,29 @@ def test_approval_resolution_folds_into_the_approval_row() -> None:
     assert (denied["resolution"], denied["state"]) == ("denied", "failed")
 
 
+def test_a_callback_row_carries_the_type_its_result_must_be() -> None:
+    """``output_schema`` is the callback tool's declared result: the page sends a str's value
+    as text, any other type's as JSON."""
+    items = [
+        (
+            0,
+            _envelope(
+                "callback_requested",
+                {"tool_id": "c1", "tool_name": "confirm", "output_schema": {"type": "string"}},
+            ),
+        ),
+        (
+            1,
+            _envelope(
+                "callback_requested",
+                {"tool_id": "c2", "tool_name": "pick", "output_schema": {"title": "Choice"}},
+            ),
+        ),
+        (2, _envelope("callback_requested", {"tool_id": "c3", "tool_name": "any"})),
+    ]
+    assert [r["result_type"] for r in _rows(_build(items))] == ["string", "Choice", None]
+
+
 @pytest.mark.parametrize(
     ("outcome", "state"), [("ok", "completed"), ("error", "failed"), ("timeout", "failed")]
 )
@@ -629,3 +652,30 @@ def test_the_footer_states_the_schema_and_the_dedupe_rule() -> None:
         "dedupe": "offset",
         "decrypted": "this machine's dev key",
     }
+
+
+def test_an_answer_in_history_closes_its_request_before_the_stream_says_so() -> None:
+    """The console's own Update is in history as soon as it is accepted; the stream's
+    resolution event may not be read yet. The row is answered, of its own kind alone."""
+    items = [
+        (0, _fixture("tool_approval_requested")),
+        (1, _fixture("callback_requested")),
+        (2, _envelope("tool_approval_requested", {"tool_id": "other", "tool_name": "post"})),
+    ]
+    session = _build(items)
+    _session.apply_answers(
+        session,
+        {
+            "call-post-0": {"kind": "approval", "approved": False},
+            "call-confirm-0": {"kind": "callback", "error": False},
+            "other": {"kind": "callback", "error": True},  # a callback's answer: not this row's
+        },
+    )
+    post, confirm, other = _rows(session)
+    assert (post["pending"], post["resolution"], post["state"]) == (False, "denied", "failed")
+    assert (confirm["pending"], confirm["resolution"], confirm["state"]) == (
+        False,
+        "ok",
+        "completed",
+    )
+    assert (other["pending"], other["resolution"]) == (True, None)

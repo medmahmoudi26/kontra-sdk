@@ -326,3 +326,116 @@ async def test_a_tool_row_links_exactly_by_its_tool_id_else_by_name_and_order() 
         "p-0": {"node": "A/probe", "event_id": 10, "fallback": True},  # the one left of its name
         "plan-0": {"node": "A/plan", "event_id": 12, "fallback": False},
     }  # and "lost": no activity left to be
+
+
+async def test_the_answers_in_history_are_the_completed_updates_opened() -> None:
+    def accepted(event_id: int, name: str, arg: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "eventId": str(event_id),
+            "workflowExecutionUpdateAcceptedEventAttributes": {
+                "acceptedRequest": {"input": {"name": name, "args": {"payloads": [arg]}}}
+            },
+        }
+
+    def completed(event_id: int, accepted_id: int, *, ok: bool = True) -> dict[str, Any]:
+        outcome = {"success": {"payloads": []}} if ok else {"failure": {"message": "no"}}
+        return {
+            "eventId": str(event_id),
+            "workflowExecutionUpdateCompletedEventAttributes": {
+                "acceptedEventId": str(accepted_id),
+                "outcome": outcome,
+            },
+        }
+
+    history = {
+        "events": [
+            accepted(5, "tool_approval", await _sealed({"tool_id": "a", "approved": True})),
+            completed(6, 5),
+            accepted(7, "provide_callback_result", await _sealed({"tool_id": "c", "error": "x"})),
+            completed(8, 7),
+            accepted(9, "tool_approval", await _sealed({"tool_id": "open", "approved": True})),
+            accepted(10, "tool_approval", await _sealed({"tool_id": "failed", "approved": True})),
+            completed(11, 10, ok=False),
+            accepted(12, "send_agent_message", await _sealed({"tool_id": "msg"})),
+            completed(13, 12),
+        ]
+    }
+    assert await _agent.Reader(_codec).answered("w", "r", history) == {
+        "a": {"kind": "approval", "approved": True},
+        "c": {"kind": "callback", "error": True},
+    }
+
+
+async def test_one_classification_tells_a_turn_run_by_the_types_temporal_reports() -> None:
+    """``Reader.hired`` is the console's one answer to "is this a turn run" (I35 §7, I36 §7):
+    the graph's ``handler`` field and OD7's refusal both read it, through ``AgentRun.hired``.
+    A run is one when its own type is ``kontra.turn.v1`` -- at a job's id or not: never a
+    reading of an id -- or its root's is, or, on a server that records no root, a parent's.
+    An agent that is its own root, or a run under a plain workflow, is not; each answer is
+    looked up once."""
+    from types import SimpleNamespace
+
+    from temporalio.api.common.v1 import WorkflowExecution
+    from temporalio.api.workflow.v1 import WorkflowExecutionInfo
+
+    from kontra.contract import names
+
+    job = names.new_job_id()
+    root, child = names.job_workflow_id(job), names.agent_workflow_id(job)
+    run = "5f0c6a7e-0000-4000-8000-000000000001"
+
+    def described(
+        wid: str, kind: str, *, root_of: str | None = None, parent: str | None = None
+    ) -> Any:
+        info = WorkflowExecutionInfo()
+        if root_of is not None:
+            info.root_execution.CopyFrom(WorkflowExecution(workflow_id=root_of, run_id=run))
+        if parent is not None:
+            info.parent_execution.CopyFrom(WorkflowExecution(workflow_id=parent, run_id=run))
+        raw = SimpleNamespace(workflow_execution_info=info, pending_activities=[])
+        return SimpleNamespace(
+            id=wid, run_id=run, workflow_type=kind, status=None, raw_description=raw
+        )
+
+    runs = {
+        root: described(root, _agent.TURN_WORKFLOW, root_of=root),
+        "console-x": described("console-x", _agent.TURN_WORKFLOW, root_of="console-x"),
+        "console-x-agent": described("console-x-agent", "AgentLike", root_of="console-x"),
+        child: described(child, "ReconHarnessAgent", root_of=root, parent=root),
+        "sub": described("sub", "CertChecker", parent=child),  # no root recorded: walk up
+        "alone": described("alone", "ReconHarnessAgent", root_of="alone"),
+        "plain": described("plain", "Sweep", root_of="plain"),
+        "batch": described("batch", "kontra.batch.v1", root_of="plain", parent="plain"),
+    }
+    asked: list[str] = []
+
+    class Handle:
+        def __init__(self, wid: str) -> None:
+            self.wid = wid
+
+        async def describe(self) -> Any:
+            asked.append(self.wid)
+            return runs[self.wid]
+
+    class Client:
+        def get_workflow_handle(self, wid: str, *, run_id: str | None = None) -> Handle:
+            return Handle(wid)
+
+    client: Any = Client()
+    reader = _agent.Reader(_codec)
+    turn = {"console-x", "console-x-agent", child, "sub", root}
+    for wid, desc in runs.items():
+        assert await reader.hired(client, desc) is (wid in turn), wid
+    assert asked == ["console-x", root, child, root, "plain"]  # the turn jobs ask nothing
+    for wid, desc in runs.items():  # remembered: nothing asked again
+        assert await reader.hired(client, desc) is (wid in turn)
+    assert len(asked) == 5
+
+    # Case ``a`` -- the job, at a job's id, before and after it started its agent -- and a turn
+    # at another id (case ``b``) are hired all the same: never the console's to answer.
+    waiting = await reader.agent_of(client, runs[root], {"events": []})
+    assert (waiting.case, waiting.started, waiting.hired) == ("a", False, True)
+    other = await reader.agent_of(client, runs["console-x"], {"events": []})
+    assert (other.case, other.hired) == ("b", True)
+    for wid in ("alone", "plain"):
+        assert (await reader.agent_of(client, runs[wid], {"events": []})).hired is False

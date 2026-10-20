@@ -11,10 +11,11 @@ on the same port and behind the same ``Host`` check.
                                graph ``kontra serve`` drew for its task queue
                                (:func:`kontra._graphs.load_static`, decisions I35);
                                ``static_graph: false`` when there is none, and
-                               ``handler: true`` when the run is a handler offering's (its
-                               job, ``kontra.turn.v1``, or the agent that job started), which
-                               has none. A ``kontra.turn.v1`` job's agent child is drawn
-                               nested, its tool activities real nodes (I36)
+                               ``handler: true`` when the run is a handler offering's, which
+                               has none: its job (``kontra.turn.v1``) or a run under it
+                               (:meth:`kontra.cli._agent.Reader.hired`, the classification
+                               OD7 reads too). A ``kontra.turn.v1`` job's agent child is
+                               drawn nested, its tool activities real nodes (I36)
 ``GET /api/session?w=&r=``     ``{"graph", "session"}`` from one snapshot: that graph and the
                                run's agent session (:mod:`kontra.cli._session`), rows and
                                short summaries; only with ``X-Kontra-Console: 1``
@@ -27,7 +28,27 @@ on the same port and behind the same ``Host`` check.
 ``GET /api/io?w=&r=&node=``    a node's (``node=`` empty: the workflow's) input, result and
                                failure, decoded here; only with ``X-Kontra-Console: 1``
 ``GET /api/io?w=&r=&event=``   one agent event's verbatim body, by its stream offset; the same
+``POST /api/approve``          dev only: answer the approval pending at ``offset`` with
+                               ``tool_id`` (``approved``, ``reason``, ``remember``), the
+                               harness's ``tool_approval`` Update to the run's agent
+``POST /api/callback``         dev only: answer the callback pending there (``result`` or
+                               ``error``), the harness's ``provide_callback_result`` Update
+``POST /api/pull``             dev only: OD1's ``[Pull once]``, one poll of a run's
+                               ``turn_events`` from offset 0, for a run whose events are in no
+                               history event yet
 =============================  ==============================================================
+
+The three ``POST`` routes change state, on loopback: each needs the console's ``Host``, its
+own ``Origin`` (present: a browser sends one with every ``POST``), ``Sec-Fetch-Site:
+same-origin`` when there is one, ``Content-Type: application/json``, ``X-Kontra-Console: 1``
+and ``X-Kontra-Session``, this console's own token, which only its page holds (minted per
+process, compared in constant time). A request is answered only when the snapshot says it is
+pending and the console may answer it -- a run hosting its own agent, still running; never a
+``kontra.turn.v1`` job, whose wrapper ends the turn on it, nor any run of one (its agent child,
+a subagent of it) opened by its own id, as Temporal's record of the run's root says (OD7) -- and
+anything else is refused with no Update sent. The Update goes to the snapshot's agent workflow (constructed, or the
+viewed run itself; never a workflow the page names) with an id fixed per request, so a second
+press sends nothing new.
 
 The page is served to the console's own origin alone (``http://127.0.0.1:P`` and
 ``http://localhost:P``), with a policy that runs nothing but its own nonce'd script and style.
@@ -53,6 +74,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import os
 import re
@@ -67,31 +89,36 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 from urllib.parse import parse_qs
 
 from google.protobuf import json_format
 from temporalio.api.common.v1 import Payload
 from temporalio.api.enums.v1 import WorkflowExecutionStatus
+from temporalio.common import RawValue
 from temporalio.converter import PayloadCodec
 from temporalio.service import RPCError
 
 from kontra import graph
 from kontra.cli import _agent, _session
 from kontra.codec import CLAIM_CHECK_ENCODING, ENCODING, CodecError, KontraCodec
+from kontra.contract.names import STREAM_POLL_UPDATE
 from kontra.serve import _agent_events as ae
 
 if TYPE_CHECKING:
     from temporalio.client import Client, WorkflowExecutionDescription
 
 __all__ = [
+    "API_POST_ROUTES",
     "API_ROUTES",
     "IO_HEADER",
     "LOG_SERVICE",
     "LOKI_UID",
     "MAX_STREAMS",
     "PAGE_ROUTE",
+    "POST_MAX",
     "ROUTES",
+    "SESSION_TOKEN_HEADER",
     "TEMPO_UID",
     "WORKFLOWS_LIMIT",
     "Connected",
@@ -99,15 +126,20 @@ __all__ = [
     "ConsoleError",
     "connect_dev",
     "handle",
+    "handle_post",
 ]
 
 PAGE_ROUTE = "/graph"
 #: ``/api/events`` was ``/api/graph/events`` (I28); the graph is ``/api/session``'s now (OD2).
 API_ROUTES = frozenset({"/api/workflows", "/api/graph", "/api/session", "/api/events", "/api/io"})
+#: The dev-only ``POST`` routes: state-changing, on loopback, behind every check above.
+API_POST_ROUTES = frozenset({"/api/approve", "/api/callback", "/api/pull"})
 ROUTES = frozenset({PAGE_ROUTE, *API_ROUTES})
 #: What ``/api/io`` and ``/api/session`` require: a header no cross-origin page sends without
 #: a preflight.
 IO_HEADER = "X-Kontra-Console"
+#: The per-console token a ``POST`` echoes: minted into the page (``__SESSION__``) alone.
+SESSION_TOKEN_HEADER = "X-Kontra-Session"  # noqa: S105 - a header's name, not a secret
 #: Server-sent event streams open at once; one more is refused (503).
 MAX_STREAMS = 16
 WORKFLOWS_LIMIT = 50
@@ -121,12 +153,10 @@ TEMPO_UID = "tempo"
 
 _PAGE_FILE = "_console.html"
 _NONCE = "__NONCE__"
+_SESSION = "__SESSION__"
+#: How long ``[Pull once]`` waits for the agent to answer its one poll.
+_PULL_TIMEOUT = 10.0
 _BATCH = "kontra.batch.v1"
-#: A handler offering's job workflow (``kontra.serve.turn.TURN_WORKFLOW``, without importing
-#: the serving side): it has no static graph.
-_TURN = "kontra.turn.v1"
-#: Parent runs whose type was looked up, remembered (a run's type never changes).
-_PARENT_CACHE = 256
 #: How long a request waits for Temporal (and the gate, for a token) before it gives up.
 _TIMEOUT = 30.0
 #: How often a stream asks Temporal whether the run changed, and says it is alive.
@@ -391,6 +421,11 @@ class Console:
         self._page = resources.files("kontra.cli").joinpath(_PAGE_FILE).read_text("utf-8")
         if self._page.count(_NONCE) < 2:
             raise RuntimeError(f"kontra/cli/{_PAGE_FILE} lost its nonce placeholders")
+        if self._page.count(_SESSION) != 1:
+            raise RuntimeError(f"kontra/cli/{_PAGE_FILE} lost its {_SESSION} placeholder")
+        #: This console's token for the POST routes: in its page alone, so a stale tab of an
+        #: earlier console, or another home's on a shared machine, is refused.
+        self._token = secrets.token_urlsafe(24)
         self.streams = threading.BoundedSemaphore(MAX_STREAMS)
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -400,10 +435,10 @@ class Console:
         self._temporal: Connected | None = None
         self._connecting: asyncio.Lock | None = None
         self._children: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
-        self._turns: OrderedDict[tuple[str, str], bool] = OrderedDict()
         #: What the session pane reads of a run's agent (decisions I36), with this codec.
         self._reader = _agent.Reader(lambda: self._codec())
         self._snapshots: OrderedDict[tuple[str, str], _Snapshot] = OrderedDict()
+        self._pulling: asyncio.Lock | None = None
 
     # ------------------------------------------------------------------ the loop
 
@@ -493,29 +528,6 @@ class Console:
             log_selector=self._selector,
         )
 
-    async def _handler_run(self, client: Client, desc: WorkflowExecutionDescription) -> bool:
-        """Whether the run is a handler offering's: its job (``kontra.turn.v1``), or the agent
-        that job started (its parent is one). Told by the types Temporal reports, never by
-        an id."""
-        if desc.workflow_type == _TURN:
-            return True
-        if not desc.parent_id or not desc.parent_run_id:
-            return False
-        key = (desc.parent_id, desc.parent_run_id)
-        turn = self._turns.get(key)
-        if turn is None:
-            try:
-                parent = await client.get_workflow_handle(key[0], run_id=key[1]).describe()
-            except RPCError:
-                return False
-            turn = parent.workflow_type == _TURN
-            self._turns[key] = turn
-            while len(self._turns) > _PARENT_CACHE:
-                self._turns.popitem(last=False)
-        else:
-            self._turns.move_to_end(key)
-        return turn
-
     async def _snapshot(
         self,
         workflow_id: str,
@@ -566,7 +578,8 @@ class Console:
         static = load_static(self.home, desc.task_queue)
         painted = graph.merge(static, live) if static is not None else live
         painted["static_graph"] = static is not None
-        painted["handler"] = static is None and await self._handler_run(client, desc)
+        # A handler offering's run (the reader's one classification, OD7's too) has none.
+        painted["handler"] = static is None and agent.hired
         await self._reader.batch_progress(client, painted, children, watched)
         subagents: list[tuple[str, str, int]] = []
         session, items = await self._session_of(client, desc, agent, index, subagents)
@@ -610,9 +623,13 @@ class Console:
             "task_queue": desc.task_queue,
             "status": agent.status if agent.started else "pending",
             "case": agent.case,
-            # Approvals and callbacks are the seller's to answer here: the page shows their
-            # rows read-only and says so (OD7).
-            "interactive": False,
+            # The console answers approvals and callbacks (dev only: no console runs under
+            # another profile) for an agent hosting its own stream, while it runs; a hired
+            # turn's wrapper ends the turn on one (OD7), so there -- and in any run of a hired
+            # turn, opened by its own id -- its rows are read-only. ``hired`` is the reader's
+            # one classification of a turn run, the graph's ``handler`` field's too.
+            "interactive": not agent.hired and agent.started and agent.status == "running",
+            "hired": agent.hired,
         }
         if not agent.started:
             return _empty(meta, "no-events"), []
@@ -637,7 +654,11 @@ class Console:
                 return _empty(meta, "in-bucket"), []
             if agent.case == "b" and not polled:
                 is_agent = _session.has_update(agent.history, ae.SEND_AGENT_MESSAGE_UPDATE)
-                return _empty(meta, "not-in-history" if is_agent else "no-agent"), []
+                if not is_agent:
+                    return _empty(meta, "no-agent"), []
+                empty = _empty(meta, "not-in-history")
+                empty["can_pull"] = bool(meta["interactive"])  # OD1: offered here alone
+                return empty, []
             return _empty(meta, "no-events"), []
         nodes = await self._reader.tool_links(agent, items, index)
         handoffs, subagents = await self._reader.subagents(
@@ -652,6 +673,9 @@ class Console:
             handoffs=handoffs,
             subagents=subagents,
             input_types=types,
+        )
+        _session.apply_answers(
+            session, await self._reader.answered(agent.workflow_id, agent.run_id, agent.history)
         )
         handler = next((t["handler"] for t in session["turns"] if t["handler"]), None)
         if handler and meta["type"]:
@@ -744,12 +768,112 @@ class Console:
             raise ConsoleError(HTTPStatus.NOT_FOUND, "no agent event at that offset")
         return {"offset": offset, "body": event.get(ae.EVENT)}
 
+    # ------------------------------------------------------------------ answers (dev only)
+
+    async def _write_client(self) -> Client:
+        """A client of the same connection whose data converter holds this machine's codec:
+        an Update's argument is encrypted to the seller like any payload of the agent's."""
+        from temporalio.client import Client
+
+        from kontra.codec import data_converter
+
+        temporal = await self._client()
+        config = temporal.client.config()
+        config["data_converter"] = data_converter(self._codec())
+        return Client(**config)
+
+    async def _answer(
+        self, workflow_id: str, run_id: str | None, request: _Request
+    ) -> dict[str, Any]:
+        """Send ``request`` (an approval or a callback's result) as the harness's Update to the
+        viewed run's agent, once this snapshot says that request is pending and the console
+        may answer it. The agent workflow and its run are the snapshot's -- constructed or the
+        viewed run itself, never the page's -- and the Update's id is fixed per request, so a
+        second press sends nothing new. Anything else is refused, and no Update is sent."""
+        snap = await self._view(workflow_id, run_id)
+        agent = snap.session.get("agent") or {}
+        if not agent.get("interactive"):
+            raise ConsoleError(
+                HTTPStatus.FORBIDDEN,
+                "this run's requests are not the console's to answer"
+                + (" (it is part of a hired turn)" if agent.get("hired") else ""),
+            )
+        if not _pending(snap.session, request.offset, request.tool_id, request.label):
+            raise ConsoleError(
+                HTTPStatus.CONFLICT, "no request pending at that offset with that tool_id"
+            )
+        client = await self._write_client()
+        handle = client.get_workflow_handle(str(agent["workflow_id"]), run_id=agent.get("run_id"))
+        update_id = f"kontra-console:{request.kind}:{agent.get('run_id')}:{request.tool_id}"
+        from temporalio.client import WorkflowUpdateFailedError
+
+        try:
+            answer = await handle.execute_update(
+                request.update, request.arg, id=update_id, result_type=dict
+            )
+        except WorkflowUpdateFailedError as e:  # the harness refused it: already answered, or
+            # a result its validator would not take -- its own words, decoded with the codec
+            why = getattr(e.cause, "message", None)
+            said = _said(ConsoleError(HTTPStatus.CONFLICT, why)) if why else _said(e)
+            raise ConsoleError(HTTPStatus.CONFLICT, f"the agent refused it: {said}") from None
+        self._snapshots.pop(
+            (snap.graph["workflow"]["workflow_id"], snap.graph["workflow"]["run_id"]), None
+        )
+        return {
+            "accepted": bool(answer.get("accepted", True)) if isinstance(answer, dict) else True
+        }
+
+    async def _pull(self, workflow_id: str, run_id: str | None) -> dict[str, Any]:
+        """OD1's ``[Pull once]``: one dev-party poll of the run's ``turn_events`` from offset 0,
+        so its in-memory log lands in history as that poll's outcome. Only for a session that
+        says its events are not in history yet; one at a time; never more than once a press."""
+        from temporalio.contrib.workflow_streams import PollInput
+
+        snap = await self._view(workflow_id, run_id)
+        session = snap.session
+        if not session.get("can_pull"):
+            raise ConsoleError(HTTPStatus.CONFLICT, "this run's events are in history already")
+        agent = session["agent"]
+        if self._pulling is None:
+            self._pulling = asyncio.Lock()
+        if self._pulling.locked():
+            raise ConsoleError(HTTPStatus.CONFLICT, "a pull is under way")
+        async with self._pulling:
+            client = await self._write_client()
+            handle = client.get_workflow_handle(
+                str(agent["workflow_id"]), run_id=agent.get("run_id")
+            )
+            poll = PollInput(topics=[ae.TURN_EVENTS_TOPIC], from_offset=0)
+            try:
+                await asyncio.wait_for(
+                    handle.execute_update(STREAM_POLL_UPDATE, poll, result_type=RawValue),
+                    _PULL_TIMEOUT,
+                )
+            except TimeoutError:
+                raise ConsoleError(
+                    HTTPStatus.GATEWAY_TIMEOUT, "the agent did not answer the poll"
+                ) from None
+        self._snapshots.pop(
+            (snap.graph["workflow"]["workflow_id"], snap.graph["workflow"]["run_id"]), None
+        )
+        return {"pulled": True}
+
     # ------------------------------------------------------------------ the routes
 
     def page(self) -> tuple[bytes, str]:
-        """The page with a fresh nonce, and the nonce."""
+        """The page with a fresh nonce and this console's token, and the nonce."""
         nonce = secrets.token_urlsafe(18)
-        return self._page.replace(_NONCE, nonce).encode(), nonce
+        return self._page.replace(_NONCE, nonce).replace(_SESSION, self._token).encode(), nonce
+
+    def token_is(self, given: str | None) -> bool:
+        """Whether ``given`` is this console's token, compared in constant time."""
+        return isinstance(given, str) and hmac.compare_digest(given.encode(), self._token.encode())
+
+    def approve(self, workflow_id: str, run_id: str | None, request: _Request) -> dict[str, Any]:
+        return self._run(self._answer(workflow_id, run_id, request))
+
+    def pull(self, workflow_id: str, run_id: str | None) -> dict[str, Any]:
+        return self._run(self._pull(workflow_id, run_id), _PULL_TIMEOUT + _TIMEOUT)
 
     def workflows(self) -> list[dict[str, Any]]:
         return self._run(self._workflows())
@@ -802,6 +926,32 @@ class Console:
                 beat = time.monotonic()
                 yield b": keepalive\n\n"
         yield _event("end", {})
+
+
+@dataclass(frozen=True)
+class _Request:
+    """An answer the page asks the console to send: its Update and the row it answers."""
+
+    kind: str  # "approve" | "callback": the Update id's
+    label: str  # the row's
+    update: str
+    offset: int
+    tool_id: str
+    arg: dict[str, Any]
+
+
+def _pending(session: Mapping[str, Any], offset: int, tool_id: str, label: str) -> bool:
+    """Whether the row at ``offset`` is a pending ``label`` request of ``tool_id``: the only
+    one a ``POST`` may answer."""
+    return any(
+        row.get("offset") == offset
+        and row.get("tool_id") == tool_id
+        and row.get("label") == label
+        and row.get("pending") is True
+        and not row.get("id_capped")  # a cut id: no answer could name the call
+        for turn in session.get("turns") or []
+        for row in turn.get("rows") or []
+    )
 
 
 def _shown(snap: _Snapshot) -> bytes:
@@ -952,6 +1102,89 @@ def handle(handler: BaseHTTPRequestHandler, console: Console, path: str, query: 
     except Exception as e:
         _log(f"{path}: {_said(e)}")
         _error(handler, e)
+
+
+def handle_post(handler: BaseHTTPRequestHandler, console: Console, path: str, body: bytes) -> None:
+    """Answer ``POST path`` for one of :data:`API_POST_ROUTES`. The codec server has checked
+    the ``Host``, that the ``Origin`` is present and the console's own, that the body is JSON
+    by its ``Content-Type`` and within bounds; here the rest: ``Sec-Fetch-Site``,
+    ``X-Kontra-Console`` and this console's token. Every refusal is before any Update."""
+    try:
+        site = handler.headers.get("Sec-Fetch-Site")
+        if site is not None and site != "same-origin":
+            raise ConsoleError(HTTPStatus.FORBIDDEN, "same-origin requests only")
+        if handler.headers.get(IO_HEADER) != "1":
+            raise ConsoleError(HTTPStatus.FORBIDDEN, f"{IO_HEADER}: 1 is required")
+        if not console.token_is(handler.headers.get(SESSION_TOKEN_HEADER)):
+            raise ConsoleError(
+                HTTPStatus.FORBIDDEN, f"{SESSION_TOKEN_HEADER} is not this console's"
+            )
+        given = _post_body(body)
+        workflow_id, run_id = _run_args(
+            {k: v for k, v in given.items() if k in ("w", "r") and isinstance(v, str)}
+        )
+        if path == "/api/pull":
+            _json(handler, HTTPStatus.OK, console.pull(workflow_id, run_id))
+        else:
+            _json(
+                handler, HTTPStatus.OK, console.approve(workflow_id, run_id, _request(path, given))
+            )
+    except (BrokenPipeError, ConnectionResetError):
+        return
+    except Exception as e:
+        _log(f"{path}: {_said(e)}")
+        _error(handler, e)
+
+
+#: The largest ``POST`` body read: an answer is small (a callback's result included).
+POST_MAX = 64 * 1024
+#: What an answer's free text may be: a reason, or a callback's error message.
+_TEXT_MAX = 2000
+
+
+def _post_body(body: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(body)
+    except ValueError:
+        raise ConsoleError(HTTPStatus.BAD_REQUEST, "a JSON object is expected") from None
+    if not isinstance(value, dict):
+        raise ConsoleError(HTTPStatus.BAD_REQUEST, "a JSON object is expected")
+    return cast("dict[str, Any]", value)
+
+
+def _request(path: str, given: Mapping[str, Any]) -> _Request:
+    offset, tool_id = given.get("offset"), given.get("tool_id")
+    if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset < 1 << 63:
+        raise ConsoleError(HTTPStatus.BAD_REQUEST, "offset is a stream offset")
+    if not isinstance(tool_id, str) or not tool_id or len(tool_id) > _ID_MAX:
+        raise ConsoleError(HTTPStatus.BAD_REQUEST, "tool_id is a tool call's id")
+    if path == "/api/approve":
+        approved, reason = given.get("approved"), given.get("reason")
+        if not isinstance(approved, bool):
+            raise ConsoleError(HTTPStatus.BAD_REQUEST, "approved is true or false")
+        arg: dict[str, Any] = {ae.APPROVAL_TOOL_ID: tool_id, ae.APPROVAL_APPROVED: approved}
+        if reason is not None:
+            if not isinstance(reason, str) or len(reason) > _TEXT_MAX:
+                raise ConsoleError(HTTPStatus.BAD_REQUEST, "reason is a short text")
+            arg[ae.APPROVAL_REASON] = reason
+        if given.get("remember") is True:
+            arg[ae.APPROVAL_REMEMBER] = True
+        return _Request(
+            "approve", "approval.requested", ae.TOOL_APPROVAL_UPDATE, offset, tool_id, arg
+        )
+    error = given.get("error")
+    arg = {ae.CALLBACK_TOOL_ID: tool_id}
+    if error is not None:
+        if not isinstance(error, str) or len(error) > _TEXT_MAX:
+            raise ConsoleError(HTTPStatus.BAD_REQUEST, "error is a short text")
+        arg[ae.CALLBACK_ERROR] = error
+    elif "result" in given:
+        arg[ae.CALLBACK_RESULT] = given["result"]
+    else:
+        raise ConsoleError(HTTPStatus.BAD_REQUEST, "a callback is answered with result or error")
+    return _Request(
+        "callback", "callback.requested", ae.PROVIDE_CALLBACK_RESULT_UPDATE, offset, tool_id, arg
+    )
 
 
 def _events(
