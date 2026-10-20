@@ -37,6 +37,9 @@ Rules (`kontra/contract/names.py`):
   ASCII-only `fullmatch` patterns and length limits; nothing is stripped or normalised first.
 * The one inverse that exists, workflow id to job id, is construct-and-compare: a candidate is
   accepted only if rebuilding the workflow id from it reproduces the input exactly.
+* *Amended by I30:* the stream relay's Temporal subject, `relay/<namespace>/job-<32 hex>`, is
+  constructed too (`relay_subject`), and the Authorizer compares it whole with the one it
+  rebuilds from a request's namespace and workflow id; nothing splits it.
 
 ## I2. The contract document and nexgen
 
@@ -80,6 +83,13 @@ is a gate call (`POST /v1/catalog`) that requires a person's session confirmed w
 internal frontend: target = the caller's namespace and the offering's task queue, name = a fresh
 random `k...` string. A compromised seller box therefore still cannot repoint any offering, and the
 Authorizer has no name-parsing rule left to get wrong.
+
+*Amended by I30:* two more kinds of token mean something on the public frontend, both minted by
+the gate alone and carrying no permission: the stream relay of one job (its poll Update and
+offset Query on that job only) and the worker controller (ten worker-deployment calls in the
+platform namespace `kontra-system` only). The relay's rule reads two typed fields of the
+decoded request, the workflow id and the handler name, and compares each whole with a value it
+constructs; it parses nothing.
 
 ## I4. Who calls Nexus
 
@@ -564,6 +574,10 @@ below), and each has its rule here.
 
 ## I20. Seller code imports Temporal only through `kontra` (D1, amended)
 
+**Superseded by I29** (kontra-sdk#51): seller code imports `temporalio` directly and nothing
+from `kontra`; `worker.py` is the one file that imports `kontra`. Kept as the record of why
+the façade was tried.
+
 The PRD's D1 said seller `workflows.py` and `activities.py` import nothing from `kontra`, so that
 deleting Kontra leaves code that runs on any Temporal. It now says the reverse of the letter and
 keeps the intent: they import Temporal **only** through the façade -- `from kontra import
@@ -588,6 +602,13 @@ workflow, activity, RetryPolicy, ApplicationError, Page` -- and never `temporali
   in strings; what loading the code loads) over the examples and the `kontra init` scaffold.
 
 ## I25. The workflow does what it wants (D1; kontra-sdk#27)
+
+**Superseded by I29** (kontra-sdk#51) in its derivation: no plugin or converter is derived
+from what a workflow imports, and the `[agents]` extra is gone; a seller passes
+`OpenAIAgentsPlugin` in `serve(plugins=[...])`. Its principle (no Kontra keyword changes what
+workflow code may do) and its endpoint rule (`model_provider=OpenAIProvider()`) stand. Not the
+I25 that `docs/security.md` and most "decisions I25" references mean: that one is "Share to
+my account", below.
 
 Kept next to I20 because it is the same rule from the worker's side: the façade aliases
 Temporal and never wraps it, so a workflow that is a legal Temporal workflow without Kontra
@@ -1211,6 +1232,10 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
 
 ## I27. `kontra graph` (kontra-sdk#42)
 
+**Amended by I29**: an agent workflow's mock runs follow the `OpenAIAgentsPlugin` its worker
+passes, not its `agents` import, and there is no `[agents]` extra; `examples/sweep` fans out
+in plain Temporal, so its graph has one `check_headers` node instead of a batch.
+
 `kontra graph` prints the static graph of the workflows `worker.py` binds, before anyone has
 run them: for each bound offering it runs the workflow `--runs` times (default 8) in
 Temporal's time-skipping test server, every activity answered by ONE dynamic stub with a
@@ -1497,3 +1522,890 @@ ways:
   ciphertext. Routes are compared without the query now (the server fetches no claim-check
   reference whatever the query says), and `tests/cli/test_codec_server.py` posts what the UI
   posts.
+
+## I29. Sellers write native Temporal; `worker.py` is the only kontra import (kontra-sdk#50, #51)
+
+Decisions 1, 2, 3, 4 and 12 of kontra-sdk#50. **Supersedes** D1 as I20 amended it, and the
+first I25's derivation of the agents plugin from the workflow's imports; **amends** I27's
+lines on agent workflows and batches in mock runs. A seller's `workflows.py` and
+`activities.py` are vanilla `temporalio`: they import Temporal themselves and nothing from
+`kontra`. `worker.py` is the one file of an offering that imports `kontra`; besides it,
+`quote.py` takes `Quote` from `kontra.serve` and `models.py` may use `kontra.types`
+(`Artifact`). Delete `worker.py` and the rest runs on any Temporal worker, unmodified --
+all but `Artifact` I/O (`kontra.types`), which needs the Kontra runtime that `worker.py`'s
+plugin installs in the process; an offering without `Artifact` needs nothing.
+
+- **Why.** The façade was never a security boundary. What constrains a seller does not care
+  what their code imports: the Authorizer (seam ①: deny by default, a token scoped to the
+  seller's namespace), the codec (everything a buyer sees, encrypted to the job's keys), the
+  contract hash (a worker serves only code whose contract the catalog holds), `names.py`
+  (service, task-queue and workflow-id strings constructed, never parsed back) and escrow
+  (I6, I16). All five are untouched. What the façade cost: an import path that is not
+  Temporal's, so no Temporal doc, sample or plugin could be pasted in as written; a mirror
+  that is never complete (contrib modules, plugins, exceptions); and Kontra's additions mixed
+  into Temporal's namespace. I20's own reasons go too: the dependency closure is a tested
+  range now, and the publish scan it enabled is dropped (both below).
+- **`kontra` exports only what Kontra defines**: `serve`, `Worker` and `KontraPlugin`, each
+  loaded on first use (so `import kontra` and `kontra.types` load no Temporal), and
+  `__version__`. `kontra.workflow`, `kontra.activity` and the `RetryPolicy`,
+  `ApplicationError` and `Page` re-exports are deleted. `kontra.workflow` (and the other four)
+  raises an `AttributeError` naming the replacement (`from temporalio import workflow`, ...);
+  `from kontra import workflow` gets Python's own `ImportError` ("cannot import name"), which
+  drops a module `__getattr__`'s message.
+- **Activities are found by a scan of the project.** `temporalio.activity.defn` notes nothing
+  anywhere, so `serve()` registers every module-level function it stamped
+  (`__temporal_activity_definition`) in a module loaded from under `worker.py`'s directory and
+  defined in that module (a function one module imports from another counts once, in its
+  own), skipping dot-directories, `tests`, `test`, `venv`, `node_modules`, `__pycache__`,
+  `build`, `dist`, `site-packages` and `kontra` itself, in import then definition order; then
+  the activities a project module binds that a function of another project module made (a
+  factory's, whose own module never binds them); then the `activities=` passed, by identity,
+  none twice. A method still needs `activities=[obj.method]`, and so does an activity defined
+  or made outside the project. Two activities of one Temporal name are a `BindingError` naming
+  both, never the last one silently winning. `KontraPlugin` and a `Worker(...)`
+  written out discover nothing: they register what they are given.
+- **`serve(entry, /, *, quote=None, **worker_kwargs)`.** `entry` is a `@workflow.defn` class or
+  one `@agent.accepts` handler of an agent written with Temporal's agent harness
+  (`serve(ReconAgent.sweep)`, below); passing the agent class itself is a `BindingError` with
+  that fix-it. Every other keyword is `temporalio.worker.Worker`'s, verbatim: `workflows=` for
+  the children the entry starts (`serve(Flow, Child)` is Python's own `TypeError` now),
+  `activities=` after the scan, and `plugins=`. `offering(path, entry=..., quote=...)` binds the
+  same two kinds (`workflow=` stays, as that keyword for a class). The contract is derived by
+  `kontra.contract`, unchanged, from the entry's type hints: for a handler, its one pydantic
+  message (parameters the harness injects, `Annotated[...]`, are skipped) and its pydantic
+  return, cross-checked with the models the agent declares for it. An agent whose init data
+  is required is refused: Kontra has nothing to pass, and init data is no part of the
+  contract. A handler of a class defined in a function or in `__main__` is refused, as a
+  workflow class is. So is a handler another agent class inherits unchanged: `ReconV2.sweep`
+  *is* `ReconV1.sweep`, the class is found from the function's `__qualname__`, and a function
+  cannot say which class it was read through, so `serve(ReconV2.sweep)` would serve
+  `ReconV1`. Refused rather than guessed, with the fix (override the handler in each agent
+  class that sells it); an explicit `entry=Agent, handler="name"` form was not added.
+- **`KontraPlugin` (`kontra.plugin`) is everything Kontra adds to a seller's Temporal**, as one
+  `temporalio.plugin.SimplePlugin` (client and worker plugin) named `kontra.KontraPlugin`:
+  - *connection*: the profile resolved (or `KONTRA_API_KEY`), its key checked against the
+    party's recipients, the profile's Temporal address, TLS and `worker` JWT (refreshed in the
+    background), the process's Kontra runtime, and the temporalio range. The `target_host`
+    passed is replaced: `kontra.plugin.TARGET` (`"kontra"`) is the placeholder, anything else
+    is logged.
+  - *client*: the profile's namespace, and the codec. Kontra's codec is a payload *codec*, so it
+    stacks under any payload *converter*: one an earlier plugin set is kept
+    (`OpenAIPayloadConverter`, the harness's), temporalio's default is replaced by pydantic's.
+    Refused, with a `ServeError` naming it: another payload codec; a failure converter other
+    than temporalio's default (Kontra installs its own, which encrypts failure messages);
+    external storage whose threshold is at or below the codec's claim-check threshold plus
+    4,096 bytes, which would offload a job's payload where its buyer cannot read it (the
+    harness's 1.5 MB default is fine). Headers stay out of the codec: any other
+    `header_codec_behavior` is replaced, with a warning, since the job header must be read
+    before any payload key is known.
+  - *worker*: a worker whose `workflows` hold an offering's entry class (the workflow, or the
+    agent of a bound handler) serves that offering: the task queue from its `name@version`
+    (the one passed is replaced), the entry first, the generated Nexus service and Kontra's
+    interceptor prepended, Temporal's sandbox with `kontra` passed through (a seller's own
+    `SandboxedWorkflowRunner` gets the same; any other runner is theirs, untouched), and for a
+    handler the turn wrapper and its activity. Any other worker of the client is left alone.
+    Several offerings bound to one class (versions of the same code: `tests/hire` serves
+    three of `TextFlow` from one worker) are told apart by the task queue the worker names,
+    compared with each offering's constructed one; a worker naming none of them is refused.
+    Refusing a second offering of a class outright, the first plan, would have broken that.
+  - *start*, once per plugin, in `run_worker`: the gate's JWKS for the hold check, the hash
+    lock (each contract hash against the catalog's; a `kontra dev` profile publishes an
+    unpublished version) and the progress forwarder, all moved there from `Worker`, so a
+    hash-lock refusal comes out of the worker's run, not out of `prepare()`. Then the worker's
+    final config is checked: a plugin given to the worker alone runs after Kontra's
+    `configure_worker`, and a changed task queue, a dropped Nexus service, another interceptor
+    first, an entry class no longer registered (a same-named swap included), or a client
+    whose converter is no longer what `configure_client` made (Kontra's codec and failure
+    converter, no offloading storage, headers unencoded) is a `ServeError`. The worker is
+    claimed for that check from the config it was built with as well as its final one, and
+    by Kontra's own Nexus service or interceptor on it, so a plugin cannot get past it by
+    moving the entry class. The client is checked the same way in `configure_worker`: a
+    client plugin placed after Kontra has the last word on the client. A start check that
+    fails fails the workers starting with it and is then forgotten: a seller's main that
+    runs the worker again checks again. A revoked session is diagnosed as before.
+
+  The constructor does no I/O. `await plugin.prepare()` (idempotent; the connection hook runs
+  it) checks the range, opens the session and builds the codec, and `aclose()` releases them.
+  A client built as `Client(service_client, plugins=[kontra])` skips the connection hook: its
+  `configure_client` without `prepare()` is a `ServeError` saying so.
+- **Plugin order: Kontra last.** `kontra.serve.Worker` stays the process runner (the CLI's
+  capture, `kontra.testing`'s Marketplace, signals, `wait_ready`), built on the plugin:
+  `Client.connect("kontra", plugins=[*client_plugins, kontra])`, then one
+  `temporalio.worker.Worker` per offering on that client. A seller plugin that is a
+  `temporalio.client.Plugin` (any `SimplePlugin`: `OpenAIAgentsPlugin`, the harness's
+  `AgentHarnessPlugin`, `ParallelPlugin`) goes on the client, in the seller's order, before
+  Kontra's: the converter it chose stays, and the last word on the connection, the namespace
+  and the codec is Kontra's. A worker-only plugin goes to the inner workers, and the start
+  check above holds it to what Kontra set.
+- **The escape hatch: `KontraPlugin.from_profile(entry)`.** A seller with a worker main of
+  their own writes `Client.connect("kontra", plugins=[*theirs, KontraPlugin.from_profile(SweepFlow)])`
+  and a plain `temporalio.worker.Worker(client, task_queue="kontra", workflows=[SweepFlow],
+  activities=[...])`, and never touches the CLI. **Where the issue and the code part ways:**
+  the issue sketches `from_profile()` with no argument; the entry is required, because the
+  contract, the task queue and the generated Nexus service all come from it, and finding it
+  in the yaml (D11), by convention or by a decorator in workflow code is exactly what the
+  issue rejects. `from_profile` binds `offering.yaml` (and `quote.py`, unless `quote=`) beside
+  the calling file, as `serve()` does; it discovers no activities.
+- **A bound handler: one hire is one turn** (`kontra.serve.turn`). An agent workflow cannot be
+  the job: its `run` returns nothing, and only after `close`; a handler's reply is an event on
+  the agent's workflow stream, not an update result. So the generated `execute` starts
+  Kontra's wrapper workflow, `kontra.turn.v1`, as the job (`job-<id>`, exactly as for a
+  workflow entry, so escrow, the codec's buyer rule and the job header are unchanged). The
+  wrapper starts the agent as a child (`args=[{}]`; id `names.agent_workflow_id(job_id)`,
+  `job-<id>/agent`, which is not job-shaped, so the agent's whole history is encrypted to the
+  seller alone; same task queue; `ParentClosePolicy.TERMINATE`; the remaining job time as its
+  timeout), runs one activity, `kontra.turn.v1.deliver`, which sends the contract-validated
+  input as the handler's message (`send_agent_message`, with an update id stable across
+  attempts) and reads the `turn_events` stream from the receipt's offset to the reply to that
+  message, then signals `close`, waits for the agent, and returns the reply as the job's
+  result. The message is the input's JSON by alias (what the harness validates it against),
+  and the reply, which the harness publishes by field name, is validated against the output
+  model and returned by alias: a job's result reads the same as a workflow entry's. A handler
+  that raises fails the job, non-retryably, with its message; a tool approval or a callback
+  for that message fails it at once (a job is one turn, without buyer approvals; session jobs
+  are kontra-sdk#60) -- an approval an auto-mode evaluator would have given included, since
+  the harness publishes the request before it consults the evaluator and the stream says
+  nothing then about whether a person will be needed (a tool the agent's policy allow-lists
+  raises no request); the agent ending first fails it. The stream ending is never final in
+  the activity: temporalio's stream client ends its iteration, rather than raising, when its
+  poll is cancelled or times out, so a worker stopping mid-turn makes the activity's
+  cancellation (retried on the next worker, whose update id gets the same admission back)
+  and any other end a retryable failure; only the wrapper, seeing the child end, fails the
+  job for it. Kontra never
+  imports the harness: its wire shape (the update, signal and topic names, the envelope and
+  reply fields, the event types) is written out once in `turn.py`, and a golden test holds it
+  to the harness. The activity heartbeats for liveness only: the interceptor never forwards
+  its heartbeats as buyer progress. `kontra graph` refuses a handler offering for now
+  (kontra-sdk#56).
+- **`execute_activities_in_parallel` is an optional helper**, `kontra.contrib.parallel`, not a
+  primitive: neither `serve()` nor `Worker` registers `kontra.batch.v1` any more. A seller who
+  wants it imports it in their workflow and passes `plugins=[ParallelPlugin()]` (a
+  `SimplePlugin` adding the child workflow and passing the module through the sandbox) to
+  `serve()` or to any Temporal worker. The child takes any page with a list `items` and a
+  `next` (`Page` stays, as a convenience). `BATCH_WORKFLOW = "kontra.batch.v1"` and the field
+  names of `_Spec`, `_Cursor` and `_Options` do not change: runs in flight, `kontra.graph` and
+  the console read them. The helper puts a `kontra` import in the workflow file, so no
+  example uses it: `examples/sweep` fans out in plain Temporal (one `execute_activity` per URL
+  under an `asyncio.Semaphore(50)`, folded by `tally`), well within one history's limits for
+  its 200 URLs (its README has the arithmetic).
+- **The `[agents]` extra is gone**, with everything that read `sys.modules["agents"]`:
+  `kontra._agents`, the derived plugin and converter, `serve(mcp_servers=)`, and the tests'
+  guard that kept `agents` unimported. A seller running OpenAI's Agents SDK depends on
+  `temporalio-openai-agents` and passes `OpenAIAgentsPlugin(model_params=ModelActivityParameters(),
+  model_provider=OpenAIProvider(), mcp_servers=...)` in `serve(plugins=[...])` themselves, as
+  `examples/chef-agents/worker.py` does. The first I25's premise, that a published offering
+  could not import `temporalio` to pass the plugin, is what decision 2 removes. Its endpoint
+  rule stands: `model_provider=OpenAIProvider()` makes the model activity read the Agents
+  SDK's default client, set in `worker.py`; without it the plugin builds its own
+  `AsyncOpenAI()` from the environment when the worker is built. Its principle stands too: no
+  Kontra keyword changes what workflow code may do; a seller's Temporal plugins are Temporal
+  config. kontra-sdk's dev group carries `temporalio-openai-agents[mcp]` (and
+  `temporal-agent-harness==0.6.0` for the handler tests), so CI still runs chef-agents and
+  type-checks `kontra graph`'s scripted model.
+- **The temporalio range.** Compatibility is a dependency problem, not an import path:
+  `temporalio>=1.34,<1.38` (and the `opentelemetry` extra's) is the range kontra-sdk is tested
+  on. It is one constant pair in `kontra._compat`, never read back from installed metadata (an
+  editable install's can be stale), and a test holds it equal to `pyproject.toml`'s.
+  `KontraPlugin.prepare()` refuses to start outside it, before anything else (the codec relies
+  on temporalio's serialization context and Nexus operation info, experimental APIs a minor
+  may change); `kontra serve` (a log warning) and `kontra publish` (a line on stderr) warn
+  before they import `worker.py`, which may be what then fails. The lock stays on the minor
+  the suite last ran green on (Dependabot ignores temporalio minors), and widening the range
+  is a deliberate PR after a green suite on the new minor. Today the range admits only 1.34:
+  1.35 to 1.37 are not released. The check orders versions as PEP 440 does: a pre-release of
+  a minor inside the range (`1.35.0rc1`) is in it, one of the lowest bound (`1.34.0rc1`,
+  `1.34.0.dev0`) sorts before `1.34` and is not, as pip would have it.
+- **The publish scan is dropped** (decision 2). `kontra publish` no longer refuses `temporalio`
+  imports or `continue_as_new` in seller code (`kontra/cli/_seller_code.py` is deleted; the
+  gate's copy is kontra-cloud#46): continuing as new is the seller's business, and an import
+  scan constrained nothing the five controls above leave open.
+- **The sandbox still passes `kontra` through** by default (`workflow_runner()`): Kontra's turn
+  wrapper runs in it, a seller's models may use `kontra.types`, a workflow that hires imports
+  `kontra.hire`, and the parallel helper keeps one class identity for its spec.
+- **Rejected.** `from kontra.temporal import workflow`: the façade under a longer name -- the
+  mirror is never complete, sellers end up with mixed imports, copying from Temporal's docs
+  stops working, and to pyright it is one line thick anyway. `entry:` in `offering.yaml`
+  (D11: the yaml names no code), a `@kontra.offering` decorator (`kontra` back inside workflow
+  files), and finding the entry by convention.
+- **Amends I27.** An agent workflow's mock runs follow the plugin the seller passed, not an
+  import: `kontra graph` gives the scripted model to a worker whose `plugins=` hold
+  `temporalio.openai_agents.OpenAIAgentsPlugin` (an `isinstance`, against that module only
+  when it is loaded: an instance existing means it is; `temporalio.contrib.openai_agents` is
+  not recognised), and its converter is that plugin's. A project whose `agents`, or Temporal's
+  integration, is not installed fails naming `temporalio-openai-agents`, the project's own
+  dependency. The mock worker still registers `kontra.batch.v1` itself, whatever the seller's
+  plugins, and its stub is temporalio's `defn` (there is no Kontra registry left to stay out
+  of). `examples/sweep`'s graph changed with its fan-out: `check_headers` is one activity
+  node, with an edge to itself from the run whose `plan` drew 201 URLs (50 start at once, then
+  each completion starts the next in a workflow task of its own), where it was the
+  `kontra.batch.v1[check_headers]` child.
+- **Checked by** `tests/examples/test_imports.py` (workflows and activities import `temporalio`
+  and no `kontra`, by statement, dynamic import or module name in a string; models only
+  `kontra.types`, quote only `kontra.serve.Quote`; loading them loads at most `kontra` and
+  `kontra.types`, and nothing for a seller without `Artifact`; the scaffold the same; and
+  `examples/hello` without `worker.py` and `quote.py` runs on a plain Temporal worker in a
+  process where importing `kontra` fails), `tests/serve/test_serve_fn.py` (the scan and its
+  refusals, the entry kinds, the agents plugin on the client with its converter kept),
+  `tests/serve/test_plugin.py` (the converter, codec, failure-converter and storage rules, the
+  order, the escape hatch running a whole Marketplace job on a plain temporalio worker, a
+  worker-only plugin that undoes Kontra refused), `tests/serve/test_turn.py` and
+  `tests/codec/test_codec_turn.py` (a real harness agent hired: one turn, a handler's failure,
+  the binding refusals, the wire constants against the harness, the marker scan of both
+  histories), `tests/serve/test_compat.py`, `tests/parallel` (the helper and its plugin) and
+  `tests/examples/test_chef_agents.py`.
+
+## I30. The authorizer after the narrowing: three token kinds, one rule that reads a request (kontra-sdk#59)
+
+_Q1–Q9 below were decided by the implementer in the owner's place, as kontra-sdk#50 directs (no
+step waits on an answer); each is listed on #59 for the owner to confirm or overturn._
+
+kontra-sdk#50 narrows the seller SDK to native Temporal (its decision 1): sellers write
+`temporalio` and emit whatever it allows -- updates, queries, workflow streams, signals between
+their own workflows, schedules, outward Nexus, Worker Versioning. What constrains them is the
+deny matrix in `temporal/authorizer`, so it was audited against the whole frontend, not the
+subset the façade curated: all 191 surfaces Temporal server v1.32.1 hands its authorizer (123
+WorkflowService, 12 OperatorService and 46 AdminService methods, `Health` `Check`/`List`/`Watch`,
+both gRPC reflection versions, five Nexus HTTP routes), each against every principal, with
+callers built by Temporal's real default JWT claim mapper and the typed request Temporal hands
+the authorizer (`CallTarget.Request`, the decoded message itself, the same object the handler
+then receives; `interceptor.go`). Checked against go.temporal.io/server v1.32.1, api v1.63.7,
+grpc 1.84.0, temporalio 1.34.0 and temporal-worker-controller v1.13.0. Exactly twelve cells
+changed, all deny to allow: two for the stream relay, ten for the worker controller.
+
+* **Three kinds of token, recognised in this order.** The internal principal (unchanged), then
+  `PublicAPIs`, then no token; then **a token that carries any permission is a party token**,
+  judged by the party rule alone whatever its subject says; then **no permission and
+  `sub == ControllerSubject`** (`platform/worker-controller`) is the worker controller; then any
+  other token is judged by **the relay rule**. "Any permission" is any namespace key or system
+  role, not any role bit: the default mapper creates a namespace's key even for a role it does
+  not know (`acme:relay` gives `Namespaces{"acme": 0}`), so a new principal cannot be a role
+  string. A permission string the mapper drops is no permission: `temporal-system:` with a role
+  it does not know (no role, no namespace key), an entry with no `:`, an entry that is not a
+  string, a `permissions` claim that is not a list; a token carrying only those is judged by its
+  subject (`TestWhatTheClaimMapperCountsAsAPermission`, and matrix cells for the controller's and
+  the relay's subject). So party tokens and the other two are told apart twice: the gate mints a
+  party token with a permission and the other two with none, and a party's subject is a handle,
+  which never contains the `/` both other subjects contain. The second holds whatever a token's
+  permissions say; the first as long as the gate writes no dropped permission into a relay's or
+  the controller's token. Neither test is a prefix test: the controller is equality with a
+  constant, the relay equality with a construction.
+* **The party allowlist is unchanged**: the same 40 WorkflowService calls, in the token's own
+  namespace, each now justified in `authorizer.go`. A seller's worker token, a seller's API-key
+  session (the gate has one Temporal mint, and I19's limits on keys are gate-side), a buyer and
+  the dev party are identical on the wire and get the same cells. **Seller self-access is decided:
+  allowed.** A party updates, queries and signals its own workflows (between its own workflows
+  too), and cancels or terminates them; its stream subscriptions, the session pane (#54) and
+  stock update handles need these. Escrow reads none of what they write: the server-recorded
+  status of the pinned chain and its first run id, provenance from the buyer's records (I16),
+  the clock and the buyer's gate calls. Stopping its own job is a refund against the seller.
+* **The stream relay** (#52): a JWT with `sub = relay/<namespace>/job-<32 hex>`
+  (`names.relay_subject`, below), a revocable `sid` and no permissions. For an
+  `UpdateWorkflowExecutionRequest` under `UpdateWorkflowExecution` with update name
+  `__temporal_workflow_stream_poll`, or a `QueryWorkflowRequest` under `QueryWorkflow` with
+  query type `__temporal_workflow_stream_offset`, in a party's namespace (not `""`,
+  `temporal-system` or the platform namespace), it is allowed when
+  `RelaySubject(request namespace, request workflow id)` equals its subject, compared whole.
+  Every other request type, a type under another API's name (Temporal itself hands the
+  cross-namespace command check a workflow task's response under `SignalWorkflowExecution`),
+  an update inside `ExecuteMultiOperation`, a stream handshake (no request) and the Nexus HTTP
+  dispatch are denied. The rule reads those two typed fields and the request's encoded size,
+  and nothing else -- no run id, update id, payload, header, callback or link is read, though
+  each counts toward the size. **A relay request is at most `RelayRequestMax`, 4 KiB** (the
+  #52 review): `proto.Size` of the whole typed request, so identity, header, arguments and
+  topics all count, compared with the constant, one integer comparison, after the handler
+  name and the subject. The largest request the gate's relay builds is 898 bytes (nine
+  topics: an offering's eight streams named with 64 characters and `kontra.progress`; the
+  largest offset; a 32-character namespace; the pinned run id; a pid@hostname identity), so
+  4 KiB is over four times a genuine poll, and the offset query is about 110 bytes. A
+  party's own requests are not capped. **Strict wire shape (Q1):** the relay
+  makes only those two calls; it re-sends its Update with the same update id and wait policy
+  COMPLETED until the answer carries the outcome (the server finds an update by its id), with an
+  empty run id so it follows a continue-as-new; `StreamDraining` is retried after a cooldown with
+  a new id, `TruncatedOffset` from offset 0, `AcceptedUpdateCompletedWorkflow` with a new id, and
+  it stops when the gate's own observer (I6) says the job closed. No
+  `PollWorkflowExecutionUpdate` (it names no update, so it would read any update's outcome by
+  id) and no `DescribeWorkflowExecution`: the stock `WorkflowStreamClient.subscribe()` uses both
+  and is refused at the first.
+* **The worker controller** (KON-15): a JWT with `sub = platform/worker-controller`, a revocable
+  `sid` and no permissions: ten calls, each named with the controller code that makes it
+  (`ControllerAPIs`: describe, set current, set ramping, set manager, update metadata and delete
+  of worker deployments and versions, `DescribeTaskQueue`, `CountWorkflowExecutions`), **in the
+  platform namespace only**. **The platform namespace is `kontra-system`, a constant** in the
+  public policy (`PlatformNamespace`, `names.PLATFORM_NAMESPACE`; Q2) and a reserved
+  handle, so no party can register it. **No `StartWorkflowExecution` or
+  `DescribeWorkflowExecution`** there: rollout gate workflows are not supported (Q3; the
+  owner may revisit), because a stolen controller credential could otherwise start any platform
+  workflow with any input. **Kontra's own workers** in `kontra-system` use ordinary
+  `kontra-system:worker` tokens on the public frontend (Q4): the party rule, no change
+  here; minting them is kontra-cloud's.
+* **The denials escrow depends on**, for every token: `ResetWorkflowExecution` (a reset revives
+  a terminated pinned run inside the same chain, its callbacks included -- the reset run's first
+  run id comes from the replayed history -- so a seller resetting after a buyer's cancel and
+  completing the new run would turn I17's refund into a delivery); `DeleteWorkflowExecution` and
+  `DeleteNexusOperationExecution` (a missing buyer record is unverified, never a delivery: a
+  buyer deleting its caller would turn a delivery into a refund against the seller; a seller
+  deleting I16's placeholder reopens cancel-then-start); `UpdateNamespace` and the other
+  namespace administration (retention decides how long those records exist); batch operations
+  and schedules (they act as Temporal's internal principal, past this policy and the callback
+  guard); the compute-config calls (`CreateWorkerDeploymentVersion`,
+  `UpdateWorkerDeploymentVersionComputeConfig`, `ValidateWorkerDeploymentVersionComputeConfig`:
+  the server would provision and invoke workers on a cloud provider with its own identity),
+  denied to the controller too. Pause, workflow options, activity operations, standalone
+  activities and workflow rules stay denied for want of a consumer. **Seller Worker Versioning
+  stays denied in v1** (Q5): a seller who turns on `use_worker_versioning` gets no tasks.
+  **Seller operations calls** (`ListWorkers`, describe and update of workers, pause and reset of
+  activities, `UpdateTaskQueueConfig`) stay denied until a seller tool needs one (Q6).
+* **Run ids are left to the gate** (Q7): every run of `job-<id>` is the seller's own, and
+  escrow ignores runs outside the pinned chain; once escrow has pinned the chain the gate sets
+  `first_execution_run_id` on the relay's Update, and Temporal refuses a look-alike chain
+  (NOT_FOUND, measured).
+* **The PRD's "only the gate starts or steers a workflow there [prod]"** describes the console
+  and buyers, not the authorizer: a seller can always steer its own job, because it runs the
+  code (Q8: to confirm on the issue).
+* **Names** (Q9): the subjects `relay/<ns>/job-<32 hex>` and
+  `platform/worker-controller`; `AllowedAPIs` keeps its name (no rename churn), with a
+  justification on every entry.
+
+`kontra/contract/names.py` gains `WORKER_CONTROLLER_SUBJECT`, `PLATFORM_NAMESPACE`,
+`STREAM_POLL_UPDATE`, `STREAM_OFFSET_QUERY` and `relay_subject(namespace, job_id)`, which
+validates a non-reserved handle and a job id and returns `"relay/" + namespace + "/" +
+job_workflow_id(job_id)`. `RelaySubject` is its Go twin. Both languages read one golden file,
+`temporal/authorizer/testdata/principals.json`, so the two constructions cannot drift, and
+`tests/contract/test_names.py` pins the installed `temporalio.contrib.workflow_streams` handler
+names (`_POLL_UPDATE`, `_OFFSET_QUERY`, Public Preview) to it: a rename upstream fails CI
+instead of silently denying every relay. Injectivity: the namespace is a handle and the workflow
+id `job-<32 hex>`, so the text after `relay/` holds exactly one `/`, and any request that
+rebuilds the subject is that one split (`TestRelaySubjectHasOneSplit`).
+
+**Amends** I3 (three token kinds, and "the only rule that had to inspect a request" is now the
+relay's two typed fields, compared whole with a construction -- the removed publisher rule was a
+prefix test of an attacker-chosen name, the opposite), I1 (`relay_subject` joins the
+constructed identifiers), `authorizer.go`'s invariant ("nothing reads a request body" becomes
+the sentence above) and `docs/security.md`.
+
+**Rejected:**
+
+1. A role string for the relay or the controller: an unknown role becomes `RoleUndefined` while
+   still creating a namespace key, and Temporal's role bitmask is fixed at four bits.
+2. The scope in `Claims.Extensions` through a second claim-mapper wrapper: a second JWT parse
+   plus a custom claim, and the default mapper would no longer decide alone what a token is
+   worth.
+3. Per-principal audiences: there is one `AudienceGetter` per server.
+4. The relay on the internal frontend: full control of Temporal inside an internet-facing
+   process.
+5. `PollWorkflowExecutionUpdate` and `DescribeWorkflowExecution` for the relay: they read any
+   update by id and the run's metadata, and the strict shape does not need them.
+6. A platform namespace in dynamic config: the gate edits that file at runtime (I12), so whoever
+   edits rate limits would move the controller's scope. A server setting read once at startup
+   stays possible if self-hosters need another name.
+7. Opening schedules or Worker Versioning to sellers now: no consumer, and the escrow reasons
+   above.
+
+**Consequences.**
+
+- kontra-cloud must mint both credentials before either works (the tracking issue's text, on
+  #59): `KeyRing.sign_relay(namespace, job_id, session_id)` and
+  `KeyRing.sign_controller(session_id)`, one function per kind with no role parameter (a relay
+  or controller token that also carried a permission would be judged a party token, and one
+  carrying a permission string the mapper drops would still be judged by its subject), each with a
+  `sid` and a 15-minute lifetime; a relay session per job relay, revoked when the job closes or
+  the last SSE listener leaves; the relay dials the **public** frontend and makes only the two
+  calls above; `kontra-system` registered through the internal frontend (a reserved handle, so
+  not through `ensure_party`); Kontra's own workers on `kontra-system:worker` tokens from a
+  platform-only mint; the controller's token rotated into the Secret its
+  `TemporalConnection.apiKeySecretRef` names. Deploy the kontra-temporal image that carries #59
+  first.
+- #52 ships the strict poll loop in kontra-sdk, so the FakeGate and the gate relay the same way:
+  `kontra dev up`'s in-process server runs no authorizer (#57), and a FakeGate relaying through a
+  stock `WorkflowStreamClient` would depend on two calls production denies. A stream must be
+  hosted by the job's handler workflow itself, since the relay reaches `job-<id>` and nothing
+  else. Each relay poll writes accepted and completed events to the seller's history and counts
+  against its rate limits: one subscription per job, fanned out, only while a buyer listens.
+  Topic filtering is the gate's (topics sit in the poll's payload, which the authorizer does not
+  read), and a poll's result is one ciphertext. **A poll's outcome is stored in the history**
+  (`WorkflowExecutionUpdateCompletedEventAttributes.Outcome`), up to the stream's poll response
+  cap (`_MAX_POLL_RESPONSE_BYTES`, about 1 MB): a genuine relay doubles the stream's volume in
+  history (each item once in its publish signal, again in a poll outcome) and spends one of the
+  run's `history.maxTotalUpdates` (2,000, Temporal's default, pinned in
+  `dynamicconfig/kontra.yaml`) per poll. #52 polls only from the tail, with topics, and has to
+  plan for both.
+- Residual risk: a relay that presented another update's id would get that update's outcome
+  (the server matches an update by id alone); update ids are random ids the relay never sees,
+  and outcomes are ciphertext to the job's parties.
+- **The relay's size cap closes what the #52 review found.** A leaked relay token's requests
+  could still end its job by their size alone: every workflow task must fit in Temporal's
+  4 MiB gRPC message, Temporal terminates a run whose workflow task it cannot deliver, and
+  #52's poll guard cannot refuse an oversized poll, because a refused update's request
+  travels in the workflow task all the same. With `RelayRequestMax`, what a relay token's
+  requests add to one workflow task of its job is at most `history.maxInFlightUpdates` (10:
+  Temporal's default, pinned in `dynamicconfig/kontra.yaml` so that the bound does not move
+  with Temporal's; `TestUpdateLimitsArePinned`) times 4 KiB, two orders of magnitude below the
+  limit. #52's poll guard (polls refused at validation, so not written to history, once the
+  run's history is past half of Kontra's pinned limits) bounds what polls add to the job's
+  history, and could not bound this; the cap bounds what their requests add to a workflow
+  task. With both, the burst the #52 review found no longer ends a job. Neither bounds the
+  polls' answers; I31's answer budget does (the residual risk next).
+- **Residual risk: a leaked relay token can end its job** (*amended by I31*). Since #52, not by
+  the history growth described next: a job root refuses polls at validation once its history is
+  past half of the pinned limits, a refused poll is not written to history, and with the size
+  cap above that bounds what a leaked relay token can do to its job's history (the guard plus
+  the polls in flight; a job someone listens to must keep its own history under the other half).
+  Nor, since I31's answer budget, through the polls' answers: the polls one workflow task
+  completes answer together in the worker's reply to that task, which must fit the 4 MiB gRPC
+  limit, and concurrent polls of the size the cap allows could make it pass that limit and
+  terminate the run (measured with both in place); a job root now answers at most 1.5 MiB in
+  one workflow task and holds any further poll back for a later one. What remains is the
+  relay's share of the history: a leaked token can spend it at once, where a genuine relay
+  spends it as the stream grows, so a job someone listens to whose own history needs more than
+  the other half of the limits is terminated (I31's history budget). The session is revoked
+  only when the job closes or the last listener leaves, so a leaked token stays live while a
+  buyer listens. The Authorizer cannot bound this: its size cap holds a relay's requests, the
+  cost is in the answers, and it does not read the payload. The bound is the job's own: the
+  guard here, and the follow-up the owner asked for on #59 (stream items by reference, a
+  per-run poll budget). Continue-as-new on handler workflows was considered and rejected by the
+  owner (#59): it puts a rule on seller code.
+- #51 documents that a seller who turns on Worker Versioning gets no tasks.
+
+Tested: the Go deny matrix, every cell with its typed request, against Kontra's and Temporal's
+two authorizers (331 cells, 260 of them denials that Temporal's no-op authorizer allows; 993
+checks), the relay's size cap among them (the largest genuine poll and the offset query
+allowed; a poll past the cap by its topics, its identity or a header, and an offset query by
+its arguments or a header, denied; a party's oversized update and query allowed); a sweep of
+all 191 surfaces against 26 kinds of caller, five namespaces and five requests -- a favourable
+one, the same past the relay's cap, two hostile ones and none (124,150 decisions, the expected
+rule restated in the test); the cap at its edge (`TestRelayRequestMax`: exactly 4 KiB passes,
+one byte more does not); Temporal's own authorization interceptor handing the relay rule the
+decoded request; and `tests/temporal` over the wire against the real binary (59 tests), the
+relay, controller, self-access and escrow cells included, and a relay poll past the cap
+refused while the relay's own poll on the same job still answers. What a relay's polls cost a job's history is stated
+above and in `docs/security.md`, not pinned by a wire test: that test would be a ready-made
+recipe in a public repository.
+
+## I31. Streams cross the boundary through the job's own workflow stream, sealed per item (kontra-sdk#52; decisions 5, 6 of #50)
+
+_OD1–OD11 below were decided by the implementer in the owner's place, as kontra-sdk#50 directs
+(no step waits on an answer); each is listed on #52 for the owner to confirm or overturn._
+
+Nexus does not stream. A seller already streams with Temporal's own API
+(`temporalio.contrib.workflow_streams`: a log in workflow state, written by a publish signal,
+read by a poll Update and an offset Query), and a buyer holds no Temporal client. So a job's
+stream reaches its buyer the way #59's relay credential allows (I30), and it **replaces** the
+bespoke progress channel rather than adding a second one. Checked against temporalio 1.34.0
+(`contrib/workflow_streams`, `worker/_workflow_instance.py`) and server 1.32 (CLI 1.9.1),
+with two prototypes whose results are below.
+
+* **The rule.** A topic the offering lists reaches the buyer; nothing else does.
+  `offering.yaml` gains `streams:` -- topic names, data, never code (D11): at most 8 distinct
+  names matching `[A-Za-z][A-Za-z0-9_.-]{0,63}`, `kontra.` reserved in any case
+  (`kontra.progress` is relayed for every job), stored sorted. `kontra.contract.offering`
+  (`check_streams`) is the one validator and `spec/offering-streams.v1.json` states the same
+  rule language-neutrally (the same vectors run through both). It is **not an `x-kontra`
+  fact**: not in the contract hash, every golden unchanged. It travels as catalog data beside
+  the document, as `recipients` does (I7): `PublishRequest.streams`, `CatalogEntry.streams`.
+  It is **fixed per version** (OD5): the gate refuses a republish of a version with
+  other streams (409 `streams_fixed`) and `KontraPlugin`'s hash lock refuses to start code
+  whose list differs from the catalog's. Per-topic item schemas in the contract are later
+  (OD11): `job.stream(type=)` takes the buyer's own model.
+* **Why the codec seals each item.** The contrib encodes a poll's answer as one payload and
+  runs the codec once on it (its own docstrings say so). Encrypted whole, the relay could read
+  no topic or offset; encrypted whole to the buyer, a gate that asked for every topic would
+  hand the buyer the seller's private ones. The codec runs outside the sandbox and knows only
+  the serialization context (one worker serves several offerings, and every job id looks
+  alike), so the only channel from the workflow to the codec is the payload's own metadata.
+  Kontra's workflow interceptor therefore marks the answer of a poll on a job root -- a
+  `RawValue` with `kontra-stream: poll/v1` and the topics the buyer may read (the offering's
+  `streams`, by task queue, and `kontra.progress`); `CompositePayloadConverter` passes a
+  `RawValue` through untouched -- and `KontraCodec` turns it into the **stream envelope**
+  (`kontra/codec/stream.py`): `{"v": 1, "items": [{"topic", "offset", "ct"}...], "next_offset",
+  "more_ready"}`, encoding `binary/kontra-stream`. Each item is the age ciphertext of its own
+  `Payload` with its topic and offset sealed inside (`kontra-topic`, `kontra-offset`), so a
+  buyer checks both against the event and a gate cannot relabel or reorder items. A listed
+  topic is sealed to the seller's recipient set and the job's buyer key and named in the clear;
+  any other to the seller's set alone, its name `null`. Items above 256 KiB of ciphertext are
+  claim-checked (or a stub without a blob store; the relay records a gap); the envelope stops at
+  512 KiB with `next_offset`/`more_ready` set exactly as the contrib's own truncation does, so
+  every subscriber just polls again. The workflow interceptor cuts the answer the same way
+  first, where the sealed envelope could pass 512 KiB (an upper bound per item, for the
+  worker's recipient count), so the codec's own trimming never changes an answer the run
+  counted as read to its end (the drain below); and an item above 256 KiB is claim-checked
+  once per job, not once per poll that re-reads it (age's randomness would make each copy a
+  new blob). Offsets and the log's length are in the clear: the
+  platform reads them from history sizes anyway. Decoding restores the exact `PollResult`, so
+  the seller's stock `WorkflowStreamClient`, its console and replay are unchanged. The offset
+  query's answer is marked too and passes in plaintext. A mark anywhere but a seller's job
+  workflow is refused (`CodecError`), never encrypted another way. `KontraPlugin` refuses
+  external storage at or below the envelope's 512 KiB (plus framing): the relay must read it.
+* **Who hosts.** The relay reaches `job-<id>` and nothing else (I30), so the job root hosts the
+  stream. **Host if absent:** when a root's run starts and its code built no `WorkflowStream`,
+  Kontra builds the contrib's own (`_HostedStream`, a subclass whose `__init__` satisfies the
+  contrib's caller-frame check), after the seller's `__init__` ran; publish signals that came
+  first are buffered by temporalio. **Early handlers:** in a run's first activation updates are
+  applied before the workflow is initialised, and the prototype got `Update handler for
+  '__temporal_workflow_stream_poll' expected but not found`; the interceptor's `init` registers
+  placeholders (a poll that waits for the stream, an offset of 0), which the stream replaces.
+  **Drain:** a relay sleeps between polls, and the prototype lost 5 of 6 items of every short
+  job; when a run returns or fails and any poll was seen in the chain, the root waits (5 s at
+  most, OD9) for a poll to have answered up to the stream's end, then answers the polls still
+  waiting (no "unfinished update handlers" warning on every listened job). 6 of 6 with it.
+  **Continue-as-new:** for a stream Kontra hosts, it drains, detaches the pollers and carries
+  the stream's end to the next run in a plaintext header (`kontra-stream-base`, rewritten in the
+  same dict the command reads when the error reaches the top), so offsets stay monotonic across
+  the chain (a 3-run chain relayed offsets 0..5, all six); a stream the seller hosts follows the
+  contrib's recipe (`prior_state`), which `docs/sellers.md` states. Every prototype history
+  replayed clean.
+* **Bound handlers: mirroring, under the same names.** A bound handler's events are published
+  by the agent child (`job-<id>/agent`), whose payloads are the seller's alone and which the
+  relay cannot reach. The turn activity already reads the child's stream, so it mirrors the
+  listed topics onto the job's stream, each item's `Payload` untouched, flushed every half
+  second and before it returns the reply, and checkpointed in its heartbeat details so a
+  retried attempt mirrors from where the last flush got (a lost worker re-publishes at most
+  one flush window; the test counts every event once). Unlisted topics are never copied.
+  **Naming rule: identity** (OD3): `streams: [turn_events]` relays the harness's own
+  `turn_events`; there is no `agent` alias -- the PRD's and the issue's `streams: [agent]`
+  was illustrative. One sentence covers both entry kinds, no alias table couples Kontra to a
+  pre-1.0 harness, and #54's renderer reads `turn_events` by one name in dev and prod.
+* **The relay** (`kontra/_relay.py`), written once: the FakeGate relays with it and
+  kontra-cloud imports it. The strict wire shape of I30 -- only `UpdateWorkflowExecution` of the
+  poll (run id empty, `first_execution_run_id` once pinned, wait policy COMPLETED, the same
+  update id re-sent until it carries an outcome) and, for a tail start, the offset
+  `QueryWorkflow` -- with every failure classified (`StreamDraining`, `TruncatedOffset`,
+  `AcceptedUpdateCompletedWorkflow`, `KontraStreamFull`, other rejections, RPC errors),
+  `RelayBatch`es whose `next_offset` the caller persists after storing their items, and pacing
+  (`MIN_INTERVAL` 2 s, `pace_for` from the job's history size). It imports no
+  `temporalio.contrib`; `parse_envelope` refuses any `ct` that is not an age file, so plaintext
+  never reaches a gate's storage, and a worker without #52 (whole ciphertext) stops it with
+  `protocol`. **Amends the issue's "FakeGate relays from a real `WorkflowStreamClient`":** the
+  stock client uses `PollWorkflowExecutionUpdate` and `DescribeWorkflowExecution`, which
+  production denies (I30), and `kontra dev up` runs no Authorizer to show it.
+* **When the relay runs** (OD2, **changed from the design's tail start**): one relay per
+  job, started once escrow has pinned the chain **and** its first listener attaches, **from
+  offset 0, once per job**; nothing polls while nobody ever listened. The gate keeps a
+  monotonic per-job cursor and stores what it relays (the caps below), so a later listener
+  replays from the gate's store with `after` or `Last-Event-ID`, as progress replayed before;
+  each item is still polled once. A listener leaving pauses the relay after 30 s, the offset
+  kept; a buyer's resume never moves it (a buyer-chosen offset would hand every buyer the
+  leaked-token amplification of I30). `kontra._relay` keeps `start="tail"` for a gate that
+  wants it, but `start=` has no default: a gate that omits it gets an error, not the tail.
+* **Seam ②** (OD4: a hard cut in this 0.x release). `POST` and `GET
+  /v1/jobs/{id}/progress`, `ProgressPost` and `ProgressEvent` are gone. `GET
+  /v1/jobs/{id}/stream` (the job's buyer or seller) serves SSE of `StreamEvent{cursor, kind:
+  item | gap | history, ...}`: `topic` (repeatable; each in the version's `streams` or
+  `kontra.progress`, else 422 `unknown_topic`), `history`, `after` or `Last-Event-ID`; it ends
+  once the job is closed and its relay finished. History events are the platform's liveness
+  summary, unchanged in content. Caps (OD7): 256 KiB per relayed item
+  (`gap{too_large}` with its size), 16 MiB per topic and 64 MiB per job stored -- past one,
+  a single `gap{topic_budget|job_budget}` (the first item that did not fit), and the gate
+  relays no more of that topic (it restarts the relay without it) or of the job (the relay
+  stops), so neither the store nor the seller's history grows by an item the gate drops --
+  8 listeners per job (429 `too_many_listeners`); no rate drop -- items wait in the
+  workflow's log while the relay paces itself.
+* **The buyer.** `job.stream(topic, type=T)` -> `JobStream[T]`: decrypt with the job's key,
+  check the sealed topic and offset, validate as `T` (`dict` for leniency), dedupe by cursor
+  (a replay) and by offset (a gate that re-read), resume through `.cursor`. Not sealed for us,
+  or relabelled: logged and skipped. A gap with an offset is logged; one without (the relay
+  stopped) raises `StreamInterrupted`; an invalid item `StreamItemInvalid`. `job.progress()`
+  keeps its public shape, as sugar over the `kontra.progress` topic (items are
+  `kontra.types.ProgressRecord{v, at, activity, details}`) plus history events; the MCP
+  `status` tool and `kontra job --progress` keep their interface, but what they show follows
+  the delivery semantics below: heartbeats appear only for a job someone listened to before
+  it closed (asking for its status while it runs is listening), else history events alone.
+  `kontra job <id> --stream TOPIC` prints decrypted items as JSON lines.
+* **History budget** (OD1, OD8). Heartbeats now cost the seller's history: one publish
+  signal is about four events, a relayed poll about five more (measured: 20 activity publish
+  batches cost 95 events, 192 with a relay polling). Against Kontra's pinned
+  `limit.historyCount.error` (20,480), yesterday's one-a-second forwarding with a listening
+  relay would terminate a job, refunded against the seller, in about 52 minutes. Adopted: **the
+  job's poll guard** -- a root refuses a poll at validation (`KontraStreamFull`) once its
+  history is past half of the pinned limits (10,240 events or 10 MiB; a test pins `== error //
+  2`); a rejected update is not written to history, so no poll, whether a genuine relay's or a
+  leaked relay token's, grows the job further, and the relay stops with `gap{history_budget}` --
+  and **a budgeted ProgressForwarder**: the latest details at most every 5 s
+  (`KONTRA_PROGRESS_INTERVAL` still overrides; 0 publishes every heartbeat, batched), the
+  interval doubling every 360 items up to 300 s, at most 1,000 items per job (about 4,000
+  events, a fifth of the limit), then one log line and nothing more; an activity's latest
+  heartbeat is published when it returns, whatever the interval. The count is per worker process
+  (each one that runs the job's activities has its own) and survives the job going quiet: a job
+  forgotten after five idle minutes keeps its count for 31 days, past the longest
+  `max_duration`. **What the guard bounds, and what it does not.** It bounds what polls add to
+  the history: past it, polls are refused and not stored, so their share is the guard plus the
+  polls in flight (`history.maxInFlightUpdates`, 10, pinned since #59, of at most 512 KiB each).
+  It caps the relay's share near half of the limits, not the job's total: the relay's events
+  stay, so a job someone listens to needs its own history under the other half (measured with
+  the limits scaled down: a job whose own work reached about 85% of them completed unlistened
+  and was terminated with a genuine relay listening, which the guard had stopped at half).
+  Capping the relay's own share (counting answered polls and their bytes in the interceptor) is
+  the better bound, recorded, not built. **The guard and #59's request cap (I30) together bound
+  what a leaked relay token can do to its job's history.** The guard stops its polls at half of
+  the limits; the cap, 4 KiB a relay request (the gate's largest poll is 898 bytes), refuses the
+  burst this change's review measured -- concurrent polls with oversized requests made the
+  worker's reply to the workflow task carrying them pass gRPC's 4 MiB limit, since the SDK
+  echoes every update request it accepts or rejects, and Temporal terminated the run
+  (`GrpcMessageTooLarge`) whether the job accepted or refused them, and with no poll handler at
+  all (the shape before #52 too); no validator can refuse what is echoed when it is refused. The
+  residual, as measured: a relay listening still costs a job history, its share up to the guard,
+  whoever holds the token, so a job someone listens to must keep its own history under the other
+  half (above). **And the answer budget closes I30's residual risk through the answers.** The
+  polls one workflow task completes answer together in the worker's reply to that task, up to
+  512 KiB each, and with only the guard and the cap, concurrent polls of the size the cap allows
+  could make that reply pass gRPC's 4 MiB limit, and Temporal terminated the run
+  (`GrpcMessageTooLarge`; measured with the pinned limits, the history far below the guard): the
+  cap holds requests and the guard holds history, so neither reached it. Now the job root counts
+  what it answers in each workflow task (`kontra.codec.stream.envelope_bound`, the codec's own
+  arithmetic for the most keys any item is sealed to, so the same on every worker) and answers
+  at most `STREAM_ANSWER_BUDGET`, 1.5 MiB, three full envelopes, in one task: a poll past it is
+  answered with no items and `more_ready`, at the offset it would have started from, so its
+  poller polls again and is answered in a later task -- not a refusal, which the relay would
+  back off from. Only answers that carry items count and the first of a task is always sent, so
+  the stream makes progress; an answer held back is never counted as read, so the drain waits
+  for the poll that carries it. 1.5 MiB leaves the rest of that reply 2.5 MiB: the update
+  requests it echoes (at most `history.maxInFlightUpdates`, 10, of at most `RelayRequestMax`,
+  4 KiB: 40 KiB), the answers with no items (a frame each), and the seller's own commands, one
+  payload at the pinned `limit.blobSize.error` (2 MiB) included; a test sums them under 4 MiB
+  from `kontra.yaml` and `authorizer.go`. A workflow task is told apart by the run's history
+  length (`workflow.info().get_current_history_length()`), checked on temporalio 1.34 in the
+  sandbox: one value for every answer completed in one task's reply (the activations that
+  resolve its local activities included), a larger one for the next, and the same on replay, so
+  the cut, and the drain's count of it, replay the same. Measured again on a dev server with the
+  pinned limits: the job keeps running, and no workflow task's answers pass 1.5 MiB. The two
+  other bounds recorded with it, an envelope small enough that the polls in flight fit one reply
+  and a lower pinned `history.maxInFlightUpdates`, are not needed. What I30's risk keeps is the
+  relay's share of the history (above): a leaked token can spend it at once, where a genuine
+  relay spends it as the stream grows. A poll names at most nine topics (`kontra._relay`: the
+  offering's eight streams and `kontra.progress`), so the gate's largest stays far under the
+  cap.
+* **Delivery semantics.** Live: a buyer who never listens before the job closes gets nothing
+  of its stream but history events (a relay attaching after a short job closed reads nothing;
+  items published before a continue-as-new of a Kontra-hosted stream nobody polled are not
+  carried). At-least-once transport from the gate, deduplicated by the buyer. An activity
+  retry re-publishes (the turn mirror is checkpointed; a seller's own activities are theirs).
+* **Not in v1.** Client publish signals are not sealed per item (OD6): a publish
+  signal, like a continue-as-new input, stays one payload encrypted to the buyer and the
+  seller, so an unlisted topic is private in what is *relayed*, not in what the buyer's key
+  could open if it ever read the seller's history (it cannot: the buyer has no Temporal access
+  to the seller's namespace). Harness-internal activities' heartbeats are forwarded as any
+  seller activity's are (OD10, asked on #52). Item schemas in the contract (OD11).
+* **The authorizer: no new cell here.** The relay's two calls are #59's, and so is the request
+  cap this change's review asked for (I30, merged in); the forwarder's and the turn mirror's
+  publish signal and the seller's own subscriptions are the party allowlist on its own job; the
+  gate's pacing reads the internal frontend. The relay loop's wire test
+  (`tests/temporal/test_relay_loop_wire.py`) belongs to this change, not to #59's branch.
+
+**Rejected.** A Kontra-owned poll update (it duplicates the contrib's long-poll and changes
+the authorizer's handler names); one whole ciphertext per poll with the item list in the clear
+beside it (the gate would decide what the buyer can open); encrypting items at publish time (a
+workflow's publish runs in the sandbox, without keys or I/O, and converters are synchronous);
+a buyer-reported relay offset (every buyer gets the leaked-token amplification); a relay subject
+for the agent child (it breaks I30's one-split proof, and the child's payloads are the
+seller's); an `agent` alias; `streams:` in `x-kontra` (a hashed document with unhashed members).
+
+**Amends** I3 and I30 (the relay's stop, its cost, the residual risk above), I7 (the stream
+envelope; a plaintext log length; external storage above the envelope limit), I29 (the turn
+activity mirrors; Kontra hosts a stream on every job root), and `docs/security.md`.
+**Supersedes** the bespoke progress channel (PRD §8.4's `POST .../progress`).
+
+Tested: the envelope and the codec branches, JSON nested past the stack refused, the
+interceptor's cut sealed whole for every size class and recipient count and within the bound
+it counts, an answer held back sealed within its frame, and a re-read large item stored once
+per job (`tests/codec/test_stream_envelope.py`); the streams rule through the
+code and the spec (`tests/contract/test_offering_streams.py`); hosting, early handlers, the
+drain (a short job's tail that passes one envelope included), the answer budget (with the budget
+scaled down, polls completed in one workflow task answered within it, the rest held back, the
+job running on and every poller reading the whole stream; the drain waiting for answers held
+back), a continue-as-new chain, the guard and replay (`tests/serve/test_stream_hosting.py`);
+the budget and the rest of a workflow task's reply under 4 MiB, from the pinned limits
+(`tests/serve/test_interceptors.py`); every relay classification (a `TruncatedOffset` at offset
+0 backed off, not spun on), an answer held back polled again at once, the same update id
+re-sent, a look-alike chain refused, `start=` required, at most `STREAMS_MAX` + 1 topics and no
+contrib import (`tests/serve/test_relay.py`); the
+forwarder, its budget across a quiet spell (`tests/serve/test_progress.py`); the mirror and its
+checkpoint (`tests/serve/test_turn.py`); the FakeGate's relay, caps (a spent budget one gap),
+resume and listener rules (`tests/testing/test_stream_relay.py`); `job.stream()`
+(`tests/hire/test_stream.py`); seam ⑤'s marker scans of every run's history, the raw SSE and the
+gate's store, with a misbehaving relay, for a workflow entry and a bound handler
+(`tests/serve/test_streams.py`); and the loop over the wire with a relay token, under #59's
+request cap (`tests/temporal/test_relay_loop_wire.py`). What a leaked token's concurrent polls
+did before the answer budget, and do with it, was measured on a dev server with the pinned
+limits; no test ends a job, and the budget's tests stay far below gRPC's limit with or without
+the budget, for the reason I30 gives: a test that ended a job would be a recipe.
+
+## I32. The engine is a property of the offering, reached through a narrow Protocol (kontra-sdk#55; decision 9 of #50)
+
+_OD1–OD11 below were decided by the implementer in the owner's place, as kontra-sdk#50 directs
+(no step waits on an answer); each is listed on #55 for the owner to confirm or overturn._
+
+Engine-agnosticism lives at a different boundary than the façade sat on:
+
+```
+seller <-> engine : native, no abstraction  (I29: the façade is deleted and never rebuilt)
+gate   <-> engine : kontra.engine, a narrow Protocol  <- seam ⑥
+```
+
+The ledger's pattern (seam ④): a Protocol (`kontra/engine/__init__.py`), a fake
+(`kontra.testing.FakeEngine`), adapters, and one contract every adapter passes unchanged
+(`kontra.testing.engine_contract`). Nexus becomes the Temporal adapter's implementation detail
+(`kontra/engine/temporal.py`), not a concept Kontra knows. A package and a module named
+`kontra.engine` cannot coexist, so the Protocol is the package's `__init__` and the adapter its
+`temporal` module (OD10); `kontra._control` stays where it is (kontra-cloud imports it)
+as the adapter's internals. `kontra.engine` imports no `temporalio` (a subprocess test).
+
+* **Why eleven members, not the issue's five** (OD1). Each is a call a gate already makes
+  to Temporal; with five, the gate would stay Temporal-coupled at hire, quote, publish,
+  cancel-before-start and liveness, and escrow could not be fed through the seam.
+  `start(contract, input, job_id) -> handle` splits into **`bind(plan) -> handle`** (pure, at
+  hire) and **`start(handle, input, hold=, deadline=)`** (idempotent by job): most jobs start
+  without the gate (the buyer's own Nexus call, I4), yet the gate observes them from their
+  first moment, so the handle must exist before any start. **`result(handle)` becomes
+  `observe(handle, pin=, holds=)`**: escrow needs a snapshot -- status, times, provenance, the
+  pin, the buyer's withdrawal, the sealed result and its digest (I6, I15-I17) -- not a blocking
+  await (the gate polls; an await would hold a connection per job and still not say "running,
+  verified"). **`cancel(handle, stop=ASK|END, pin=)`** covers the three stops escrow issues.
+  Added: **`fence`** (I16's occupy, separate from cancel: see Rejected), **`liveness`** (the
+  history events of §8.4), **`quote`** (I4's relay), **`expose`** (I1/I3's endpoint at
+  publish), **`isolate`** (a party's home, and with a session its credential: "the
+  authorizer-on-the-frontend", the whole ballgame), **`stream`** (#52's relay, I31), and
+  **`name`**. The Workers view (I21, OD8) and kontra-cloud's blame read for a job that
+  never started (FIXUPS #22, OD7: a follow-up, not ported) are Temporal-only extensions,
+  their models being Temporal's by definition.
+* **The engine-neutral job record** (OD2). A job's handle is opaque bytes the adapter
+  minted (Temporal: `temporal/1\n` + canonical JSON of `{buyer, job, offering, route,
+  seller}`, at most 1 KiB), stored on the job row and handed back verbatim. Only its adapter
+  parses it, strictly and before any I/O -- prefix, size, exactly those keys, each field by its
+  own anchored validator, construct-and-compare -- and then *constructs* namespaces, workflow
+  id and service with `names.py`; it is never shown to a party and never authorizes anything.
+  `JobRecord.run_id` and `Observation.run_id` are now **`pin`** (opaque: escrow stores and
+  compares it, nothing more), and **`JobRecord.seller_ns` is gone** (escrow never read it; the
+  handle carries it). `HoldClaims.seller_ns`/`buyer_ns` stay on the wire: the seller's handler
+  checks them. `EffectKind` values stay -- they are persisted in kontra-cloud's
+  `jobs.pending_stop` -- and `kontra.engine.STOPS` maps each onto a `Stop` and whether the pin
+  goes with it (OD9). The lockstep migration is kontra-cloud#45's.
+* **End-to-end encryption is a Protocol guarantee, not a Temporal feature** (OD3).
+  Content leaves an adapter only as `SealedPayload` (a delivery: the codec's envelope,
+  `binary/kontra-age` with an age file, or `binary/kontra-claim-check`; canonical; `kontra-v`
+  1 and no other metadata; `kontra.codec.check_sealed`) or `Sealed` (a relayed stream item, an
+  age file), both checked when the value is built -- an age file by its structure
+  (`kontra.codec.age.is_age_file`: the version line, a recipient stanza, the header MAC, the
+  nonce, a sealed chunk), so plaintext behind the version line is refused. `Observed` refuses
+  a result that is not a verified completion's or whose digest is not of its bytes, a
+  verified completion without its result, and a digest without one: escrow pays a verified
+  completion as a delivery, so no adapter can hand over one the gate does not hold (one with
+  no bytes reports `UNSEALED`). Sealing is the seller side's
+  (Temporal: `KontraCodec` under `KontraPlugin`; an engine without a codec hook: a Kontra guest
+  library in the seller's component) -- a gate-side adapter that encrypted would hold
+  plaintext. A verified completion whose result is not sealed is the new
+  **`ObservedStatus.UNSEALED`**: the adapter drops its bytes, escrow refunds it at once as
+  "delivery not sealed", counted against the seller (who bypassed the codec). The quote's
+  answer is the one plaintext that crosses (a price, I4); a quote refusal's message is the
+  seller's own words, logged by the gate, never stored for a party.
+* **The engine at publish** (OD4, OD5, OD11). `PublishRequest.engine:
+  Literal["temporal"]` (`ENGINE_NAMES`), **beside the contract hash, not in `x-kontra`**:
+  catalog data like `recipients` and `streams`, so no hash, golden or published document
+  moves. Fixed per version at its first publish (409 `engine_fixed` with the recorded engine,
+  after the ownership check, so only the owner learns it); a name that is not an engine and
+  that the gate runs no adapter for is 422 `unsupported_engine` (a known engine a gate has no
+  adapter for -- a fake gate with no Temporal -- is recorded, its sellers offline); no
+  buyer-facing response carries it (a test walks every modelled response schema, another the
+  served bytes of every catalog read, the A2A card included). **Changed from the design
+  (OD11):** the SDK omits `engine` when it is the default (`Field(exclude_if=)`, so the
+  dependency floor is pydantic 2.12, pinned by a test), and a gate reads its absence as
+  `temporal`, so this release adds no deploy-order dependency of its own on kontra-cloud#45
+  (an old gate refuses an unknown member). `serve()`
+  derives the engine from the entry's type (`kontra.serve.offering.engine_for`: a
+  `@workflow.defn` class or an `@agent.accepts` handler is temporalio code, so `temporal`);
+  `serve(..., engine=)`, `offering(..., engine=)` and `KontraPlugin.from_profile(...,
+  engine=)` take an override that must agree (`ValueError`). The hash lock checks no engine
+  for a version that exists (OD5: its catalog read is buyer-facing and must not carry it; with
+  one engine no mismatch can exist; a seller-scoped read comes with a second adapter); the dev
+  publish turns a 409 `engine_fixed` into a refusal line.
+* **Temporal only; Golem as the design target.** Every signature maps onto Golem 1.5/1.6 with
+  no Temporal concept in the types: `bind` = `{environment, agent type, KontraJob(job id)}`;
+  `start` = invoke with `Idempotency-Key: <job id>`; `observe` = agent metadata, the recorded
+  invocation's result, provenance from the runtime-written oplog entry naming the gate's
+  principal, `pin` = that invocation's oplog index, `buyer_canceled` always False; `cancel(ASK)`
+  = cancel the pending invocation, `cancel(END)` = interrupt then delete; `fence` = trivial
+  (only the gate may invoke job agents); `stream` = Durable Streams from an offset; `isolate` =
+  an environment and a narrowed permission card. A test pins that no member, parameter, or
+  public attribute (field, property, method) of a type the Protocol hands over or takes is
+  named for a namespace, task queue, run, workflow, activity, Nexus endpoint or history, with
+  one exemption the test names: the catalog's `OfferingId` (taken by `expose`, `quote` and
+  `JobPlan`) is an offering's id, not a type of this seam, and its `namespace`, `task_queue`
+  and `service_name` are `names.py` derivations (constructed, never parsed) that only the
+  Temporal adapter reads. Golem forced three things into the semantics, now
+  written in: END must be irreversible *by the seller* (a resumable interrupt is not END),
+  sealing is seller-side, and provenance comes from records the runtime wrote. Restate maps
+  cleanly (ingress with an idempotency key, cancel vs kill) but has no offset streams (`stream`
+  would raise `StreamStopped("unsupported")`); DBOS collapses `isolate` onto the substrate (the
+  gate would read the seller's own system database). **No second adapter before PMF:** its
+  isolation proof, dev stack and fake do not amortise, and a Golem adapter is a product change
+  (seller code on Kontra's sandbox, not the seller's hardware), not plumbing. The buyer-facing
+  Temporal coordinates (`CatalogEntry.endpoint`/`service`/`task_queue`, `HireView.endpoint`,
+  `workflow_id`, `operation_id`, `JobView.workflow_id`/`operation_id`) stay for v1 (OD6): "buyers never see `engine`" holds literally, and whether a second adapter bridges them
+  (a gate-hosted Nexus endpoint) or makes them optional is the open question it must answer.
+* **The guardrail.** The Protocol never grows a workflow-authoring member: none runs, defines
+  or schedules seller code, and the only callable any member takes is the gate's own `closed`
+  predicate (a test). `kontra.engine.MEMBERS` is pinned by a test, so adding a member is a
+  decision recorded here, not a refactor. The day someone wants `engine.execute_activity(...)`,
+  that is the façade crawling back, and the answer is no.
+* **The contract** (`kontra.testing.engine_contract.run_engine_contract`; E1-E18): conformance
+  and the pinned members; isolation locally (one home per party, a credential per party and
+  session) and over the wire (E18: the seller's credential reaches its job's run; the buyer's,
+  whose side is its own start, and a stranger's neither reach it nor can terminate,
+  request-cancel or fence it; no party's can provision a home or expose a route); handles pure,
+  deterministic, distinct, refused when tampered before any I/O; idempotent start by job
+  (concurrent, late, after completion: one lineage); NOT_FOUND before any start; END final
+  whatever the seller tries, and a stop with a pin stopping nothing outside its lineage (a run
+  of the seller's own stays open, I17); a delivery stands; ASK only a request;
+  provenance; the fence (and raced against starts); restarts keep the pin; ciphertext only
+  (UNSEALED withheld, a marker the seller's code put in every value found in nothing returned);
+  the buyer's withdrawal; streams (topics asked for only, offsets, `after`, `"tail"`, the end);
+  quotes (the seller's failure an answer, never raised); expose; errors are not facts.
+  Twenty-eight broken FakeEngines are each rejected on their rule, and every rule rejects at
+  least one (a test), so weakening a check -- here or in the platform's copy of the contract
+  -- fails (`tests/engine/broken_engines.py`). The FakeGate dispatches every job op through
+  `engines[version.engine]` (`FakeGate(engines=...)`; by default a `TemporalEngine` over its
+  control plane), so every FakeGate and Marketplace test runs through the seam.
+* **The relay's credential and pace.** `stream` mints the relay token (I30) inside the adapter
+  and dials its `relay_service` with it, and again with a fresh one once half its life
+  (`worker_ttl`, 15 minutes) is spent: a token only has to be good when a call is admitted,
+  and a job's stream lasts as long as the job, which no one token does (the same subject and
+  session every time, so a revoked session still ends it). Its pace reads the run's history
+  through `Control.history_size`, so `kontra._control` stays the only code that talks to the
+  internal frontend; where that frontend is also the relay's (a dev server, which judges no
+  token), `kontra._control.internal_relay_service` hands it over.
+
+**Rejected.** `start() -> handle` as the only mint (a job starts without the gate); a blocking
+`result()`; `cancel` absorbing `fence` (it would terminate a genuine run before it was pinned,
+and escrow would refund it against the seller as "terminated"); a MAC on the handle (the gate's
+database is the trust boundary, as for every job column, and provenance never trusts the handle);
+`engine` inside `x-kontra` (every hash and golden moves, every offering republishes); `engine`
+in `CatalogEntry`; a `kontra/engine.py` module beside a `kontra/engine/` package; sending the
+default engine (OD11).
+
+**Residue.** The buyer-facing Temporal coordinates (OD6); the sealed envelope's container is
+the protobuf `temporal.api.common.v1.Payload` (a format fact; a Golem adapter would vendor a
+two-field `payload.proto`); no engine check in the hash lock for an existing version (OD5);
+kontra-cloud's `judge_call` stays a `GateControl` extension until it is ported behind
+`observe` (OD7); `isolate`'s provisioning is remembered per process (a gate restart provisions
+again, idempotently); `check_sealed` and `Sealed` are structural: an age file's shape, not to
+whom it is sealed (the gate holds no key to prove an age file is to the buyer), so they stop a
+seller side that did not seal, not one that forges a header.
+
+**Amends** I3 and I30 (the worker and relay tokens are minted through `isolate` and `stream`),
+I6 and I15-I17 (escrow reads `Observation.pin`; `UNSEALED`), I7 (sealed-only is the seam's
+rule), I21 (the Workers view is the Temporal adapter's extension), I31 (`stream` wraps
+`kontra._relay`), and `docs/security.md` (what an adapter must prove).
+
+Tested: the Protocol's pins, the guardrail, the vocabulary walk, import purity, the sealed
+types and `STOPS` (`tests/engine/test_protocol.py`); the contract against FakeEngine and its
+teeth (`tests/engine/test_fake_engine_contract.py`, `test_engine_contract_teeth.py`); the
+Temporal adapter's handle golden, strict parse vectors and every member's exact control-plane
+call, the relay token renewed and the pace read through the control plane
+(`tests/engine/test_temporal_engine.py`); the contract against `TemporalEngine` on a dev
+server, every check but E18 (`tests/engine/test_temporal_engine_contract.py`); E1-E3, E14 and
+E18 over the wire on Kontra's server, and a job's relay outliving a 5-second token
+(`tests/temporal/test_engine_isolation_wire.py`); the FakeGate's dispatch on FakeEngine -- a
+whole lifecycle with no Temporal, two engines, the engine fixed, `unsupported_engine`, the
+served catalog reads and the card without the engine, the Workers view
+(`tests/testing/test_engine_dispatch.py`); `PublishRequest.engine`, the pydantic floor and no
+buyer-facing schema carrying it (`tests/gate_client/test_routes.py`); `UNSEALED` and the
+engine-neutral record (`tests/escrow/test_escrow.py`); `serve(engine=)`, `engine_for` and the
+hash lock's `engine_fixed` (`tests/serve`); a pinned ASK (`tests/control/test_control.py`).

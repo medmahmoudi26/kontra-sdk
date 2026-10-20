@@ -5,7 +5,7 @@ from workflows import BulkFlow
 from kontra.serve import Worker, offering
 
 worker = Worker(
-    offerings=[offering("offering.yaml", workflow=BulkFlow, quote=quote)],
+    offerings=[offering("offering.yaml", entry=BulkFlow, quote=quote)],
     activities=[produce],
 )
 

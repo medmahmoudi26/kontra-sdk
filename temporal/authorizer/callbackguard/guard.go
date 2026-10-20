@@ -19,8 +19,10 @@
 // validate callback URLs on every API that accepts them (UpdateWorkflowExecution, v1.32.1),
 // and a callback is an HTTP request made by Temporal itself.
 //
-// It is deliberately separate from the Authorizer: the policy there never reads a request
-// body; this is input validation of a token Temporal trusts.
+// It is deliberately separate from the Authorizer: the policy there reads two typed fields,
+// only for a stream relay, and decides who may make a call; this is input validation of a
+// token Temporal trusts. It applies to every caller but the internal principal, the stream
+// relay and the worker controller included.
 package callbackguard
 
 import (

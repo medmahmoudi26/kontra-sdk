@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import os
 import re
 import secrets
@@ -233,23 +234,25 @@ async def test_ac08_no_plaintext_of_a_100mb_job_in_the_bucket_or_temporal(
 async def test_ac13_heartbeats_reach_the_buyer_in_order_and_the_gate_keeps_ciphertext(
     stack: Stack, tmp_path: Path
 ) -> None:
-    """The seller's activity (Temporal only through the façade) heartbeats
-    ``{percent, message}`` 100 times, every 1.5 s, under the forwarder's default throttle (one
-    event a second per job, latest wins); ``job.progress()`` yields all 100 in order,
-    decrypted. Nothing the stack stores holds a message's text. A second job, whose activity
-    never heartbeats, still shows liveness and the running activity's name, from history."""
+    """The seller's activity (vanilla Temporal, no kontra import) heartbeats
+    ``{percent, message}`` 100 times, every 1.5 s, under the forwarder's shipped budget (the
+    latest every 5 s per job, decisions I31: a heartbeat is an item of the job stream's
+    ``kontra.progress`` topic, relayed while the buyer listens); ``job.progress()`` yields
+    them in order, decrypted, at least one per pacing window, and the last one always.
+    Nothing the stack stores holds a message's text. A second job, whose activity never
+    heartbeats, still shows liveness and the running activity's name, from history."""
     seller = await stack.party("ac13")
     buyer = await stack.party("ac13-buyer")
     key = f"{seller.handle}/pulse@1.0.0"
     project = own_project("pulse", tmp_path / "pulse", f"{seller.handle}/pulse")
     activities = (project / "activities.py").read_text()
-    assert "import kontra" not in activities
-    assert re.search(r"^\s*(from|import)\s+(temporalio|nexusrpc)\b", activities, re.M) is None
+    assert re.search(r"^\s*(from|import)\s+kontra\b", activities, re.M) is None
+    assert re.search(r"^from temporalio import activity$", activities, re.M)
     tag = marker("ac13")
     k = buyer.kontra()
     try:
         # The seller's own settings: no KONTRA_PROGRESS_INTERVAL (party_env passes no
-        # KONTRA_* of ours), so the forwarder throttles as shipped, one event a second.
+        # KONTRA_* of ours), so the forwarder paces as shipped, the latest every 5 s.
         async with serving(project, seller, [key], log=tmp_path / "serve.log"):
             job = await k.hire(key, max_price="1.00", beats=100, tag=tag, quiet_seconds=0)
             events: list[Progress] = []
@@ -273,8 +276,14 @@ async def test_ac13_heartbeats_reach_the_buyer_in_order_and_the_gate_keeps_ciphe
         f"(stream ended: {ended}); first {beats[0] if beats else None!s}, last "
         f"{beats[-1] if beats else None!s}"
     )
-    assert [p.message for p in beats] == [f"beat {i} {tag}" for i in range(1, 101)]
-    assert [p.percent for p in beats] == [float(i) for i in range(1, 101)]
+    numbers = [int((p.message or "").split()[1]) for p in beats]
+    assert [p.message for p in beats] == [f"beat {n} {tag}" for n in numbers]
+    assert numbers == sorted(set(numbers))  # in order, none twice
+    assert numbers[-1] == 100  # the activity's last word always arrives
+    assert beats[-1].percent == 100.0
+    assert len(beats) >= 20  # 150 s of heartbeats, paced at 5 s: at least one per window
+    gaps = [(b.at - a.at).total_seconds() for a, b in itertools.pairwise(beats)]
+    assert max(gaps) <= 15, gaps
     assert {p.activity for p in beats} == {"pulse"}
     seqs = [p.seq for p in events]
     assert seqs == sorted(seqs)
@@ -306,7 +315,17 @@ async def test_ac13_heartbeats_reach_the_buyer_in_order_and_the_gate_keeps_ciphe
     assert scan.hits == {}
     assert bucket.hits == {}
     assert on_disk == []
-    assert any(p.startswith("kontra.") and "progress" in p for p in scan.scanned)
+    # The gate's store of the job's stream was among what was scanned, holding at least the
+    # heartbeats relayed (a row per item, kontra-cloud#44). A table named for the stream: the
+    # old progress table, which the gate may keep read-only until its retention ends, holds
+    # none of this job's and does not count.
+    stored = {
+        place: rows
+        for place, rows in scan.scanned.items()
+        if place.startswith("kontra.") and "stream" in place.split(".")[2]
+    }
+    assert stored, sorted(scan.scanned)
+    assert max(stored.values()) >= len(beats), stored
 
 
 # --------------------------------------------------------------------------- acceptance 14

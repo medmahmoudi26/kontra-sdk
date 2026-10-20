@@ -2,7 +2,7 @@
 fake gate relays quotes to a real Nexus sync handler, starts ``execute`` as a standalone
 operation in the buyer's namespace, watches ``job-<id>`` in the seller's namespace, and
 moves money by kontra.escrow -- delivery and accept, silence and release, failure,
-timeout and cancel refunds, with progress streamed from history."""
+timeout and cancel refunds, with the job's stream (history events: this seller hosts no workflow stream)."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ from kontra.testing import Marketplace, TestParty
 from kontra.testing.devserver import DevServer
 from kontra.testing.ledger_contract import assert_invariants
 
-from .seller import PRICE_PER_CHAR, serving
+from .seller import PRICE_PER_CHAR, sealing, serving, unseal_payload
 from .support import handle, json_payload, offering_doc, unwire, wire
 
 #: A buyer key for a direct `GateClient.hire` call. Real hires make one per job
@@ -67,7 +67,8 @@ class Deal:
     jwks: dict[str, object]
 
     def seller_client(self) -> Client:
-        return self.mp.client(self.seller.namespace)
+        """The seller's client, sealing its jobs' results as a seller's codec does."""
+        return sealing(self.mp.client(self.seller.namespace))
 
     async def hire(self, text: str, mode: str = "ok") -> m.HireView:
         q = await self.buyer.gate.quote(
@@ -112,10 +113,11 @@ async def test_quote_hire_deliver_accept(deal: Deal) -> None:
         q = await deal.buyer.gate.quote(deal.entry.name, wire(json_payload({"text": "hello"})))
         assert (q.status, q.amount_minor, q.price) == (m.QuoteStatus.OK, PRICE_PER_CHAR * 5, "5.00")
         job = await deal.buyer.gate.hire(q.quote_id or "", buyer_key=_A_BUYER_KEY)
-        events: list[m.ProgressEvent] = []
+        events: list[m.StreamEvent] = []
 
         async def follow() -> None:
-            async for e in deal.buyer.gate.progress(job.job_id):
+            # This seller hosts no workflow stream: its job's stream is history alone.
+            async for e in deal.buyer.gate.stream(job.job_id, history=True):
                 events.append(e)
 
         follower = asyncio.create_task(follow())
@@ -128,11 +130,11 @@ async def test_quote_hire_deliver_accept(deal: Deal) -> None:
     assert view.started_at is not None
     result = await deal.buyer.gate.result(job.job_id)
     assert (result.sha256, result.size) == (view.delivery.sha256, view.delivery.size)
-    assert json.loads(unwire(result.payload).data) == {"text": "HELLO"}
+    assert json.loads(unseal_payload(unwire(result.payload)).data) == {"text": "HELLO"}
 
     assert events, "no progress from history"
-    assert [e.seq for e in events] == list(range(1, len(events) + 1))
-    assert all(e.source is m.ProgressSource.HISTORY for e in events)
+    assert [e.cursor for e in events] == list(range(1, len(events) + 1))
+    assert all(e.kind is m.StreamEventKind.HISTORY for e in events)
     assert events[-1].state is m.JobState.COMPLETED
     assert events[-1].last_event == "WorkflowExecutionCompleted"
     assert events[-1].activities_completed == 2
@@ -345,7 +347,7 @@ async def test_a_run_finishing_just_before_the_terminate_is_delivered_and_paid(
     assert (view.state, view.escrow) == (m.JobState.COMPLETED, m.Escrow.HELD)
     assert view.delivery is not None
     result = await deal.buyer.gate.result(job.job_id)
-    assert json.loads(unwire(result.payload).data) == {"text": "JUST IN TIME"}
+    assert json.loads(unseal_payload(unwire(result.payload)).data) == {"text": "JUST IN TIME"}
     assert (await deal.buyer.gate.accept(job.job_id)).escrow is m.Escrow.RELEASED
     price = PRICE_PER_CHAR * len("just in time")
     assert (await deal.buyer.balance()).available_minor == 5000 - price
@@ -421,7 +423,7 @@ async def test_a_respelled_hold_the_handler_accepted_still_pays_the_seller(deal:
         view = await deal.until(job.job_id, lambda v: v.state is m.JobState.COMPLETED)
     assert (view.escrow, view.delivery is not None) == (m.Escrow.HELD, True)
     result = await deal.buyer.gate.result(job.job_id)
-    assert json.loads(unwire(result.payload).data) == {"text": "RESPELLED"}
+    assert json.loads(unseal_payload(unwire(result.payload)).data) == {"text": "RESPELLED"}
 
 
 async def test_a_canceled_job_cannot_be_started_with_its_still_valid_hold(deal: Deal) -> None:

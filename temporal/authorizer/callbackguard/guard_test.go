@@ -21,6 +21,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 
+	kontra "github.com/medmahmoudi26/kontra-sdk/temporal/authorizer"
 	"github.com/medmahmoudi26/kontra-sdk/temporal/authorizer/callbackguard"
 )
 
@@ -187,6 +188,45 @@ func TestTheInternalPrincipalIsNotChecked(t *testing.T) {
 		ctx := context.WithValue(context.Background(), authorization.MappedClaims, claims)
 		if _, err := callbackguard.Intercept(ctx, start(legacy), nil, handler); err == nil {
 			t.Fatalf("%+v was not checked", claims)
+		}
+	}
+}
+
+// TestTheRelayAndTheControllerAreChecked: the stream relay's one write is an Update, which
+// can carry completion callbacks; the authorizer allows it by its handler name and workflow
+// and never reads a callback. The guard applies to it, and to the worker controller, as to
+// any caller that is not Temporal's internal principal.
+func TestTheRelayAndTheControllerAreChecked(t *testing.T) {
+	handler := func(context.Context, any) (any, error) { return "ok", nil }
+	poll := func(cbs ...*commonpb.Callback) *ws.UpdateWorkflowExecutionRequest {
+		return &ws.UpdateWorkflowExecutionRequest{
+			Namespace:         "acme",
+			WorkflowExecution: &commonpb.WorkflowExecution{WorkflowId: "job-0123456789abcdef0123456789abcdef"},
+			Request: &updatepb.Request{
+				Input:               &updatepb.Input{Name: kontra.StreamPollUpdate},
+				CompletionCallbacks: cbs,
+			},
+		}
+	}
+	for _, claims := range []*authorization.Claims{
+		// What Temporal's default claim mapper makes of the relay's and the controller's
+		// tokens: no permission, so no namespace and no system role.
+		{AuthType: "jwt", Subject: kontra.RelaySubject("acme", "job-0123456789abcdef0123456789abcdef")},
+		{AuthType: "jwt", Subject: kontra.ControllerSubject},
+	} {
+		ctx := context.WithValue(context.Background(), authorization.MappedClaims, claims)
+		info := &grpc.UnaryServerInfo{FullMethod: ws.WorkflowService_UpdateWorkflowExecution_FullMethodName}
+		var denied *serviceerror.PermissionDenied
+		_, err := callbackguard.Intercept(ctx, poll(callback("http://127.0.0.1:7246/api/v1/nexus/endpoints", nil)), info, handler)
+		if !errors.As(err, &denied) {
+			t.Fatalf("%s: a poll carrying a non-system callback got %v", claims.Subject, err)
+		}
+		_, err = callbackguard.Intercept(ctx, poll(system(hsmToken(t, ""))), info, handler)
+		if !errors.As(err, &denied) {
+			t.Fatalf("%s: a poll carrying a forged token got %v", claims.Subject, err)
+		}
+		if _, err := callbackguard.Intercept(ctx, poll(), info, handler); err != nil {
+			t.Fatalf("%s: a plain poll was refused: %v", claims.Subject, err)
 		}
 	}
 }

@@ -14,6 +14,7 @@ from datetime import timedelta
 import nexusrpc
 import nexusrpc.handler
 from temporalio import nexus, workflow
+from temporalio.contrib.workflow_streams import WorkflowStream
 
 SELLER_NAMESPACE = "acme"
 SELLER_TASK_QUEUE = "acme/enrich@1.2.0"  # OfferingId(acme, enrich, 1.2.0).task_queue
@@ -23,6 +24,8 @@ BUYER_TASK_QUEUE = "buyer/flows"
 OTHER_NAMESPACE = "other"
 OTHER_TASK_QUEUE = "other/probe@1.0.0"
 OTHER_SERVICE = "other.probe"
+PLATFORM_TASK_QUEUE = "kontra-system/platform"  # Kontra's own workers (KON-15)
+PLATFORM_DEPLOYMENT = "kontra-platform"
 
 # What the handlers saw, for the tests to read back (the workers run in the test process).
 STARTED_JOBS: list[str] = []  # handler workflow ids started by EnrichHandler.execute
@@ -176,3 +179,51 @@ class BuyerComposes:
         )
         await second
         return await first
+
+
+# --- workflow streams and the platform's own workers (decisions I30) -------------------
+
+
+@dataclass
+class StreamJobInput:
+    steps: int  # items the workflow itself publishes on each of its two topics
+
+
+@workflow.defn
+class StreamJob:
+    """A seller's handler workflow (`job-<id>`) hosting a workflow stream: it publishes on
+    two topics, `progress` and `log`, and waits for an `approve` update -- the harness's
+    approvals in the dev console's session pane (#54) -- before it completes."""
+
+    @workflow.init
+    def __init__(self, job: StreamJobInput) -> None:
+        self.stream = WorkflowStream()
+        self._approved = False
+
+    @workflow.run
+    async def run(self, job: StreamJobInput) -> str:
+        progress = self.stream.topic("progress", type=str)
+        log = self.stream.topic("log", type=str)
+        for i in range(job.steps):
+            progress.publish(f"step-{i}")
+            log.publish(f"line-{i}")
+        await workflow.wait_condition(lambda: self._approved, timeout=timedelta(minutes=2))
+        return "approved"
+
+    @workflow.update
+    def approve(self, by: str) -> str:
+        self._approved = True
+        return f"approved by {by}"
+
+    @workflow.signal
+    def nudge(self) -> None:
+        pass
+
+
+@workflow.defn
+class PlatformPing:
+    """A workflow of Kontra's own, run by a versioned platform worker."""
+
+    @workflow.run
+    async def run(self) -> str:
+        return "pong"

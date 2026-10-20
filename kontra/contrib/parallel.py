@@ -1,9 +1,17 @@
 """``execute_activities_in_parallel``: one activity per item over a paged source, with
 continue-as-new hidden in a child workflow, ``kontra.batch.v1`` (:class:`_Batch`).
 
+An optional helper (decisions I29), not a Kontra primitive: ``kontra.serve`` does not register
+it. A seller who wants it imports it in their workflow and adds :class:`ParallelPlugin` to
+their worker -- ``serve(Flow, plugins=[ParallelPlugin()])``, or any Temporal worker's
+``plugins=`` -- which registers the child workflow and passes this module through the
+workflow sandbox. Everything it does is plain Temporal: a seller can equally write the
+fan-out with ``workflow.execute_activity`` and a semaphore, and handle history size and
+continue-as-new themselves.
+
 A seller's workflow awaits it like any ``workflow`` function. It starts the child on the
 parent's task queue and returns what the child returns. The child takes pages -- from
-``pages=``, an activity ``(cursor) -> Page``, or ``items=``, one page held in memory --,
+``pages=``, an activity ``(cursor) -> page``, or ``items=``, one page held in memory --,
 schedules the item activity for each item with never more than ``max_concurrent`` of them
 open, and folds each result into an accumulator with ``reduce=`` (default: list-append) in
 the order they complete. When the server suggests continue-as-new, the child lets what is
@@ -11,6 +19,11 @@ in flight finish and then carries only a :class:`_Cursor` into the next run: the
 page's cursor, the accumulator, and the current page's items not yet started. History is
 bounded by ``max_concurrent``, never by the number of items; results never reach it, only
 the accumulator does.
+
+A page is anything the ``pages=`` activity returns with a list ``items`` and a ``next`` (the
+cursor of the next page, None after the last): :class:`Page`, or the seller's own model, so
+the activities module needs nothing from ``kontra``. It is decoded as the activity's return
+annotation says (:class:`Page` when it has none).
 
 Functions cross into the child by reference (module and qualified name, resolved there by
 import), never by value. Activities are scheduled by their Temporal name; the reference
@@ -20,8 +33,10 @@ continue-as-new. All three must therefore be module-level (an activity may also 
 method of a module-level class); a lambda, a closure or a nested function is refused when
 the call is made, not in the child.
 
-Workflow code imports this module and the worker passes ``kontra`` through the sandbox:
-nothing here keeps module-level state.
+The Temporal name ``kontra.batch.v1`` and the field names of :class:`_Spec`, :class:`_Cursor`
+and :class:`_Options` are a wire shape: runs in flight carry them across continue-as-new, and
+``kontra graph``, the dev graph page and the console read them. Nothing here keeps
+module-level state.
 """
 
 from __future__ import annotations
@@ -33,7 +48,7 @@ import inspect
 import sys
 import types
 import typing
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Generic, TypeVar, overload
@@ -41,13 +56,16 @@ from typing import Any, Generic, TypeVar, overload
 from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.exceptions import ApplicationError
+from temporalio.plugin import SimplePlugin
+from temporalio.worker import WorkflowRunner
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 # Passed through even under a sandbox that does not pass ``kontra`` through (a seller's own
 # workflow_runner): the ``kontra.contract`` package touches the filesystem when imported.
 with workflow.unsafe.imports_passed_through():
     from kontra.contract.names import batch_workflow_id
 
-__all__ = ["BATCH_WORKFLOW", "Page", "execute_activities_in_parallel"]
+__all__ = ["BATCH_WORKFLOW", "Page", "ParallelPlugin", "execute_activities_in_parallel"]
 
 T = TypeVar("T")
 A = TypeVar("A")
@@ -59,8 +77,9 @@ BATCH_WORKFLOW = "kontra.batch.v1"
 
 @dataclass
 class Page(Generic[T]):
-    """What a ``pages=`` activity returns: this page's items, and the cursor to fetch the
-    next page with (None: this page was the last)."""
+    """What a ``pages=`` activity may return: this page's items, and the cursor to fetch the
+    next page with (None: this page was the last). A convenience: any model with a list
+    ``items`` and a ``next`` serves as well."""
 
     items: list[T]
     next: Any = None
@@ -235,8 +254,9 @@ async def execute_activities_in_parallel(
     """Run ``activity`` once per item, at most ``max_concurrent`` at a time, in a child
     workflow that continues as new on its own; return the fold of the results.
 
-    ``pages=``: an activity ``(cursor) -> Page``, first called with None, then with each
-    page's ``next`` until one is None. ``items=``: the items themselves, as one page; they
+    ``pages=``: an activity ``(cursor) -> page`` (a :class:`Page`, or any model with a list
+    ``items`` and a ``next``), first called with None, then with each page's ``next`` until
+    one is None. ``items=``: the items themselves, as one page; they
     travel in the child's input, so they must fit one payload. Exactly one of the two.
 
     ``reduce=``: a pure module-level function ``(acc, result) -> acc`` run in the workflow,
@@ -311,6 +331,23 @@ async def execute_activities_in_parallel(
 # --------------------------------------------------------------------------- the child
 
 
+def _page(name: str, page: object) -> tuple[list[Any], Any]:
+    """A page's items and next cursor: attributes ``items`` (a list) and ``next`` of any
+    object, or the same keys of a mapping. Anything else is a bug in the pages activity."""
+    if isinstance(page, Mapping):
+        fields = typing.cast(Mapping[str, Any], page)
+        items, has_next, following = fields.get("items"), "next" in fields, fields.get("next")
+    else:
+        items, has_next = getattr(page, "items", None), hasattr(page, "next")
+        following = getattr(page, "next", None)
+    if not isinstance(items, list) or not has_next:
+        raise TypeError(
+            f"{name} returned {type(page).__name__}, not a page: a page has a list `items` "
+            "and a `next` (kontra.contrib.parallel.Page, or a model of your own)"
+        )
+    return typing.cast(list[Any], items), following
+
+
 def _typed(value: Any, type_hint: Any) -> Any:
     """``value`` (as decoded without a type) as ``type_hint``, through the worker's own
     payload converter."""
@@ -331,8 +368,8 @@ async def _settle(pending: dict[asyncio.Task[None], None]) -> None:
 
 @workflow.defn(name=BATCH_WORKFLOW)
 class _Batch:
-    """The child behind :func:`execute_activities_in_parallel`; registered on every
-    :class:`kontra.serve.Worker`."""
+    """The child behind :func:`execute_activities_in_parallel`; registered by
+    :class:`ParallelPlugin` on the worker that runs the parent."""
 
     @workflow.run
     async def run(self, spec: _Spec, cur: _Cursor) -> Any:
@@ -395,18 +432,16 @@ class _Batch:
                 page = await workflow.execute_activity(
                     spec.pages, cursor, result_type=page_type, **options
                 )
-                if not isinstance(page, Page):
-                    raise TypeError(f"{spec.pages} returned {type(page).__name__}, not a Page")
-                page = typing.cast(Page[Any], page)
-                if not page.items and page.next is not None and page.next == cursor:
+                found, following = _page(spec.pages, page)
+                if not found and following is not None and following == cursor:
                     raise ApplicationError(
                         f"{spec.pages} returned an empty page whose next is the cursor it "
                         f"was given ({cursor!r}): it would be called with it forever",
                         type="KontraBatchStuck",
                         non_retryable=True,
                     )
-                rest.extend(page.items)
-                started, cursor = True, page.next
+                rest.extend(found)
+                started, cursor = True, following
             await workflow.wait_condition(lambda: not pending or bool(failures))
         except BaseException:  # cancelled, or a page that failed: nothing is left running
             await _settle(pending)
@@ -422,4 +457,37 @@ class _Batch:
                 spec if spec.items is None else dataclasses.replace(spec, items=[]),
                 _Cursor(next=cursor, acc=acc, started=started, rest=list(rest)),
             ]
+        )
+
+
+# --------------------------------------------------------------------------- the plugin
+
+#: What :class:`ParallelPlugin` passes through the workflow sandbox: this module, so ``_Batch``,
+#: :class:`Page` and the spec keep one class identity per process (a ``pages=`` activity's
+#: :class:`Page` is decoded outside the sandbox) and nothing is re-imported per run.
+_PASSTHROUGH = __name__
+
+
+def _passed_through(runner: WorkflowRunner | None) -> WorkflowRunner:
+    """``runner`` with this module passed through, when it is Temporal's sandbox; any other
+    runner is the seller's choice, kept as it is."""
+    if runner is None:
+        runner = SandboxedWorkflowRunner()
+    if not isinstance(runner, SandboxedWorkflowRunner):
+        return runner
+    return dataclasses.replace(
+        runner, restrictions=runner.restrictions.with_passthrough_modules(_PASSTHROUGH)
+    )
+
+
+class ParallelPlugin(SimplePlugin):
+    """``plugins=[ParallelPlugin()]``: what a worker needs to run a workflow that calls
+    :func:`execute_activities_in_parallel` -- the ``kontra.batch.v1`` child workflow on the
+    parent's task queue, and this module passed through the workflow sandbox. A
+    ``temporalio`` plugin like any other: ``serve(Flow, plugins=[ParallelPlugin()])``, or a
+    plain ``temporalio.worker.Worker`` / ``Client.connect`` of the seller's own."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "kontra.ParallelPlugin", workflows=[_Batch], workflow_runner=_passed_through
         )

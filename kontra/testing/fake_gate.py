@@ -7,22 +7,26 @@ answers :mod:`kontra._passkeys` verifies, as on the platform), parties with Temp
 namespaces, the devices that read a party's jobs and the job-key wraps copied to them
 (decisions I25, with :mod:`kontra._jobkeys`'s proofs), the catalog (contract validation,
 opaque endpoint names,
-the endpoint created through the control plane), the Workers view (Temporal's task-queue
+the endpoint created through the engine), the Workers view (Temporal's task-queue
 stats of a seller's own version), the quote relay, hire with a signed hold
-token, the escrow lifecycle, progress over SSE, artifacts and claim-check blobs behind
-signed URLs, balances and disputes. Its rules are the platform's: the job rules are
-:mod:`kontra.escrow` (shared with the real gate), money is a
-:func:`~kontra.testing.fake_ledger`, and Temporal is reached through
-:class:`kontra._control.Control` -- usually on a dev server
-(:mod:`kontra.testing.devserver`) -- exactly as the real gate reaches its internal frontend.
-With no control plane (``control=None``) it is a gate whose sellers are all offline:
-publishing records the endpoint name, quotes and starts answer 503, and open jobs refund
-at their deadline.
+token, the escrow lifecycle, each job's workflow stream relayed over SSE (through the
+engine's :meth:`~kontra.engine.Engine.stream`, as the platform gate relays it), artifacts and
+claim-check blobs behind signed URLs, balances and disputes. Its rules are the platform's: the
+job rules are :mod:`kontra.escrow` (shared with the real gate), money is a
+:func:`~kontra.testing.fake_ledger`, and every engine is reached through seam ⑥
+(:mod:`kontra.engine`, decisions I32), dispatched by the engine each offering version was
+published on. Temporal is :class:`kontra.engine.temporal.TemporalEngine` over
+:class:`kontra._control.Control` -- usually on a dev server (:mod:`kontra.testing.devserver`)
+-- exactly as the real gate reaches its internal frontend; ``engines=`` replaces it (with a
+:class:`~kontra.testing.FakeEngine`, a whole job lifecycle runs with no Temporal at all).
+With no engine (``control=None`` and no ``engines``) it is a gate whose sellers are all
+offline: publishing records the endpoint name, quotes and starts answer 503, and open jobs
+refund at their deadline.
 
 Two ways to run it:
 
 * ``FakeGate.app`` is the ASGI app, for ``httpx.ASGITransport``. Use ``async with gate:``
-  to run the sweeper on the current loop. A progress stream only ends when its job does
+  to run the sweeper on the current loop. A job's stream only ends when its job does
   (``ASGITransport`` buffers whole responses).
 * ``await gate.serve()`` runs uvicorn on ``127.0.0.1:0`` in a background thread and returns
   the base URL, so SSE streams for real; ``await gate.stop()`` ends it. The gate's state
@@ -60,7 +64,6 @@ import secrets
 import socket
 import sys
 import threading
-import time
 import types
 import warnings
 from collections import deque
@@ -82,7 +85,7 @@ from urllib.parse import parse_qs, urlsplit
 import jwt
 import uvicorn
 from cryptography.hazmat.primitives.asymmetric import ec
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google.protobuf.message import DecodeError
@@ -94,22 +97,13 @@ from temporalio.api.common.v1 import Payload
 from kontra import _jobkeys as jk
 from kontra import _passkeys as pk
 from kontra import escrow
-from kontra._control import (
-    BuyerCall,
-    BuyerLookupError,
-    EndpointConflict,
-    HistorySummary,
-    NexusSyncKind,
-    Occupation,
-    TemporalControl,
-    TemporalError,
-    hold_digest,
-    input_size,
-)
+from kontra._control import TemporalControl, input_size, internal_relay_service
+from kontra._relay import MIN_INTERVAL
 from kontra.codec import InvalidPayload
 from kontra.contract import ContractError, ContractInfo, KontraQuote, agent_card, validate_document
 from kontra.contract.facts import check_public_key
 from kontra.contract.names import (
+    PROGRESS_TOPIC,
     NameError_,
     OfferingId,
     OfferingRef,
@@ -121,7 +115,30 @@ from kontra.contract.names import (
     new_job_id,
     validate_handle,
 )
+from kontra.contract.offering import STREAMS_MAX, check_streams, check_topic
 from kontra.contract.quote import MAX_ETA_SECONDS
+from kontra.engine import (
+    AGE_MAGIC,
+    DEFAULT_ENGINE,
+    ENGINE_NAMES,
+    STOPS,
+    Engine,
+    EngineError,
+    Fenced,
+    JobHandle,
+    JobPlan,
+    Liveness,
+    Observed,
+    PartyLookupError,
+    Pin,
+    QuoteKind,
+    RouteConflict,
+    StopReason,
+    StreamBatch,
+    StreamStopped,
+    hold_digest,
+)
+from kontra.engine.temporal import HISTORY_LIMITS, Signer, TemporalEngine, worker_token
 from kontra.escrow import (
     Effect,
     EffectKind,
@@ -152,6 +169,7 @@ from kontra.testing.ledger import InMemoryLedger
 from kontra.workers import offline, workers_view
 
 __all__ = [
+    "AGE_MAGIC",
     "AUD_API",
     "AUD_HOLD",
     "AUD_TEMPORAL",
@@ -231,11 +249,15 @@ KEYS_LISTED = 100
 SESSIONS_LISTED = 100
 #: A relayed Nexus payload (quote or start input): Temporal's own default blob limit.
 MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
-MAX_PROGRESS_BYTES = 64 * 1024
-#: Heartbeat ciphertext kept per job, in total (later heartbeats are dropped).
-HEARTBEAT_BUDGET_BYTES = 64 * 1024 * 1024
-#: Every age v1 file starts with this line: progress the gate keeps must be ciphertext.
-AGE_MAGIC = b"age-encryption.org/v1\n"
+#: How long a job's relay keeps polling after its last listener left.
+RELAY_GRACE = 30.0
+_CURSOR = re.compile(r"0|[1-9][0-9]{0,18}", re.ASCII)
+_GAP_REASONS: dict[StopReason, m.StreamGapReason] = {
+    "budget": m.StreamGapReason.HISTORY_BUDGET,
+    "protocol": m.StreamGapReason.RELAY_FAILED,
+    "denied": m.StreamGapReason.RELAY_FAILED,
+    "unsupported": m.StreamGapReason.RELAY_FAILED,
+}
 MAX_BLOB_BYTES = 64 * 1024 * 1024
 NOTE_MAX = 2000
 WORKER_TTL = timedelta(minutes=15)
@@ -263,8 +285,6 @@ _NO_HOLD_OK = frozenset({HoldState.HELD, HoldState.REFUNDED})
 _SECRET_LEN = 43  # secrets.token_urlsafe(32)
 _SECRET = re.compile(r"[A-Za-z0-9_-]{43}", re.ASCII)
 _PATH_VERSION_MAX = 29
-_JSON_PLAIN = b"json/plain"
-_ACTIVITY = re.compile(r"[^\x00-\x1f\x7f]{1,255}")
 _SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 #: Printable ASCII, no control characters (it becomes a header value downstream).
 _CONTENT_TYPE = re.compile(r"[\x21-\x7e][\x20-\x7e]{0,254}", re.ASCII)
@@ -373,6 +393,21 @@ class _KeyRing:
         if now.timestamp() >= exp:
             raise _unauthorized("token_expired", "token has expired")
         return claims
+
+
+class _GateSigner:
+    """The gate's key ring as an engine adapter signs with it (:class:`Signer`): the issuer is
+    read when a token is minted, since :meth:`FakeGate.serve` changes the gate's URL."""
+
+    def __init__(self, gate: "FakeGate") -> None:
+        self._gate = gate
+
+    @property
+    def issuer(self) -> str:
+        return self._gate.issuer
+
+    def sign(self, claims: Mapping[str, Any]) -> str:
+        return self._gate.keys.sign(claims)
 
 
 def _unverified_audience(token: str) -> Any:
@@ -691,6 +726,11 @@ class _Offering:
     card: dict[str, Any]
     published_at: datetime
     retired: bool = False
+    #: ``offering.yaml``'s ``streams:``, fixed when the version was first published.
+    streams: tuple[str, ...] = ()
+    #: The engine the version runs on (``PublishRequest.engine``), fixed at its first publish
+    #: and never shown to a buyer (decisions I32): every job of it is dispatched by it.
+    engine: str = DEFAULT_ENGINE
 
     @property
     def id(self) -> OfferingId:
@@ -726,6 +766,7 @@ class _Offering:
             recipients=list(recipients),
             published_at=self.published_at,
             retired=self.retired,
+            streams=list(self.streams),
         )
 
 
@@ -747,13 +788,21 @@ class _Quote:
 @dataclass
 class _Job:
     record: JobRecord
+    #: The parties' namespaces (their handles, decisions I1): the hold's claims. Nothing on
+    #: the escrow path reads them; the engine knows the job by its handle alone.
     buyer_ns: str
+    seller_ns: str
     buyer_key: str
     contract_hash: str
     endpoint: str
     service: str
     max_duration: timedelta
     quote_id: str
+    #: The engine the job's offering version runs on, and the handle it minted at hire
+    #: (opaque: only that engine's adapter reads it). None: no engine was there to bind it,
+    #: so nothing can run the job and it refunds at its deadline.
+    engine: str = DEFAULT_ENGINE
+    handle: JobHandle | None = None
     hold_ref: str | None = None
     settled: bool = False
     pending_stop: EffectKind | None = None
@@ -763,14 +812,16 @@ class _Job:
     resolution_note: str = ""
     escrow_closed_at: datetime | None = None
     output_reserved: int = 0
-    events: list[m.ProgressEvent] = field(default_factory=list[m.ProgressEvent])
-    #: Set once no more progress can arrive (the job closed and its last history summary,
-    #: if any, is recorded): a stream that has sent everything then ends.
+    #: The job's stream as the gate stores it: relayed items, gaps and history events, by
+    #: cursor (``events[i].cursor == i + 1``). Ciphertext only.
+    events: list[m.StreamEvent] = field(default_factory=list[m.StreamEvent])
+    #: Set once no more history events can arrive (the job closed and its last history
+    #: summary, if any, is recorded): a stream that has sent everything, and whose relay
+    #: finished, then ends.
     progress_final: bool = False
-    #: The job state and history summary of the last history event recorded.
-    last_progress: tuple[m.JobState, HistorySummary] | None = None
-    heartbeats: deque[float] = field(default_factory=deque[float])
-    heartbeat_bytes: int = 0
+    #: The job state and the engine's liveness of the last history event recorded.
+    last_progress: tuple[m.JobState, Liveness] | None = None
+    relay: "_RelayState" = field(default_factory=lambda: _RelayState())
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     #: :func:`~kontra._control.hold_digest` of every hold token issued for the job: a run
     #: of ``job-<id>`` counts only if the buyer's call carried one of them (decisions I15).
@@ -792,17 +843,6 @@ class _Job:
         return f"job-{self.record.job_id}"
 
     @property
-    def call(self) -> BuyerCall:
-        """The buyer's ``execute`` call as this gate recorded it: what an observed run must
-        trace back to before it can deliver."""
-        return BuyerCall(
-            namespace=self.buyer_ns,
-            endpoint=self.endpoint,
-            service=self.service,
-            holds=frozenset(self.holds),
-        )
-
-    @property
     def hold_expires_at(self) -> datetime:
         """The hold token's ``exp``: lock time + max_duration (decisions I10), in whole
         seconds as the token carries it, so the gate and a seller's handler agree on it."""
@@ -810,7 +850,7 @@ class _Job:
         return datetime.fromtimestamp(exp, UTC)
 
     def notify(self) -> None:
-        """Wake every progress stream of this job."""
+        """Wake every stream listener of this job."""
         event, self.changed = self.changed, asyncio.Event()
         event.set()
 
@@ -845,6 +885,37 @@ class _Job:
 
 
 @dataclass
+class _RelayState:
+    """One job's relay (decisions I31): one task per job, from offset 0 at its first
+    listener (owner, OD2), the persisted offset kept across pauses, the stored budgets."""
+
+    task: asyncio.Task[None] | None = None
+    #: The session the engine's relay credential names (the platform revokes it when the
+    #: relay pauses; here nothing is revoked).
+    session: str = field(default_factory=lambda: secrets.token_hex(16))
+    #: The next offset to poll from: persisted after each stored batch.
+    offset: int = 0
+    listeners: int = 0
+    #: The relay ended: the job closed (drained), or it stopped (``stopped`` says why).
+    done: bool = False
+    stopped: str | None = None
+    pause: asyncio.TimerHandle | None = None
+    topic_bytes: dict[str, int] = field(default_factory=dict[str, int])
+    job_bytes: int = 0
+    #: Topics whose stored budget is spent (one gap said so; the relay polls them no more),
+    #: and the job's (one gap; the relay stopped).
+    spent_topics: set[str] = field(default_factory=set[str])
+    job_spent: bool = False
+    #: Polls answered and items dropped (defence in depth), for tests.
+    batches: int = 0
+    dropped: int = 0
+
+    @property
+    def running(self) -> bool:
+        return self.task is not None and not self.task.done()
+
+
+@dataclass
 class _Artifact:
     key: str
     owner: str
@@ -870,8 +941,12 @@ class FakeGate:
     """An in-memory gate. Every parameter has a test-friendly default.
 
     ``control``: the Temporal control plane (:class:`kontra._control.Control`), or None for
-    a gate with no Temporal. ``ledger``: defaults to ``fake_ledger(fee_bps)`` on this gate's
-    clock. ``base_url``: what URLs and token issuers say in ASGI mode (``serve()`` replaces
+    a gate with no Temporal. ``engines``: the engines it dispatches jobs to, by the name an
+    offering version was published on (seam ⑥, decisions I32); by default
+    ``{"temporal": TemporalEngine(control, ...)}`` on this gate's key ring and clock when
+    ``control`` is given, else none (every seller offline). With ``engines``, ``control`` is
+    only kept as :attr:`control`. ``ledger``: defaults to ``fake_ledger(fee_bps)`` on this
+    gate's clock. ``base_url``: what URLs and token issuers say in ASGI mode (``serve()`` replaces
     it with the real address). ``temporal_address``: handed to clients in ``Me`` and
     Temporal tokens (default: the control plane's frontend). ``signup_grant``: play money
     a new party gets (USD). ``resolvers``: parties allowed to resolve disputes.
@@ -901,6 +976,19 @@ class FakeGate:
     show. ``passkey_origins``: the console's origins (``KONTRA_CONSOLE_ORIGINS``; default
     :attr:`base_url`), of which only those on the RP ID are taken (:attr:`passkey_origins`).
 
+    A job's workflow stream is relayed with the engine's
+    :meth:`~kontra.engine.Engine.stream` (on Temporal :func:`kontra._relay.relay`, on the
+    control plane's client, as the platform relays it on a relay token's: decisions I31,
+    I32): one relay per job, started once the job is pinned and its first listener
+    attaches, from offset 0; paused ``relay_grace`` seconds after its last listener leaves,
+    its offset kept.
+    ``relay_interval``: the shortest wait between two polls (the platform's 2 s);
+    ``relay_rpc_timeout``: one poll RPC's deadline; ``history_limits``: the server's
+    history limits it paces against (Kontra's pinned ones). ``stream_item_max``,
+    ``stream_topic_budget``, ``stream_job_budget``: what it stores (an item above the first
+    is a gap; past a budget, one gap, and the relay polls that topic no more, or stops);
+    ``stream_listeners_max``: listeners per job.
+
     The clock offset (:meth:`advance`) moves token ``iat``/``exp`` too: a seller's
     handler verifying a hold token issued *after* an advance on the machine's clock sees
     an ``iat`` in the future, which PyJWT refuses by default. Advance after the start.
@@ -910,6 +998,7 @@ class FakeGate:
         self,
         control: TemporalControl | None = None,
         *,
+        engines: Mapping[str, Engine] | None = None,
         ledger: Ledger | None = None,
         fee_bps: int = 500,
         base_url: str = "http://localhost",
@@ -939,7 +1028,14 @@ class FakeGate:
         part_size: int = 16 * 1024 * 1024,
         max_input_bytes: int = 5 * 1000**3,
         url_ttl: timedelta = timedelta(hours=1),
-        progress_rate_per_s: int = 5,
+        relay_interval: float = MIN_INTERVAL,
+        relay_grace: float = RELAY_GRACE,
+        relay_rpc_timeout: float = 30.0,
+        history_limits: tuple[int, int] = HISTORY_LIMITS,
+        stream_item_max: int = m.STREAM_ITEM_MAX,
+        stream_topic_budget: int = m.STREAM_TOPIC_BUDGET,
+        stream_job_budget: int = m.STREAM_JOB_BUDGET,
+        stream_listeners_max: int = m.STREAM_LISTENERS_MAX,
         input_retention: timedelta = timedelta(days=7),
         orphan_upload_ttl: timedelta = timedelta(hours=24),
         keepalive: float = 5.0,
@@ -997,7 +1093,14 @@ class FakeGate:
         self.part_size = part_size
         self.max_input_bytes = max_input_bytes
         self.url_ttl = url_ttl
-        self.progress_rate_per_s = progress_rate_per_s
+        self.relay_interval = relay_interval
+        self.relay_grace = relay_grace
+        self.relay_rpc_timeout = relay_rpc_timeout
+        self.history_limits = history_limits
+        self.stream_item_max = stream_item_max
+        self.stream_topic_budget = stream_topic_budget
+        self.stream_job_budget = stream_job_budget
+        self.stream_listeners_max = stream_listeners_max
         self.input_retention = input_retention
         self.orphan_upload_ttl = orphan_upload_ttl
         self.keepalive = keepalive
@@ -1007,6 +1110,26 @@ class FakeGate:
         self._passkey_origins = None if passkey_origins is None else tuple(passkey_origins)
 
         self.keys = _KeyRing()
+        self.signer: Signer = _GateSigner(self)
+        if engines is None:
+            engines = {}
+            if control is not None:
+                engines = {
+                    DEFAULT_ENGINE: TemporalEngine(
+                        control,
+                        signer=self.signer,
+                        address=self.temporal_address,
+                        # This gate relays through its control plane's own client.
+                        relay_service=internal_relay_service(control),
+                        worker_ttl=WORKER_TTL,
+                        relay_interval=relay_interval,
+                        relay_rpc_timeout=relay_rpc_timeout,
+                        history_limits=history_limits,
+                        clock=self.now,
+                    )
+                }
+        #: The engines by name: every job op goes to its offering version's (seam ⑥).
+        self.engines: dict[str, Engine] = dict(engines)
         self._url_secret = secrets.token_bytes(32)
         self.parties: dict[str, _Party] = {}
         self.sessions: dict[str, _Session] = {}
@@ -1093,8 +1216,16 @@ class FakeGate:
 
     async def _shutdown(self) -> None:
         self._stopping = True
+        relays: list[asyncio.Task[None]] = []
         for job in self.jobs.values():
             job.notify()
+            if job.relay.pause is not None:
+                job.relay.pause.cancel()
+                job.relay.pause = None
+            if job.relay.task is not None and not job.relay.task.done():
+                job.relay.task.cancel()
+                relays.append(job.relay.task)
+        await asyncio.gather(*relays, return_exceptions=True)
         task, self._sweeper = self._sweeper, None
         if task is not None:
             task.cancel()
@@ -1131,7 +1262,7 @@ class FakeGate:
         return self.base_url
 
     async def stop(self) -> None:
-        """Stop :meth:`serve` (open progress streams end)."""
+        """Stop :meth:`serve` (open stream listeners end)."""
         server, thread = self._server, self._thread
         if server is None or thread is None:
             return
@@ -2400,27 +2531,33 @@ class FakeGate:
         rec.consumed = True
         return self._open_session(rec.party, rec.auth_time, rec.via)
 
-    def temporal_token(self, who: Principal) -> m.TemporalToken:
+    async def temporal_token(self, who: Principal) -> m.TemporalToken:
         """The party's Temporal *worker* JWT: the only Temporal token there is (decisions
-        I3). A dev server does not enforce it; it is well-formed all the same."""
-        now = self.now()
-        expires = datetime.fromtimestamp(int((now + WORKER_TTL).timestamp()), UTC)
-        token = self.keys.sign(
-            {
-                "iss": self.issuer,
-                "aud": AUD_TEMPORAL,
-                "sub": who.party,
-                "sid": who.session_id,
-                "permissions": [f"{who.party}:worker"],
-                "iat": int(now.timestamp()),
-                "exp": int(expires.timestamp()),
-            }
-        )
+        I3), minted by the Temporal engine's :meth:`~kontra.engine.Engine.isolate` for the
+        caller's session (the seller<->engine credential, which is native: this route stays
+        Temporal's). A dev server does not enforce it; it is well-formed all the same, and a
+        gate with no Temporal engine mints the same claims itself."""
+        engine = self.engines.get(DEFAULT_ENGINE)
+        if engine is None:
+            token, expires = worker_token(
+                self.signer, who.party, who.session_id, now=self.now(), ttl=WORKER_TTL
+            )
+            home, address = self.parties[who.party].namespace, self.temporal_address
+        else:
+            try:
+                iso = await engine.isolate(who.party, session=who.session_id)
+            except EngineError as e:
+                raise GateHTTPError(
+                    503, "temporal_unavailable", f"could not reach the party's home: {e}"
+                ) from None
+            if iso.credential is None or iso.expires_at is None:
+                raise GateHTTPError(503, "temporal_unavailable", "the engine minted no token")
+            token, expires, home, address = iso.credential, iso.expires_at, iso.home, iso.address
         return m.TemporalToken(
             token=token,
             expires_at=expires,
-            namespace=self.parties[who.party].namespace,
-            temporal_address=self.temporal_address,
+            namespace=home,
+            temporal_address=address,
             role="worker",
         )
 
@@ -2441,10 +2578,10 @@ class FakeGate:
                 if new:
                     raise GateHTTPError(409, "handle_taken", f"the handle {handle} is taken")
                 return existing
-            if self.control is not None:
+            for engine in self.engines.values():
                 try:
-                    await self.control.ensure_namespace(handle)
-                except TemporalError as e:
+                    await engine.isolate(handle)  # its home in every engine (I32)
+                except EngineError as e:
                     raise GateHTTPError(
                         503, "namespace_unavailable", f"could not register the namespace: {e}"
                     ) from None
@@ -2770,7 +2907,7 @@ class FakeGate:
                 if job.hold_ref is None:
                     continue
                 if r.state is not m.JobState.CANCELED or (
-                    r.run_id is not None and r.reason != escrow.BUYER_CANCEL_REASON
+                    r.pin is not None and r.reason != escrow.BUYER_CANCEL_REASON
                 ):
                     refunded += 1
             elif r.escrow in (m.Escrow.DISPUTED, m.Escrow.RESOLVED):
@@ -2803,16 +2940,34 @@ class FakeGate:
     def _open_jobs(self, offering: str) -> list[_Job]:
         return [j for j in self.jobs.values() if j.record.offering == offering and j.record.open]
 
-    async def publish(self, who: Principal, document: dict[str, Any]) -> m.CatalogEntry:
+    async def publish(
+        self,
+        who: Principal,
+        document: dict[str, Any],
+        streams: Sequence[str] = (),
+        engine: str = DEFAULT_ENGINE,
+    ) -> m.CatalogEntry:
         """Publishing (§11.4, decisions I1/I3): validate, check ownership, assign an opaque
-        endpoint name once per version, and create the endpoint through the control plane
-        targeting the caller's namespace and the version's task queue."""
+        endpoint name once per version, and expose the version under it through its engine
+        (Temporal: the Nexus endpoint, targeting the caller's namespace and the version's
+        task queue). ``streams`` (the topics a buyer may read, decisions I31) and ``engine``
+        (what the version runs on, decisions I32) are kept with the version, and fixed: a
+        republish of the version with others is 409 ``streams_fixed`` / ``engine_fixed``
+        (the latter after the ownership check, so only the owner learns it). An engine name
+        neither known nor run here is 422 ``unsupported_engine``; a known one this gate has
+        no adapter for is recorded, its sellers offline."""
         try:
             info = validate_document(document)
         except ContractError as e:
             raise GateHTTPError(
                 422, "invalid_contract", f"{e.path}: {e.message}", {"path": e.path}
             ) from None
+        try:
+            topics = check_streams(list(streams))
+        except ValueError as e:
+            raise GateHTTPError(422, "invalid_streams", f"streams: {e}") from None
+        if engine not in self.engines and engine not in ENGINE_NAMES:
+            raise GateHTTPError(422, "unsupported_engine", f"this gate runs no {engine!r} adapter")
         oid = info.offering
         if oid.party != who.party:
             raise GateHTTPError(
@@ -2820,10 +2975,26 @@ class FakeGate:
                 "not_owner",
                 f"{oid.full_name} belongs to the party {oid.party!r}; you are {who.party!r}",
             )
-        owner = self._party(who.party)
+        self._party(who.party)  # the caller's party row (its home is provisioned at sign-up)
         card = agent_card(info.document, url=self.entry_url(oid))
         now = self.now()
         row = self.offerings.get(oid.key)
+        if row is not None and row.streams != topics:
+            raise GateHTTPError(
+                409,
+                "streams_fixed",
+                f"{oid.key} was published with streams {list(row.streams)}; streams are "
+                "fixed per version: publish a new version",
+                {"streams": list(row.streams)},
+            )
+        if row is not None and row.engine != engine:
+            raise GateHTTPError(
+                409,
+                "engine_fixed",
+                f"{oid.key} was published for the {row.engine!r} engine; the engine is fixed "
+                "per version: publish a new version",
+                {"engine": row.engine},
+            )
         if row is None:
             row = _Offering(
                 info=info,
@@ -2831,6 +3002,8 @@ class FakeGate:
                 endpoint_ready=False,
                 card=card,
                 published_at=now,
+                streams=topics,
+                engine=engine,
             )
             self.offerings[oid.key] = row
             self._by_endpoint[row.endpoint] = oid.key
@@ -2854,17 +3027,18 @@ class FakeGate:
                     {"open_jobs": open_jobs, "contract_hash": row.info.contract_hash},
                 )
             row.info, row.card, row.published_at = info, card, now
-        if self.control is not None:
+        target = self.engines.get(row.engine)
+        if target is not None:
             try:
-                await self.control.create_endpoint(row.endpoint, owner.namespace, oid.task_queue)
-            except EndpointConflict:
+                await target.expose(oid, row.endpoint)
+            except RouteConflict:
                 raise GateHTTPError(
                     409,
                     "endpoint_conflict",
                     "the offering's Nexus endpoint exists with another target",
                 ) from None
-            except TemporalError:
-                log.exception("creating endpoint %s of %s failed", row.endpoint, oid.key)
+            except EngineError:
+                log.exception("exposing %s under %s failed", oid.key, row.endpoint)
                 raise GateHTTPError(
                     503,
                     "endpoint_unavailable",
@@ -2972,13 +3146,20 @@ class FakeGate:
             raise GateHTTPError(404, "offering_not_found", "no such offering")
         row = max(mine, key=lambda o: o.id.version)
         task_queue = row.id.task_queue
-        if self.control is None:
+        engine = self.engines.get(row.engine)
+        if engine is None:
             return workers_view(row.key, task_queue, offline())
-        try:
-            described = await self.control.describe_task_queue(
-                self._party(who.party).namespace, task_queue
+        if not isinstance(engine, TemporalEngine):
+            # Temporal's task-queue stats by definition (I21): a Temporal-only extension of
+            # its adapter, not a member of seam ⑥ (owner decision OD8 of #55).
+            raise GateHTTPError(
+                404,
+                "workers_unavailable",
+                f"{row.key} runs on the {row.engine!r} engine, which has no Workers view",
             )
-        except TemporalError:
+        try:
+            described = await engine.workers(row.id)
+        except EngineError:
             log.exception("describing task queue %s failed", task_queue)
             raise GateHTTPError(
                 503, "temporal_unavailable", "could not ask Temporal yet; try again shortly"
@@ -3028,7 +3209,8 @@ class FakeGate:
             ref = OfferingRef.parse(req.offering)
         except NameError_ as e:
             raise GateHTTPError(422, "invalid_offering", str(e)) from None
-        payload = _decode_wire_payload(req.input)
+        raw = _wire_bytes(req.input)
+        payload = _payload_of(raw)
         row = self.resolve_ref(ref)
         if row is None:
             raise GateHTTPError(404, "offering_not_found", f"no published offering matches {ref}")
@@ -3056,38 +3238,31 @@ class FakeGate:
                 eta_seconds=busy[1],
                 reason=f"{oid.key} is running its maximum of {facts.max_concurrent_jobs} concurrent jobs",
             )
-        if self.control is None:
+        engine = self.engines.get(row.engine)
+        if engine is None:
             raise GateHTTPError(
                 503,
                 "seller_unavailable",
                 "the seller did not answer; no worker is serving this offering right now",
             )
         try:
-            answer = await self.control.nexus_sync(
-                oid.namespace,
-                oid.task_queue,
-                oid.service_name,
-                QUOTE_OPERATION,
-                payload,
-                {},
-                self.quote_timeout,
-            )
-        except TemporalError:
+            answer = await engine.quote(oid, raw, timeout=self.quote_timeout)
+        except EngineError:
             log.exception("quote relay to %s failed", oid.key)
             raise GateHTTPError(
                 503, "seller_unavailable", "the seller could not be reached; try again later"
             ) from None
-        if answer.kind is NexusSyncKind.HANDLER_ERROR:
+        if answer.kind is QuoteKind.REFUSED:
             log.info("quote handler of %s failed: %s", oid.key, answer.message[:500])
             raise GateHTTPError(502, "seller_error", "the seller's quote handler failed")
-        if answer.kind is not NexusSyncKind.OK:
+        if answer.kind is not QuoteKind.OK:
             raise GateHTTPError(
                 503,
                 "seller_unavailable",
                 "the seller did not answer; no worker is serving this offering right now",
                 {"reason": answer.kind.value},
             )
-        q = _parse_quote(answer.payload)
+        q = _parse_quote(answer.document)
         if q.status == "rejected":
             return view(m.QuoteStatus.REJECTED, reason=q.reason)
         if q.status == "busy":
@@ -3147,7 +3322,7 @@ class FakeGate:
             job_id=r.job_id,
             offering=r.offering,
             seller=r.seller,
-            seller_ns=r.seller_ns,
+            seller_ns=job.seller_ns,
             buyer=r.buyer,
             buyer_ns=job.buyer_ns,
             buyer_key=job.buyer_key,
@@ -3214,7 +3389,6 @@ class FakeGate:
             offering=oid.key,
             buyer=who.party,
             seller=oid.party,
-            seller_ns=oid.namespace,
             amount=q.amount,
             max_duration=q.max_duration,
             review_window=row.info.facts.review_window,
@@ -3224,14 +3398,21 @@ class FakeGate:
         job = _Job(
             record=record,
             buyer_ns=me.namespace,
+            seller_ns=oid.namespace,
             buyer_key=req.buyer_key,
             contract_hash=row.info.contract_hash,
             endpoint=row.endpoint,
             service=oid.service_name,
             max_duration=q.max_duration,
             quote_id=q.quote_id,
+            engine=row.engine,
             input_size=q.input_size,
         )
+        engine = self.engines.get(row.engine)
+        if engine is not None:
+            # Bound at hire: the buyer's own start may come before any call to the gate, and
+            # the job is observed from its first moment (I4, I32).
+            job.handle = engine.bind(JobPlan(job_id, oid, row.endpoint, who.party, oid.party))
         self.jobs[job_id] = job
         try:
             handle = await self.ledger.lock(
@@ -3289,6 +3470,14 @@ class FakeGate:
         if job is None or party not in (job.record.buyer, job.record.seller):
             raise GateHTTPError(404, "job_not_found", "no such job")
         return job
+
+    def _bound(self, job: _Job) -> tuple[Engine, JobHandle] | None:
+        """The job's engine and the handle it minted, or None when no engine can run it (no
+        engine of the version's name here, as on a gate whose sellers are all offline)."""
+        engine = self.engines.get(job.engine)
+        if engine is None or job.handle is None:
+            return None
+        return engine, job.handle
 
     @staticmethod
     def _require_buyer(job: _Job, party: str, what: str) -> None:
@@ -3359,23 +3548,17 @@ class FakeGate:
             raise GateHTTPError(
                 409, "hold_expired", "the hold token has expired; the job will refund"
             )
-        payload = _decode_wire_payload(wire)
-        if self.control is None:
+        raw = _wire_bytes(wire)
+        _payload_of(raw)
+        bound = self._bound(job)
+        if bound is None:
             raise GateHTTPError(
                 503, "temporal_unavailable", "could not start the job yet; try again shortly"
             )
+        engine, handle = bound
         try:
-            await self.control.start_operation(
-                job.buyer_ns,
-                job.operation_id,
-                job.endpoint,
-                job.service,
-                EXECUTE_OPERATION,
-                payload,
-                {HOLD_HEADER: self.hold_token(job)},
-                max(timedelta(seconds=1), job.record.deadline - now),
-            )
-        except TemporalError:
+            await engine.start(handle, raw, hold=self.hold_token(job), deadline=job.record.deadline)
+        except EngineError:
             log.exception("starting job %s in %s failed", job_id, job.buyer_ns)
             raise GateHTTPError(
                 503, "temporal_unavailable", "could not start the job yet; try again shortly"
@@ -3414,7 +3597,7 @@ class FakeGate:
         the money. When Temporal cannot say, the cancel is refused rather than guessed.
 
         A job with no run yet is closed to starts before it is refunded
-        (:meth:`~kontra._control.Control.occupy_job`, decisions I16): the hold token stays
+        (:meth:`~kontra.engine.Engine.fence`, decisions I16): the hold token stays
         valid until it expires and the seller's handler checks it offline, so the buyer
         could otherwise run ``execute`` with it after the refund and get a short job done
         for free. If a run appeared in the meantime, it is looked at again and stopped as a
@@ -3424,21 +3607,21 @@ class FakeGate:
         its run is terminated, and the refund waits for what Temporal shows of the pinned
         chain afterwards (:meth:`_complete_cancel`)."""
         job = self.job_for(job_id, who.party)
-        if who.party == job.record.buyer and job.record.open and self.control is not None:
+        bound = self._bound(job)
+        if who.party == job.record.buyer and job.record.open and bound is not None:
+            engine, handle = bound
             obs = await self._look_before_cancel(job)
             if obs.status is ObservedStatus.NOT_FOUND and job.record.open:
                 try:
-                    occupied = await self.control.occupy_job(
-                        job.record.seller_ns, job.workflow_id, escrow.BUYER_CANCEL_REASON
-                    )
+                    fenced = await engine.fence(handle, reason=escrow.BUYER_CANCEL_REASON)
                 except Exception:
-                    log.warning("cannot occupy %s for a cancel", job.workflow_id, exc_info=True)
+                    log.warning("cannot fence job %s for a cancel", job.job_id, exc_info=True)
                     raise GateHTTPError(
                         503,
                         "temporal_unavailable",
                         "could not close the job to late starts; try again shortly",
                     ) from None
-                if occupied is Occupation.STARTED:
+                if fenced is Fenced.STARTED:
                     await self._look_before_cancel(job)
         now = self.now()
         job = await self._transition(job_id, lambda r: escrow.cancel(r, who.party, now))
@@ -3458,7 +3641,7 @@ class FakeGate:
         stands. A termination that did not land, or a chain that cannot be observed, is a
         503: the cancel stays requested, the sweeper keeps terminating and observing until
         the chain closes, and asking again is safe."""
-        if job.pending_stop is EffectKind.TERMINATE_RUN or self.control is None:
+        if job.pending_stop is EffectKind.TERMINATE_RUN or self._bound(job) is None:
             raise GateHTTPError(
                 503,
                 "temporal_unavailable",
@@ -3473,22 +3656,22 @@ class FakeGate:
             )
 
     async def _look_before_cancel(self, job: _Job) -> Observation:
-        """Observe ``job-<id>`` and apply what it shows, for a cancel: 503 when Temporal
+        """Observe the job's run and apply what it shows, for a cancel: 503 when the engine
         cannot say."""
-        assert self.control is not None
+        bound = self._bound(job)
+        assert bound is not None
+        engine, handle = bound
         try:
-            obs, result = await self.control.observe(
-                job.record.seller_ns, job.workflow_id, job.call, job.record.run_id
-            )
+            seen = await engine.observe(handle, pin=_pin(job.record.pin), holds=job.holds)
         except Exception:
-            log.warning("cannot observe %s before a cancel", job.workflow_id, exc_info=True)
+            log.warning("cannot observe job %s before a cancel", job.job_id, exc_info=True)
             raise GateHTTPError(
                 503,
                 "temporal_unavailable",
                 "could not check whether the job has delivered; try again shortly",
             ) from None
-        await self._apply_observation(job.job_id, obs, result)
-        return obs
+        await self._apply_observation(job.job_id, seen)
+        return seen.observation
 
     # ------------------------------------------------------------------ disputes
 
@@ -3572,86 +3755,257 @@ class FakeGate:
             raise GateHTTPError(422, "invalid_amount", str(e)) from None
         return m.TopupResult(credited=True, balance=await self.balance(party, req.currency))
 
-    # ------------------------------------------------------------------ progress
+    # ------------------------------------------------------------------ streams
 
-    def _record_event(self, job: _Job, **fields: Any) -> m.ProgressEvent:
-        event = m.ProgressEvent.model_validate({"seq": len(job.events) + 1, **fields})
+    def _record_event(self, job: _Job, **fields: Any) -> m.StreamEvent:
+        event = m.StreamEvent.model_validate({"cursor": len(job.events) + 1, **fields})
         job.events.append(event)
         job.notify()
         return event
 
-    def post_progress(self, who: Principal, job_id: str, post: m.ProgressPost) -> None:
-        """A seller's heartbeat details, encrypted to the buyer. At most
-        ``progress_rate_per_s`` per second per job are kept (latest-wins is the sender's
-        job); the excess is dropped without an error, as a throttle should."""
+    def stream_topics(self, job: _Job) -> tuple[str, ...]:
+        """What a job's relay reads and a listener may ask for: the offering version's
+        ``streams`` and ``kontra.progress``."""
+        row = self.offerings.get(job.record.offering)
+        return tuple(sorted({*(row.streams if row is not None else ()), PROGRESS_TOPIC}))
+
+    def open_stream(
+        self,
+        who: Principal,
+        job_id: str,
+        topics: Sequence[str],
+        history: bool,
+        after: int | None,
+        last_event_id: str | None,
+    ) -> AsyncIterator[bytes]:
+        """``GET /v1/jobs/{id}/stream``, for the job's buyer or seller: the checks, then the
+        events (:meth:`stream_events`)."""
         job = self.job_for(job_id, who.party)
-        if who.party != job.record.seller:
-            raise GateHTTPError(403, "forbidden", "only the job's seller posts progress")
-        if not job.record.open:
-            raise GateHTTPError(409, "not_open", f"job is {job.record.state.value}")
-        if _ACTIVITY.fullmatch(post.activity) is None:
+        allowed = self.stream_topics(job)
+        chosen: list[str] = []
+        for topic in topics:
+            try:
+                check_topic(topic)
+            except ValueError:
+                raise GateHTTPError(422, "unknown_topic", "a topic is not a topic name") from None
+            if topic not in allowed:
+                raise GateHTTPError(
+                    422,
+                    "unknown_topic",
+                    f"{topic!r} is not one of this job's topics {list(allowed)}",
+                )
+            if topic not in chosen:
+                chosen.append(topic)
+        if after is None and last_event_id is not None:
+            if _CURSOR.fullmatch(last_event_id) is None:
+                raise GateHTTPError(422, "invalid_cursor", "Last-Event-ID is not a cursor")
+            after = int(last_event_id)
+        if job.relay.listeners >= self.stream_listeners_max:
             raise GateHTTPError(
-                422,
-                "invalid_progress",
-                "activity must be 1 to 255 characters without control characters",
+                429,
+                "too_many_listeners",
+                f"at most {self.stream_listeners_max} listeners per job",
             )
-        if len(post.ciphertext_b64) > 4 * math.ceil(MAX_PROGRESS_BYTES / 3):
-            raise GateHTTPError(
-                413, "too_large", f"a progress event is at most {MAX_PROGRESS_BYTES} bytes"
-            )
+        job.relay.listeners += 1
+        return self.stream_events(job, frozenset(chosen or allowed), history, after or 0)
+
+    async def stream_events(
+        self, job: _Job, topics: frozenset[str], history: bool, after: int
+    ) -> AsyncIterator[bytes]:
+        """Replay the stored events after ``after``, then follow; keepalive comments while
+        idle; end once the job is closed, its relay finished and every event was sent. The
+        relay is started here (once the job is pinned) and paused when its last listener
+        has been gone a while."""
+        last = after
         try:
-            raw = base64.b64decode(post.ciphertext_b64, validate=True)
-        except (binascii.Error, ValueError):
-            raise GateHTTPError(
-                422, "invalid_progress", "ciphertext_b64 is not standard base64"
-            ) from None
-        if len(raw) > MAX_PROGRESS_BYTES:
-            raise GateHTTPError(
-                413, "too_large", f"a progress event is at most {MAX_PROGRESS_BYTES} bytes"
-            )
-        if not raw.startswith(AGE_MAGIC):
-            # As the platform gate does: a client bug must not leave plaintext here.
-            raise GateHTTPError(
-                422,
-                "not_ciphertext",
-                "progress details must be encrypted to the buyer (an age v1 file)",
-            )
-        mono = time.monotonic()
-        beats = job.heartbeats
-        while beats and mono - beats[0] >= 1.0:
-            beats.popleft()
-        if len(beats) >= self.progress_rate_per_s:
+            if job.record.pin is None and job.record.open:
+                # Pinned as soon as someone listens, not at the next sweep: the relay
+                # never polls an unpinned job-<id> (I30).
+                with contextlib.suppress(Exception):
+                    await self._observe(job.job_id)
+            while True:
+                waiter = job.changed
+                self._ensure_relay(job)
+                for event in job.events[last:]:
+                    last = event.cursor
+                    if not _wanted(event, topics, history):
+                        continue
+                    data = event.model_dump_json(exclude_none=True)
+                    yield f"id: {event.cursor}\nevent: {event.kind.value}\ndata: {data}\n\n".encode()
+                if self._stopping:
+                    return
+                if job.progress_final and self._relay_settled(job) and last >= len(job.events):
+                    return
+                try:
+                    async with asyncio.timeout(self.keepalive):
+                        await waiter.wait()
+                except TimeoutError:
+                    yield b": keepalive\n\n"
+        finally:
+            self._left(job)
+
+    def _left(self, job: _Job) -> None:
+        state = job.relay
+        state.listeners = max(state.listeners - 1, 0)
+        if state.listeners or not state.running or self._loop is None:
             return
-        if job.heartbeat_bytes + len(raw) > HEARTBEAT_BUDGET_BYTES:
-            return  # the job's budget is spent; history events still show liveness
-        beats.append(mono)
-        job.heartbeat_bytes += len(raw)
-        self._record_event(
-            job,
-            at=post.at if post.at.tzinfo is not None else post.at.replace(tzinfo=UTC),
-            source=m.ProgressSource.HEARTBEAT,
-            activity=post.activity,
-            ciphertext_b64=post.ciphertext_b64,
-            state=job.record.state,
+        if state.pause is not None:
+            state.pause.cancel()
+        state.pause = asyncio.get_running_loop().call_later(
+            self.relay_grace, self._maybe_pause, job
         )
 
-    async def progress_stream(self, job: _Job, after: int) -> AsyncIterator[bytes]:
-        """Replay events after ``after``, then follow; keepalive comments while idle; end
-        once the job is closed and every event has been sent."""
-        last = after
-        while True:
-            waiter = job.changed
-            for event in job.events[last:]:
-                last = event.seq
-                data = event.model_dump_json()
-                yield f"id: {event.seq}\nevent: progress\ndata: {data}\n\n".encode()
-            if (job.progress_final and last >= len(job.events)) or self._stopping:
-                return
-            try:
-                async with asyncio.timeout(self.keepalive):
-                    await waiter.wait()
-            except TimeoutError:
-                yield b": keepalive\n\n"
+    def _maybe_pause(self, job: _Job) -> None:
+        """The last listener has been gone ``relay_grace`` seconds: stop polling, keep the
+        offset (the platform revokes the relay session here)."""
+        state = job.relay
+        state.pause = None
+        if state.listeners == 0 and state.task is not None:
+            state.task.cancel()
+
+    def _relay_settled(self, job: _Job) -> bool:
+        """Nothing more will be relayed: the relay finished, or never started and the job
+        is closed (a relay attaching after a job closed reads nothing)."""
+        state = job.relay
+        return state.done or not state.running
+
+    def _ensure_relay(self, job: _Job) -> None:
+        state = job.relay
+        if state.running or state.done or state.listeners == 0:
+            return
+        if not job.record.open or job.record.pin is None:
+            return  # never an unpinned job-<id>; a closed job's stream is gone
+        bound = self._bound(job)
+        if bound is None:
+            return
+        if state.pause is not None:
+            state.pause.cancel()
+            state.pause = None
+        state.task = asyncio.get_running_loop().create_task(
+            self._relay(job, *bound), name=f"fake-gate-relay-{job.job_id}"
+        )
+
+    async def _relay(self, job: _Job, engine: Engine, handle: JobHandle) -> None:
+        """One job's relay: the engine's :meth:`~kontra.engine.Engine.stream` of the pinned
+        lineage, each batch stored, the offset persisted after it; a stop recorded as a gap
+        without an item (none for an engine that relays no streams)."""
+        state = job.relay
+        assert job.record.pin is not None
+        pin = Pin(job.record.pin)
+
+        async def closed() -> bool:
+            return self._stopping or not job.record.open
+
+        try:
+            # A spent budget is one gap, not one per item: a topic whose budget is spent is
+            # polled no more (the relay starts again without it, from the persisted
+            # offset), and a spent job budget ends the relay.
+            while not state.job_spent:
+                topics = [t for t in self.stream_topics(job) if t not in state.spent_topics]
+                if not topics:
+                    break
+                again = False
+                batches = engine.stream(
+                    handle,
+                    pin=pin,
+                    topics=topics,
+                    after=state.offset,
+                    closed=closed,
+                    session=state.session,
+                )
+                try:
+                    async for batch in batches:
+                        if self._store_batch(job, batch):
+                            again = True
+                            break
+                finally:
+                    close: Any = getattr(batches, "aclose", None)
+                    if close is not None:
+                        await close()
+                if not again:
+                    break  # the job closed
+            if state.job_spent:
+                state.stopped = "job_budget"
+        except StreamStopped as e:
+            state.stopped = e.reason
+            if e.reason == "unsupported":
+                log.info("job %s: its engine relays no streams", job.job_id)
+            else:
+                log.info("the relay of job %s stopped: %s", job.job_id, e)
+                self._record_event(
+                    job,
+                    kind=m.StreamEventKind.GAP,
+                    at=self.now(),
+                    reason=_GAP_REASONS[e.reason],
+                    state=job.record.state,
+                )
+        except asyncio.CancelledError:
+            raise  # paused: the offset is kept for the next listener
+        except Exception:
+            log.exception("the relay of job %s failed", job.job_id)
+            state.stopped = "failed"
+            self._record_event(
+                job,
+                kind=m.StreamEventKind.GAP,
+                at=self.now(),
+                reason=m.StreamGapReason.RELAY_FAILED,
+                state=job.record.state,
+            )
+        state.done = True
+        job.notify()
+
+    def _store_batch(self, job: _Job, batch: StreamBatch) -> bool:
+        """Store a batch's items -- ciphertext only, within the caps -- then its offset.
+        True when a budget was spent here: the relay must poll fewer topics, or stop."""
+        state = job.relay
+        state.batches += 1
+        state.dropped += batch.dropped
+        spent = False
+        for item in batch.items:
+            if item.offset < state.offset:
+                continue  # stored already (a poll re-read after a pause)
+            if item.topic in state.spent_topics:
+                continue  # its budget's gap is stored; nothing more of it is
+            # Ciphertext by type: an item is a kontra.engine.Sealed age file, or None.
+            gap: m.StreamGapReason | None = None
+            if item.sealed is None or item.size > self.stream_item_max:
+                gap = m.StreamGapReason.TOO_LARGE
+            elif state.topic_bytes.get(item.topic, 0) + item.size > self.stream_topic_budget:
+                gap = m.StreamGapReason.TOPIC_BUDGET
+            elif state.job_bytes + item.size > self.stream_job_budget:
+                gap = m.StreamGapReason.JOB_BUDGET
+            if gap is not None:
+                self._record_event(
+                    job,
+                    kind=m.StreamEventKind.GAP,
+                    at=self.now(),
+                    topic=item.topic,
+                    offset=item.offset,
+                    size=item.size,
+                    reason=gap,
+                    state=job.record.state,
+                )
+                if gap is m.StreamGapReason.TOPIC_BUDGET:
+                    state.spent_topics.add(item.topic)
+                    spent = True
+                elif gap is m.StreamGapReason.JOB_BUDGET:
+                    state.job_spent = spent = True
+                    break
+                continue
+            assert item.sealed is not None
+            state.topic_bytes[item.topic] = state.topic_bytes.get(item.topic, 0) + item.size
+            state.job_bytes += item.size
+            self._record_event(
+                job,
+                kind=m.StreamEventKind.ITEM,
+                at=self.now(),
+                topic=item.topic,
+                offset=item.offset,
+                ciphertext_b64=base64.b64encode(item.sealed.data).decode("ascii"),
+                state=job.record.state,
+            )
+        state.offset = max(state.offset, batch.next_offset)
+        return spent
 
     # ------------------------------------------------------------------ transitions & effects
 
@@ -3719,22 +4073,16 @@ class FakeGate:
                 await self._stop_workflow(job, effect.kind, effect.reason)
 
     async def _stop_workflow(self, job: _Job, kind: EffectKind, reason: str) -> None:
-        """Carry out a workflow stop. ``TERMINATE_RUN`` (a cancel's) terminates the open run
-        of ``job-<id>``: that is the pinned chain's run whenever the chain is still open (a
-        workflow id has one open run at most), and when it is not, whatever the termination
-        hits is a run nobody may work on; what it achieved for the money is read back from
-        the pinned chain by the caller, never assumed."""
-        if self.control is not None:
-            ns, wf = job.record.seller_ns, job.workflow_id
-            if kind is EffectKind.CANCEL_WORKFLOW:
-                await self.control.cancel_workflow(ns, wf, reason)
-            elif kind is EffectKind.TERMINATE_RUN:
-                # Only the pinned chain: a run outside it is never terminated by a cancel.
-                await self.control.terminate_workflow(
-                    ns, wf, reason, first_run_id=job.record.run_id or ""
-                )
-            else:
-                await self.control.terminate_workflow(ns, wf, reason)
+        """Carry out a stop through the job's engine, as :data:`kontra.engine.STOPS` maps
+        escrow's effect: ``TERMINATE_RUN`` (a cancel's) ends the pinned lineage only (a run
+        outside it is never stopped by a cancel); what it achieved for the money is read
+        back from the pinned lineage by the caller, never assumed."""
+        bound = self._bound(job)
+        if bound is not None:
+            engine, handle = bound
+            stop, pinned = STOPS[kind]
+            pin = _pin(job.record.pin) if pinned else None
+            await engine.cancel(handle, stop=stop, pin=pin, reason=reason)
         if job.pending_stop is kind:
             job.pending_stop, job.pending_stop_reason = None, ""
 
@@ -3815,17 +4163,19 @@ class FakeGate:
         deadline (token expiry + grace) the gate keeps stopping any run of ``job-<id>``,
         so nobody works on a refunded job and the buyer gets no result for free."""
         return (
-            self.control is not None
+            self._bound(job) is not None
             and job.record.state is m.JobState.CANCELED
             and job.pending_stop is None
             and now < job.record.deadline
         )
 
     async def _stop_late_start(self, job: _Job) -> None:
-        """Any run of ``job-<id>`` is stopped, not only the pinned one: nobody works on a
-        refunded job, whoever started the run."""
-        assert self.control is not None
-        obs, _ = await self.control.observe(job.record.seller_ns, job.workflow_id, job.call, None)
+        """Any run of the job is stopped, not only the pinned one: nobody works on a refunded
+        job, whoever started the run."""
+        bound = self._bound(job)
+        assert bound is not None
+        engine, handle = bound
+        obs = (await engine.observe(handle, pin=None, holds=job.holds)).observation
         if (
             obs.status is ObservedStatus.RUNNING
             and obs.provenance is not Provenance.OCCUPIED  # the cancel's own placeholder
@@ -3849,16 +4199,16 @@ class FakeGate:
         job = self.jobs.get(job_id)
         if job is None or not job.record.open:
             return
-        if self.control is None:
+        bound = self._bound(job)
+        if bound is None:
             now = self.now()
             await self._transition(job_id, lambda r: escrow.tick(r, now))
             return
+        engine, handle = bound
         try:
-            obs, result = await self.control.observe(
-                job.record.seller_ns, job.workflow_id, job.call, job.record.run_id
-            )
-        except BuyerLookupError:
-            # The buyer's own namespace could not be read. The buyer controls its load, so
+            seen = await engine.observe(handle, pin=_pin(job.record.pin), holds=job.holds)
+        except PartyLookupError:
+            # The buyer's own records could not be read. The buyer controls their load, so
             # this never gives up into a blind refund: the buyer could otherwise keep it
             # failing past the deadline and be refunded for a delivered job.
             log.warning("cannot read %s's records of %s; retrying", job.buyer_ns, job.job_id)
@@ -3866,15 +4216,18 @@ class FakeGate:
         except Exception:
             now = self.now()
             if now < job.record.deadline + self.observe_give_up:
-                log.warning("cannot observe %s; retrying", job.workflow_id, exc_info=True)
+                log.warning("cannot observe job %s; retrying", job.job_id, exc_info=True)
                 return
             await self._transition(job_id, lambda r: escrow.tick(r, now))
             return
-        await self._apply_observation(job_id, obs, result)
+        await self._apply_observation(job_id, seen)
 
-    async def _apply_observation(self, job_id: str, obs: Observation, result: bytes | None) -> None:
-        """Feed one observation of ``job-<id>`` to the escrow rules: the delivery (if this
-        one delivers), history progress, and the end of the progress stream."""
+    async def _apply_observation(self, job_id: str, seen: Observed) -> None:
+        """Feed one observation of the job's run to the escrow rules: the delivery (if this
+        one delivers; only ever a :class:`~kontra.engine.SealedPayload`'s bytes), history
+        progress, and the end of the progress stream."""
+        obs = seen.observation
+        result = seen.result.data if seen.result is not None else None
         if result is not None:
             obs = replace(
                 obs, result_sha256=hashlib.sha256(result).hexdigest(), result_size=len(result)
@@ -3891,18 +4244,19 @@ class FakeGate:
             job.notify()
 
     async def _history_progress(self, job: _Job) -> None:
-        """Progress from history metadata (§8.4), recorded when it changed -- of the pinned
-        chain only, as the gate does (FIXUPS #34). Before a pin, whatever runs as
-        ``job-<id>`` is no one's job: a run the seller started itself, or the placeholder a
-        cancel left (decisions I16), is not the buyer's progress."""
-        if self.control is None or job.record.run_id is None:
+        """Progress from the engine's metadata (§8.4, :meth:`~kontra.engine.Engine.liveness`),
+        recorded when it changed -- of the pinned lineage only, as the gate does (FIXUPS
+        #34). Before a pin, whatever runs as the job is no one's job: a run the seller started
+        itself, or the placeholder a cancel left (decisions I16), is not the buyer's
+        progress."""
+        bound = self._bound(job)
+        if bound is None or job.record.pin is None:
             return
+        engine, handle = bound
         try:
-            summary = await self.control.history_summary(
-                job.record.seller_ns, job.workflow_id, job.record.run_id
-            )
+            summary = await engine.liveness(handle, pin=Pin(job.record.pin))
         except Exception:
-            log.warning("history of %s unavailable", job.workflow_id, exc_info=True)
+            log.warning("history of job %s unavailable", job.job_id, exc_info=True)
             return
         if summary is None:
             return
@@ -3915,13 +4269,13 @@ class FakeGate:
         job.last_progress = progress
         self._record_event(
             job,
+            kind=m.StreamEventKind.HISTORY,
             at=self.now(),
-            source=m.ProgressSource.HISTORY,
             state=job.record.state,
-            last_event=summary.last_event,
-            activities_completed=summary.activities_completed,
-            activities_running=list(summary.activities_running),
-            continue_as_new_count=summary.continue_as_new_count,
+            last_event=summary.last_step,
+            activities_completed=summary.steps_done,
+            activities_running=list(summary.steps_running),
+            continue_as_new_count=summary.restarts,
         )
 
     def _expire(self, now: datetime) -> None:
@@ -4139,6 +4493,14 @@ class FakeGate:
 # --------------------------------------------------------------------------- helpers
 
 
+def _wanted(event: m.StreamEvent, topics: frozenset[str], history: bool) -> bool:
+    """Whether a listener asked for ``event``: an item or a gap of one of its topics, a gap
+    that is not an item's (the relay stopped), a history event when it asked for them."""
+    if event.kind is m.StreamEventKind.HISTORY:
+        return history
+    return event.topic is None or event.topic in topics
+
+
 def _frontend_of(control: TemporalControl | None) -> str:
     """The address clients are told to dial: the control plane's own frontend when it
     has one (a dev server is both), else a name that never resolves."""
@@ -4252,17 +4614,23 @@ def _path_ref(party: str, name: str, version: str) -> OfferingRef:
     return OfferingRef(party, name, nums[0], nums[1], nums[2])
 
 
-def _decode_wire_payload(wire: m.WirePayload) -> Payload:
-    """The ``Payload`` a :class:`~kontra.gate_client.models.WirePayload` carries. Relayed,
-    never interpreted: only what is not a payload at all, or too big, is refused."""
+def _wire_bytes(wire: m.WirePayload) -> bytes:
+    """The serialized ``Payload`` a :class:`~kontra.gate_client.models.WirePayload` carries,
+    exactly as sent: what the engine relays byte for byte. Only what is too big, or not
+    base64, is refused here."""
     if len(wire.b64) > 4 * math.ceil(MAX_PAYLOAD_BYTES / 3):
         raise GateHTTPError(
             413, "too_large", f"a payload is at most {MAX_PAYLOAD_BYTES} bytes; use an Artifact"
         )
     try:
-        raw = base64.b64decode(wire.b64, validate=True)
+        return base64.b64decode(wire.b64, validate=True)
     except (binascii.Error, ValueError):
         raise GateHTTPError(422, "invalid_payload", "payload is not standard base64") from None
+
+
+def _payload_of(raw: bytes) -> Payload:
+    """``raw`` read as a ``Payload`` (to measure it, never to interpret it); 422 for what is
+    not a payload at all."""
     payload = Payload()
     try:
         payload.ParseFromString(raw)
@@ -4273,15 +4641,20 @@ def _decode_wire_payload(wire: m.WirePayload) -> Payload:
     return payload
 
 
-def _parse_quote(payload: Payload | None) -> KontraQuote:
+def _pin(value: str | None) -> Pin | None:
+    return None if value is None else Pin(value)
+
+
+def _parse_quote(document: bytes | None) -> KontraQuote:
     """The seller's answer must be a plaintext ``json/plain`` ``KontraQuote`` (decisions
-    I4); anything else is the seller's bug, reported as 502."""
-    if payload is None or payload.metadata.get("encoding") != _JSON_PLAIN:
+    I4; :attr:`kontra.engine.QuoteAnswer.document`); anything else is the seller's bug,
+    reported as 502."""
+    if document is None:
         raise GateHTTPError(
             502, "invalid_quote", "the seller's quote is not a plaintext JSON payload"
         )
     try:
-        return KontraQuote.model_validate_json(payload.data)
+        return KontraQuote.model_validate_json(document)
     except ValidationError:
         raise GateHTTPError(
             502, "invalid_quote", "the seller's quote is not a KontraQuote"
@@ -4469,7 +4842,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
         who: Party, body: m.TemporalTokenRequest, response: Response
     ) -> m.TemporalToken:
         no_store(response)
-        return gate.temporal_token(who)
+        return await gate.temporal_token(who)
 
     async def me(who: PartyOrWorker) -> m.Me:
         return gate.me(who)
@@ -4591,7 +4964,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
     # ---------------------------------------------------------------- catalog
 
     async def publish(who: Fresh, body: m.PublishRequest) -> m.CatalogEntry:
-        return await gate.publish(who, body.document)
+        return await gate.publish(who, body.document, body.streams, body.engine)
 
     async def search(
         q: Annotated[str | None, Query(max_length=SEARCH_Q_MAX)] = None,
@@ -4679,19 +5052,20 @@ def _build_app(gate: FakeGate) -> FastAPI:
     async def share_job_keys(who: Party, body: m.ShareJobKeys) -> m.SharedJobKeys:
         return gate.share_job_keys(who, body)
 
-    async def progress(
-        who: Party, job_id: str, after: Annotated[int, Query(ge=0)] = 0
+    async def stream(
+        who: Party,
+        job_id: str,
+        topic: Annotated[list[str] | None, Query(max_length=STREAMS_MAX + 1)] = None,
+        history: bool = False,
+        after: Annotated[int | None, Query(ge=0)] = None,
+        last_event_id: Annotated[str | None, Header(alias="Last-Event-ID", max_length=32)] = None,
     ) -> StreamingResponse:
-        target = gate.job_for(job_id, who.party)
+        events = gate.open_stream(who, job_id, topic or [], history, after, last_event_id)
         return StreamingResponse(
-            gate.progress_stream(target, after),
+            events,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
-
-    async def post_progress(who: PartyOrWorker, job_id: str, body: m.ProgressPost) -> Response:
-        gate.post_progress(who, job_id, body)
-        return Response(status_code=204)
 
     add("quote", quote)
     add("hire", hire)
@@ -4706,8 +5080,7 @@ def _build_app(gate: FakeGate) -> FastAPI:
     add("job_key", job_key)
     add("job_keys", job_keys)
     add("share_job_keys", share_job_keys)
-    add("progress", progress, response_class=StreamingResponse)
-    add("post_progress", post_progress)
+    add("stream", stream, response_class=StreamingResponse)
 
     # ---------------------------------------------------------------- artifacts & blobs
 

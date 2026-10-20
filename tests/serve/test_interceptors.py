@@ -1,12 +1,19 @@
-"""The ``kontra-job`` header: plain JSON, validated on the way in, never trusted otherwise."""
+"""The ``kontra-job`` header: plain JSON, validated on the way in, never trusted otherwise;
+and which heartbeats reach the buyer as progress."""
 
 from __future__ import annotations
 
-from temporalio.api.common.v1 import Payload
+import dataclasses
+from typing import Any
 
+from temporalio.api.common.v1 import Payload
+from temporalio.testing import ActivityEnvironment
+
+from kontra.codec import stream as s
 from kontra.contract.names import new_job_id
-from kontra.serve import JOB_HEADER
-from kontra.serve.interceptors import job_from_headers, job_header
+from kontra.serve import JOB_HEADER, interceptors
+from kontra.serve.interceptors import _ActivityInbound, job_from_headers, job_header
+from kontra.serve.turn import TURN_ACTIVITY
 
 
 def test_the_header_round_trips() -> None:
@@ -32,3 +39,116 @@ def test_anything_else_is_ignored() -> None:
         {"other": job_header(new_job_id())},
     ):
         assert job_from_headers(headers) is None, headers
+
+
+class _Sink:
+    def __init__(self) -> None:
+        self.offered: list[tuple[str, str, tuple[Any, ...]]] = []
+
+    def offer(self, job_id: str, activity: str, details: tuple[Any, ...]) -> None:
+        self.offered.append((job_id, activity, details))
+
+    async def settle(self, job_id: str) -> None:
+        pass
+
+
+def _offered(activity_type: str) -> list[tuple[str, str, tuple[Any, ...]]]:
+    """What a heartbeat of an activity of ``activity_type`` working for a job offers the
+    progress forwarder."""
+    sink = _Sink()
+    inbound = _ActivityInbound(None, sink)  # type: ignore[arg-type]  # next is not called
+    inbound.job_id = new_job_id()
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(env.info, activity_type=activity_type)
+    env.run(inbound.offer, ({"percent": 50},))
+    return sink.offered
+
+
+def test_a_sellers_heartbeat_is_offered_as_progress() -> None:
+    [(_, kind, details)] = _offered("enrich")
+    assert (kind, details) == ("enrich", ({"percent": 50},))
+
+
+def test_the_turn_activitys_heartbeat_never_reaches_the_buyer() -> None:
+    """``kontra.turn.v1.deliver`` heartbeats for liveness (kontra.serve.turn): Kontra's own,
+    not the seller's progress, so the forwarder never sees it."""
+    assert _offered(TURN_ACTIVITY) == []
+
+
+def test_the_guard_is_half_the_pinned_limits() -> None:
+    from pathlib import Path
+
+    import yaml
+
+    pinned = yaml.safe_load(
+        (
+            Path(__file__).resolve().parents[2] / "temporal/authorizer/dynamicconfig/kontra.yaml"
+        ).read_text()
+    )
+    assert pinned["limit.historyCount.error"][0]["value"] // 2 == interceptors.STREAM_HISTORY_EVENTS
+    assert pinned["limit.historySize.error"][0]["value"] // 2 == interceptors.STREAM_HISTORY_BYTES
+    assert pinned["limit.blobSize.warn"][0]["value"] >= s.ENVELOPE_MAX
+
+
+def test_the_answer_budget_leaves_room_in_a_workflow_tasks_reply() -> None:
+    """What a root answers in one workflow task (``STREAM_ANSWER_BUDGET``) holds its first
+    answer, cut to one envelope, so the stream makes progress; and with the rest of the
+    worker's reply to that task -- the update requests it echoes (at most
+    ``history.maxInFlightUpdates`` in flight, each a relay's at most ``RelayRequestMax``), the
+    answers with no items, one payload of the seller's at ``limit.blobSize.error`` -- it stays
+    under gRPC's 4 MiB message, which a reply must fit or Temporal ends the run."""
+    import re
+    from pathlib import Path
+
+    import yaml
+
+    root = Path(__file__).resolve().parents[2] / "temporal/authorizer"
+    pinned = yaml.safe_load((root / "dynamicconfig/kontra.yaml").read_text())
+    [in_flight] = pinned["history.maxInFlightUpdates"]
+    [blob] = pinned["limit.blobSize.error"]
+    m = re.search(r"\bRelayRequestMax = (\d+) << (\d+)\b", (root / "authorizer.go").read_text())
+    assert m is not None
+    request = int(m[1]) << int(m[2])
+    held = s.envelope_bound((), buyer_topics=(), recipients=interceptors.RECIPIENTS_BOUND)
+    assert s.ENVELOPE_MAX <= interceptors.STREAM_ANSWER_BUDGET
+    rest = blob["value"] + in_flight["value"] * (request + held)
+    assert interceptors.STREAM_ANSWER_BUDGET + rest < 4 * 1024 * 1024
+
+
+def test_the_hosted_stream_is_the_contribs_own_class() -> None:
+    """``WorkflowStream`` reads its caller's frame name: Kontra's subclass must be built from
+    an ``__init__``, and must stay the contrib's implementation."""
+    import inspect
+
+    from temporalio.contrib.workflow_streams import WorkflowStream
+
+    assert issubclass(interceptors._HostedStream, WorkflowStream)  # pyright: ignore[reportPrivateUsage]
+    source = inspect.getsource(WorkflowStream.__init__)
+    assert 'caller_name != "__init__"' in source
+    assert set(vars(interceptors._HostedStream)) <= {"__init__", "__module__", "__doc__", "__qualname__", "__firstlineno__", "__static_attributes__"}  # pyright: ignore[reportPrivateUsage]  # fmt: skip
+
+
+def test_the_recipients_bound_is_a_partys_keys_and_the_buyer() -> None:
+    """A poll's answer is cut for items sealed to at most this many keys -- the gate keeps at
+    most ``RECIPIENTS_MAX`` keys per party, and the job's buyer key is one more -- a constant,
+    so the cut (and the drain that counts on it) replays the same on any worker."""
+    from temporalio.contrib.workflow_streams import PollResult
+    from temporalio.contrib.workflow_streams._types import (  # pyright: ignore[reportPrivateUsage]
+        _WorkflowStreamWireItem,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    from kontra.gate_client.models import RECIPIENTS_MAX
+    from kontra.serve.interceptors import KontraInterceptor
+
+    assert interceptors.RECIPIENTS_BOUND == RECIPIENTS_MAX + 1
+    items = [_WorkflowStreamWireItem("events", "A" * 4_000, i) for i in range(400)]
+    sizes = [("events", i, 3_000) for i in range(400)]
+    inbound = KontraInterceptor(None)._inbound(None)  # type: ignore[arg-type]  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+    cut = inbound._trim(PollResult(items=items, next_offset=400), frozenset({"events"}))  # pyright: ignore[reportPrivateUsage]
+    fit = s.items_that_fit(sizes, buyer_topics={"events"}, recipients=interceptors.RECIPIENTS_BOUND)
+    assert 0 < len(cut.items) == fit < 400
+    assert (cut.more_ready, cut.next_offset) == (True, fit)  # the contrib's truncation
+    # Fewer keys would fit more: the bound is the most, not this worker's count.
+    assert s.items_that_fit(sizes, buyer_topics={"events"}, recipients=2) > fit
+    small = PollResult(items=items[:3], next_offset=3, more_ready=False)
+    assert inbound._trim(small, frozenset()) is small  # pyright: ignore[reportPrivateUsage]

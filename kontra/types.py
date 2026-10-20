@@ -1,6 +1,9 @@
 """Types a seller may use in ``models.py``. ``Artifact`` is the only Kontra touch allowed
-in seller models (D1, §10.8): a reference to bytes in the claim-check bucket, never the
-bytes themselves.
+in seller models (decisions I29, §10.8): a reference to bytes in the claim-check bucket,
+never the bytes themselves. Importing this module loads no Temporal.
+
+:class:`ProgressRecord` is not for models: it is the item a seller's heartbeats become on
+the job stream's ``kontra.progress`` topic (decisions I31), what ``job.progress()`` reads.
 
 The methods reach the process's Kontra runtime (``kontra._runtime``), installed by
 ``kontra.serve.Worker`` on the seller side and by ``kontra.hire.Kontra`` on the buyer side.
@@ -11,10 +14,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue
 
-__all__ = ["Artifact"]
+__all__ = ["Artifact", "ProgressRecord"]
 
 
 class Artifact(BaseModel):
@@ -92,3 +96,18 @@ class Artifact(BaseModel):
     async def read_bytes(self) -> bytes:
         """The whole plaintext in memory. For small artifacts only."""
         return b"".join([c async for c in self.chunks()])
+
+
+class ProgressRecord(BaseModel):
+    """One item of the ``kontra.progress`` topic of a job's stream: a heartbeat of one of
+    the job's activities, as Kontra's progress forwarder publishes it
+    (:mod:`kontra.serve.progress`). ``details`` are the heartbeat's details as JSON (one
+    detail as itself, several as a list)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    v: Literal[1] = 1
+    at: AwareDatetime
+    #: The activity's type name: 1 to 255 characters, no control characters.
+    activity: str = Field(min_length=1, max_length=255, pattern=r"^[^\x00-\x1f\x7f]+$")
+    details: JsonValue = None

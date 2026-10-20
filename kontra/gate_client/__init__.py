@@ -71,9 +71,14 @@ _AUTHENTICATED = frozenset(
 #: The route auth kinds whose 403 ``confirmation_required`` a ``confirm`` hook may answer:
 #: the changes. Never a read (``human``), never another code.
 _CONFIRMABLE = frozenset({"fresh", "recent", "resolver"})
-#: Statuses a progress stream retries (a gate restarting behind its proxy); others are final.
+#: Statuses a job's stream retries (a gate restarting behind its proxy); others are final.
 _STREAM_RETRY_STATUS = frozenset({502, 503, 504})
 _ERROR_TEXT_MAX = 500
+
+#: A query parameter: a list repeats it (``?topic=a&topic=b``).
+_Param = str | int | Sequence[str] | None
+#: The SSE event names of ``GET /v1/jobs/{id}/stream`` (``message`` is the default name).
+_STREAM_EVENTS = frozenset({"message", "item", "gap", "history"})
 
 # Indirection so tests can observe reconnect delays without patching asyncio itself.
 _sleep = asyncio.sleep
@@ -159,9 +164,10 @@ class ServerSentEvent:
 
 
 _LINE_END = re.compile(r"\r\n|\r|\n")
-#: Upper bound, in characters, on one unfinished line plus the data of one event. Progress
-#: events are small; without a bound a server or proxy that never ends a line or an event
-#: would grow the buffer until the buyer's process runs out of memory.
+#: Upper bound, in characters, on one unfinished line plus the data of one event. A stream
+#: event is at most a relayed item (256 KiB of ciphertext, base64); without a bound a
+#: server or proxy that never ends a line or an event would grow the buffer until the
+#: buyer's process runs out of memory.
 _SSE_MAX = 4 * 1024 * 1024
 
 
@@ -266,7 +272,7 @@ class GateClient:
     answer stands, whatever it is.
     """
 
-    #: Delays between consecutive failed reconnects of a progress stream; the stream raises
+    #: Delays between consecutive failed reconnects of a job's stream; the stream raises
     #: once they are used up. A successful connect resets the count.
     reconnect_delays: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0, 15.0)
 
@@ -331,7 +337,7 @@ class GateClient:
         self,
         route: Route,
         path: Mapping[str, str] | None,
-        params: Mapping[str, str | int | None] | None,
+        params: Mapping[str, _Param] | None,
         body: BaseModel | None,
         token: str | None,
         accept: str | None,
@@ -356,7 +362,7 @@ class GateClient:
         name: str,
         *,
         path: Mapping[str, str] | None = None,
-        params: Mapping[str, str | int | None] | None = None,
+        params: Mapping[str, _Param] | None = None,
         body: BaseModel | None = None,
         stream: bool = False,
         accept: str | None = None,
@@ -390,7 +396,7 @@ class GateClient:
         name: str,
         *,
         path: Mapping[str, str] | None = None,
-        params: Mapping[str, str | int | None] | None = None,
+        params: Mapping[str, _Param] | None = None,
         body: BaseModel | None = None,
         quiet: bool = False,
     ) -> httpx.Response:
@@ -430,7 +436,7 @@ class GateClient:
         model: type[_ModelT],
         *,
         path: Mapping[str, str] | None = None,
-        params: Mapping[str, str | int | None] | None = None,
+        params: Mapping[str, _Param] | None = None,
         body: BaseModel | None = None,
         quiet: bool = False,
     ) -> _ModelT:
@@ -626,9 +632,20 @@ class GateClient:
         await self._none("remove_device", path={"public_key": public_key})
 
     # catalog
-    async def publish(self, document: dict[str, Any]) -> m.CatalogEntry:
+    async def publish(
+        self,
+        document: dict[str, Any],
+        *,
+        streams: Sequence[str] = (),
+        engine: m.EngineName = m.DEFAULT_ENGINE,
+    ) -> m.CatalogEntry:
+        """Publish ``document`` with ``offering.yaml``'s ``streams`` and the ``engine`` the
+        version runs on (catalog data beside it, never hashed, fixed per version: decisions
+        I31, I32). The default engine is not sent: a gate reads its absence as it."""
         return await self._model(
-            "publish", m.CatalogEntry, body=m.PublishRequest(document=document)
+            "publish",
+            m.CatalogEntry,
+            body=m.PublishRequest(document=document, streams=list(streams), engine=engine),
         )
 
     async def search(
@@ -767,24 +784,43 @@ class GateClient:
             "share_job_keys", m.SharedJobKeys, body=m.ShareJobKeys(items=list(items))
         )
 
-    def progress(self, job_id: str, *, after: int = 0) -> AsyncIterator[m.ProgressEvent]:
-        """Server-sent events until the job is closed; reconnects from the last ``seq``."""
-        return self._progress(job_id, after)
+    def stream(
+        self,
+        job_id: str,
+        *,
+        topics: Sequence[str] = (),
+        history: bool = False,
+        after: int = 0,
+    ) -> AsyncIterator[m.StreamEvent]:
+        """The job's relayed workflow stream (decisions I31), server-sent events until the
+        job is closed and its relay finished; reconnects from the last ``cursor``.
+        ``topics``: the topics to read (default: every one the offering lists, and
+        ``kontra.progress``); ``history``: the platform's liveness events too. The items are
+        ciphertext: :class:`kontra.hire.Job` opens them."""
+        if isinstance(topics, str):
+            raise TypeError("topics is a sequence of topic names, not one name")
+        return self._stream(job_id, list(topics), history, after)
 
-    async def _progress(self, job_id: str, after: int) -> AsyncIterator[m.ProgressEvent]:
-        """Follow the stream, resuming with ``?after=<last seq>`` after a dropped connection
-        or a 502/503/504, with bounded backoff. A clean end of stream is the gate saying the
-        job is closed and drained, so it ends the iteration. Events at or below the last
-        seq (a replay overlapping what we already yielded) are skipped."""
+    async def _stream(
+        self, job_id: str, topics: list[str], history: bool, after: int
+    ) -> AsyncIterator[m.StreamEvent]:
+        """Follow the stream, resuming with ``?after=<last cursor>`` after a dropped
+        connection or a 502/503/504, with bounded backoff. A clean end of stream is the gate
+        saying the job is closed and drained, so it ends the iteration. Events at or below
+        the last cursor (a replay overlapping what we already yielded) are skipped."""
         _segment(job_id)  # fail before connecting, not on the first iteration's request
         last = after
         failures = 0
         while True:
             try:
                 resp = await self._send(
-                    "progress",
+                    "stream",
                     path={"job_id": job_id},
-                    params={"after": last},
+                    params={
+                        "topic": topics or None,
+                        "history": "true" if history else None,
+                        "after": last,
+                    },
                     stream=True,
                     accept="text/event-stream",
                 )
@@ -801,19 +837,19 @@ class GateClient:
                         continue
                     failures = 0
                     async for sse in _sse_events(resp.aiter_bytes(), resp.status_code):
-                        if sse.event not in ("message", "progress") or not sse.data:
+                        if sse.event not in _STREAM_EVENTS or not sse.data:
                             continue
                         try:
-                            event = _answer(m.ProgressEvent, sse.data)
+                            event = _answer(m.StreamEvent, sse.data)
                         except ValidationError as e:
                             raise GateError(
                                 resp.status_code,
                                 "invalid_response",
-                                f"a progress event is not a ProgressEvent: {e}",
+                                f"a stream event is not a StreamEvent: {e}",
                             ) from e
-                        if event.seq <= last:
+                        if event.cursor <= last:
                             continue
-                        last = event.seq
+                        last = event.cursor
                         yield event
                 finally:
                     await resp.aclose()
@@ -823,9 +859,6 @@ class GateClient:
                 if failures > len(self.reconnect_delays):
                     raise
                 await _sleep(self.reconnect_delays[failures - 1])
-
-    async def post_progress(self, job_id: str, event: m.ProgressPost) -> None:
-        await self._none("post_progress", path={"job_id": job_id}, body=event)
 
     # artifacts & claim-check blobs
     async def create_artifact(self, req: m.ArtifactCreate) -> m.ArtifactUpload:
