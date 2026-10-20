@@ -1308,14 +1308,19 @@ for contract X is never served by code running contract Y.
 A new version is a new document, endpoint and task queue. Jobs hired on the old version
 finish on a worker that still serves it.
 
-kontra-sdk declares the `temporalio` versions it is tested on, `temporalio>=1.34,<1.38`, and
-your project gets `temporalio` through it: you import it directly, so compatibility is a
+kontra-sdk declares the `temporalio` range it runs on, `temporalio>=1.34,<1.38` (its suite
+runs on the minor its lock holds: 1.34, today the only one released in the range), and your
+project gets `temporalio` through it: you import it directly, so compatibility is a
 dependency range, not an import path. Outside that range a Kontra worker refuses to start
 (Kontra's codec relies on experimental temporalio APIs a minor release may change), and
-`kontra serve` and `kontra publish` warn first, before they import `worker.py`:
-`temporalio 1.38.0 is outside the range kontra-sdk is tested on (temporalio>=1.34,<1.38);
-install one in it`. If your own dependencies pull in another `temporalio`, pin it into the
-range.
+`kontra publish` and `kontra serve` say so first, before they import `worker.py` (`publish`
+on stderr, `serve` in its log):
+
+```text
+warning: temporalio 1.38.0 is outside the range kontra-sdk is tested on (temporalio>=1.34,<1.38); install one in it, e.g. `pip install 'temporalio>=1.34,<1.38'`
+```
+
+If your own dependencies pull in another `temporalio`, pin it into the range.
 
 ## Getting paid
 
