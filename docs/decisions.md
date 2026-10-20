@@ -2427,7 +2427,7 @@ as the adapter's internals. `kontra.engine` imports no `temporalio` (a subproces
   (UNSEALED withheld, a marker the seller's code put in every value found in nothing returned);
   the buyer's withdrawal; streams (topics asked for only, offsets, `after`, `"tail"`, the end);
   quotes (the seller's failure an answer, never raised); expose; errors are not facts.
-  Twenty-eight broken FakeEngines (*amended by I40:* thirty-one) are each rejected on their
+  Twenty-eight broken FakeEngines (*amended by I40:* thirty-three) are each rejected on their
   rule, and every rule rejects at least one (a test), so weakening a check -- here or in the
   platform's copy of the contract -- fails (`tests/engine/broken_engines.py`). The FakeGate dispatches every job op through
   `engines[version.engine]` (`FakeGate(engines=...)`; by default a `TemporalEngine` over its
@@ -3638,23 +3638,38 @@ semantics are kontra-cloud's, case for case; nothing new is decided about blame.
    (`Control.describe_call`, kontra-cloud's `describe_operation` with the same answers: none
    is None, a malformed id names nothing, any other refusal is `BuyerLookupError`) after the
    observation escrow needs, and maps it. **None means "cannot say"**, the field's default,
-   and blames no one: a read that fails is None, never raised, so reputation never holds up
-   an observation, a cancel or a refund. The read is one RPC, not retried: it now happens on
-   every observation of a job with no verified lineage, and a buyer can keep its own
-   namespace refusing reads.
-5. **The fake and the contract.** `FakeEngine` reports `STARTED` once the gate's start began a
-   lineage, `REFUSED` for a start it refused (a fence, a run of the seller's own first) and
-   `NEVER_DISPATCHED` before any start, whatever runs of the seller's own exist; and
-   `FakeEngine.script_reach` sets what an engine would have recorded (an unanswered start
-   with its times, a withdrawal, None). It does not model an absent worker -- a start nothing
-   serves begins a run there -- so a test scripts `UNANSWERED`. **E19**: every verified or
-   pinned observation the suite made is `STARTED`; `NEVER_DISPATCHED` before a start and
-   while only a run of the seller's own exists; the gate's start of a job such a run took
-   first, or of a fenced job, is `REFUSED` or `NEVER_DISPATCHED` (`REFUSED` on a dev server);
-   the buyer's start that began a lineage is `STARTED`, before and after its end. Its teeth:
-   `ReachFromAnyRun` (reads the job's runs, so the seller is blamed for a run of its own when
-   the buyer never started), `BlamesWhenUnsure` (`UNANSWERED` when nothing was started) and
-   `ForgetsTheStart` (a verified lineage forged as `NEVER_DISPATCHED`).
+   and blames no one: a read that fails is None, never raised, so reputation never fails an
+   observation, a cancel or a refund. It can delay one: the read is one RPC, not retried, cut
+   off at `CALL_READ_TIMEOUT` (2 s, not the other calls' 15 s; the adapter bounds the wait
+   itself too, whatever the control plane), because it now happens on every observation of a
+   job with no verified lineage -- the gate's watch of open jobs and of canceled ones, every
+   pass, not only attribution -- in a namespace whose load its buyer controls, and its
+   failures, being None, give the gate's per-namespace backoff nothing to see. A fenced job's
+   placeholder (`OCCUPIED`) is None with no read: no gate judges a job it fenced, and a
+   canceled job is watched until its deadline (up to 30 days).
+5. **The fake and the contract.** `FakeEngine` reports what the adapter reads: `STARTED` once
+   the gate's start began a lineage, `REFUSED` for a start a run of the seller's own beat,
+   and `NEVER_DISPATCHED` before any start, whatever runs of the seller's own exist, and for
+   an observation whose `holds` are not the start's (as `reach_of` matches the call); None
+   for a fenced job's placeholder. `FakeEngine.script_reach` sets what an engine would have
+   recorded (an unanswered start with its times, a withdrawal, None). It does not model an
+   absent worker -- a start nothing serves begins a run there -- so a test scripts
+   `UNANSWERED`. **E19**: every verified or pinned observation the suite made is `STARTED`;
+   `NEVER_DISPATCHED` before a start and while only a run of the seller's own exists; the
+   gate's start of a job such a run took first is `REFUSED` or `NEVER_DISPATCHED` (`REFUSED`
+   on a dev server), of a fenced job either or None; the buyer's start observed with holds
+   that are not its own blames no one; the start that began a lineage is `STARTED`, before
+   and after its end. Every start's record the suite is handed is that start's, as the
+   gate's window reads it: made when the suite made it, giving up by the deadline it gave
+   (never later, nor never), not withdrawn where the buyer never asked (clocks may differ by
+   10 s). It cannot check a withdrawal that *was* asked: on Temporal a cancel request lands
+   only on a live call, and no start the harness makes stays live without being taken (no
+   absent worker). Its teeth: `ReachFromAnyRun` (reads the job's runs, so the seller is
+   blamed for a run of its own when the buyer never started), `BlamesWhenUnsure`
+   (`UNANSWERED` when nothing was started), `ForgetsTheStart` (a verified lineage forged as
+   `NEVER_DISPATCHED`), `ReachIgnoresHolds` (`STARTED` for a start the observation's holds do
+   not name) and `ForgesStartTimes` (a start's record made in 2000 that never gives up, which
+   passes any window).
 6. **Money is unchanged.** Escrow is handed `Observed.observation`, which has no reach; a
    test pins that `kontra/escrow.py` names neither field nor type and imports no engine type,
    and that one observation moves money the same way whatever reach came with it.
@@ -3665,7 +3680,10 @@ semantics are kontra-cloud's, case for case; nothing new is decided about blame.
    holds=...)`; `BuyerCallSeen`, the `jobs.buyer_call` values, `CallWindow` and the reasons
    stay, and a None reach is the old `BuyerLookupError` (unjudged, asked again with the
    namespace's backoff). A control plane the gate hands `TemporalEngine` implements
-   `describe_call`; one that does not gives None, never an error.
+   `describe_call`; one that does not gives None, never an error. `attribute` now depends on
+   `observe` itself succeeding (it reads the seller's namespace too, and the buyer's for
+   provenance): its `PartyLookupError` backs the buyer's namespace off as `BuyerLookupError`
+   did, and any other `EngineError` leaves the job unjudged.
 
 **Where the semantics were ambiguous, kept as kontra-cloud has them.** `NEVER_DISPATCHED` is
 "not seen", not "provably never": a buyer workflow's own call shows nothing here (a run it
@@ -3675,11 +3693,15 @@ and a buyer's own client picks the reuse policy, so a later call can replace an 
 (`UNANSWERED`). A buyer's cancel request on a call nothing took leaves it live: past the
 window it is still `UNANSWERED` and blames the seller; inside it, its wording is the buyer's
 cancel. `BAD_REQUEST` refuses whether or not the handler declared it final (a handler that sets
-no retry behaviour records it retryable); only `INTERNAL` reads the flag.
+no retry behaviour records it unspecified, which the server treats as `BAD_REQUEST`'s
+non-retryable default; `final` is True only for an explicit non-retryable); only `INTERNAL`
+reads the flag.
 
 Tested: `tests/engine/test_protocol.py` (the field's checks; the vocabulary walk over the
-enums), `test_temporal_engine.py` (the judge_call table; the read and its failures),
-`test_fake_engine_contract.py` (the model and the script), `test_engine_contract_teeth.py`
-(the three teeth), `test_temporal_engine_contract.py` (E19 on a dev server),
-`tests/control/test_provenance.py` (`describe_call` on server 1.32) and
-`tests/escrow/test_escrow.py` (escrow never reads it).
+enums, their values, and names in any spelling), `test_temporal_engine.py` (the judge_call
+table; the read, its failures, its bound and the placeholder), `test_fake_engine_contract.py`
+(the model and the script), `test_engine_contract_teeth.py` (the five teeth),
+`test_temporal_engine_contract.py` (E19 on a dev server), `tests/control/test_provenance.py`
+(`describe_call` on server 1.32), `tests/control/test_describe_call.py` (`call_record` over
+every recorded shape and every refusal `describe_call` maps, ported from kontra-cloud's
+`test_temporal_seam.py`) and `tests/escrow/test_escrow.py` (escrow never reads it).
