@@ -162,6 +162,9 @@ STREAM_REFS_MAX = 65_536
 #: The production default of the codec's ``stream_upload_budget`` (and
 #: :class:`~kontra.plugin.KontraPlugin`'s): a fifth of Temporal's 10 s workflow task timeout.
 STREAM_UPLOAD_BUDGET = 2.0
+#: The largest stream upload budget a codec takes: under Temporal's 10 s workflow task timeout,
+#: with room for the rest of the task, so no budget can hold a task past it.
+STREAM_UPLOAD_BUDGET_MAX = 8.0
 #: The failure types of a poll a job root refuses (or fails) itself: past its budget (stop),
 #: busy -- too many polls in flight, or an offset past the stream's end (wait, retry) --, any
 #: other failure of the stream's own handler (:class:`PollFailure`).
@@ -213,10 +216,14 @@ class PollFailure(ApplicationError):
 
 def check_upload_budget(seconds: float) -> float:
     """``seconds`` as a stream upload budget (:data:`STREAM_UPLOAD_BUDGET`): a finite number
-    of seconds above 0, or :class:`ValueError`. A budget of 0 would make every item a stub,
-    and an unbounded one would let a slow bucket hold a workflow task past its timeout."""
-    if not (math.isfinite(seconds) and seconds > 0):
-        raise ValueError("stream_upload_budget must be a finite number of seconds above 0")
+    of seconds above 0 and at most :data:`STREAM_UPLOAD_BUDGET_MAX`, or :class:`ValueError`.
+    A budget of 0 would make every item a stub, and a larger one would let a slow bucket hold
+    a workflow task past its timeout."""
+    if not (math.isfinite(seconds) and 0 < seconds <= STREAM_UPLOAD_BUDGET_MAX):
+        raise ValueError(
+            "stream_upload_budget must be a number of seconds above 0 and at most "
+            f"{STREAM_UPLOAD_BUDGET_MAX:g}"
+        )
     return float(seconds)
 
 

@@ -282,11 +282,13 @@ async def test_one_upload_budget_per_completion() -> None:
 
 
 def test_the_upload_budget_is_the_codecs_to_set() -> None:
-    """2 s by default (``kontra serve``'s), any finite number of seconds above 0 given; 0, a
-    negative, an infinite or a NaN budget refused when the codec is built."""
+    """2 s by default (``kontra serve``'s), any number of seconds above 0 and at most 8 given;
+    0, a negative, one past 8 (under the 10 s task timeout), an infinite or a NaN budget
+    refused when the codec is built."""
     assert codec().stream_upload_budget == s.STREAM_UPLOAD_BUDGET == 2.0
     assert codec(stream_upload_budget=8).stream_upload_budget == 8.0
-    for bad in (0, -1.0, float("inf"), float("nan")):
+    assert s.STREAM_UPLOAD_BUDGET_MAX == 8.0
+    for bad in (0, -1.0, 8.01, 30, float("inf"), float("nan")):
         with pytest.raises(ValueError, match="stream_upload_budget"):
             codec(stream_upload_budget=bad)
 

@@ -319,9 +319,8 @@ async def test_the_relay_waits_out_its_rate_and_reads_on(cluster: Cluster) -> No
             query=WorkflowQuery(query_type=names.STREAM_OFFSET_QUERY),
         )
         seen = _RateSeen(relay.workflow_service)
-        empty = asyncio.Event()
 
-        async def spend() -> None:
+        async def spend(empty: asyncio.Event) -> None:
             # The same subject's offset queries until the relay's own poll is refused for the
             # rate: its bucket is empty when the relay starts, and stays so until then.
             async def one() -> None:
@@ -336,9 +335,10 @@ async def test_the_relay_waits_out_its_rate_and_reads_on(cluster: Cluster) -> No
 
             await asyncio.gather(*(one() for _ in range(4)))
 
-        items: list[_relay.RelayItem] = []
-        async with asyncio.timeout(60):
-            spender = asyncio.create_task(spend())
+        async def read_once() -> list[_relay.RelayItem]:
+            empty = asyncio.Event()
+            spender = asyncio.create_task(spend(empty))
+            read: list[_relay.RelayItem] = []
             try:
                 await empty.wait()
                 async for batch in _relay.relay(
@@ -351,13 +351,24 @@ async def test_the_relay_waits_out_its_rate_and_reads_on(cluster: Cluster) -> No
                     min_interval=0.0,
                     blobs=seller.blobs.fetch,
                 ):
-                    items += batch.items
-                    if len(items) >= 2:
+                    read += batch.items
+                    if len(read) >= 2:
                         break
             finally:
                 spender.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await spender
+            return read
+
+        # The bucket refills continuously (a token every 100 ms): a relay poll that lands just
+        # as one appears, before a spender takes it, is admitted and may read both items with
+        # no refusal at all. Read again from 0 until a refusal is seen, a few times at most.
+        items: list[_relay.RelayItem] = []
+        async with asyncio.timeout(120):
+            for _ in range(5):
+                items = await read_once()
+                if seen.refused:
+                    break
         assert seen.refused > 0  # refused for its rate, and it read on
         assert [i.offset for i in items] == [0, 1]
         await handle.signal(app.BoundJob.finish)

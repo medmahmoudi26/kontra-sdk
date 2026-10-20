@@ -183,7 +183,7 @@ def test_a_stream_upload_budget_that_bounds_nothing_is_refused(tmp_path: Path) -
     """The budget is a finite number of seconds above 0, checked when the plugin is built
     (no I/O yet): 0 would stub every item, an infinite one hold a task on a slow bucket."""
     bound = seller.bind(write_offering(tmp_path))
-    for bad in (0, -2.0, float("inf"), float("nan")):
+    for bad in (0, -2.0, 30.0, float("inf"), float("nan")):
         with pytest.raises(ValueError, match="stream_upload_budget"):
             KontraPlugin(bound, stream_upload_budget=bad)
 
