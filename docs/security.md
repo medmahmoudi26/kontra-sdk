@@ -313,9 +313,7 @@ written to the job's history: Temporal stores a completed Update's outcome
 (`WorkflowExecutionUpdateCompleted`), up to the envelope's 512 KiB, and every relay poll
 spends one of the run's updates (`history.maxTotalUpdates`, Temporal's default of 2,000,
 pinned in `dynamicconfig/kontra.yaml`). A genuine relay doubles the listed topics' volume in
-history. Before #52 a leaked relay token could spend that on purpose -- polling from offset 0
-again and again until the history passed `limit.historySize.error` (20 MiB, pinned in
-`dynamicconfig/kontra.yaml`) and Temporal terminated the run, refunded against the seller. Now
+history. Before #52 nothing bounded what a leaked relay token's polls could add to the job's history. Now
 every job root refuses a poll at validation (`KontraStreamFull`) once its history is past half
 of the pinned limits (10,240 events or 10 MiB), and Temporal writes nothing to history for a
 refused update. **The guard bounds history growth only:** past it no poll adds to the history
