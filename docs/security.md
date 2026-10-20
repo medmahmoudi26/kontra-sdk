@@ -275,9 +275,9 @@ builds is under 900 bytes: nine topics (an offering's eight streams and `kontra.
 at most 64 characters, an offset, the pinned run id and its identity. The cap keeps what a
 relay token's requests can add to one workflow task of its job far below the 4 MiB gRPC
 message every workflow task must fit in (Temporal terminates a run whose workflow task it
-cannot deliver): Temporal holds at most `history.maxInFlightUpdates` (10 by default) of a
-workflow's updates in flight at once, so that is at most 40 KiB. A party's own requests are
-not capped: the cap is the relay rule's.
+cannot deliver): Temporal holds at most `history.maxInFlightUpdates` (10, Temporal's default,
+pinned in `dynamicconfig/kontra.yaml`) of a workflow's updates in flight at once, so that is
+at most 40 KiB. A party's own requests are not capped: the cap is the relay rule's.
 
 The relay needs nothing else. Re-sending its Update with the same update id returns that
 update's outcome, and with an empty run id it targets the current run, so it follows a
@@ -298,9 +298,9 @@ history: Temporal stores a completed Update's outcome in the history
 returns, up to the stream's response cap of about 1 MB. A genuine relay therefore doubles a
 stream's volume in history (each item once in the publish signal that wrote it, and again in
 the poll that read it) and spends one of the run's updates per poll (`history.maxTotalUpdates`,
-Temporal's default of 2,000; Kontra does not pin it). A leaked relay token can spend them on
-purpose. Polling from offset 0 again and again, each time with a new update id, it appends up
-to 2,000 completed updates of up to about 1 MB each, and once the history passes
+Temporal's default of 2,000, pinned in `dynamicconfig/kontra.yaml`). A leaked relay token can
+spend them on purpose. Polling from offset 0 again and again, each time with a new update id,
+it appends up to 2,000 completed updates of up to about 1 MB each, and once the history passes
 `limit.historySize.error` (20 MiB, pinned in `dynamicconfig/kontra.yaml`) Temporal terminates
 the run. Escrow then refunds the job as "seller workflow terminated", against the seller. Any
 stream above about 10.5 KB is enough; one of about 1 MB takes about twenty polls (measured
@@ -314,9 +314,9 @@ continue-as-new when `workflow.info().is_continue_as_new_suggested()`: that turn
 termination into churn, because escrow follows the pinned chain and the relay's empty run id
 follows its current run. The gate's relay (#52) polls only from the tail, with topics: that
 keeps a genuine relay's share of history to what its buyer reads, but does nothing against a
-leaked token, which picks its own offset. A per-namespace `history.maxTotalUpdates` pin bounds
-it only together with continue-as-new: 20 MiB at 1 MB a poll is about twenty updates, which
-would also cap a genuine subscription's polls per run.
+leaked token, which picks its own offset. A per-namespace `history.maxTotalUpdates` below the
+pinned 2,000 bounds it only together with continue-as-new: 20 MiB at 1 MB a poll is about
+twenty updates, which would also cap a genuine subscription's polls per run.
 
 ### The worker controller
 
