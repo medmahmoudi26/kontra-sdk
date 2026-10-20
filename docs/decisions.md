@@ -2243,6 +2243,9 @@ the budget, for the reason I30 gives: a test that ended a job would be a recipe.
 
 ## I32. The engine is a property of the offering, reached through a narrow Protocol (kontra-sdk#55; decision 9 of #50)
 
+_OD1–OD11 below were decided by the implementer in the owner's place, as kontra-sdk#50 directs
+(no step waits on an answer); each is listed on #55 for the owner to confirm or overturn._
+
 Engine-agnosticism lives at a different boundary than the façade sat on:
 
 ```
@@ -2255,10 +2258,10 @@ The ledger's pattern (seam ④): a Protocol (`kontra/engine/__init__.py`), a fak
 (`kontra.testing.engine_contract`). Nexus becomes the Temporal adapter's implementation detail
 (`kontra/engine/temporal.py`), not a concept Kontra knows. A package and a module named
 `kontra.engine` cannot coexist, so the Protocol is the package's `__init__` and the adapter its
-`temporal` module (owner, OD10); `kontra._control` stays where it is (kontra-cloud imports it)
+`temporal` module (OD10); `kontra._control` stays where it is (kontra-cloud imports it)
 as the adapter's internals. `kontra.engine` imports no `temporalio` (a subprocess test).
 
-* **Why eleven members, not the issue's five** (owner, OD1). Each is a call a gate already makes
+* **Why eleven members, not the issue's five** (OD1). Each is a call a gate already makes
   to Temporal; with five, the gate would stay Temporal-coupled at hire, quote, publish,
   cancel-before-start and liveness, and escrow could not be fed through the seam.
   `start(contract, input, job_id) -> handle` splits into **`bind(plan) -> handle`** (pure, at
@@ -2273,10 +2276,10 @@ as the adapter's internals. `kontra.engine` imports no `temporalio` (a subproces
   history events of §8.4), **`quote`** (I4's relay), **`expose`** (I1/I3's endpoint at
   publish), **`isolate`** (a party's home, and with a session its credential: "the
   authorizer-on-the-frontend", the whole ballgame), **`stream`** (#52's relay, I31), and
-  **`name`**. The Workers view (I21, owner OD8) and kontra-cloud's blame read for a job that
-  never started (FIXUPS #22, owner OD7: a follow-up, not ported) are Temporal-only extensions,
+  **`name`**. The Workers view (I21, OD8) and kontra-cloud's blame read for a job that
+  never started (FIXUPS #22, OD7: a follow-up, not ported) are Temporal-only extensions,
   their models being Temporal's by definition.
-* **The engine-neutral job record** (owner, OD2). A job's handle is opaque bytes the adapter
+* **The engine-neutral job record** (OD2). A job's handle is opaque bytes the adapter
   minted (Temporal: `temporal/1\n` + canonical JSON of `{buyer, job, offering, route,
   seller}`, at most 1 KiB), stored on the job row and handed back verbatim. Only its adapter
   parses it, strictly and before any I/O -- prefix, size, exactly those keys, each field by its
@@ -2287,8 +2290,8 @@ as the adapter's internals. `kontra.engine` imports no `temporalio` (a subproces
   handle carries it). `HoldClaims.seller_ns`/`buyer_ns` stay on the wire: the seller's handler
   checks them. `EffectKind` values stay -- they are persisted in kontra-cloud's
   `jobs.pending_stop` -- and `kontra.engine.STOPS` maps each onto a `Stop` and whether the pin
-  goes with it (owner, OD9). The lockstep migration is kontra-cloud#45's.
-* **End-to-end encryption is a Protocol guarantee, not a Temporal feature** (owner, OD3).
+  goes with it (OD9). The lockstep migration is kontra-cloud#45's.
+* **End-to-end encryption is a Protocol guarantee, not a Temporal feature** (OD3).
   Content leaves an adapter only as `SealedPayload` (a delivery: the codec's envelope,
   `binary/kontra-age` with an age file, or `binary/kontra-claim-check`; canonical; `kontra-v`
   1 and no other metadata; `kontra.codec.check_sealed`) or `Sealed` (a relayed stream item, an
@@ -2306,7 +2309,7 @@ as the adapter's internals. `kontra.engine` imports no `temporalio` (a subproces
   "delivery not sealed", counted against the seller (who bypassed the codec). The quote's
   answer is the one plaintext that crosses (a price, I4); a quote refusal's message is the
   seller's own words, logged by the gate, never stored for a party.
-* **The engine at publish** (owner, OD4, OD5, OD11). `PublishRequest.engine:
+* **The engine at publish** (OD4, OD5, OD11). `PublishRequest.engine:
   Literal["temporal"]` (`ENGINE_NAMES`), **beside the contract hash, not in `x-kontra`**:
   catalog data like `recipients` and `streams`, so no hash, golden or published document
   moves. Fixed per version at its first publish (409 `engine_fixed` with the recorded engine,
@@ -2348,8 +2351,7 @@ as the adapter's internals. `kontra.engine` imports no `temporalio` (a subproces
   isolation proof, dev stack and fake do not amortise, and a Golem adapter is a product change
   (seller code on Kontra's sandbox, not the seller's hardware), not plumbing. The buyer-facing
   Temporal coordinates (`CatalogEntry.endpoint`/`service`/`task_queue`, `HireView.endpoint`,
-  `workflow_id`, `operation_id`, `JobView.workflow_id`/`operation_id`) stay for v1 (owner,
-  OD6): "buyers never see `engine`" holds literally, and whether a second adapter bridges them
+  `workflow_id`, `operation_id`, `JobView.workflow_id`/`operation_id`) stay for v1 (OD6): "buyers never see `engine`" holds literally, and whether a second adapter bridges them
   (a gate-hosted Nexus endpoint) or makes them optional is the open question it must answer.
 * **The guardrail.** The Protocol never grows a workflow-authoring member: none runs, defines
   or schedules seller code, and the only callable any member takes is the gate's own `closed`
