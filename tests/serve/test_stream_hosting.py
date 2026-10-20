@@ -1,7 +1,8 @@
 """The job's workflow stream, hosted, marked, guarded and drained by Kontra's workflow
 interceptor (decisions I31), on a dev server: a root that hosts no stream gets Kontra's, one
 that hosts its own keeps it; a poll in the run's first activation is answered; the tail of a
-short job reaches the relay; a continue-as-new chain keeps offsets monotonic and loses
+short job reaches the relay; the answers of one workflow task stay within its budget, and the
+drain waits for the ones held back; a continue-as-new chain keeps offsets monotonic and loses
 nothing; the history guard stops the relay; every history replays."""
 
 from __future__ import annotations
@@ -14,7 +15,8 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateStage
+from temporalio.api.common.v1 import Payload
+from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHistory, WorkflowUpdateStage
 from temporalio.common import RawValue
 from temporalio.contrib.workflow_streams import PollInput, WorkflowStreamClient
 from temporalio.worker import Replayer, Worker
@@ -28,7 +30,17 @@ from kontra.serve import interceptors, seller_data_converter
 from kontra.serve.interceptors import KontraInterceptor
 from kontra.testing.devserver import DevServer
 
-from .streamflows import LISTED, UNLISTED, Burst, ChainJob, HostedJob, OwnInput, OwnStreamJob, burst
+from .streamflows import (
+    LISTED,
+    UNLISTED,
+    Burst,
+    ChainJob,
+    FilledJob,
+    HostedJob,
+    OwnInput,
+    OwnStreamJob,
+    burst,
+)
 
 pytestmark = [pytest.mark.temporal, pytest.mark.asyncio(loop_scope="module")]
 
@@ -230,6 +242,108 @@ async def test_the_drain_counts_only_what_the_envelope_carried(rig: Rig) -> None
     assert [i.offset for i in items] == list(range(8))
     assert all(len(opened(i)["pad"]) == 100_000 for i in items)
     assert await handle.result() == "ok"
+
+
+def first_task_answers(history: WorkflowHistory) -> list[Payload]:
+    """The poll answers the run's first workflow task completed, as its history stores them
+    (the outcomes of the updates completed in that task's reply)."""
+    answers: list[Payload] = []
+    tasks = 0
+    for e in history.events:
+        if e.HasField("workflow_task_completed_event_attributes"):
+            tasks += 1
+            if tasks > 1:
+                break
+        elif tasks and e.HasField("workflow_execution_update_completed_event_attributes"):
+            [answer] = (
+                e.workflow_execution_update_completed_event_attributes.outcome.success.payloads
+            )
+            answers.append(answer)
+    return answers
+
+
+async def polled_before_its_first_task(
+    rig: Rig, relays: int, n: int, pad: int, *, wait: bool
+) -> tuple[str, Any, list[AsyncIterator[_relay.RelayBatch]], str]:
+    """A :class:`FilledJob` started on a queue no worker serves yet, and ``relays`` relays
+    whose first polls the server holds for its first workflow task, which then completes
+    them all, in one reply. The caller iterates the relays, then starts the worker."""
+    queue = f"budget-{uuid.uuid4().hex[:8]}"
+    job = new_job_id()
+    handle = await rig.seller.start_workflow(
+        FilledJob.run, args=[n, pad, wait], id=job_workflow_id(job), task_queue=queue
+    )
+    return job, handle, [rig.relay(job) for _ in range(relays)], queue
+
+
+async def replays(rig: Rig, history: WorkflowHistory, interceptor: KontraInterceptor) -> None:
+    replayer = Replayer(
+        workflows=[FilledJob], interceptors=[interceptor], data_converter=rig.seller.data_converter
+    )
+    result = await replayer.replay_workflow(history, raise_on_replay_failure=False)
+    assert result.replay_failure is None, result.replay_failure
+
+
+async def test_the_answers_of_one_workflow_task_stay_within_its_budget(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The polls one workflow task completes answer in one reply to it: past
+    ``STREAM_ANSWER_BUDGET`` a poll is answered with no items and ``more_ready``, and polls
+    again. Four relays' first polls, all completed in the job's first task: one is answered
+    (cut to an envelope), the others are held back at offset 0; the job keeps running, and
+    every relay then reads the whole stream. The budget is scaled down to one and a half
+    envelopes, so the case stays small."""
+    budget = s.ENVELOPE_MAX * 3 // 2
+    monkeypatch.setattr(interceptors, "STREAM_ANSWER_BUDGET", budget)
+    job, handle, relays, queue = await polled_before_its_first_task(rig, 4, 6, 100_000, wait=True)
+    reading = [asyncio.create_task(collect(r, 6)) for r in relays]
+    await asyncio.sleep(1.0)  # the polls wait for the first workflow task
+    interceptor = KontraInterceptor(None, streams={queue: [LISTED]})
+    async with Worker(
+        rig.seller, task_queue=queue, workflows=[FilledJob], interceptors=[interceptor]
+    ):
+        got = await asyncio.wait_for(asyncio.gather(*reading), 60)
+        assert [[i.offset for i in items] for items in got] == [list(range(6))] * 4
+        assert all(len(opened(i)["pad"]) == 100_000 for items in got for i in items)
+        assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
+        await handle.signal(FilledJob.finish)
+        assert await handle.result() == "ok"
+    history = await rig.plain.get_workflow_handle(job_workflow_id(job)).fetch_history()
+    first = first_task_answers(history)
+    assert len(first) == 4  # all four in one task: the case is not vacuous
+    assert sum(len(p.data) for p in first) <= budget
+    answered, *held = [s.parse_envelope(p) for p in first]
+    assert answered.items  # cut to one envelope, as before
+    assert answered.more_ready
+    assert [(len(e.items), e.next_offset, e.more_ready) for e in held] == [(0, 0, True)] * 3
+    await replays(rig, history, interceptor)
+
+
+async def test_the_drain_waits_for_the_answers_held_back(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job that publishes and returns in its first workflow task, which also completes four
+    relays' first polls under a budget that holds all but one back: it still waits until a
+    poll has answered to its stream's end, so the tail reaches a relay before it closes."""
+    monkeypatch.setattr(interceptors, "STREAM_ANSWER_BUDGET", 1)  # one answer per task
+    job, handle, relays, queue = await polled_before_its_first_task(rig, 4, 6, 100_000, wait=False)
+    reading = [asyncio.create_task(until_closed(r)) for r in relays]
+    await asyncio.sleep(1.0)
+    interceptor = KontraInterceptor(None, streams={queue: [LISTED]})
+    async with Worker(
+        rig.seller, task_queue=queue, workflows=[FilledJob], interceptors=[interceptor]
+    ):
+        got = await asyncio.wait_for(asyncio.gather(*reading), 60)
+        assert await handle.result() == "ok"
+    offsets = [[i.offset for i in items] for items in got]
+    assert max(offsets, key=len) == list(range(6))
+    assert all(o == list(range(len(o))) for o in offsets)  # no gap, no repeat
+    history = await rig.plain.get_workflow_handle(job_workflow_id(job)).fetch_history()
+    answered, *held = [s.parse_envelope(p) for p in first_task_answers(history)]
+    assert answered.items
+    assert answered.more_ready
+    assert [(len(e.items), e.more_ready) for e in held] == [(0, True)] * 3
+    await replays(rig, history, interceptor)
 
 
 async def test_a_continue_as_new_chain_keeps_offsets_and_loses_nothing(rig: Rig) -> None:

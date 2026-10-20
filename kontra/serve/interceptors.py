@@ -45,12 +45,19 @@ nothing else, so the root hosts the stream (``temporalio.contrib.workflow_stream
   history is past half of Kontra's pinned limits (:data:`STREAM_HISTORY_EVENTS`,
   :data:`STREAM_HISTORY_BYTES`). A rejected update is not written to history, so past it no
   poll adds to the history: the relay's share stays near half of the limits (a job someone
-  listens to must keep its own work under the other half). It bounds history growth only. A burst of oversized poll
-  requests would end a run whatever this answers (the SDK echoes refused updates too): the
-  Authorizer refuses a relay request over 4 KiB (decisions I30), and with both, what a relay
-  token's polls do to the job's history is bounded. Neither bounds the answers: the polls one
-  workflow task completes answer in one reply, which concurrent polls can push past gRPC's
-  4 MiB limit, ending the run (``docs/security.md``, residual risks; decisions I31).
+  listens to must keep its own work under the other half). It bounds history growth only.
+  A burst of oversized poll requests would end a run whatever this answers (the SDK echoes
+  refused updates too): the Authorizer refuses a relay request over 4 KiB (decisions I30),
+  and with both, what a relay token's polls do to the job's history is bounded. The answers
+  are the answer budget's.
+* **Answer budget.** The polls one workflow task completes answer together, in the worker's
+  reply to that task, which must fit gRPC's 4 MiB message or Temporal ends the run. A root
+  answers at most :data:`STREAM_ANSWER_BUDGET` (1.5 MiB) in one workflow task; a poll past
+  it is answered with no items and ``more_ready``, at the offset it would have started from,
+  so its poller polls again and is answered in a later task. The first answer of a task is
+  always sent, so the stream makes progress, and one held back is not counted as read (the
+  drain below waits for it). The task is told apart by the run's history length, which is
+  the same for every answer of one task, and the same on replay.
 * **Drain.** A relay sleeps between polls, so a job that publishes and returns would close
   before the next poll. When the run returns or fails and any poll was seen in the chain,
   the root waits (at most :data:`DRAIN_TIMEOUT`) for a poll to have answered up to the
@@ -109,9 +116,11 @@ from temporalio.worker import (
 from kontra import _runtime
 from kontra.codec.stream import (
     BUYER_TOPICS_KEY,
+    ENVELOPE_MAX,
     POLL_MARK,
     STREAM_MARK,
     buyer_topics,
+    envelope_bound,
     items_that_fit,
 )
 from kontra.codec.stream import offset_payload as _offset_payload
@@ -129,6 +138,7 @@ __all__ = [
     "DRAIN_TIMEOUT",
     "JOB_HEADER",
     "RECIPIENTS_BOUND",
+    "STREAM_ANSWER_BUDGET",
     "STREAM_BASE_HEADER",
     "STREAM_FULL",
     "STREAM_HISTORY_BYTES",
@@ -162,6 +172,16 @@ STREAM_FULL = "KontraStreamFull"
 #: keeps at most 16, ``gate_client.models.RECIPIENTS_MAX``) and the job's buyer key. A poll's
 #: answer is cut to what surely fits one envelope sealed to that many.
 RECIPIENTS_BOUND = 16 + 1
+#: The most a job root answers its stream's polls with in one workflow task, counted with
+#: :func:`~kontra.codec.stream.envelope_bound` over the answers that carry items: past it, a
+#: poll is answered with no items and ``more_ready``, and its poller polls again (decisions
+#: I31). The worker's reply to a workflow task carries every answer completed in it, and must
+#: fit gRPC's 4 MiB. Three full envelopes (1.5 MiB) leave the rest of that reply 2.5 MiB: the
+#: update requests it echoes (a relay's are at most 4 KiB, ``RelayRequestMax``, and at most
+#: ``history.maxInFlightUpdates``, 10, are in flight: 40 KiB), the answers with no items (a
+#: frame each), and the seller's own commands, one payload at Kontra's pinned
+#: ``limit.blobSize.error`` (2 MiB) included.
+STREAM_ANSWER_BUDGET = 3 * ENVELOPE_MAX
 _JSON_PLAIN = b"json/plain"
 _INT = re.compile(rb"0|[1-9][0-9]{0,18}", re.ASCII)
 
@@ -239,6 +259,10 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
     _in_flight: int = 0
     #: The largest ``next_offset`` of a poll answered with ``more_ready`` false.
     _answered_to: int = 0
+    #: The workflow task whose answers :attr:`_task_answered` counts (its history length, see
+    #: :meth:`_budget`), and the bytes answered in it.
+    _task: int = -1
+    _task_answered: int = 0
     #: The headers of the continue-as-new this run raised (the base is rewritten there).
     _can_headers: dict[str, Payload] | None = None
 
@@ -389,7 +413,7 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
         if not isinstance(result, PollResult):
             return result  # not the stream's answer: encrypted whole, the relay stops
         listed = self._listed.get(workflow.info().task_queue, frozenset[str]())
-        result = self._trim(result, listed)
+        result = self._budget(self._trim(result, listed), listed)
         if not result.more_ready:
             self._answered_to = max(self._answered_to, result.next_offset)
         [p] = workflow.payload_converter().to_payloads([result])
@@ -405,14 +429,39 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
         any party's item is sealed to, a constant, never this worker's own key count."""
         items = result.items
         fit = items_that_fit(
-            # A wire item's data is base64 of the serialized Payload: 3/4 of it, at most.
-            ((i.topic, i.offset, len(i.data) * 3 // 4) for i in items),
-            buyer_topics=listed | {PROGRESS_TOPIC},
-            recipients=RECIPIENTS_BOUND,
+            _sizes(items), buyer_topics=listed | {PROGRESS_TOPIC}, recipients=RECIPIENTS_BOUND
         )
         if fit >= len(items):
             return result
         return PollResult(items=items[:fit], next_offset=items[fit].offset, more_ready=True)
+
+    def _budget(self, result: PollResult, listed: frozenset[str]) -> PollResult:
+        """The (cut) answer, or none yet: when it would take what this workflow task answers
+        past :data:`STREAM_ANSWER_BUDGET`, the poll is answered with no items and
+        ``more_ready``, ``next_offset`` at the first item it held back (the contrib's own
+        truncation protocol: the poller polls again at once, and is answered in a later
+        task). Only answers that carry items are counted, and the first of a task is always
+        sent, so the stream makes progress; one held back is never counted as read, so the
+        drain waits for the poll that carries it.
+
+        The task is the run's current history length, as Temporal gave it to this
+        activation: the same for every answer completed in one workflow task (the activations
+        that resolve its local activities included), larger for the next, and the same on
+        replay -- so the cut, and the drain's count of it, replay the same."""
+        if not result.items:
+            return result  # a frame: part of the rest of the reply (STREAM_ANSWER_BUDGET)
+        task = workflow.info().get_current_history_length()
+        if task != self._task:
+            self._task, self._task_answered = task, 0
+        cost = envelope_bound(
+            _sizes(result.items),
+            buyer_topics=listed | {PROGRESS_TOPIC},
+            recipients=RECIPIENTS_BOUND,
+        )
+        if self._task_answered and self._task_answered + cost > STREAM_ANSWER_BUDGET:
+            return PollResult(items=[], next_offset=result.items[0].offset, more_ready=True)
+        self._task_answered += cost
+        return result
 
     async def handle_query(self, input: HandleQueryInput) -> Any:
         result = await super().handle_query(input)
@@ -425,6 +474,12 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
         ):
             return RawValue(_offset_payload(result))
         return result
+
+
+def _sizes(items: Iterable[Any]) -> Iterable[tuple[str, int, int]]:
+    """``(topic, offset, size)`` of a poll's wire items, for the codec's arithmetic: a wire
+    item's data is base64 of the serialized Payload, so 3/4 of it is at least its size."""
+    return ((i.topic, i.offset, len(i.data) * 3 // 4) for i in items)
 
 
 class _WorkflowOutbound(WorkflowOutboundInterceptor):

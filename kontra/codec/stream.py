@@ -79,6 +79,7 @@ __all__ = [
     "EnvelopeItem",
     "ItemUnreadable",
     "buyer_topics",
+    "envelope_bound",
     "items_that_fit",
     "offset_payload",
     "open_item",
@@ -341,6 +342,19 @@ def items_that_fit(
             break
         count += 1
     return count
+
+
+def envelope_bound(
+    items: Iterable[tuple[str, int, int]], *, buyer_topics: Collection[str], recipients: int
+) -> int:
+    """At least the size of the envelope :func:`seal_poll` writes for ``items`` (the
+    arguments of :func:`items_that_fit`), its frame included. Kontra's workflow interceptor
+    counts the answers one workflow task carries with it (pure arithmetic, in the sandbox,
+    the same on every worker)."""
+    total = _ENVELOPE_FRAME
+    for topic, offset, size in items:
+        total += _item_bound(topic, offset, size, topic in buyer_topics, recipients)
+    return total
 
 
 async def seal_poll(

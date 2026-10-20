@@ -44,6 +44,7 @@ from kontra.contract.names import (
     job_workflow_id,
     new_job_id,
 )
+from kontra.contract.offering import STREAMS_MAX
 from kontra.serve.interceptors import KontraInterceptor
 from kontra.testing.devserver import DevServer
 
@@ -356,6 +357,19 @@ async def test_unlisted_and_unasked_items_are_dropped(waits: list[float]) -> Non
     assert batch.run_id == "run-1"
 
 
+async def test_an_answer_held_back_is_polled_again_at_once(waits: list[float]) -> None:
+    """A job root past its answer budget for a workflow task answers no items and
+    ``more_ready`` at the offset asked (``kontra.serve.interceptors``): not a refusal, so the
+    relay polls the same offset again, without waiting."""
+    held = success(envelope([], 0, more_ready=True))
+    service = Scripted([held, held, success(envelope([ITEM], 1))])
+    batches, _ = await run(service, min_interval=5.0)
+    assert [(len(b.items), b.next_offset) for b in batches] == [(0, 0), (0, 0), (1, 1)]
+    assert service.offsets() == [0, 0, 0, 1]
+    assert len(set(service.ids())) == 4  # each a poll of its own
+    assert waits == [pytest.approx(5.0, abs=1.0)]  # once, after the answer that was not held
+
+
 async def test_pacing(waits: list[float]) -> None:
     paced: list[float | None] = [10.0, None]
 
@@ -410,6 +424,30 @@ async def test_the_relay_names_its_topics() -> None:
             await run(Scripted([]), topics=bad)
     with pytest.raises(ValueError, match="start"):
         await run(Scripted([]), start=-1)
+
+
+def test_a_poll_names_at_most_an_offerings_streams_and_progress() -> None:
+    """``_TOPICS_MAX`` is ``STREAMS_MAX`` and ``kontra.progress``; the largest poll the relay
+    builds -- that many 64-character topics, the largest offset, a pinned run id and a long
+    identity -- is far under the Authorizer's cap on a relay request, and one topic more is
+    refused here, before it would be denied there."""
+    import re
+    from pathlib import Path
+
+    assert _relay._TOPICS_MAX == STREAMS_MAX + 1  # pyright: ignore[reportPrivateUsage]
+    go = (Path(__file__).resolve().parents[2] / "temporal/authorizer/authorizer.go").read_text()
+    m = re.search(r"\bRelayRequestMax = (\d+) << (\d+)\b", go)
+    assert m is not None
+    cap = int(m[1]) << int(m[2])
+    topics = [f"t{i}" + "x" * 62 for i in range(STREAMS_MAX)] + [PROGRESS_TOPIC]
+    request, chosen = _relay._request, _relay._topics  # pyright: ignore[reportPrivateUsage]
+    identity = "4194304@" + "h" * 64
+    req = request(
+        "n" * 32, job_workflow_id(JOB), str(uuid.uuid4()), chosen(topics), 2**63 - 1, identity
+    )
+    assert req.ByteSize() < cap // 4
+    with pytest.raises(ValueError, match="at most"):
+        chosen([*topics, "t9" + "x" * 62])
 
 
 async def test_the_start_is_the_callers_to_say() -> None:
