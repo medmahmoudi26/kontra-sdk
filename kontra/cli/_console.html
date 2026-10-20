@@ -644,7 +644,7 @@ function select(id) {
   shownEvent = null;
   draw(G);
   pane();
-  highlightRows();
+  reveal(highlightRows()); // a node's rows, brought into view in the session's own box
 }
 function linkRow(links, labels) {
   const row = el("div", { class: "links" });
@@ -756,7 +756,20 @@ function failureBox(n, decoded) {
 // Rows link to graph nodes (OD4): a row selects and flashes its node; a node lights its rows.
 function highlightRows() {
   document.querySelectorAll("#session .row.sel").forEach(r => r.classList.remove("sel"));
-  if (selected) document.querySelectorAll(`#session .row[data-node="${CSS.escape(selected)}"]`).forEach(r => r.classList.add("sel"));
+  const lit = selected ? [...document.querySelectorAll(`#session .row[data-node="${CSS.escape(selected)}"]`)] : [];
+  lit.forEach(r => r.classList.add("sel"));
+  return lit[0] || null;
+}
+// A row chosen (or lit by its node) stays in view: scrolled to inside the rows' own box, which
+// then no longer follows the tail -- the node pane growing under it must not pin it away.
+function reveal(row) {
+  const wrap = row && row.closest(".rows-wrap");
+  if (!wrap) return;
+  requestAnimationFrame(() => {
+    const rb = row.getBoundingClientRect(), wb = wrap.getBoundingClientRect();
+    if (rb.top < wb.top || rb.bottom > wb.bottom) wrap.scrollTop += rb.top - wb.top - wb.height / 3;
+    wrap.dataset.tail = wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 8 ? "1" : "0";
+  });
 }
 function flashNode(id) {
   const g = $("canvas").querySelector(`.node[data-id="${CSS.escape(id)}"]`);
@@ -764,7 +777,7 @@ function flashNode(id) {
   g.classList.remove("flash"); void g.getBoundingClientRect(); g.classList.add("flash");
   if (g.scrollIntoView) g.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
 }
-function onRow(row) {
+function onRow(row, el) {
   if (row.node) {
     selected = row.node; shownEvent = null;
     draw(G); pane(); highlightRows(); flashNode(row.node);
@@ -772,6 +785,7 @@ function onRow(row) {
     selected = null; shownEvent = row;
     draw(G); pane(); highlightRows();
   }
+  reveal(el);
 }
 function header(g) {
   const wf = g.workflow || {};
@@ -844,8 +858,8 @@ function rowEl(row, nested) {
   r.append(right);
   if (node || (row.offset != null && !nested)) {
     r.tabIndex = 0; r.setAttribute("role", "button");
-    r.addEventListener("click", () => onRow(row));
-    r.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); onRow(row); } });
+    r.addEventListener("click", () => onRow(row, r));
+    r.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); onRow(row, r); } });
   }
   return r;
 }
