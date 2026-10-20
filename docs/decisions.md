@@ -1241,6 +1241,13 @@ time-skipping test server) and Temporal UI 2.55.0. Where the issue and the code 
 passes, not its `agents` import, and there is no `[agents]` extra; `examples/sweep` fans out
 in plain Temporal, so its graph has one `check_headers` node instead of a batch.
 
+**Amended by I35** (kontra-sdk#56; the CLI half, not the mechanism; see #40 and #42/#46):
+`kontra graph` is hidden, and nobody is told to run it. `kontra serve` under a dev profile
+runs it in a child process once an offering's contract hash differs from the one its stored
+graph records (document version 2, which adds `contract_hash`); a version-1 file reads as
+absent. The mock runs, the sampler, the test server's directory and the store below are
+unchanged, the store moved to `kontra/_graphs.py`, and `--offering` is repeatable.
+
 `kontra graph` prints the static graph of the workflows `worker.py` binds, before anyone has
 run them: for each bound offering it runs the workflow `--runs` times (default 8) in
 Temporal's time-skipping test server, every activity answered by ONE dynamic stub with a
@@ -1393,6 +1400,10 @@ against temporalio 1.34 and its test server. Where the issue and the code part w
   (`tests/parallel`, an activity module that reads `os.environ` at import).
 
 ## I28. The dev graph page (kontra-sdk#43)
+
+**Amended by I35**: the static layer is the graph `kontra serve` draws under a dev profile;
+without one the page says that starting `kontra serve` once draws it, and for a handler
+offering's runs that only the run is drawn -- never to run `kontra graph`.
 
 `kontra dev up --ui` prints `graph http://127.0.0.1:<codec port>/graph`: one page, shipped as
 `kontra/cli/_console.html` (no build step), served by the codec server process
@@ -2831,3 +2842,101 @@ read A's stream from 0 and was told the budget was spent; about four and a half 
     - **`POST /_devgate/config`** may take a Temporal restart (the stop grace and the ready wait);
       the CLI waits that long. A fresh gate that replaced a dev profile, with no `--persist` state
       restored, says to restart any `kontra serve` started before it (design §4.1.10).
+
+## I35. `kontra serve` draws the static graph, keyed by the contract hash; `kontra graph` is hidden (kontra-sdk#56; decision 10 of #50)
+
+Amends I27's CLI half (not its mechanism) and I28's notice; the graph page is #40's ask, the
+command #42's (merged as #46).
+
+1. **The problem.** I27 made the right mechanical choice -- Temporal keeps no definition of a
+   workflow (I26), and the page's codec server has no access to the seller's project, so a
+   seller process must draw the static graph -- and then surfaced it as a top-level `kontra
+   graph` with flags, a doc section and a page that told sellers to go run it. The page was
+   the ask; the command is plumbing that leaked into the CLI.
+
+2. **Who draws.** The worker serving under a dev profile (`profile.dev`), in `KontraPlugin`'s
+   start, once the hash lock passed. For each workflow-entry offering it compares
+   `bound.contract_hash()` -- the hash lock's own, so nothing derives it again -- with the
+   `contract_hash` stored for its task queue, and draws only when they differ or nothing is
+   stored. A handler (turn) offering has no static graph and is skipped silently. A non-dev
+   profile never draws: production has no graph page. The project directory is what `kontra
+   serve --dir` and `serve()` run as `python worker.py` already know, `Worker.project`, handed
+   to `KontraPlugin(project=)`; no name is parsed for it. A Worker no one set it on (a test's
+   `Marketplace.serve`, a seller's own main) draws nothing, nor does a home without a profile
+   file (a `KONTRA_API_KEY` session: the page reads no such home).
+
+3. **How.** A daemon thread (`kontra._graphs.Refresh`) runs the hidden `kontra graph --dir
+   <project> --offering <each> --runs 8 --seed 0 --timeout 5` in a child process: the same
+   code path, so what it stores is the graph each README shows (a test compares them). The
+   child is `python -P -c` with `os.nice(10)` before the CLI's `main` (no `preexec_fn` in a
+   process with temporalio's threads; `-P` keeps the working directory off `sys.path`, as the
+   console script does), in a session of its own, stdin and stdout closed, stderr read, no
+   API key in its environment. It is time-bounded: each run's 5 s deadline (I27), and a hard
+   limit of 120 s plus every run's deadline, after which it gets SIGTERM, which `kontra graph`
+   takes as Ctrl-C (it shuts its test server down), and 5 s later SIGKILL to its whole group,
+   the test server included. The thread only spawns and waits (in `communicate`'s select);
+   start-up awaits nothing but the read of the stored hashes, off the event loop. It is never
+   joined; `KontraPlugin.aclose` stops the child, so it dies when serve exits. Why a child
+   and not the serving process: the time-skipping test server, the sandboxed re-imports and
+   the sampled answers stay away from the worker serving paid jobs, a hang or a leak dies
+   with the child, and the serving event loop never waits on it.
+
+4. **Failures are one WARNING line**, never a refusal to serve, never a crash: no test server
+   and no network to download it, the hard limit, a non-zero exit (the child's last stderr
+   line is quoted), an import error in the child, and an exit 0 that saved nothing. Each has a
+   test (`tests/graph/test_refresh.py`), and one that a worker whose child cannot even load
+   the project serves (`tests/serve/test_plugin.py`). The advice `kontra graph` prints (never
+   scheduled, open runs, unsampleable returns) is logged at INFO after a successful draw.
+
+5. **What is stored.** The document's version is 2 and it gains `contract_hash`; a version-1
+   file reads as absent and is drawn again. `save_static` takes the hash, `read_static`
+   returns a `StaticGraph` record (`load_static` still returns the graph, for the page),
+   keeping the checks (a regular file, read non-blocking; the size cap; the exact task queue)
+   and adding the fields' types. The store moved from `kontra/cli/_graph.py`, which
+   re-exports it, to `kontra/_graphs.py` (the standard library only at import): the plugin
+   uses it now, and a serving worker should not import the CLI. Two workers that save one
+   queue at once: `os.replace` makes the last writer win, and a test with two writers and a
+   reader sees only whole documents. Beyond the decision: **one refresh at a time per home**,
+   an `flock` on `graphs/.drawing.lock` polled at 0.5 s (so a stop is never stuck behind it),
+   and the thread looks at what is out of date again once it holds it, so the second of two
+   workers of one project spawns nothing. It also bounds a test session's example sellers,
+   which share one marketplace home and are each a `python worker.py`, to one test server at
+   a time.
+
+6. **`kontra graph` is hidden** (`hidden=True`), kept with its flags as the child's entry point
+   and for the READMEs' graphs (`tests/graph/test_cli.py`, unchanged goldens); `--offering`
+   is repeatable now, for a worker whose several offerings are out of date. It is gone from
+   the CLI's command list (its module docstring says it is hidden and why), `docs/sellers.md`
+   (whose section is now "The graph of a workflow") and the examples' READMEs' prose;
+   CLAUDE.md and the scaffold never named it. A test: `kontra
+   --help` does not mention `graph`, `kontra graph --help` still works.
+
+7. **The page.** Without a static graph: "No static graph for this offering yet: start `kontra
+   serve` once and it is drawn in the background". For a handler offering's run: "This
+   offering's entry is a handler, so only what this run did is drawn" -- `/api/graph` gains
+   `handler`, true when the run's type is `kontra.turn.v1` or its parent's is (the agent the
+   job started; one `DescribeWorkflowExecution` of the parent, remembered), read from the
+   types Temporal reports, never from an id. The tooltips of a step this run did not reach
+   read "the mock runs `kontra serve` drew the graph from". No string of the page or its
+   server names `kontra graph` (a test; code comments and docstrings aside).
+
+8. **Where the issue and the code part ways, and the limits.**
+   - **The contract hash is the contract's, not the code's.** It covers the input and output
+     types and `offering.yaml` (seam ③), not what the workflow does: an edit to the workflow
+     that keeps its types keeps the hash, and the page keeps the graph drawn before it. The
+     issue reads "only when the workflow changed"; the decision keys on the contract hash, and
+     only `kontra.contract` hashes. Removing `$KONTRA_HOME/graphs/` draws it again at the next
+     start (`docs/sellers.md` says so); keying on the bound code would need a hash
+     `kontra.contract` defines over it, a follow-up.
+   - Under one version, a contract change passes the hash lock only once republished (the dev
+     gate takes a version again while no job of it is open): that is when the stored hash
+     differs. A new version is a new task queue, with nothing stored.
+   - The test server listens on every interface while the child runs (I27), now without anyone
+     typing a command; the runs hold sampled values only (a refresh gives no `--input`), and
+     `docs/sellers.md` says so.
+   - A worker killed with SIGKILL leaves its child to finish on its own, bounded by the runs'
+     deadlines (a stalled first download of the test server is not).
+   - **End to end** (`tests/cli/test_dev_stack.py`, on a real `kontra dev up`: a fresh home,
+     free ports, the in-process dev gate): `kontra serve` of a copy of `examples/hello` stores
+     the graph with the code's contract hash; served again unchanged it logs no spawn and the
+     file is untouched; with `models.py` changed and republished it draws again; `down`.

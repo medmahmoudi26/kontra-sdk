@@ -691,7 +691,8 @@ serve(ReconAgent.sweep, plugins=[AgentHarnessPlugin()])
   nothing tells, at that moment, whether a person will be needed, so the job fails there too;
   allow-list those tools in the policy instead. Session jobs, with buyer approvals, are
   kontra-sdk#60.
-- `kontra graph` does not draw a handler offering yet (kontra-sdk#56).
+- A handler offering has no static graph: the [graph page](#the-graph-page) draws what each
+  of its runs did.
 
 **An agent that is a process**, [`examples/chef-claude`](../examples/chef-claude): no SDK at
 all. One activity spawns the binary -- here `claude -p ... --output-format stream-json
@@ -891,37 +892,32 @@ seller that never delivers and the refund at the deadline. Install with
 worker's stream upload budget is 8 s, not 2, so a busy test machine stores every stream item;
 to see the gaps a slow bucket leaves, pass `mp.serve(worker, seller, stream_upload_budget=0.5)`.
 
-## The graph: `kontra graph`
+## The graph of a workflow
 
-Temporal keeps no definition of a workflow, only what each run did. `kontra graph` draws
-yours before anyone pays for a run, from mock runs:
+Temporal keeps no definition of a workflow, only what each run did. Kontra draws yours before
+anyone pays for a run, from mock runs, for `kontra dev`'s [graph page](#the-graph-page): under
+a dev profile (`kontra dev up`), `kontra serve` -- and `python worker.py`, whose `serve()`
+knows its directory -- draws the static graph of each workflow offering it serves in the
+background once its start checks have passed, and again whenever the offering's contract hash
+differs from the one the stored graph was drawn from. There is nothing to run for it, and
+serving never waits for it.
 
-```sh
-kontra graph                     # from the directory with worker.py: one line per edge
-kontra graph --mermaid           # a Mermaid flowchart, for a `mermaid` block GitHub renders
-kontra graph --json              # [{"offering", "runs", "graph", "never_scheduled"}]
-kontra graph --runs 16 --seed 7  # more runs, other random values
-kontra graph --input in.json     # every run starts with this input
-```
-
-For each offering `worker.py` binds (`--offering NAME@VERSION` picks one, `--dir` names
-another directory), the workflow runs `--runs` times (default 8) in Temporal's time-skipping
-test server, with what `serve()` registers -- the bound workflow and the further ones it
-registers (the children it starts) -- and `kontra.contrib.parallel`'s batch child, under
-Kontra's sandbox and payload converter, but none of the worker's other options or plugins
-(but one, below), and no codec. Every activity is
-answered by a stub with a value of the type it declares, so no activity body runs, nothing
-is fetched and no key is needed; timers are skipped. The input is drawn the same way from the
-workflow's input type, unless `--input` gives one (checked against the type first). Run 0
+The workflow runs 8 times in Temporal's time-skipping test server, in a child process of the
+worker at a lower priority, with what `serve()` registers -- the bound workflow and the
+further ones it registers (the children it starts) -- and `kontra.contrib.parallel`'s batch
+child, under Kontra's sandbox and payload converter, but none of the worker's other options or
+plugins (but one, below), and no codec. Every activity is answered by a stub with a value of
+the type it declares, so no activity body runs, nothing is fetched and no key is needed;
+timers are skipped. The input is drawn the same way from the workflow's input type. Run 0
 draws the smallest values (false, 0, empty lists, no optional fields), run 1 the largest
 (true, 3 items, every field), run 2 large lists near the top of the value (201 items, so a
-loop that batches its input by 50 or 100 goes round), and the others random ones from
-`--seed`: an `if` on a boolean an activity returned shows both branches from two runs on,
-however deep in the value it sits (only a recursive model is cut short, where it recurses),
-and the same command prints the same graph. The runs' graphs are then united: a loop is one
-node with an edge back, the activities one workflow task starts at once share a parallel
-group (an `if`'s branches, which no run starts together, never do), and the optional
-helper's `execute_activities_in_parallel` is one node, `execute_activities_in_parallel(<activity>)`
+loop that batches its input by 50 or 100 goes round), and the others seeded random ones: an
+`if` on a boolean an activity returned shows both branches from two runs on, however deep in
+the value it sits (only a recursive model is cut short, where it recurses), and the same code
+draws the same graph. The runs' graphs are then united: a loop is one node with an edge back,
+the activities one workflow task starts at once share a parallel group (an `if`'s branches,
+which no run starts together, never do), and the optional helper's
+`execute_activities_in_parallel` is one node, `execute_activities_in_parallel(<activity>)`
 (a `pages=` batch names its page activity too, the two sorted), however many items it ran,
 none included, and however many times it continued as new.
 [`examples/sweep`](../examples/sweep) shows a fan-out, a branch, and one activity per URL as
@@ -932,39 +928,56 @@ An agent workflow (one whose `worker.py` passes Temporal's `OpenAIAgentsPlugin` 
 `plugins=`) runs with that integration and a scripted model instead of yours: it calls every
 tool the agent was given once, then answers with a value of the agent's output type, so the
 graph shows model, tools, model. The project's own `temporalio-openai-agents` must be installed
-to import it at all. An offering bound to an agent's handler is not drawn yet
-(kontra-sdk#56).
+to import it at all. An offering bound to an agent's handler has no static graph: the page
+draws what each of its runs did.
 
-What the runs could not show goes to stderr, and the exit status stays 0 (it is advice):
+The worker's log says when it draws (`drawing the graph page's static graph of
+acme/sweep@0.1.0 in the background`) and when it drew it; what the runs could not show follows
+at INFO, as `the mock runs said: ...`:
 
 - activities the worker registers that no run of any offering scheduled, once for the worker
   (`never scheduled in 8 mock runs: ship — branches on timers, signals or inputs the runs did
   not reach`): a branch only a signal, a particular input or more runs reach. Activities a
   batch child, a child's child or a local activity ran count as scheduled, and so do another
-  offering's; with `--offering`, the offerings left out ran nothing.
+  offering's.
 - runs that waited for what no timer brings (a signal, a `wait_condition` without a timeout):
   the test server skips to the run's timeout and times it out; the graph holds what it did
-  until then. A run still open after `--timeout` seconds of wall-clock time (default 5), or
-  whose workflow task fails on the mock values every time, is terminated, with the same
-  note. The stub answers an activity the same way every time within a run, so a loop that
-  polls one until it says done (`while not (await status()).done`) ends only in the runs
-  that drew `done`; a loop over a large drawn count (1000 in run 1) can take that long too.
+  until then. A run still open after 5 seconds of wall-clock time, or whose workflow task
+  fails on the mock values every time, is terminated, with the same note. The stub answers an
+  activity the same way every time within a run, so a loop that polls one until it says done
+  (`while not (await status()).done`) ends only in the runs that drew `done`; a loop over a
+  large drawn count (1000 in run 1) can take that long too.
 - a return type no valid value could be drawn for (a pattern with a lookaround, a model
   validator nothing satisfies): the stub returned null, and the workflow may have failed on
   it.
+
+When the graph cannot be drawn -- no test server and no network to download it, a project
+that fails to import there, mock runs past their time limit (two minutes beyond the runs' own
+deadlines, after which the child and its test server are stopped) -- the worker logs one
+WARNING line (`the graph page's static graph of ... was not drawn: ...`) and serves anyway; the
+page then draws what each run did, and the next start tries again. Production has no graph
+page: a worker serving under any other profile draws nothing, and so does a home without a
+profile file (a worker on `KONTRA_API_KEY` alone). A `Worker` you build in `worker.py` draws
+under `kontra serve`; run as `python worker.py`, or with `KontraPlugin` on your own main, it
+draws only when told the project's directory (`worker.project = Path(__file__).parent`,
+`KontraPlugin(..., project=...)`).
+
+The contract hash covers the types and `offering.yaml`, not what the workflow does: an edit to
+the workflow that keeps its types keeps the graph drawn before it. Remove
+`$KONTRA_HOME/graphs/` and start the worker again to draw it anew. A new version is a new task
+queue, and is drawn at its first start.
 
 The test server is a binary temporalio downloads once on first use into
 `~/.cache/kontra/temporal-test-server` (under `$XDG_CACHE_HOME` when that is set), a
 directory made 0700; never the shared temp directory, where whoever creates the file name
 first chooses what runs. Anything in that directory someone else owns or can write is
-refused. Offline, before the download, `kontra graph` says it cannot start it. The server
-cannot be bound to the loopback: while the command runs it listens on every interface, on a
-random port, unauthenticated, so anyone who can reach the machine can read the runs there --
-an `--input` you give included -- and start workflows the mock worker runs. Ctrl-C, SIGTERM
-and SIGHUP stop the command and the server with it. With a profile in
-`$KONTRA_HOME`, each offering's graph is also saved under `$KONTRA_HOME/graphs/`, for
-`kontra dev`'s graph page to paint a live run on (`--no-save` skips it); it is never sent
-anywhere: `kontra publish` does not carry it.
+refused. The server cannot be bound to the loopback: while the mock runs go it listens on
+every interface, on a random port, unauthenticated, so anyone who can reach the machine can
+read the runs there (sampled values, nothing of a buyer's) and start workflows the mock worker
+runs. Stopping the worker stops the child and the server with it. Each offering's graph is
+saved under `$KONTRA_HOME/graphs/` (0600 files in a 0700 directory, by the task queue's hash),
+with the contract hash it was drawn from; one worker of a home draws at a time, and a second
+finds the first's graph. It is never sent anywhere: `kontra publish` does not carry it.
 
 ## Running locally: `kontra dev`
 
@@ -1113,7 +1126,7 @@ anything out.
 ```
 
 It lists your namespace's latest 50 runs (the batches' children left out), and opens one as
-its graph: the steps of the workflow as [`kontra graph`](#the-graph-kontra-graph) draws them,
+its graph: the steps of the workflow as [`kontra serve` draws them](#the-graph-of-a-workflow),
 with what this run did painted on. Each step shows its status (scheduled, running,
 completed, failed, timed out, canceled) and duration, `×3` when it is on its third attempt,
 `∥50` when it ran 50 at once; the activities one workflow task started together are boxed as
@@ -1138,10 +1151,12 @@ worker serving with `kontra serve --otlp http://127.0.0.1:4317`, which also writ
 context the Trace link reads into the run's history. The Logs link selects `kontra-worker`,
 or `OTEL_SERVICE_NAME` as `kontra dev up` saw it: give the worker the same one.
 
-The whole workflow, branches this run never takes included, comes from `kontra graph`: run
-`kontra graph --dir <project>` with the dev profile's `KONTRA_HOME` once the workflow changes,
-and the page paints each run on the graph saved for its task queue (the one `kontra serve`
-serves, exactly). Without one, it draws what the run did and says how to get the rest.
+The whole workflow, branches this run never takes included, is the graph `kontra serve` draws
+under the dev profile once it has served the offering, and again when its contract changes
+([above](#the-graph-of-a-workflow)); the page paints each run on the graph saved for its task
+queue (the one `kontra serve` serves, exactly). Without one, it draws what the run did and
+says that starting `kontra serve` once draws the rest; for a handler offering, whose entry is a
+turn of an agent, it draws what the run did and says so.
 
 The run's graph carries names, statuses and times, never an input, result, failure message
 or heartbeat (it is read from history by `kontra.graph`, which emits no payload). A step's
@@ -1473,8 +1488,8 @@ The examples: [`examples/hello`](../examples/hello) (the smallest offering, one 
 one out, as a five-minute tutorial), [`examples/enrich`](../examples/enrich) (types-first, with
 an artifact), [`examples/legacy-actor`](../examples/legacy-actor) (an older job turned into
 an offering), [`examples/sweep`](../examples/sweep) (a fan-out, one activity per URL with at
-most 50 open, and a branch, and the graph `kontra graph` draws of them), and two agents:
+most 50 open, and a branch, and the graph `kontra serve` draws of them), and two agents:
 [`examples/chef-agents`](../examples/chef-agents) (as workflow code) and
 [`examples/chef-claude`](../examples/chef-claude) (as a process). Each keeps its derived
 `contract.yaml` as a golden file, reproduced byte for byte by the tests, and its README its
-graph, which the tests compare with `kontra graph --mermaid`.
+graph, which the tests compare with the mock runs' (`tests/graph/test_cli.py`).
