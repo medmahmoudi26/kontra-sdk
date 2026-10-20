@@ -237,8 +237,8 @@ def server_dir() -> Path:
     found = os.lstat(path)
     if not stat.S_ISDIR(found.st_mode) or found.st_uid != uid:
         fail(
-            f"{path} is not a directory of yours: kontra graph runs the test server it holds, "
-            "so no one else may own it"
+            f"{path} is not a directory of yours: the graph's mock runs run the test server "
+            "it holds, so no one else may own it"
         )
     if stat.S_IMODE(found.st_mode) & 0o077:
         os.chmod(path, 0o700)
@@ -247,7 +247,7 @@ def server_dir() -> Path:
         if held.st_uid != uid or held.st_mode & 0o022 or stat.S_ISLNK(held.st_mode):
             fail(
                 f"{entry.path} is not yours alone (a link, or someone else's, or writable by "
-                "others): kontra graph would run it; remove it and the test server is "
+                "others): the graph's mock runs would run it; remove it and the test server is "
                 "downloaded again"
             )
     return path

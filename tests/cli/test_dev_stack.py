@@ -356,13 +356,15 @@ def _needs_a_test_server() -> None:
         pytest.skip(f"no time-skipping test server: {e}")
 
 
-def _served(project: Path) -> tuple[str, str]:
-    """The offering's task queue and contract hash, as ``kontra serve``'s worker builds them."""
+def _served(project: Path) -> tuple[str, str, str]:
+    """The offering's task queue and contract hash, and the project's code hash, as
+    ``kontra serve``'s worker builds them."""
+    from kontra._graphs import code_hash
     from kontra.cli._project import load_worker
 
     with load_worker(project) as worker:
         [bound] = worker.offerings
-        return bound.offering_id.task_queue, bound.contract_hash()
+        return bound.offering_id.task_queue, bound.contract_hash(), code_hash(project)
 
 
 #: What a serving worker logs as it spawns the child that draws the graph page's graph.
@@ -407,25 +409,39 @@ class _Serving:
         return self.log.read_text(errors="replace")
 
 
-def _drawn(home: Path, queue: str, contract_hash: str, serving: _Serving) -> None:
+def _drawn(home: Path, served: tuple[str, str, str], serving: _Serving) -> dict[str, Any]:
+    """The graph stored for ``served`` (its task queue, contract hash and code hash), once
+    the serving worker drew it."""
     from kontra._graphs import read_static
 
+    queue, contract_hash, code_hash = served
     end = time.monotonic() + 240
     while True:
         found = read_static(home, queue)
-        if found is not None and found.contract_hash == contract_hash:
-            return
-        assert time.monotonic() < end, f"no graph for {contract_hash}:\n{serving.text()}"
+        if found is not None and (found.contract_hash, found.code_hash) == (
+            contract_hash,
+            code_hash,
+        ):
+            return dict(found.graph)
+        assert time.monotonic() < end, f"no graph for {served}:\n{serving.text()}"
         assert "was not drawn" not in serving.text(), serving.text()
         time.sleep(0.5)
 
 
-def test_kontra_serve_draws_the_graph_page_s_graph_once_per_contract(tmp_path: Path) -> None:
+def _nodes(graph: Mapping[str, Any]) -> set[str]:
+    return {n["id"] for n in graph["nodes"]}
+
+
+def test_kontra_serve_draws_the_graph_page_s_graph_again_when_the_code_changes(
+    tmp_path: Path,
+) -> None:
     """Decisions I35 on a real ``kontra dev up`` (the in-process dev gate, a fresh home, free
     ports): ``kontra serve`` draws the graph page's static graph of ``examples/hello`` in the
-    background, recording the code's contract hash; served again unchanged, it runs no
-    child; after a contract change -- republished under the same version, which the dev
-    gate takes while no job is open -- it draws it again."""
+    background, recording the contract hash and the code hash it was drawn from; served
+    again unchanged, it runs no child; with the workflow edited -- its types kept, so the
+    contract and its hash are too, and nothing is republished -- it draws it again, without
+    the step the edit removed; and after a contract change, republished under the same
+    version (which the dev gate takes while no job is open), again."""
     from kontra._graphs import static_path
 
     _needs_a_cli()
@@ -440,12 +456,14 @@ def test_kontra_serve_draws_the_graph_page_s_graph_once_per_contract(tmp_path: P
     try:
         up = _run(["dev", "up", "--handle", "acme", *_port_flags(ports)], env)
         assert up.returncode == 0, up.stdout + up.stderr
-        queue, first = _served(project)
+        first = _served(project)
+        queue = first[0]
 
         with _Serving(project, env, tmp_path / "serve-1.log") as one:
-            _drawn(home, queue, first, one)
+            drawn = _drawn(home, first, one)
         assert one.text().count(_SPAWNED) == 1, one.text()
         assert "drew the graph page's static graph of acme/hello@0.1.0" in one.text()
+        assert "greet" in {n["name"] for n in drawn["nodes"]}
         drawn_at = static_path(home, queue).stat().st_mtime_ns
 
         with _Serving(project, env, tmp_path / "serve-2.log") as two:
@@ -453,18 +471,34 @@ def test_kontra_serve_draws_the_graph_page_s_graph_once_per_contract(tmp_path: P
         assert _SPAWNED not in two.text(), two.text()
         assert static_path(home, queue).stat().st_mtime_ns == drawn_at
 
+        # The workflow no longer calls its activity: the types, and the contract, stay.
+        flow = project / "workflows.py"
+        call = flow.read_text().index("        return await workflow.execute_activity(")
+        flow.write_text(
+            flow.read_text()[:call] + '        return HelloOutput(greeting=f"Hi {inp.name}.")\n'
+        )
+        edited = _served(project)
+        assert edited[:2] == first[:2]  # the same queue and contract hash
+        assert edited[2] != first[2]
+        with _Serving(project, env, tmp_path / "serve-3.log") as three:
+            redrawn = _drawn(home, edited, three)
+        assert three.text().count(_SPAWNED) == 1, three.text()
+        assert "greet" not in {n["name"] for n in redrawn["nodes"]}
+        assert _nodes(redrawn) != _nodes(drawn)
+
         models = project / "models.py"
         models.write_text(
             models.read_text().replace('"Who to greet."', '"Who to greet, by their name."')
         )
-        same_queue, second = _served(project)
-        assert (same_queue, second != first) == (queue, True)
+        second = _served(project)
+        assert (second[0], second[1] != first[1]) == (queue, True)
         published = _run(["publish", "--dir", str(project)], env)
         assert published.returncode == 0, published.stdout + published.stderr
-        with _Serving(project, env, tmp_path / "serve-3.log") as three:
-            _drawn(home, queue, second, three)
-        assert three.text().count(_SPAWNED) == 1, three.text()
-        assert "was not drawn" not in one.text() + two.text() + three.text()
+        with _Serving(project, env, tmp_path / "serve-4.log") as four:
+            _drawn(home, second, four)
+        assert four.text().count(_SPAWNED) == 1, four.text()
+        logs = one.text() + two.text() + three.text() + four.text()
+        assert "was not drawn" not in logs
     finally:
         down = _run(["dev", "down"], env)
     assert down.returncode == 0, down.stdout + down.stderr

@@ -2,9 +2,12 @@
 I27, I35; kontra-sdk#42, #56).
 
 A hidden command: the graph page's static graphs are drawn by ``kontra serve`` under a dev
-profile, which runs this command in a child process when an offering's contract changed
-(:class:`kontra._graphs.Refresh`). It stays, with its flags, as that child's entry point and
-for the examples' README graphs (``tests/graph/test_cli.py``), never in ``kontra --help``.
+profile, which runs this command in a child process when an offering's contract or the
+project's code changed (:class:`kontra._graphs.Refresh`), with two hidden flags of its own:
+``--code-hash``, the worker's, to save the graph under, and ``--background``, which words what
+it says for the worker's log (no ``--input`` to suggest there). It stays, with its flags, as
+that child's entry point and for the examples' README graphs (``tests/graph/test_cli.py``),
+never in ``kontra --help``.
 
 Temporal keeps no definition of a workflow, only what each run did (I26), so the graph of
 code nobody has run yet comes from runs nobody pays for: :mod:`kontra.cli._mock` runs each
@@ -17,8 +20,8 @@ found for, and, once for the worker, the activities it registers that no run of 
 offering scheduled.
 
 With a profile in ``$KONTRA_HOME``, each offering's graph is also saved where ``kontra dev``'s
-graph page (#43) reads it, with the contract hash of the code it was drawn from
-(:func:`kontra._graphs.save_static`): that page is served by a process that has no access to
+graph page (#43) reads it, with the contract hash and the code hash of the code it was drawn
+from (:func:`kontra._graphs.save_static`): that page is served by a process that has no access to
 the seller's project, and paints a live run on this graph.
 """
 
@@ -35,7 +38,14 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
-from kontra._graphs import GRAPHS_DIR, load_static, read_static, save_static, static_path
+from kontra._graphs import (
+    GRAPHS_DIR,
+    code_hash,
+    load_static,
+    read_static,
+    save_static,
+    static_path,
+)
 from kontra.cli._common import emit_json, fail, read_input
 from kontra.cli._seller import _DIR, _pick
 
@@ -105,9 +115,12 @@ def _mock_runs(n: int) -> str:
     return f"{n} mock run" if n == 1 else f"{n} mock runs"
 
 
-def _inputs(bound: Any, given: object, source: str | None, runs: int, seed: int) -> list[Any]:
+def _inputs(
+    bound: Any, given: object, source: str | None, runs: int, seed: int, *, background: bool
+) -> list[Any]:
     """Each run's input for ``bound``: ``given`` (from ``--input``), checked against the
-    workflow's input type, else one sampled in each run's mode."""
+    workflow's input type, else one sampled in each run's mode. ``kontra serve``'s child
+    (``background``) is not told of ``--input``: the worker that logs it has none."""
     from pydantic import TypeAdapter, ValidationError
 
     from kontra._sample import Unsampleable, draw
@@ -117,6 +130,11 @@ def _inputs(bound: Any, given: object, source: str | None, runs: int, seed: int)
         try:
             return [draw(bound.input_type, i, seed) for i in range(runs)]
         except Unsampleable as e:
+            if background:
+                fail(
+                    f"cannot sample a valid {name} ({e}), so the graph page draws only what "
+                    "each run did"
+                )
             fail(f"cannot sample a valid {name} ({e}); give one with --input FILE")
     try:
         TypeAdapter(bound.input_type).validate_json(json.dumps(given))
@@ -128,18 +146,23 @@ def _inputs(bound: Any, given: object, source: str | None, runs: int, seed: int)
     return [given] * runs
 
 
-def _never_scheduled(explored: list[Explored], every_offering: bool) -> None:
+def _never_scheduled(explored: list[Explored], every_offering: bool, background: bool) -> None:
     """The worker's activities no run scheduled: once for the worker, since one offering's
     runs never schedule another's activities."""
     if not explored or not explored[0].never_scheduled:
         return
     offerings = ", ".join(e.offering for e in explored)
     runs = sum(e.runs for e in explored)
+    if every_offering:
+        left_out = ""
+    elif background:  # kontra serve drew only the offerings whose graph was out of date
+        left_out = ", or the worker's offerings whose graph was current"
+    else:
+        left_out = ", or the worker's offerings --offering left out"
     _warn(
         f"{offerings}: never scheduled in {_mock_runs(runs)}: "
         f"{', '.join(explored[0].never_scheduled)} — branches on timers, signals or inputs "
-        "the runs did not reach"
-        + ("" if every_offering else ", or the worker's offerings --offering left out")
+        f"the runs did not reach{left_out}"
     )
 
 
@@ -220,6 +243,19 @@ def _chosen(bound: tuple[Any, ...], only: tuple[str, ...]) -> list[Any]:
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @click.option("--mermaid", is_flag=True, help="A Mermaid flowchart per offering.")
 @click.option("--no-save", is_flag=True, help="Do not save the graph for kontra dev's graph page.")
+@click.option(
+    "--code-hash",
+    "drawn_from",
+    hidden=True,
+    help="The code hash to save the graph under: the serving worker's (decisions I35); "
+    "default: the project's, as imported here.",
+)
+@click.option(
+    "--background",
+    is_flag=True,
+    hidden=True,
+    help="Run by kontra serve for the graph page: what it says is worded for the worker's log.",
+)
 def graph(
     directory: Path,
     only: tuple[str, ...],
@@ -230,6 +266,8 @@ def graph(
     as_json: bool,
     mermaid: bool,
     no_save: bool,
+    drawn_from: str | None,
+    background: bool,
 ) -> None:
     """Print the static graph of worker.py's workflows, from mock runs in Temporal's
     time-skipping test server (every activity answered with a sampled value of its type)."""
@@ -246,8 +284,9 @@ def graph(
         with load_worker(directory) as worker:
             chosen = _chosen(worker.offerings, only)
             hashes = {b.key: b.contract_hash() for b in chosen}
+            code = drawn_from or code_hash(directory)
             every_offering = len(chosen) == len(worker.offerings)
-            inputs = [_inputs(b, given, source, runs, seed) for b in chosen]
+            inputs = [_inputs(b, given, source, runs, seed, background=background) for b in chosen]
             with _stopped_like_ctrl_c():
                 explored = run(lambda: explore(worker, chosen, inputs, seed=seed, deadline=timeout))
     except ModuleNotFoundError as err:
@@ -285,7 +324,7 @@ def graph(
             for a, b in _edges(found.graph):
                 click.echo(f"  {a} → {b}")
         _warnings(found, timeout)
-    _never_scheduled(explored, every_offering)
+    _never_scheduled(explored, every_offering, background)
     home = kontra_home()
     if no_save or not (home / PROFILE_FILE).is_file():
         return
@@ -295,6 +334,7 @@ def graph(
             found.task_queue,
             offering=found.offering,
             contract_hash=hashes[found.offering],
+            code_hash=code,
             runs=found.runs,
             seed=seed,
             graph=found.graph,

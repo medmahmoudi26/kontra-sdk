@@ -2,7 +2,7 @@
 `kontra`, so this runs on any Temporal worker as it is (decisions I29). Kontra starts it with
 the id `job-<job id>` when a buyer hires the offering.
 
-The job is the shapes `kontra graph` draws (the README has the graph):
+The job is the shapes the graph page draws (the README has the graph):
 
 1. `plan`: each URL once, and the sites they are on;
 2. a fan-out: every site's robots.txt and security.txt, two different activities at once;

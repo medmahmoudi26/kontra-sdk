@@ -538,8 +538,8 @@ async def test_the_graph_page_is_drawn_under_a_dev_profile_when_the_contract_cha
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Decisions I35: once the hash lock passed, a dev profile's worker draws the static
-    graph of each workflow offering whose stored one was drawn from another contract hash,
-    or that has none, from the project's directory; a non-dev profile (production has no
+    graph of each workflow offering whose stored one was drawn from another contract hash or
+    other code, or that has none, from the project's directory; a non-dev profile (production has no
     graph page), a plugin that knows no project, and a home without a profile draw none."""
     from types import SimpleNamespace
 
@@ -566,22 +566,32 @@ async def test_the_graph_page_is_drawn_under_a_dev_profile_when_the_contract_cha
     assert refresh is not None
     assert started == [refresh]
     queue = bound.offering_id.task_queue
-    assert refresh.wanted == (_graphs.Wanted(bound.key, queue, hashes[bound.key]),)
+    code = _graphs.code_hash(tmp_path)
+    assert refresh.wanted == (_graphs.Wanted(bound.key, queue, hashes[bound.key], code),)
     assert (refresh.home, refresh.project) == (home, tmp_path)
     g: dict[str, Any] = {"workflow": {}, "nodes": [], "edges": []}
 
-    def drawn(contract_hash: str) -> None:
+    def drawn(contract_hash: str, code_hash: str = code) -> None:
         _graphs.save_static(
-            home, queue, offering=bound.key, contract_hash=contract_hash, runs=8, seed=0, graph=g
+            home,
+            queue,
+            offering=bound.key,
+            contract_hash=contract_hash,
+            code_hash=code_hash,
+            runs=8,
+            seed=0,
+            graph=g,
         )
 
     drawn(hashes[bound.key])
     assert await draw(dev) is None  # current: no child
     drawn("sha256:" + "0" * 64)
     assert await draw(dev) is not None  # drawn from another contract
+    drawn(hashes[bound.key], "sha256:" + "1" * 64)
+    assert await draw(dev) is not None  # the same contract, other code
     (home / PROFILE_FILE).unlink()
     assert await draw(dev) is None  # nowhere the page reads (an API key's session)
-    assert len(started) == 2
+    assert len(started) == 3
 
 
 @pytest.mark.temporal

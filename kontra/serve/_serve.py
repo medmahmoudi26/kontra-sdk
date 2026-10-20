@@ -53,7 +53,15 @@ from temporalio.worker import WorkerConfig
 from kontra.serve.offering import BindingError, QuoteFunction, offering
 from kontra.serve.worker import Worker
 
-__all__ = ["OFFERING_FILE", "QUOTE_FILE", "capture", "project_activities", "serve", "serve_from"]
+__all__ = [
+    "OFFERING_FILE",
+    "QUOTE_FILE",
+    "capture",
+    "project_activities",
+    "project_files",
+    "serve",
+    "serve_from",
+]
 
 #: What serve() binds, beside the calling file.
 OFFERING_FILE = "offering.yaml"
@@ -128,6 +136,20 @@ def _in_project(name: str, module: object, base: Path) -> bool:
     except (OSError, ValueError):
         return False
     return not any(part.startswith(".") or part in _SKIP_DIRS for part in rel.parts[:-1])
+
+
+def project_files(base: Path) -> list[Path]:
+    """The files the project's modules under ``base`` were loaded from -- the modules
+    :func:`project_activities` looks in -- resolved, sorted: what the graph page's static
+    graph is keyed by besides the contract hash (:func:`kontra._graphs.code_hash`, decisions
+    I35)."""
+    return sorted(
+        {
+            Path(str(getattr(m, "__file__", ""))).resolve()
+            for n, m in list(sys.modules.items())
+            if _in_project(n, m, base)
+        }
+    )
 
 
 def _activity_name(fn: object) -> str:

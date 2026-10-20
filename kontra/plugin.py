@@ -30,8 +30,8 @@ Temporal worker, and nothing else:
   that ran after Kontra (one given to the worker only) undid any of the above. A failed
   check fails the workers starting with it and is then forgotten: a later start checks
   again. Under a dev profile, with the project's directory known (``project``), the graph
-  page's static graph of each workflow offering whose contract hash is not the one it was
-  drawn from is drawn again in the background, in a child process (:mod:`kontra._graphs`,
+  page's static graph of each workflow offering whose contract hash or code is not what it
+  was drawn from is drawn again in the background, in a child process (:mod:`kontra._graphs`,
   decisions I35): a failure there is a log line, never a refusal to serve.
 
 Put it **last** in ``Client.connect(plugins=[...])``: the last client plugin has the final word
@@ -820,25 +820,30 @@ class KontraPlugin(SimplePlugin):
         self, profile: Profile, hashes: dict[str, str]
     ) -> _graphs.Refresh | None:
         """Under a dev profile, once the hash lock passed: the graph page's static graphs of
-        the workflow offerings whose stored graph was drawn from another contract hash (or
-        that have none), drawn again in the background (:class:`kontra._graphs.Refresh`), from
-        the project's directory. A handler offering has no static graph; a non-dev profile
-        has no graph page. Never raises: a failure is a log line."""
-        if not profile.dev or self._project is None:
+        the workflow offerings whose stored graph was drawn from another contract hash or
+        other code (:func:`kontra._graphs.code_hash` of the project), or that have none, drawn
+        again in the background (:class:`kontra._graphs.Refresh`), from the project's
+        directory. A handler offering has no static graph; a non-dev profile has no graph
+        page. Never raises: a failure is a log line."""
+        project = self._project
+        if not profile.dev or project is None:
             return None
         try:
             home = _home_dir(profile, self._home)
             if not (home / PROFILE_FILE).is_file():
                 return None  # an API key's session: nowhere the page reads
+            workflows = [b for b in self._offerings if b.kind == "workflow"]
+            if not workflows:
+                return None
+            code = await asyncio.to_thread(_graphs.code_hash, project)
             wanted = [
-                _graphs.Wanted(b.key, b.offering_id.task_queue, hashes[b.key])
-                for b in self._offerings
-                if b.kind == "workflow"
+                _graphs.Wanted(b.key, b.offering_id.task_queue, hashes[b.key], code)
+                for b in workflows
             ]
             stale = await asyncio.to_thread(_graphs.out_of_date, home, wanted)
             if not stale:
                 return None
-            refresh = _graphs.Refresh(home, self._project, stale)
+            refresh = _graphs.Refresh(home, project, stale)
             refresh.start()
         except Exception as e:  # a log line, never a refusal to serve
             log.warning("the graph page's static graphs were not drawn: %s", e)

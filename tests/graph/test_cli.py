@@ -297,6 +297,18 @@ def test_a_worker_of_two_offerings_warns_once_of_what_neither_scheduled(home: Pa
         "on timers, signals or inputs the runs did not reach, or the worker's offerings "
         "--offering left out\n"
     )
+    logged = ok(
+        kontra(
+            home,
+            *("graph", "--dir", directory, "--runs", "1", "--offering", "acme/two-a@1.0.0"),
+            "--background",
+        )
+    )  # kontra serve's child, which draws only the offerings out of date
+    assert logged.stderr == (
+        "warning: acme/two-a@1.0.0: never scheduled in 1 mock run: act_b, unused — branches "
+        "on timers, signals or inputs the runs did not reach, or the worker's offerings "
+        "whose graph was current\n"
+    )
 
 
 # --------------------------------------------------------------------------- output, input
@@ -339,6 +351,35 @@ def test_input_is_validated(home: Path, tmp_path: Path) -> None:
     # Every run starts with the input given: none of them reaches `after`.
     g = graph_of(home, PROJECTS / "stuck", "--input", "-", "--runs", "2", stdin='{"then": "done"}')
     assert edges(g) == {("start", "step"), ("step", "odd"), ("odd", "after"), ("after", "end")}
+
+
+def test_an_unsampleable_input_is_advised_for_whoever_reads_it(home: Path, tmp_path: Path) -> None:
+    """Typed, the way out is ``--input``; run by ``kontra serve`` (``--background``), whose
+    worker logs it and has no ``--input``, it says what the graph page does instead."""
+    project = tmp_path / "picky"
+    shutil.copytree(EXAMPLES / "hello", project, ignore=shutil.ignore_patterns("__pycache__"))
+    models = project / "models.py"
+    field = '    name: str = Field(min_length=1, max_length=100, description="Who to greet.")\n'
+    text = models.read_text()
+    assert field in text
+    models.write_text(
+        text.replace("import BaseModel,", "import field_validator, BaseModel,").replace(
+            field,
+            field
+            + "\n    @field_validator('name')\n    @classmethod\n"
+            + "    def _known(cls, v: str) -> str:\n"
+            + "        raise ValueError('an unknown name')\n",
+        )
+    )
+    typed = kontra(home, "graph", "--dir", str(project), "--runs", "1")
+    assert typed.exit_code == 1
+    assert typed.stderr.startswith("error: cannot sample a valid HelloInput (")
+    assert typed.stderr.endswith("); give one with --input FILE\n")
+    logged = kontra(home, "graph", "--dir", str(project), "--runs", "1", "--background")
+    assert logged.exit_code == 1
+    assert logged.stderr.startswith("error: cannot sample a valid HelloInput (")
+    assert logged.stderr.endswith("), so the graph page draws only what each run did\n")
+    assert "--input" not in logged.stderr
 
 
 # --------------------------------------------------------------------------- runs that stop
@@ -537,19 +578,21 @@ def serve_task_queue(directory: Path) -> str:
     return served(directory)[0]
 
 
-def served(directory: Path) -> tuple[str, str]:
-    """The task queue ``kontra serve`` runs the offering on, and its contract hash, as its
-    worker builds them."""
+def served(directory: Path) -> tuple[str, str, str]:
+    """The task queue ``kontra serve`` runs the offering on, its contract hash, and the
+    project's code hash, as its worker builds them."""
+    from kontra._graphs import code_hash
+
     with load_worker(directory) as worker:
         [bound] = worker.offerings
-        return bound.offering_id.task_queue, bound.contract_hash()
+        return bound.offering_id.task_queue, bound.contract_hash(), code_hash(directory)
 
 
 def test_the_static_graph_is_saved_for_kontra_devs_page(home: Path) -> None:
     make_profile(home)
     result = ok(kontra(home, "graph", "--dir", str(EXAMPLES / "hello"), "--json", "--runs", "2"))
     assert result.stderr == f"static graph saved for kontra dev's graph page ({home / 'graphs'})\n"
-    task_queue, drawn_from = served(EXAMPLES / "hello")
+    task_queue, drawn_from, code = served(EXAMPLES / "hello")
     path = static_path(home, task_queue)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
@@ -560,12 +603,18 @@ def test_the_static_graph_is_saved_for_kontra_devs_page(home: Path) -> None:
         "task_queue": task_queue,
         "offering": "acme/hello@0.1.0",
         "contract_hash": drawn_from,  # the code's (BoundOffering.contract_hash()), I35
+        "code_hash": code,  # the project's code as imported here, by hand
         "runs": 2,
         "seed": 0,
         "graph": printed["graph"],
     }
     assert load_static(home, task_queue) == printed["graph"]
     assert [p.name for p in path.parent.iterdir()] == [path.name]  # no temporary file left
+    # kontra serve's child saves under the serving worker's code hash, whatever it imported.
+    given = "sha256:" + "5" * 64
+    args = ("--json", "--runs", "2", "--background", "--code-hash", given)
+    ok(kontra(home, "graph", "--dir", str(EXAMPLES / "hello"), *args))
+    assert json.loads(path.read_text())["code_hash"] == given
 
 
 def test_no_save_and_no_profile_save_nothing(home: Path, tmp_path: Path) -> None:
@@ -583,20 +632,31 @@ def test_load_static_reads_only_the_graph_of_that_task_queue(tmp_path: Path) -> 
     g: dict[str, Any] = {"version": 1, "workflow": {}, "nodes": [], "edges": []}
     a, b = "acme/a@1.0.0", "acme/b@1.0.0"
     assert load_static(tmp_path, a) is None  # nothing saved
-    save_static(tmp_path, a, offering=a, contract_hash="sha256:a", runs=8, seed=0, graph=g)
+    save_static(
+        tmp_path,
+        a,
+        offering=a,
+        contract_hash="sha256:a",
+        code_hash="sha256:c",
+        runs=8,
+        seed=0,
+        graph=g,
+    )
     assert load_static(tmp_path, a) == g
     # A's file under B's name: the stored task queue is A's, so it is not B's graph.
     shutil.copy(static_path(tmp_path, a), static_path(tmp_path, b))
     assert load_static(tmp_path, b) is None
     path = static_path(tmp_path, a)
     whole = json.loads(path.read_text())
-    v1 = {k: v for k, v in whole.items() if k != "contract_hash"} | {"version": 1}
+    v1 = {k: v for k, v in whole.items() if k not in ("contract_hash", "code_hash")}
+    v1 |= {"version": 1}
     for broken in (
         b"{",
         b"[]",
         json.dumps(v1).encode(),  # what kontra graph saved before I35: drawn again
         json.dumps(whole | {"version": 3}).encode(),
         json.dumps(whole | {"contract_hash": None}).encode(),
+        json.dumps(whole | {"code_hash": ""}).encode(),
         json.dumps(whole | {"runs": True}).encode(),
     ):
         path.write_bytes(broken)

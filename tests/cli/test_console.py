@@ -237,6 +237,7 @@ async def test_a_run_is_painted_on_the_static_graph_of_its_task_queue(
             task_queue,
             offering="acme/x@1.0.0",
             contract_hash="sha256:x",
+            code_hash="sha256:code",
             runs=8,
             seed=0,
             graph=static,

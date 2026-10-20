@@ -126,7 +126,7 @@ class _ScriptedModel(Model):
         tracing: ModelTracing,
         **kwargs: Any,
     ) -> AsyncIterator[TResponseStreamEvent]:
-        raise NotImplementedError("kontra graph's mock model does not stream")
+        raise NotImplementedError("the mock runs' model does not stream")
 
 
 class _ScriptedProvider(ModelProvider):
