@@ -34,7 +34,7 @@ What that means concretely, and what enforces it:
 | One seller forges another seller's Nexus result | the callback guard (below) |
 | A buyer reads, signals or cancels a seller's handler workflow | the Authorizer: a buyer's token has no call in the seller's namespace, including the job it paid for |
 | A seller resets or deletes a workflow, or a buyer deletes its call records or shortens their retention, to change what escrow sees | the Authorizer: resets, deletes, namespace updates, batch operations and schedules are denied to every token |
-| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as ciphertext -- each item sealed on its own, an unlisted topic's to the seller alone and its name hidden -- and cannot publish to it. It cannot end that job either: the job refuses polls once its history is past half of Temporal's limits, and a refused poll is not written to history ([the stream relay](#the-stream-relay)) |
+| The gate's stream-relay credential leaks | the Authorizer holds it to one job's stream poll and offset query, until its session is revoked (within 5 s) or it expires (15 minutes): it reads that stream as ciphertext -- each item sealed on its own, an unlisted topic's to the seller alone and its name hidden -- and cannot publish to it. It **can still end that job** (a residual risk, below): the job's poll guard bounds what polls add to its history, not a burst of oversized polls that overflows the worker's answer to Temporal ([the stream relay](#the-stream-relay)) |
 | The worker controller's credential leaks | rollouts of Kontra's own workers in the platform namespace: no seller namespace, no workflow start, no compute config |
 | A buyer forges or alters a hold token (amount, seller, expiry, contract) | ES256 signature checked offline by the seller's handler, with audience, expiry, seller namespace, offering and contract hash |
 | A buyer replays a hold token | the handler workflow id is built from the job id and started with reject-duplicate: one execution per hold; a cancel before the job started occupies that id, so the refunded hold cannot start it either |
@@ -305,12 +305,17 @@ could spend that on purpose -- polling from offset 0 again and again until the h
 `limit.historySize.error` (20 MiB, pinned in `dynamicconfig/kontra.yaml`) and Temporal
 terminated the run, refunded against the seller. Now every job root refuses a poll at
 validation (`KontraStreamFull`) once its history is past half of the pinned limits (10,240
-events or 10 MiB), and Temporal writes nothing to history for a refused update. Neither a
-genuine relay nor a leaked token can push a job past that point; the overshoot is bounded by
-the polls in flight (`maxInFlightUpdates`, 10, of at most 512 KiB each), below the termination
-limits. The gate's relay paces itself from the job's history size too (`kontra._relay.pace_for`)
-and stops at the same half. The seller's own publishing, and Kontra's progress forwarder (at
-most 1,000 items a job), are the seller's to keep within the limits.
+events or 10 MiB), and Temporal writes nothing to history for a refused update. **The guard
+bounds history growth only:** past it no poll adds to the history (the overshoot is the polls
+in flight, `maxInFlightUpdates`, 10, of at most 512 KiB each). It caps the relay's share of a
+job's history near half of the limits, not the job's total: the relay's events stay, so a job
+someone listens to needs its own history under the other half. The gate's relay paces itself
+from the job's history size too (`kontra._relay.pace_for`) and stops at the same half. The
+seller's own publishing, and Kontra's progress forwarder (at most 1,000 items per job and
+worker process), are the seller's to keep within the limits.
+
+It does not stop a leaked relay token from ending its job: that is the residual risk below,
+which only the Authorizer can bound, not the job (not done yet).
 
 ### The worker controller
 
@@ -414,11 +419,19 @@ deadline rule.
   before 28 a machine on the host's own network that routes the `control` subnet through the
   host may too, unless the host's `FORWARD` policy drops it; the address is the same on every
   install (`KONTRA_CONTROL_NET`.2).
-- **A leaked stream-relay token can end its job.** Its two calls are enough: every poll's
-  result is written to the job's history, and enough of them push the job past Temporal's
-  history size limit, which terminates it, a refund against the seller. The Authorizer
-  cannot bound it (it does not read payloads); see [the stream relay](#the-stream-relay) for
-  the numbers and the mitigations recorded in decisions I30.
+- **A leaked stream-relay token can end its job.** Its poll call is enough, though no longer
+  by filling the history: polls past the job's guard (10,240 events or 10 MiB) are refused at
+  validation and never stored, so what polls add is the guard plus up to 10 in-flight polls of
+  at most 512 KiB each ([the stream relay](#the-stream-relay), decisions I31). What remains is
+  a burst of concurrent polls with oversized requests: the worker's answer to the workflow
+  task that carries them echoes every update request it accepts **or rejects**, passes
+  gRPC's message limit, and Temporal terminates the run (`GrpcMessageTooLarge`), a refund
+  against the seller -- measured with the pinned limits, the guard refusing every poll
+  included, and on a job root with no poll handler at all (the shape before #52). No
+  workflow code can refuse it, since a rejection is echoed too. The Authorizer can: the
+  relay rule has the typed request, and a genuine poll is about a hundred bytes (at most
+  nine topics and an offset), so refusing a relay request larger than a few KiB closes it.
+  That change belongs to the Authorizer's branch (kontra-sdk#59) and is not made here.
 - **Token lifetime.** A worker token's session revoked at the gate is refused by Kontra's
   Temporal server within its revocation poll (5 s), as long as the server can reach the
   gate's list (`GET /v1/auth/revocations`); while it cannot, the token stays valid until its

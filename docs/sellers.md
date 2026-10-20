@@ -73,6 +73,7 @@ max_concurrent_jobs: 10         # optional; beyond this many open jobs quotes an
 max_output_bytes: 5GB           # the gate refuses artifact uploads beyond this
 artifact_retention: 7d          # after accept; the buyer must download by then
 uses_hosted_model: false        # optional; true when the input goes to a model provider
+streams: [events]               # optional; topics a buyer may read (not hashed, fixed per version)
 ```
 
 | Key | Range |
@@ -82,6 +83,7 @@ uses_hosted_model: false        # optional; true when the input goes to a model 
 | `artifact_retention` | 1s to 90d |
 | `max_output_bytes` | up to 5 TiB (`512MB`, `5GB`, `1GiB`: SI and IEC units both work) |
 | `max_concurrent_jobs` | up to 10,000 |
+| `streams` | up to 8 topic names, each `[A-Za-z][A-Za-z0-9_.-]{0,63}`, `kontra.` reserved ([Streaming to the buyer](#streaming-to-the-buyer)) |
 
 `uses_hosted_model: true` says the job sends the buyer's input to a hosted model (an LLM API),
 where it is plaintext to that provider: Kontra's encryption ends at your worker. It is a fact
@@ -255,7 +257,9 @@ history like any publish: about four events. So forwarding is budgeted per job: 
 details at most every 5 s (`KONTRA_PROGRESS_INTERVAL` changes it; 0 forwards every heartbeat,
 batched), the interval doubling every 360 forwarded items up to 5 minutes, and at most 1,000
 items per job, after which the worker logs once and forwards no more (history keeps showing
-the job alive). When an activity returns, its latest heartbeat is forwarded then, whatever the
+the job alive). The count is each worker process's own (a job whose activities run on three
+workers can forward up to three times as many) and outlasts a quiet spell: a job that
+heartbeats in phases spends one budget. When an activity returns, its latest heartbeat is forwarded then, whatever the
 interval: the buyer sees the last word. Forwarding is best effort: it never raises into, or
 blocks, your activity.
 
@@ -314,8 +318,9 @@ What happens on the way (`docs/decisions.md` I31):
   restart at 0.
 - **Cost.** Every publish signal and every relay poll is written to your job's history (about
   four and five events). The job refuses relay polls once its history is past half of
-  Temporal's limits, so a relay never pushes it into termination; your own publishing is
-  yours to keep within them.
+  Temporal's limits, which caps the relay's share near that half -- its polls stay in the
+  history -- so keep your job's own history (your publishing, activities and signals) under
+  the other half: a listened-to job whose own work goes past it can still be terminated.
 
 ## Many activities
 

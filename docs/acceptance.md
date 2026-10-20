@@ -1,7 +1,8 @@
 # Acceptance criteria (PRD §16)
 
-What proves each of the nineteen acceptance criteria, how to run it, and what the last full
-run gave. A criterion is proved one of two ways, often both:
+What proves each of the nineteen acceptance criteria of PRD §16 (rows 1-19), and of the ones
+added since (row 20, the workflow stream of kontra-sdk#52), how to run it, and what the last
+full run gave. A criterion is proved one of two ways, often both:
 
 * **End to end** (`tests/e2e`, run by `make e2e`): against the real stack `kontra dev` brings
   up -- Kontra's Temporal server with the Authorizer, the gate image, Postgres and SeaweedFS

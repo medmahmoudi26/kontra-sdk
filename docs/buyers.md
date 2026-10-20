@@ -233,7 +233,11 @@ async def follow(k: Kontra, job_id: str) -> None:
 - An item too large to relay (above 256 KiB) is skipped with a log line; an item that is not
   your `type` raises `StreamItemInvalid` (use `type=dict` to see it).
 - `job.progress()` is the same mechanism on Kontra's own topic, `kontra.progress`, with the
-  platform's liveness events mixed in.
+  platform's liveness events mixed in, and so are `kontra job --progress` and the MCP
+  `status` tool: a job nobody listened to before it closed shows its liveness events, not its
+  heartbeats.
+- Once the gate has stored a topic's budget (16 MiB, 64 MiB for the whole job), it records
+  one gap and relays no more of that topic (or of the job).
 
 The script needs no Temporal worker of its own: the job runs as a standalone Nexus operation in
 your namespace, started with the hold token in a header.
@@ -323,7 +327,7 @@ Register it with your agent's MCP configuration, for example:
 | `describe` | an offering's contract: input and output schema, limits, price hint |
 | `quote` | ask the seller's price for an input |
 | `hire` | lock at most `max_price` (required) and start the job, from a `quote_id` or an offering and input |
-| `status` | the job's state, escrow and latest progress |
+| `status` | the job's state, escrow and latest progress (heartbeats only once someone listened while the job ran: asking for its status while it runs is listening; else liveness from history) |
 | `result` | wait for the delivery (up to `wait_seconds`) and write it into `download_dir` |
 | `accept` / `reject` | release the escrow, or dispute the delivery with a reason |
 

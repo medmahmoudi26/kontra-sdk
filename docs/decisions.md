@@ -1922,8 +1922,10 @@ the sentence above) and `docs/security.md`.
   and outcomes are ciphertext to the job's parties.
 - **Residual risk: a leaked relay token can end its job** (*amended by I31*: a job root now
   refuses polls at validation once its history is past half of the pinned limits, and a
-  refused poll is not written to history, so the guard bounds a leaked relay token too; what
-  follows is the risk before it). With only its two allowed calls, it
+  refused poll is not written to history, so the guard bounds the history growth described
+  next -- but not the risk: a burst of concurrent polls with oversized requests still
+  terminates the run, guard or not, and only the Authorizer can refuse those; see I31's
+  history budget). With only its two allowed calls, it
   polls from offset 0 again and again, each time with a new update id, and so appends up to
   `history.maxTotalUpdates` completed updates of up to about 1 MB each to job J's history. Past
   `limit.historySize.error` (20 MiB, pinned) Temporal terminates the run
@@ -1993,7 +1995,12 @@ with two prototypes whose results are below.
   any other to the seller's set alone, its name `null`. Items above 256 KiB of ciphertext are
   claim-checked (or a stub without a blob store; the relay records a gap); the envelope stops at
   512 KiB with `next_offset`/`more_ready` set exactly as the contrib's own truncation does, so
-  every subscriber just polls again. Offsets and the log's length are in the clear: the
+  every subscriber just polls again. The workflow interceptor cuts the answer the same way
+  first, where the sealed envelope could pass 512 KiB (an upper bound per item, for the
+  worker's recipient count), so the codec's own trimming never changes an answer the run
+  counted as read to its end (the drain below); and an item above 256 KiB is claim-checked
+  once per job, not once per poll that re-reads it (age's randomness would make each copy a
+  new blob). Offsets and the log's length are in the clear: the
   platform reads them from history sizes anyway. Decoding restores the exact `PollResult`, so
   the seller's stock `WorkflowStreamClient`, its console and replay are unchanged. The offset
   query's answer is marked too and passes in plaintext. A mark anywhere but a seller's job
@@ -2049,7 +2056,7 @@ with two prototypes whose results are below.
   each item is still polled once. A listener leaving pauses the relay after 30 s, the offset
   kept; a buyer's resume never moves it (a buyer-chosen offset would hand every buyer the
   leaked-token amplification of I30). `kontra._relay` keeps `start="tail"` for a gate that
-  wants it.
+  wants it, but `start=` has no default: a gate that omits it gets an error, not the tail.
 * **Seam ②** (owner, OD4: a hard cut in this 0.x release). `POST` and `GET
   /v1/jobs/{id}/progress`, `ProgressPost` and `ProgressEvent` are gone. `GET
   /v1/jobs/{id}/stream` (the job's buyer or seller) serves SSE of `StreamEvent{cursor, kind:
@@ -2057,9 +2064,12 @@ with two prototypes whose results are below.
   `kontra.progress`, else 422 `unknown_topic`), `history`, `after` or `Last-Event-ID`; it ends
   once the job is closed and its relay finished. History events are the platform's liveness
   summary, unchanged in content. Caps (owner, OD7): 256 KiB per relayed item
-  (`gap{too_large}` with its size), 16 MiB per topic and 64 MiB per job stored
-  (`gap{topic_budget|job_budget}`), 8 listeners per job (429 `too_many_listeners`); no rate
-  drop -- items wait in the workflow's log while the relay paces itself.
+  (`gap{too_large}` with its size), 16 MiB per topic and 64 MiB per job stored -- past one,
+  a single `gap{topic_budget|job_budget}` (the first item that did not fit), and the gate
+  relays no more of that topic (it restarts the relay without it) or of the job (the relay
+  stops), so neither the store nor the seller's history grows by an item the gate drops --
+  8 listeners per job (429 `too_many_listeners`); no rate drop -- items wait in the
+  workflow's log while the relay paces itself.
 * **The buyer.** `job.stream(topic, type=T)` -> `JobStream[T]`: decrypt with the job's key,
   check the sealed topic and offset, validate as `T` (`dict` for leniency), dedupe by cursor
   (a replay) and by offset (a gate that re-read), resume through `.cursor`. Not sealed for us,
@@ -2067,8 +2077,10 @@ with two prototypes whose results are below.
   stopped) raises `StreamInterrupted`; an invalid item `StreamItemInvalid`. `job.progress()`
   keeps its public shape, as sugar over the `kontra.progress` topic (items are
   `kontra.types.ProgressRecord{v, at, activity, details}`) plus history events; the MCP
-  `status` tool and `kontra job --progress` are unchanged, and `kontra job <id> --stream TOPIC`
-  prints decrypted items as JSON lines.
+  `status` tool and `kontra job --progress` keep their interface, but what they show follows
+  the delivery semantics below: heartbeats appear only for a job someone listened to before
+  it closed (asking for its status while it runs is listening), else history events alone.
+  `kontra job <id> --stream TOPIC` prints decrypted items as JSON lines.
 * **History budget** (owner, OD1, OD8). Heartbeats now cost the seller's history: one publish
   signal is about four events, a relayed poll about five more (measured: 20 activity publish
   batches cost 95 events, 192 with a relay polling). Against Kontra's pinned
@@ -2082,10 +2094,26 @@ with two prototypes whose results are below.
   every 5 s (`KONTRA_PROGRESS_INTERVAL` still overrides; 0 publishes every heartbeat, batched),
   the interval doubling every 360 items up to 300 s, at most 1,000 items per job (about 4,000
   events, a fifth of the limit), then one log line and nothing more; an activity's latest
-  heartbeat is published when it returns, whatever the interval. **Amends I30's residual risk
-  "a leaked relay token can end its job":** polls past the guard are refused and not stored, so
-  the remaining bound is the guard plus the polls in flight (Temporal's
-  `maxInFlightUpdates`, 10, of at most 512 KiB each), below the termination limits.
+  heartbeat is published when it returns, whatever the interval. The count is per worker
+  process (each one that runs the job's activities has its own) and survives the job going
+  quiet: a job forgotten after five idle minutes keeps its count for 31 days, past the
+  longest `max_duration`. **What the guard bounds, and what it does not.** It bounds what
+  polls add to the history: past it, polls are refused and not stored, so their share is the
+  guard plus the polls in flight (Temporal's `maxInFlightUpdates`, 10, of at most 512 KiB
+  each). It caps the relay's share near half of the limits, not the job's total: the relay's
+  events stay, so a job someone listens to needs its own history under the other half
+  (measured with the limits scaled down: a job whose own work reached about 85% of them
+  completed unlistened and was terminated with a genuine relay listening, which the guard had
+  stopped at half). Capping the relay's own share (counting answered polls and their bytes in
+  the interceptor) is the better bound, recorded, not built. **I30's residual risk "a leaked
+  relay token can end its job" stands:** a burst of concurrent polls with oversized requests
+  makes the worker's answer to the workflow task carrying them pass gRPC's limit (the SDK
+  echoes every update request it accepts or rejects), and Temporal terminates the run
+  (`GrpcMessageTooLarge`) whether the job accepts or refuses those polls, and with no poll
+  handler at all (measured; the shape before #52 too). No validator can stop what is echoed
+  when it is refused. The Authorizer can: the relay rule has the typed request, and a genuine
+  poll is about a hundred bytes, so a relay request larger than a few KiB is refused there --
+  a change for #59's branch, reported, not made here.
 * **Delivery semantics.** Live: a buyer who never listens before the job closes gets nothing
   of its stream but history events (a relay attaching after a short job closed reads nothing;
   items published before a continue-as-new of a Kontra-hosted stream nobody polled are not
@@ -2115,13 +2143,17 @@ envelope; a plaintext log length; external storage above the envelope limit), I2
 activity mirrors; Kontra hosts a stream on every job root), and `docs/security.md`.
 **Supersedes** the bespoke progress channel (PRD §8.4's `POST .../progress`).
 
-Tested: the envelope and the codec branches (`tests/codec/test_stream_envelope.py`); the
-streams rule through the code and the spec (`tests/contract/test_offering_streams.py`); hosting,
-early handlers, the drain, a continue-as-new chain, the guard and replay
-(`tests/serve/test_stream_hosting.py`); every relay classification, the same update id
-re-sent, a look-alike chain refused and no contrib import (`tests/serve/test_relay.py`); the
-forwarder (`tests/serve/test_progress.py`); the mirror and its checkpoint
-(`tests/serve/test_turn.py`); the FakeGate's relay, caps, resume and listener rules
+Tested: the envelope and the codec branches, JSON nested past the stack refused, the
+interceptor's cut sealed whole for every size class and recipient count, and a re-read large
+item stored once per job (`tests/codec/test_stream_envelope.py`); the streams rule through
+the code and the spec (`tests/contract/test_offering_streams.py`); hosting, early handlers,
+the drain (a short job's tail that passes one envelope included), a continue-as-new chain, the
+guard and replay (`tests/serve/test_stream_hosting.py`); every relay classification (a
+`TruncatedOffset` at offset 0 backed off, not spun on), the same update id re-sent, a
+look-alike chain refused, `start=` required and no contrib import
+(`tests/serve/test_relay.py`); the forwarder, its budget across a quiet spell
+(`tests/serve/test_progress.py`); the mirror and its checkpoint (`tests/serve/test_turn.py`);
+the FakeGate's relay, caps (a spent budget one gap), resume and listener rules
 (`tests/testing/test_stream_relay.py`); `job.stream()` (`tests/hire/test_stream.py`); seam ⑤'s
 marker scans of every run's history, the raw SSE and the gate's store, with a misbehaving
 relay, for a workflow entry and a bound handler (`tests/serve/test_streams.py`); and the loop
