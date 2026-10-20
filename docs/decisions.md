@@ -1957,26 +1957,13 @@ the sentence above) and `docs/security.md`.
   one workflow task and holds any further poll back for a later one. What remains is the
   relay's share of the history: a leaked token can spend it at once, where a genuine relay
   spends it as the stream grows, so a job someone listens to whose own history needs more than
-  the other half of the limits is terminated (I31's history budget). As first found, with only
-  its two allowed calls, it polls from offset 0 again and again, each time with a new update id,
-  and so appends up to `history.maxTotalUpdates` completed updates of up to about 1 MB each to
-  job J's history.
-  Past `limit.historySize.error` (20 MiB, pinned) Temporal terminates the run
-  (`enforceHistorySizeCheck`, reason "Workflow history size exceeds limit."), and escrow refunds
-  the job as "seller workflow terminated", against the seller. Any stream above about 10.5 KB
-  (20 MiB / 2,000) is enough, and one of about 1 MB takes about twenty polls (measured over the
-  wire). The session is revoked only when the job closes or the last listener leaves, so a
-  leaked token stays live while a buyer listens. The Authorizer cannot bound this: its size cap
-  holds a relay's requests, the cost is in the answers, and it does not read the payload.
-  Mitigations, recorded and **not adopted here** (the owner decides): handler workflows that
-  host a stream continue-as-new on `workflow.info().is_continue_as_new_suggested()` (escrow
-  follows the pinned chain, and the relay's empty run id follows the current run), which turns
-  the termination into churn; #52's relay polls only from the tail, with topics (I31 chose
-  offset 0, once per job), which bounds a genuine relay's cost but not a leaked token's, since
-  that token picks its own offset; a per-namespace `history.maxTotalUpdates` below the pinned
-  2,000, chosen with `limit.historySize.error` in mind, which bounds it only together with
-  continue-as-new (20 MiB at 1 MB a poll is about twenty updates, a cap a genuine subscription
-  would hit too).
+  the other half of the limits is terminated (I31's history budget). The session is revoked
+  only when the job closes or the last listener leaves, so a leaked token stays live while a
+  buyer listens. The Authorizer cannot bound this: its size cap holds a relay's requests, the
+  cost is in the answers, and it does not read the payload. The bound is the job's own: the
+  guard here, and the follow-up the owner asked for on #59 (stream items by reference, a
+  per-run poll budget). Continue-as-new on handler workflows was considered and rejected by the
+  owner (#59): it puts a rule on seller code.
 - #51 documents that a seller who turns on Worker Versioning gets no tasks.
 
 Tested: the Go deny matrix, every cell with its typed request, against Kontra's and Temporal's
