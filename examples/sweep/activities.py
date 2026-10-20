@@ -1,5 +1,5 @@
-"""Temporal activities through the kontra façade (D1): `activity` is Temporal's, and its
-`defn` also notes the activity for `serve()` to register. Each is a unit Temporal schedules,
+"""Plain Temporal activities: `activity` is `temporalio`'s, and `serve()` in worker.py finds
+them by scanning this project. Each is a unit Temporal schedules,
 times out and retries on its own:
 
 * `plan`: the input normalised, each URL once, and the sites it is on;

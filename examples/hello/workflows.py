@@ -1,6 +1,6 @@
-"""Temporal through the kontra façade (D1): `workflow` and `RetryPolicy` are Temporal's own
-objects, so with `from temporalio import workflow` this runs on any Temporal. Kontra starts
-it with the id `job-<job id>` when a buyer hires the offering."""
+"""Vanilla Temporal: `workflow` and `RetryPolicy` are `temporalio`'s, and nothing here imports
+`kontra`, so this runs on any Temporal worker as it is (decisions I29). Kontra starts it with
+the id `job-<job id>` when a buyer hires the offering."""
 
 from datetime import timedelta
 

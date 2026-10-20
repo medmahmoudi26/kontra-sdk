@@ -1,7 +1,8 @@
 """An agent as workflow code: OpenAI's Agents SDK runs its loop here, durably, through
 Temporal's integration -- every model call and every tool call is an activity, retried and
-recorded like any other. Importing `agents` is all it takes: the worker gives a workflow
-that imports it what it needs (decisions I25). Temporal through the kontra façade (D1).
+recorded like any other. Vanilla Temporal and Temporal's own integration
+(`temporalio.openai_agents`); nothing here imports `kontra` (decisions I29). The worker runs
+the integration's plugin (worker.py).
 
 Which model answers, and where it runs, is the worker's (worker.py), never this file's:
 the agent names no model, so it runs the one the worker's Agents SDK defaults to."""

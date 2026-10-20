@@ -1,6 +1,6 @@
 """An agent whose loop is a process, not workflow code: Claude Code (`claude -p`) runs the
-whole loop -- model calls and tool calls -- and this one activity drives it. No agent SDK;
-Temporal through the kontra façade (D1). The shape fits any agent that is a binary.
+whole loop -- model calls and tool calls -- and this one activity drives it. No agent SDK,
+and no `kontra`: a plain Temporal activity. The shape fits any agent that is a binary.
 
 Durable the Temporal way. The activity heartbeats once per line the binary prints (its
 `stream-json` events; the buyer sees them as progress) and returns on the `result` event. The

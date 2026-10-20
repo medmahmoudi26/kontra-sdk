@@ -3,12 +3,13 @@ runs in Temporal's time-skipping test server.
 
 #42's "done when", as far as this command answers for it: every seller example's graph is
 the one its README documents (and ``examples/recon`` is refused, with a clear line: it is
-buyer code, with no worker.py); ``examples/sweep``'s fan-out is one parallel group, its batch
-one child node with no continue-as-new chain, and its ``if`` on what the batch found shows
-both branches from two runs; never-scheduled activities are listed with exit status 0. Then
-the other warnings, ``--json``, ``--input``, and the static graph ``kontra dev``'s page reads.
-The projects under ``projects/`` are seller projects written for these tests (``branches``
-has the same three shapes, and an activity only a signal reaches; ``nested`` what only a
+buyer code, with no worker.py); ``examples/sweep``'s fan-out is one parallel group, its one
+activity per URL one node, and its ``if`` on what the checks found shows both branches from
+two runs; never-scheduled activities are listed with exit status 0. Then the other warnings,
+``--json``, ``--input``, and the static graph ``kontra dev``'s page reads. The projects under
+``projects/`` are seller projects written for these tests (``branches`` has a fan-out, a
+batch -- the optional ``kontra.contrib.parallel`` helper's child -- and a branch, and an
+activity only a signal reaches; ``nested`` what only a
 child's history or a marker shows, and a batch over pages; ``two`` a worker that binds two
 offerings); the command runs in-process (``CliRunner``)."""
 
@@ -139,31 +140,36 @@ def test_the_graph_of_every_seller_example_is_its_readmes(home: Path, example: s
 
 
 @pytest.mark.parametrize("runs", ["2", "4"])
-def test_the_sweep_example_shows_a_fan_out_a_batch_and_both_branches(home: Path, runs: str) -> None:
-    """examples/sweep, #42's three shapes: the two fetches are one parallel group (same
-    group, the same predecessor), which the ``if``'s two branches are not; the batch is ONE
-    child node, named from its input and labelled with the call, with no continue-as-new
-    chain and none of its item activities in the parent's graph; and the ``if`` on what it
-    found shows both branches from two runs (run 0's check finds nothing, run 1's carries an
-    error, so its page counts as unreachable and the run scores)."""
+def test_the_sweep_example_shows_a_fan_out_one_activity_per_url_and_both_branches(
+    home: Path, runs: str
+) -> None:
+    """examples/sweep, #42's three shapes in vanilla Temporal: the two fetches are one parallel
+    group (same group, the same predecessor), which the ``if``'s two branches are not; the
+    per-URL checks are ONE activity node however many URLs there are, and no child workflow
+    -- with an edge to itself only from run 2 on, whose ``plan`` drew 201 URLs, more than
+    the 50 the workflow's semaphore lets open, so each completion starts the next in a
+    workflow task of its own; and the ``if`` on what they found shows both branches from two
+    runs (run 0's check finds nothing, run 1's carries an error, so its page counts as
+    unreachable and the run scores)."""
     g = graph_of(home, EXAMPLES / "sweep", "--runs", runs)
     robots, security_txt = node(g, "fetch_robots"), node(g, "fetch_security_txt")
     assert robots["group"] == security_txt["group"] != node(g, "plan")["group"]
     assert {s for s, t in edges(g) if t in ("fetch_robots", "fetch_security_txt")} == {"plan"}
     # The same predecessor, but taken by different runs: two groups, not a fan-out.
     assert node(g, "score")["group"] != node(g, "all_clear")["group"]
-    batch = "kontra.batch.v1[check_headers]"
-    children = [n for n in g["nodes"] if n["kind"] == "child"]
-    assert [(n["id"], n["label"]) for n in children] == [
-        (batch, "execute_activities_in_parallel(check_headers)")
-    ]
-    assert {(s, t) for s, t in edges(g) if batch in (s, t)} == {
-        ("fetch_robots", batch),
-        ("fetch_security_txt", batch),
-        (batch, "score"),
-        (batch, "all_clear"),
-    }  # no self edge: one node, not a chain of runs
-    assert not any(n["name"] == "check_headers" for n in g["nodes"])
+    assert not [n for n in g["nodes"] if n["kind"] == "child"]
+    check = "check_headers"
+    assert [(n["id"], n["kind"]) for n in g["nodes"] if n["name"] == check] == [
+        (check, "activity")
+    ]  # one node: never check_headers#2
+    loop = {(check, check)} if runs == "4" else set()  # runs 0 and 1 draw 1 and 3 URLs
+    assert {(s, t) for s, t in edges(g) if check in (s, t)} == {
+        ("fetch_robots", check),
+        ("fetch_security_txt", check),
+        (check, "score"),
+        (check, "all_clear"),
+        *loop,
+    }
     assert {("score", "write_report"), ("all_clear", "write_report"), ("write_report", "end")} <= (
         edges(g)
     )

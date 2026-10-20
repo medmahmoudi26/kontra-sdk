@@ -1,7 +1,7 @@
-"""The pantry, as an activity the agent calls as a tool (`workflow.activity_as_tool` in
-workflows.py): its name, docstring and argument become the tool's, and every call is an
-activity -- retried, recorded, and run on this worker. Temporal through the kontra façade
-(D1). A real offering reads its stock here."""
+"""The pantry, as an activity the agent calls as a tool (`activity_as_tool` in workflows.py):
+its name, docstring and argument become the tool's, and every call is an activity --
+retried, recorded, and run on this worker. A plain Temporal activity. A real offering reads
+its stock here."""
 
 from temporalio import activity
 

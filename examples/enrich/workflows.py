@@ -1,5 +1,5 @@
-"""Temporal through the kontra façade (D1): `workflow` and `RetryPolicy` are Temporal's own
-objects, so with `from temporalio import ...` this runs on any Temporal. The one Kontra type
+"""Vanilla Temporal: `workflow` and `RetryPolicy` are `temporalio`'s, and nothing here imports
+`kontra`, so this runs on any Temporal worker as it is (decisions I29). The one Kontra type
 the job touches, `Artifact`, comes from models.py as the activity's return value."""
 
 from datetime import timedelta

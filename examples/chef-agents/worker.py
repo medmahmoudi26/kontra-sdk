@@ -1,12 +1,18 @@
-"""Binds the code to the offering; all worker tuning lives here (D11). `serve()` binds
-offering.yaml and quote.py beside this file to `ChefFlow` and registers every activity the
-workflow imports; the workflow imports `agents`, so the worker runs Temporal's OpenAI Agents
-plugin too (decisions I25). Every keyword is a `temporalio.worker.Worker` argument, passed
-through verbatim.
+"""Binds the code to the offering; all worker tuning lives here (D11), and this is the one file
+that imports `kontra` (decisions I29). `serve()` binds offering.yaml and quote.py beside this
+file to `ChefFlow`, and registers every `@activity.defn` function of this project. Every
+keyword is a `temporalio.worker.Worker` argument, passed through verbatim -- `plugins=`
+included: Temporal's `OpenAIAgentsPlugin`, which runs the agent's model and tool calls as
+activities, goes on the worker's client ahead of Kontra's plugin, so its payload converter is
+the one the client uses (and Kontra's codec encrypts under it). Its integration,
+`temporalio-openai-agents`, is this project's dependency, not kontra-sdk's.
 
 The model endpoint is this worker's, set the Agents SDK's own way -- its default client --
 so any OpenAI-compatible server answers the agent: Ollama, vLLM, OpenRouter, Mistral. The
-model's name is the SDK's `OPENAI_DEFAULT_MODEL`, from this worker's environment too."""
+model's name is the SDK's `OPENAI_DEFAULT_MODEL`, from this worker's environment too.
+`model_provider=OpenAIProvider()` is what makes the plugin's model activity use that client:
+without it, the plugin builds its own `AsyncOpenAI()` from the environment when the worker is
+built, and the default client set here is never asked."""
 
 import os
 from datetime import timedelta
