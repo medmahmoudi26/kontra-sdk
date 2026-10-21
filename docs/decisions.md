@@ -2863,6 +2863,8 @@ every model: a difference anywhere else is a bug in one emitter, and reported as
   `worker.py` uses the harness and asserts that its golden `contract.yaml` is what the binding
   derives and equals the harness's schema for its handler with no difference at all, so that
   example must not declare `extra="allow"` (pydantic's default or `"forbid"` both agree).
+  (*Amended by I37:* `examples/recon-harness` is that example; the hook runs for it, with no
+  difference, and a test of the list keeps it from skipping.)
 - **Checked by** `tests/contract/test_harness_rules.py` (each rule of the canonical form on
   hand-written harness documents: names, annotations, an inline enum, optionals, composite
   defaults, a scalar default compared and one on a required member not, the discriminator, a
@@ -3492,6 +3494,7 @@ command #42's (merged as #46).
 9. **No browser in `make check` (OD9).** The lifecycle test (`tests/cli/test_session_lifecycle.py`,
    `ReconHarnessAgent` in `tests/serve/recon_harness.py`, a scripted model and a real subagent,
    no LLM) checks behaviour over HTTP; PR screenshots are scratch tooling, and no extra is added.
+   (*Amended by I37:* the agent is `examples/recon-harness`'s `ReconAgent`, the fixture is gone.)
 
 10. **One page, measured.** The turn header names the input's type as the agent's own
     `agent_interface` query says it (asked once per run, three seconds; else its first field).
@@ -3499,3 +3502,80 @@ command #42's (merged as #46).
     column, the same layout and framing (compared pixel for pixel over the graph fixtures). On an
     agent's page the right column is as tall as the room below its top, so the session, its
     footer and the node pane are in view together, and the session follows its tail.
+
+## I37. Examples on vanilla temporalio, and the agent story on both sides of the seam (kontra-sdk#58; decisions 1, 4, 7 and 8 of #50)
+
+_The `kontra.contrib` question below was decided by the implementer in the owner's place, as
+kontra-sdk#50 directs; it is listed on #58 for the owner to confirm or overturn._
+
+- **Every seller example is vanilla temporalio** (I29; the rewrite and the inverted
+  `tests/examples/test_imports.py` landed with #51): `hello`, `enrich`, `sweep`, `chef-agents`,
+  `chef-claude`, `legacy-actor`. #58 changes no contract of theirs: every golden is
+  byte-for-byte what it was.
+- **`examples/recon-harness`, the seller.** An agent is a workflow whose entry is one typed
+  handler, and the word "agent" appears nowhere in Kontra's surface: `ReconAgent.sweep`
+  (`@agent.defn`, `@agent.init`, `@agent.accepts`, an `AgentWorkflowRunner` on a
+  `WorkflowStream`) and its subagent `CertChecker` in `workflows.py`, the tools in
+  `activities.py`, vanilla temporalio and the harness; `worker.py` the one `kontra` import,
+  `serve(ReconAgent.sweep, workflows=[CertChecker], plugins=[AgentHarnessPlugin(tools=TOOLS)])`;
+  `streams: [turn_events]` (topics are named by identity, I31). The harness's payload
+  converter and Kontra's payload codec stack (I29). `SweepRequest` and `SweepReport` forbid
+  other keys and every output field is required, without a default, so the contract equals
+  the harness's schema with no difference at all (I33): #68's examples hook runs for it and
+  can no longer skip (a test holds the list of harness examples). The agent is #54's test
+  agent, promoted: `tests/cli/test_session_lifecycle.py` runs the example's own code under an
+  offering of its own, and `tests/serve/recon_harness.py` is gone (one copy).
+- **The model is the worker's.** `think`, an activity, is the model: scripted with no
+  `LLM_BASE_URL` in the worker's environment, an OpenAI-compatible endpoint (`LLM_MODEL`,
+  `LLM_API_KEY`) with one -- the chef examples' switch. The steps are the agent's code; the
+  model says each one and writes the report's summary, its prompt carrying counts, never the
+  buyer's domains. Rejected: the harness's OpenAI Agents integration with a fake model, whose
+  model events come only from the SDK's streamed path, which a scripted model would have to
+  speak event by event; a seller who wants the model to choose the tools changes
+  `workflows.py`, and nothing Kontra sees.
+- **One hire is one turn** (I29), and the example says so where a buyer meets it: `quote.py`
+  refuses a sweep that asks for an approval or a callback before anything is locked, rather
+  than the job failing at the request. The dev console drives both for an agent run on its
+  own (I36); multi-turn sessions are kontra-sdk#60.
+- **The graph of a handler offering is a run's.** A handler has no static graph (I35), so the
+  README carries a hired run's: `kontra.graph.mermaid(graph, nested=True)` -- new, the default
+  unchanged -- draws the child `parse(nested=...)` nested as a Mermaid subgraph: the turn root,
+  the agent child and its tool activities in one block, equal to a fresh run's with the README
+  goldens' `%% <offering>` header. Two choices make the run the same every time: the run drawn
+  is a hire nobody listens to (a listened job's root also waits, a bounded while, for the relay
+  to read its stream to the end, I31, a timer that is there or not by timing), and the agent
+  stops its subagent last, after the summary, so the subagent's close is read in the same
+  window of the agent's history on every run.
+- **`examples/buyer-harness-agent`, the buyer.** A buyer's own harness agent hires offerings as
+  tools on the buyer's own worker (`kontra.hire.worker`): `kontra pull --lang python` gives
+  the typed client (`gen/recon_harness`, committed so the test needs no nexgen, and held to the
+  nexgen view of the seller's golden contract, and to nexgen's output when `NEXGEN_BIN` is
+  set); a page of glue (`tools.py`) makes a harness tool whose input is the pulled input type
+  and whose result the pulled output type, both through the converters nexgen generated; the
+  tool quotes, asks to spend, and hires with `kontra.hire.service`, waiting durably for the
+  escrowed job as a Nexus operation of the agent's workflow.
+- **Spend control is the harness's approval policy.** Every hire goes through `spend(offering,
+  price, currency)`, a tool that is not inherently safe, called by the hiring tool with its own
+  quote, so the price approved is the price quoted, not a number the model chose. Auto mode
+  with the agent's evaluator approves a price at or under the cap (`spend_cap` in its criteria'
+  context, settable per session through `AgentConfig`) and escalates anything above it to a
+  person; it never denies on its own. A denial hires nothing and locks nothing; an approval
+  hires with `max_price` the approved price, so the escrow can never hold more than was
+  approved.
+- **No `kontra.contrib` adapter.** A generic one would build a tool from any pulled client:
+  a model-facing signature made at runtime from generated types, and codegen details of one
+  language in Kontra's own package, for a page of code that changes with each offering's types.
+  The glue stays in the example.
+- **The pins.** `temporal-agent-harness==0.6.0`, exactly, in both examples' READMEs (it is
+  pre-1.0) and in kontra-sdk's dev group (I29), whose `temporal-agent-harness/0.6` events the
+  console understands (I36); the pulled client is nexgen v0.2.5's, `kontra pull`'s pin.
+- **Checked by** `tests/examples/test_recon_harness.py` (on the dev gate: quote and hire, the
+  typed report, the agent's events on `job.stream("turn_events")`, the escrow released, the
+  quote's refusal, the contract against the harness's schema, `/api/session`'s rows, the
+  README's graph; the model scripted and against a stand-in endpoint),
+  `tests/examples/test_buyer_harness_agent.py` (under the cap, above it denied and approved,
+  `max_price` to the cent; the pulled client; the glue's JSON), `tests/examples/test_imports.py`
+  and `test_layout.py` (both examples; the buyer's modules take only `kontra.hire`'s workflow
+  door), `tests/contract/test_harness.py`, `tests/cli/test_session_lifecycle.py`,
+  `tests/graph/test_graph.py` (the subgraph) and `tests/graph/test_cli.py` (the handler example
+  refused by `kontra graph`, its README graph checked where its runs are).

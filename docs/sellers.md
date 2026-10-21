@@ -635,8 +635,12 @@ serve(
   encrypted in Temporal like the rest of the job.
 
 **One handler of an agent**, written with Temporal's agent harness
-(`pip install temporal-agent-harness`). `serve()` takes the handler itself, and one hire is
-one turn of the agent:
+(`pip install temporal-agent-harness==0.6.0`: it is pre-1.0, so pin it exactly). `serve()`
+takes the handler itself, and one hire is one turn of the agent.
+[`examples/recon-harness`](../examples/recon-harness) is the whole project: an agent with
+activity tools, a subagent and a model behind the worker's switch, its contract equal to the
+harness's own schema to the last member, and the buyer's side in
+[`examples/buyer-harness-agent`](../examples/buyer-harness-agent). In short:
 
 ```python
 # recon.py -- vanilla Temporal and the harness, nothing from kontra

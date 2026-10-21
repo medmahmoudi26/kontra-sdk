@@ -312,6 +312,24 @@ Temporal's.
 Composition returns only the final result (no progress stream); use a script when you want
 `job.progress()`. [`examples/recon`](../examples/recon) is this example, runnable.
 
+## From your own agent
+
+An agent of yours, written with Temporal's agent harness and run on your own worker, can hire
+offerings as tools: [`examples/buyer-harness-agent`](../examples/buyer-harness-agent). The glue
+is a page of the example's, not part of `kontra`: `kontra pull --lang python` gives the
+offering's typed client, a harness tool takes its input type and returns its output type, and
+the tool quotes, asks to spend the quote, then hires with `kontra.hire.service` as above, so
+the agent waits durably for the escrowed job.
+
+**Spend control is the harness's approval policy.** Each hire goes through a tool that is not
+inherently safe, with the quote as its input, so the agent's policy decides it: the example's
+auto-mode evaluator approves a price under a cap and puts anything above it to a person ("agent
+wants to spend 0.06 USD hiring acme/recon-harness@0.1.0 -- approve?"). A denial hires nothing
+and locks nothing; an approval hires with `max_price` set to the approved price, so the hold can
+never be more than what was approved. The seller's agent behind the offering takes one message
+and gives one reply: a hire is one turn, without approvals on its side (kontra-sdk#60 is the
+later session jobs).
+
 ## From an agent (MCP)
 
 ```sh
