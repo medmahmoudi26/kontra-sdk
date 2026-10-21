@@ -2031,3 +2031,36 @@ def test_merge_and_mermaid_keep_a_nested_child_to_itself() -> None:
         "Settle/write_records",
     }
     assert mermaid(nested) == mermaid(flat)
+
+
+def test_mermaid_draws_a_nested_child_as_a_subgraph_when_asked() -> None:
+    """``nested=True``: the child's node becomes a subgraph of its own start, nodes, edges and
+    end, in that node's place and under its name (the run's edges to it are unchanged); the
+    rest of the chart is line for line what it is without."""
+    flat, nested = _nested()
+    drawn = mermaid(nested, nested=True).splitlines()
+    host = next(line.strip() for line in mermaid(flat).splitlines() if '[["Settle"]]' in line)
+    name = host.split("[", 1)[0]
+    at = drawn.index(f'    subgraph {name} ["Settle"]')
+    block = drawn[at : drawn.index("    end", at) + 1]
+    assert block == [
+        f'    subgraph {name} ["Settle"]',
+        f"        {name}_s((start))",
+        f'        {name}_0["fetch_batch"]',
+        f'        {name}_1["enrich"]',
+        f'        {name}_2["write_records"]',
+        f"        {name}_e((end))",
+        f"        {name}_1 --> {name}_2",
+        f"        {name}_0 --> {name}_1",
+        f"        {name}_s --> {name}_0",
+        f"        {name}_2 --> {name}_e",
+        "    end",
+    ]
+    rest = drawn[:at] + drawn[at + len(block) :]
+    plain = [line for line in mermaid(flat).splitlines() if line.strip() != host]
+    assert [line for line in rest if not line.startswith("    class ")] == [
+        line for line in plain if not line.startswith("    class ")
+    ]
+    [painted] = [line for line in drawn if line.startswith("    class ")]
+    assert painted.split()[1].split(",") == ["n0", "n1", f"{name}_0", f"{name}_1", f"{name}_2"]
+    assert mermaid(flat, nested=True) == mermaid(flat)  # nothing nested: nothing changes

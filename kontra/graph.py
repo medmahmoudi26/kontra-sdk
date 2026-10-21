@@ -1534,54 +1534,97 @@ def _mermaid_text(value: str) -> str:
     return "".join(_ENTITIES.get(c, c if c.isprintable() else " ") for c in value)
 
 
-def mermaid(graph: Graph) -> str:
+def mermaid(graph: Graph, *, nested: bool = False) -> str:
     """``graph`` as a Mermaid flowchart. Nodes are ``n0``, ``n1``... in graph order (a
     name is only ever a label); an activity is a box, a local activity a dashed one, a
     child a subroutine, a timer a stadium and a Nexus operation a hexagon; a label ends in
     ``×n`` for the attempt past the first and ``∥n`` for a fan-out. A class per status,
     ``unreached`` for a node the live run did not reach, and a dotted edge for one it did
-    not take."""  # noqa: RUF002 -- the multiplication sign is the label's
-    nodes = [
-        n for n in graph.get("nodes") or [] if isinstance(n.get("id"), str) and "parent" not in n
-    ]
+    not take.
+
+    A child drawn nested (:func:`parse`'s ``nested``) is left out, its node a subroutine
+    like any child's; ``nested=True`` draws it as a subgraph in that node's place instead,
+    named and titled as that node, holding the child's own nodes, edges and ``start`` and
+    ``end`` (``n1_0``, ``n1_s``... for the child in ``n1``; the subgraph itself takes no
+    status class): one block for a run and the agent it hosts, as the dev console draws
+    them (decisions I36, I37)."""  # noqa: RUF002 -- the multiplication sign is the label's
+    every = [n for n in graph.get("nodes") or [] if isinstance(n.get("id"), str)]
+    nodes = [n for n in every if "parent" not in n]
     names = {n["id"]: f"n{i}" for i, n in enumerate(nodes)}
-    names.update({START: "s", END: "e"})
-    edges = [
-        e
-        for e in graph.get("edges") or []
-        if e.get("from") in names and e.get("to") in names and "parent" not in e
-    ]
-    ends = {e["from"] for e in edges} | {e["to"] for e in edges}
-    lines = ["flowchart TD"]
-    if START in ends:
-        lines.append("    s((start))")
+    inside: dict[str, list[dict[str, Any]]] = {}
+    if nested:
+        for n in every:
+            if isinstance(n.get("parent"), str) and n["parent"] in names:
+                inside.setdefault(n["parent"], []).append(n)
     classes: dict[str, list[str]] = {}
-    for node in nodes:
-        name = names[node["id"]]
-        label = str(node.get("label") or node.get("name") or node["id"])
-        attempt, parallel = node.get("attempt"), node.get("parallel")
-        if isinstance(attempt, int) and attempt > 1:
-            label += f" \u00d7{attempt}"  # MULTIPLICATION SIGN
-        if isinstance(parallel, int) and parallel > 1:
-            label += f" ∥{parallel}"
-        left, right = _SHAPES.get(node.get("kind") or "", _SHAPES["activity"])
-        lines.append(f"    {name}{left}{_mermaid_text(label)}{right}")
-        marks = [node.get("status")]
-        marks += ["local" if node.get("kind") == "local_activity" else None]
-        marks += ["unreached" if node.get("reached") is False else None]
-        for mark in marks:
-            if mark in _STYLES:
-                classes.setdefault(mark, []).append(name)
-    if END in ends:
-        lines.append("    e((end))")
-    for e in edges:
-        arrow = "-.->" if e.get("reached") is False else "-->"
-        lines.append(f"    {names[e['from']]} {arrow} {names[e['to']]}")
+    lines = ["flowchart TD"]
+    outer = _mermaid_part(graph, nodes, names, None, classes, inside)
+    lines += [f"    {line}" for line in outer]
     for mark, style in _STYLES.items():
         if mark in classes:
             lines.append(f"    classDef {mark} {style}")
             lines.append(f"    class {','.join(classes[mark])} {mark}")
     return "\n".join(lines) + "\n"
+
+
+def _mermaid_node(node: Mapping[str, Any], name: str, classes: dict[str, list[str]]) -> str:
+    label = str(node.get("label") or node.get("name") or node["id"])
+    attempt, parallel = node.get("attempt"), node.get("parallel")
+    if isinstance(attempt, int) and attempt > 1:
+        label += f" \u00d7{attempt}"  # MULTIPLICATION SIGN
+    if isinstance(parallel, int) and parallel > 1:
+        label += f" ∥{parallel}"
+    left, right = _SHAPES.get(node.get("kind") or "", _SHAPES["activity"])
+    marks = [node.get("status")]
+    marks += ["local" if node.get("kind") == "local_activity" else None]
+    marks += ["unreached" if node.get("reached") is False else None]
+    for mark in marks:
+        if mark in _STYLES:
+            classes.setdefault(mark, []).append(name)
+    return f"{name}{left}{_mermaid_text(label)}{right}"
+
+
+def _mermaid_part(
+    graph: Graph,
+    nodes: Sequence[Mapping[str, Any]],
+    names: dict[str, str],
+    parent: str | None,
+    classes: dict[str, list[str]],
+    inside: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> list[str]:
+    """The lines of one level: the run's own (``parent`` None), or a nested child's, whose
+    ``start`` and ``end`` are its own and whose edges carry ``parent``."""
+    prefix = "" if parent is None else f"{names[parent]}_"
+    local = {**names, START: f"{prefix}s", END: f"{prefix}e"}
+    edges = [
+        e
+        for e in graph.get("edges") or []
+        if e.get("from") in local and e.get("to") in local and e.get("parent") == parent
+    ]
+    ends = {e["from"] for e in edges} | {e["to"] for e in edges}
+    lines: list[str] = []
+    if START in ends:
+        lines.append(f"{local[START]}((start))")
+    for node in nodes:
+        name = names[node["id"]]
+        held = inside.get(node["id"])
+        if not held:
+            lines.append(_mermaid_node(node, name, classes))
+            continue
+        title = str(node.get("label") or node.get("name") or node["id"])
+        lines.append(f'subgraph {name} ["{_mermaid_text(title)}"]')
+        own = {n["id"]: f"{name}_{i}" for i, n in enumerate(held)}
+        lines += [
+            f"    {line}"
+            for line in _mermaid_part(graph, held, {**names, **own}, node["id"], classes, {})
+        ]
+        lines.append("end")
+    if END in ends:
+        lines.append(f"{local[END]}((end))")
+    for e in edges:
+        arrow = "-.->" if e.get("reached") is False else "-->"
+        lines.append(f"{local[e['from']]} {arrow} {local[e['to']]}")
+    return lines
 
 
 # --------------------------------------------------------------------------- with_io
