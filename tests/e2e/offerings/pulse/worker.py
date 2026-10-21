@@ -5,7 +5,7 @@ from workflows import PulseFlow
 from kontra.serve import Worker, offering
 
 worker = Worker(
-    offerings=[offering("offering.yaml", workflow=PulseFlow, quote=quote)],
+    offerings=[offering("offering.yaml", entry=PulseFlow, quote=quote)],
     activities=[pulse, quiet],
 )
 

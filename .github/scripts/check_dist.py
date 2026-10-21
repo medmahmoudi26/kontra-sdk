@@ -27,6 +27,12 @@ SDIST_TOP = frozenset(
     {"kontra", "README.md", "LICENSE", "pyproject.toml", "PKG-INFO", ".gitignore", "hatch_build.py"}
 )
 _WHEEL_INFO = re.compile(r"kontra_sdk-[^/]+\.dist-info", re.ASCII)
+#: The one compose file a distribution may carry: the observability stack `kontra dev up
+#: --observability` runs. The e2e compose.yaml (the prod gate image) is never shipped (I34, §7).
+OBSERVABILITY_COMPOSE = "kontra/_dev/observability/compose.yaml"
+_COMPOSE_NAME = re.compile(r"compose.*\.ya?ml", re.ASCII)
+#: The prod gate's image, never in a shipped file (PyPI is public and permanent).
+GATE_YAML_MARKER = b"kontra-gate"
 #: Phrases that describe the callback-forgery issue (case-insensitive, any whitespace).
 MARKERS = tuple(
     re.compile(p, re.IGNORECASE)
@@ -79,6 +85,17 @@ def problems(dist: Path) -> list[str]:
                 found.append(f"{archive.name}: {name} is outside the package")
             if parts and parts[0] in FORBIDDEN_TOP:
                 found.append(f"{archive.name}: {name} is under {parts[0]}/")
+            normalized = "/".join(parts)
+            base = parts[-1] if parts else ""
+            if _COMPOSE_NAME.fullmatch(base) and normalized != OBSERVABILITY_COMPOSE:
+                found.append(
+                    f"{archive.name}: {name} is a compose file; only {OBSERVABILITY_COMPOSE} may ship "
+                    "(the e2e stack's compose.yaml is repository tooling, not a wheel file)"
+                )
+            if base.endswith((".yaml", ".yml")) and GATE_YAML_MARKER in data:
+                found.append(
+                    f"{archive.name}: {name} names kontra-gate; the prod gate is never in a shipped file"
+                )
             for marker in _mentions(name, data):
                 found.append(f"{archive.name}: {name} describes the callback issue ({marker})")
         if not any(n.split("/")[-1] == "README.md" for n in members) and archive is sdists[0]:

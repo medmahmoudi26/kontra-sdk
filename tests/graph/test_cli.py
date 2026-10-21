@@ -3,12 +3,13 @@ runs in Temporal's time-skipping test server.
 
 #42's "done when", as far as this command answers for it: every seller example's graph is
 the one its README documents (and ``examples/recon`` is refused, with a clear line: it is
-buyer code, with no worker.py); ``examples/sweep``'s fan-out is one parallel group, its batch
-one child node with no continue-as-new chain, and its ``if`` on what the batch found shows
-both branches from two runs; never-scheduled activities are listed with exit status 0. Then
-the other warnings, ``--json``, ``--input``, and the static graph ``kontra dev``'s page reads.
-The projects under ``projects/`` are seller projects written for these tests (``branches``
-has the same three shapes, and an activity only a signal reaches; ``nested`` what only a
+buyer code, with no worker.py); ``examples/sweep``'s fan-out is one parallel group, its one
+activity per URL one node, and its ``if`` on what the checks found shows both branches from
+two runs; never-scheduled activities are listed with exit status 0. Then the other warnings,
+``--json``, ``--input``, and the static graph ``kontra dev``'s page reads. The projects under
+``projects/`` are seller projects written for these tests (``branches`` has a fan-out, a
+batch -- the optional ``kontra.contrib.parallel`` helper's child -- and a branch, and an
+activity only a signal reaches; ``nested`` what only a
 child's history or a marker shows, and a batch over pages; ``two`` a worker that binds two
 offerings); the command runs in-process (``CliRunner``)."""
 
@@ -18,7 +19,6 @@ import asyncio
 import importlib.util
 import json
 import os
-import re
 import shutil
 import signal
 import stat
@@ -33,11 +33,11 @@ import pytest
 from click.testing import CliRunner, Result
 from temporalio.testing import WorkflowEnvironment
 
-from kontra import activity as kontra_activity
 from kontra.cli import cli
 from kontra.cli._graph import load_static, static_path
 from kontra.cli._mock import explore, server_dir
 from kontra.cli._project import load_worker
+from tests.graph.readme import MERMAID, readme_graph
 
 pytestmark = pytest.mark.temporal
 
@@ -48,16 +48,14 @@ AGENTS = importlib.util.find_spec("temporalio.openai_agents") is not None
 
 #: Every seller example: a directory with a worker.py (examples/recon is buyer code).
 SELLERS = sorted(p.parent.name for p in EXAMPLES.glob("*/worker.py"))
+#: The ones that sell an agent's handler, which has no static graph (decisions I35): their
+#: README draws a hired run instead (tests/examples/test_recon_harness.py checks it).
+HANDLERS = ("recon-harness",)
+#: The ones ``kontra graph`` draws.
+DRAWN = [s for s in SELLERS if s not in HANDLERS]
+
+
 #: The one ```mermaid block of a README.
-_MERMAID = re.compile(r"^```mermaid\n(.*?)^```$", re.MULTILINE | re.DOTALL)
-
-
-def readme_graph(example: str) -> str:
-    """The graph ``examples/<example>/README.md`` documents."""
-    [block] = _MERMAID.findall((EXAMPLES / example / "README.md").read_text(encoding="utf-8"))
-    return block
-
-
 @pytest.fixture(scope="module", autouse=True)
 def test_server() -> None:
     """Temporal's time-skipping test server, which ``kontra graph`` downloads into its own
@@ -72,16 +70,6 @@ def test_server() -> None:
         asyncio.run(start())
     except Exception as e:
         pytest.skip(f"no time-skipping test server: {e}")
-
-
-@pytest.fixture(autouse=True)
-def only_the_projects_activities(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``serve()`` registers every kontra activity defined in the process: in the command's
-    own process, the project's. This one holds every test module's too (``tests/parallel``
-    defines its activities as it is collected), which would be registered on every worker
-    and reported never scheduled. Each test starts with none defined, as ``kontra graph``
-    does; ``load_worker`` imports the project afresh, which defines its own."""
-    monkeypatch.setattr(kontra_activity, "_DEFINED", {})
 
 
 @pytest.fixture
@@ -127,54 +115,93 @@ def node(g: dict[str, Any], node_id: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- the examples
 
 
+def test_kontra_graph_is_hidden_from_help_and_still_answers_its_own() -> None:
+    """Not a command for users (decisions I35): ``kontra serve`` runs it under a dev profile
+    to draw the graph page's static graphs. Kept, with its flags, as that child's entry point
+    and for the READMEs' graphs below."""
+    top = CliRunner().invoke(cli, ["--help"])
+    assert top.exit_code == 0, top.output
+    assert "graph" not in top.output.lower()
+    own = CliRunner().invoke(cli, ["graph", "--help"])
+    assert own.exit_code == 0, own.output
+    for flag in ("--dir", "--offering", "--runs", "--seed", "--input", "--timeout", "--json"):
+        assert flag in own.output
+    assert "--mermaid" in own.output
+    assert "--no-save" in own.output
+
+
 def test_every_seller_example_is_drawn() -> None:
-    assert SELLERS == ["chef-agents", "chef-claude", "enrich", "hello", "legacy-actor", "sweep"]
+    assert SELLERS == [
+        "chef-agents",
+        "chef-claude",
+        "enrich",
+        "hello",
+        "legacy-actor",
+        "recon-harness",
+        "sweep",
+    ]
+    assert DRAWN == ["chef-agents", "chef-claude", "enrich", "hello", "legacy-actor", "sweep"]
 
 
-@pytest.mark.parametrize("example", SELLERS)
+def test_a_handler_example_is_refused_with_where_its_graph_is(home: Path) -> None:
+    """examples/recon-harness sells ``ReconAgent.sweep``: one hire is one turn of the agent,
+    so there is no workflow to explore, and the refusal says the page draws its runs."""
+    result = kontra(home, "graph", "--dir", str(EXAMPLES / "recon-harness"), "--mermaid")
+    assert result.exit_code != 0
+    assert "an agent's handler has no static graph: acme/recon-harness@0.1.0 is " in result.stderr
+    assert "ReconAgent.sweep, and the graph page draws what its runs did" in result.stderr
+    assert not home.exists()
+
+
+@pytest.mark.parametrize("example", DRAWN)
 def test_the_graph_of_every_seller_example_is_its_readmes(home: Path, example: str) -> None:
     """Golden: the README's ```mermaid block is what ``kontra graph --mermaid`` prints (8
     runs, seed 0). After a deliberate change, ``UPDATE_GOLDEN=1 pytest tests/graph/test_cli.py``
     rewrites the blocks; review the diff."""
     if example == "chef-agents" and not AGENTS:
-        pytest.skip("the [agents] extra is not installed")
+        pytest.skip("temporalio-openai-agents (the dev group's) is not installed")
     result = ok(kontra(home, "graph", "--dir", str(EXAMPLES / example), "--mermaid"))
     assert result.stderr == ""  # every activity scheduled, every run closed
     assert not home.exists()  # no profile: nothing saved
     if os.environ.get("UPDATE_GOLDEN") == "1":
         readme = EXAMPLES / example / "README.md"
         text = readme.read_text(encoding="utf-8")
-        [old] = _MERMAID.findall(text)
+        [old] = MERMAID.findall(text)
         readme.write_text(text.replace(old, result.stdout, 1), encoding="utf-8")
     assert result.stdout == readme_graph(example)
 
 
 @pytest.mark.parametrize("runs", ["2", "4"])
-def test_the_sweep_example_shows_a_fan_out_a_batch_and_both_branches(home: Path, runs: str) -> None:
-    """examples/sweep, #42's three shapes: the two fetches are one parallel group (same
-    group, the same predecessor), which the ``if``'s two branches are not; the batch is ONE
-    child node, named from its input and labelled with the call, with no continue-as-new
-    chain and none of its item activities in the parent's graph; and the ``if`` on what it
-    found shows both branches from two runs (run 0's check finds nothing, run 1's carries an
-    error, so its page counts as unreachable and the run scores)."""
+def test_the_sweep_example_shows_a_fan_out_one_activity_per_url_and_both_branches(
+    home: Path, runs: str
+) -> None:
+    """examples/sweep, #42's three shapes in vanilla Temporal: the two fetches are one parallel
+    group (same group, the same predecessor), which the ``if``'s two branches are not; the
+    per-URL checks are ONE activity node however many URLs there are, and no child workflow
+    -- with an edge to itself only from run 2 on, whose ``plan`` drew 201 URLs, more than
+    the 50 the workflow's semaphore lets open, so each completion starts the next in a
+    workflow task of its own; and the ``if`` on what they found shows both branches from two
+    runs (run 0's check finds nothing, run 1's carries an error, so its page counts as
+    unreachable and the run scores)."""
     g = graph_of(home, EXAMPLES / "sweep", "--runs", runs)
     robots, security_txt = node(g, "fetch_robots"), node(g, "fetch_security_txt")
     assert robots["group"] == security_txt["group"] != node(g, "plan")["group"]
     assert {s for s, t in edges(g) if t in ("fetch_robots", "fetch_security_txt")} == {"plan"}
     # The same predecessor, but taken by different runs: two groups, not a fan-out.
     assert node(g, "score")["group"] != node(g, "all_clear")["group"]
-    batch = "kontra.batch.v1[check_headers]"
-    children = [n for n in g["nodes"] if n["kind"] == "child"]
-    assert [(n["id"], n["label"]) for n in children] == [
-        (batch, "execute_activities_in_parallel(check_headers)")
-    ]
-    assert {(s, t) for s, t in edges(g) if batch in (s, t)} == {
-        ("fetch_robots", batch),
-        ("fetch_security_txt", batch),
-        (batch, "score"),
-        (batch, "all_clear"),
-    }  # no self edge: one node, not a chain of runs
-    assert not any(n["name"] == "check_headers" for n in g["nodes"])
+    assert not [n for n in g["nodes"] if n["kind"] == "child"]
+    check = "check_headers"
+    assert [(n["id"], n["kind"]) for n in g["nodes"] if n["name"] == check] == [
+        (check, "activity")
+    ]  # one node: never check_headers#2
+    loop = {(check, check)} if runs == "4" else set()  # runs 0 and 1 draw 1 and 3 URLs
+    assert {(s, t) for s, t in edges(g) if check in (s, t)} == {
+        ("fetch_robots", check),
+        ("fetch_security_txt", check),
+        (check, "score"),
+        (check, "all_clear"),
+        *loop,
+    }
     assert {("score", "write_report"), ("all_clear", "write_report"), ("write_report", "end")} <= (
         edges(g)
     )
@@ -287,6 +314,18 @@ def test_a_worker_of_two_offerings_warns_once_of_what_neither_scheduled(home: Pa
         "on timers, signals or inputs the runs did not reach, or the worker's offerings "
         "--offering left out\n"
     )
+    logged = ok(
+        kontra(
+            home,
+            *("graph", "--dir", directory, "--runs", "1", "--offering", "acme/two-a@1.0.0"),
+            "--background",
+        )
+    )  # kontra serve's child, which draws only the offerings out of date
+    assert logged.stderr == (
+        "warning: acme/two-a@1.0.0: never scheduled in 1 mock run: act_b, unused — branches "
+        "on timers, signals or inputs the runs did not reach, or the worker's offerings "
+        "whose graph was current\n"
+    )
 
 
 # --------------------------------------------------------------------------- output, input
@@ -329,6 +368,35 @@ def test_input_is_validated(home: Path, tmp_path: Path) -> None:
     # Every run starts with the input given: none of them reaches `after`.
     g = graph_of(home, PROJECTS / "stuck", "--input", "-", "--runs", "2", stdin='{"then": "done"}')
     assert edges(g) == {("start", "step"), ("step", "odd"), ("odd", "after"), ("after", "end")}
+
+
+def test_an_unsampleable_input_is_advised_for_whoever_reads_it(home: Path, tmp_path: Path) -> None:
+    """Typed, the way out is ``--input``; run by ``kontra serve`` (``--background``), whose
+    worker logs it and has no ``--input``, it says what the graph page does instead."""
+    project = tmp_path / "picky"
+    shutil.copytree(EXAMPLES / "hello", project, ignore=shutil.ignore_patterns("__pycache__"))
+    models = project / "models.py"
+    field = '    name: str = Field(min_length=1, max_length=100, description="Who to greet.")\n'
+    text = models.read_text()
+    assert field in text
+    models.write_text(
+        text.replace("import BaseModel,", "import field_validator, BaseModel,").replace(
+            field,
+            field
+            + "\n    @field_validator('name')\n    @classmethod\n"
+            + "    def _known(cls, v: str) -> str:\n"
+            + "        raise ValueError('an unknown name')\n",
+        )
+    )
+    typed = kontra(home, "graph", "--dir", str(project), "--runs", "1")
+    assert typed.exit_code == 1
+    assert typed.stderr.startswith("error: cannot sample a valid HelloInput (")
+    assert typed.stderr.endswith("); give one with --input FILE\n")
+    logged = kontra(home, "graph", "--dir", str(project), "--runs", "1", "--background")
+    assert logged.exit_code == 1
+    assert logged.stderr.startswith("error: cannot sample a valid HelloInput (")
+    assert logged.stderr.endswith("), so the graph page draws only what each run did\n")
+    assert "--input" not in logged.stderr
 
 
 # --------------------------------------------------------------------------- runs that stop
@@ -524,31 +592,46 @@ def make_profile(home: Path) -> None:
 
 def serve_task_queue(directory: Path) -> str:
     """The task queue ``kontra serve`` runs the offering on, as its worker builds it."""
+    return served(directory)[0]
+
+
+def served(directory: Path) -> tuple[str, str, str]:
+    """The task queue ``kontra serve`` runs the offering on, its contract hash, and the
+    project's code hash, as its worker builds them."""
+    from kontra._graphs import code_hash
+
     with load_worker(directory) as worker:
         [bound] = worker.offerings
-        return bound.offering_id.task_queue
+        return bound.offering_id.task_queue, bound.contract_hash(), code_hash(directory)
 
 
 def test_the_static_graph_is_saved_for_kontra_devs_page(home: Path) -> None:
     make_profile(home)
     result = ok(kontra(home, "graph", "--dir", str(EXAMPLES / "hello"), "--json", "--runs", "2"))
     assert result.stderr == f"static graph saved for kontra dev's graph page ({home / 'graphs'})\n"
-    task_queue = serve_task_queue(EXAMPLES / "hello")
+    task_queue, drawn_from, code = served(EXAMPLES / "hello")
     path = static_path(home, task_queue)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     saved = json.loads(path.read_text())
     [printed] = json.loads(result.stdout)
     assert saved == {
-        "version": 1,
+        "version": 2,
         "task_queue": task_queue,
         "offering": "acme/hello@0.1.0",
+        "contract_hash": drawn_from,  # the code's (BoundOffering.contract_hash()), I35
+        "code_hash": code,  # the project's code as imported here, by hand
         "runs": 2,
         "seed": 0,
         "graph": printed["graph"],
     }
     assert load_static(home, task_queue) == printed["graph"]
     assert [p.name for p in path.parent.iterdir()] == [path.name]  # no temporary file left
+    # kontra serve's child saves under the serving worker's code hash, whatever it imported.
+    given = "sha256:" + "5" * 64
+    args = ("--json", "--runs", "2", "--background", "--code-hash", given)
+    ok(kontra(home, "graph", "--dir", str(EXAMPLES / "hello"), *args))
+    assert json.loads(path.read_text())["code_hash"] == given
 
 
 def test_no_save_and_no_profile_save_nothing(home: Path, tmp_path: Path) -> None:
@@ -566,13 +649,33 @@ def test_load_static_reads_only_the_graph_of_that_task_queue(tmp_path: Path) -> 
     g: dict[str, Any] = {"version": 1, "workflow": {}, "nodes": [], "edges": []}
     a, b = "acme/a@1.0.0", "acme/b@1.0.0"
     assert load_static(tmp_path, a) is None  # nothing saved
-    save_static(tmp_path, a, offering=a, runs=8, seed=0, graph=g)
+    save_static(
+        tmp_path,
+        a,
+        offering=a,
+        contract_hash="sha256:a",
+        code_hash="sha256:c",
+        runs=8,
+        seed=0,
+        graph=g,
+    )
     assert load_static(tmp_path, a) == g
     # A's file under B's name: the stored task queue is A's, so it is not B's graph.
     shutil.copy(static_path(tmp_path, a), static_path(tmp_path, b))
     assert load_static(tmp_path, b) is None
     path = static_path(tmp_path, a)
-    for broken in (b"{", b"[]", json.dumps({"version": 2, "task_queue": a, "graph": g}).encode()):
+    whole = json.loads(path.read_text())
+    v1 = {k: v for k, v in whole.items() if k not in ("contract_hash", "code_hash")}
+    v1 |= {"version": 1}
+    for broken in (
+        b"{",
+        b"[]",
+        json.dumps(v1).encode(),  # what kontra graph saved before I35: drawn again
+        json.dumps(whole | {"version": 3}).encode(),
+        json.dumps(whole | {"contract_hash": None}).encode(),
+        json.dumps(whole | {"code_hash": ""}).encode(),
+        json.dumps(whole | {"runs": True}).encode(),
+    ):
         path.write_bytes(broken)
         assert load_static(tmp_path, a) is None
     path.unlink()

@@ -1,29 +1,27 @@
-"""``kontra.serve.Worker``: ``temporalio.worker.Worker`` plus exactly four things (PRD §6.5).
+"""``kontra.serve.Worker``: the process that serves a seller's offerings (PRD §6.5).
 
-1. A generated Nexus service per bound offering (:mod:`kontra.serve.handler`).
-2. The hold-token check before ``execute`` starts anything (:mod:`kontra.serve.hold`).
-3. The encryption codec (:class:`kontra.codec.KontraCodec`, seller role).
-4. The task queue, derived from ``name@version`` (:attr:`OfferingId.task_queue`); passing
-   ``task_queue`` is a ``TypeError``.
+It is ``temporalio``'s client and worker with :class:`~kontra.plugin.KontraPlugin` on them, and
+the concerns of a process around them: ``python worker.py`` and ``kontra serve`` run it,
+``kontra publish``/``contract``/``graph`` read it without starting anything, and
+``kontra.testing.Marketplace`` serves it in a test. Starting it (:meth:`Worker.run` /
+:meth:`Worker.run_async`) connects ``Client.connect(plugins=[*your client plugins, kontra])``
+-- the plugin last, so it has the final word on the connection, the namespace and the codec
+--, then builds one ``temporalio.worker.Worker`` per offering on that client, on the
+offering's own task queue (derived from ``name@version``; passing ``task_queue`` is a
+``TypeError``), and runs them until SIGINT/SIGTERM or :meth:`Worker.shutdown`.
 
-Everything else is Temporal's: every ``temporalio.worker.Worker`` keyword is forwarded
-verbatim to each inner worker (one per offering task queue), except the three that must be
-merged -- ``workflows`` (the bound workflow, then yours, then ``kontra.batch.v1``, the child
-behind ``workflow.execute_activities_in_parallel``), ``nexus_service_handlers`` (the
-generated one, then yours) and ``interceptors`` (Kontra's first, then yours) -- and one
-default: without your ``workflow_runner``, workflows run in Temporal's sandbox with
-``kontra`` passed through (:func:`workflow_runner`), so ``kontra`` is imported once per
-process rather than once per run. A ``workflow_runner`` you pass is used as it is: pass
-``kontra`` through in yours too. The accepted keywords are read from temporalio's own
-signature, so a new temporalio keyword passes through without a Kontra release.
-
-Starting (:meth:`Worker.run` / :meth:`Worker.run_async`), in order: load the session
-(``KONTRA_API_KEY``, else the profile), install the process's Kontra runtime, connect to Temporal as the ``worker`` role
-(the JWT is refreshed in the background, §10.3) with the pydantic converter and the codec,
-fetch the gate's JWKS, then the **hash lock** (§11.2): each offering's contract hash must
-equal the catalog's, or the worker refuses to start ("republish or bump the version"). An
-unpublished version is refused too -- except on a ``kontra dev`` profile, where the worker
-publishes it (the gate creates the Nexus endpoint; the worker never needs its name).
+Every ``temporalio.worker.Worker`` keyword is passed to each inner worker verbatim, except:
+``workflows`` (the offering's entry class goes first: it is how the plugin knows which
+offering a worker serves), ``workflow_runner`` (Temporal's ``SandboxedWorkflowRunner``
+arrives as a copy with ``kontra`` passed through, :func:`with_kontra_passthrough`; any other
+runner is untouched), and ``plugins``, which are routed -- a plugin that is also a
+``temporalio.client.Plugin`` (any ``SimplePlugin``: ``OpenAIAgentsPlugin``, the agent
+harness's ``AgentHarnessPlugin``, :class:`~kontra.contrib.parallel.ParallelPlugin`) goes on the
+client, in your order, before Kontra's, so it may set the payload converter; a worker-only
+plugin goes to the inner workers, and runs after Kontra's worker configuration (the plugin
+checks before polling that nothing Kontra set was undone). The accepted keywords are read
+from temporalio's own signature, so a new temporalio keyword passes through without a
+Kontra release.
 
 The connection takes two of ``Client.connect``'s own keywords, ``runtime`` and
 ``interceptors``, as ``kontra serve --metrics`` and ``--otlp`` pass them
@@ -43,32 +41,38 @@ import sys
 import threading
 from collections.abc import Generator, Sequence
 from pathlib import Path
-from typing import Any, Unpack
+from typing import TYPE_CHECKING, Any, Unpack
 
 import temporalio.client
 import temporalio.runtime
 import temporalio.worker
-from temporalio.client import Client, HeaderCodecBehavior
+from temporalio.client import Client
+from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import DataConverter
-from temporalio.worker import WorkerConfig
+from temporalio.worker import WorkerConfig, WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
 
-from kontra import _agents, _runtime
-from kontra._parallel import _Batch
 from kontra.auth import Session
-from kontra.codec import GateBlobStore, KontraCodec, data_converter
-from kontra.codec.age import public_key_of
-from kontra.gate_client import GateClient, GateError
-from kontra.gate_client import models as m
-from kontra.profile import KEY_FILE_ENV, NotLoggedIn, Profile, kontra_home
-from kontra.serve.handler import OfferingService, service_handler
+from kontra.codec import KontraCodec, data_converter
+from kontra.gate_client import GateClient
+from kontra.serve.errors import ServeError
+from kontra.serve.handler import OfferingService
 from kontra.serve.hold import HoldVerifier
-from kontra.serve.interceptors import KontraInterceptor
-from kontra.serve.jobs import JobDirectory, SellerKeyCache
+from kontra.serve.jobs import JobDirectory
 from kontra.serve.offering import BoundOffering
 from kontra.serve.progress import ProgressForwarder
 
-__all__ = ["ServeError", "Worker", "seller_data_converter", "workflow_runner"]
+if TYPE_CHECKING:
+    from kontra.plugin import KontraPlugin
+
+__all__ = [
+    "TEMPORAL_KWARGS",
+    "ServeError",
+    "Worker",
+    "seller_data_converter",
+    "with_kontra_passthrough",
+    "workflow_runner",
+]
 
 log = logging.getLogger("kontra.serve")
 
@@ -78,83 +82,52 @@ TEMPORAL_KWARGS: frozenset[str] = frozenset(
     for name, p in inspect.signature(temporalio.worker.Worker.__init__).parameters.items()
     if name != "self" and p.kind is not inspect.Parameter.VAR_KEYWORD
 )
-_OPEN_STATES = (m.JobState.SUBMITTED, m.JobState.WORKING)
-_JOB_PAGES = 20
 #: Loggers that write the full URL of every request at INFO: the bucket's presigned URLs
 #: (their signatures included) and every URL a seller's activities fetch for a buyer.
 _URL_LOGGERS = ("httpx",)
 #: The longest a stopping worker waits for temporalio's own threads to leave Python code.
 _SETTLE_TIMEOUT = 5.0
-#: The longest a failed worker waits for the gate to say whether it still accepts its session.
-_REFUSAL_TIMEOUT = 10.0
 
 
-class ServeError(RuntimeError):
-    """The worker refuses to start -- a contract that drifted from the catalog, an
-    unpublished version, a key that does not match the profile -- or stopped because its
-    credentials were revoked."""
-
-
-async def _refused(session: Session | None) -> str | None:
-    """After an inner worker failed: why, when it is that the gate no longer accepts the
-    worker's session -- its API key revoked, its login signed out or disallowed. Temporal
-    refuses that session's tokens within seconds of the gate (the revocation list), and
-    temporalio reports it as a bare ``RuntimeError("Workflow worker failed")`` over a
-    PermissionDenied deep in its core: a seller who revoked a key on purpose, or found one
-    revoked, deserves the reason and what to do. Asked of the gate, never read from the
-    error's text. None when the gate still accepts the session, or cannot be asked in time:
-    the failure is another one, and is raised as it came."""
-    if session is None:
-        return None
-    try:
-        async with asyncio.timeout(_REFUSAL_TIMEOUT):
-            await session.gate.me()
-    except NotLoggedIn as e:
-        return f"the worker stopped, refused by Temporal: {e}"
-    except Exception:  # unreachable, slow, or failing otherwise: not this function's call
-        return None
-    return None
-
-
-def seller_data_converter(codec: KontraCodec, *, plugins: object = None) -> DataConverter:
+def seller_data_converter(codec: KontraCodec) -> DataConverter:
     """:func:`kontra.codec.data_converter` (failures encrypted too) with the pydantic payload
-    converter, so models in workflow and activity signatures round-trip.
-
-    A worker whose ``plugins`` include the OpenAI Agents plugin (its workflows run an agent)
-    gets the agents package's ``OpenAIPayloadConverter`` instead, because the model
-    activities' inputs do not decode with the strict pydantic one. It is laxer (it builds an
-    object that fails validation rather than refusing it), so only such a worker gets it;
-    buyer input is checked against the contract schema before either runs."""
+    converter, so models in workflow and activity signatures round-trip: what a Kontra
+    worker's client gets when no plugin chose a payload converter (tests build clients
+    with it)."""
     return dataclasses.replace(
-        data_converter(codec),
-        payload_converter_class=_agents.payload_converter_class(plugins),
+        data_converter(codec), payload_converter_class=PydanticPayloadConverter
     )
+
+
+#: What a Kontra worker's sandbox passes through: ``kontra`` -- Kontra's own turn wrapper
+#: (:mod:`kontra.serve.turn`) runs in it, a seller's models may use :mod:`kontra.types`, a
+#: workflow that hires imports :mod:`kontra.hire`, and :mod:`kontra.contrib.parallel` keeps
+#: one class identity for its spec.
+_PASSTHROUGH = "kontra"
 
 
 def workflow_runner() -> SandboxedWorkflowRunner:
-    """Temporal's sandbox with ``kontra`` passed through: workflow code that imports
-    ``kontra.workflow`` shares the process's ``kontra`` modules instead of re-importing
-    them every run (one class identity for ``Page`` and the batch spec, no per-run import
-    cost). Safe because nothing in ``kontra`` keeps module-level state a workflow sees."""
+    """Temporal's sandbox with ``kontra`` passed through: the ``kontra`` modules a workflow
+    reaches are the process's, imported once rather than every run. Safe because nothing in
+    ``kontra`` keeps module-level state a workflow sees."""
     return SandboxedWorkflowRunner(
-        restrictions=SandboxRestrictions.default.with_passthrough_modules("kontra")
+        restrictions=SandboxRestrictions.default.with_passthrough_modules(_PASSTHROUGH)
     )
 
 
-def _current_runtime() -> _runtime.Runtime | None:
-    try:
-        return _runtime.current()
-    except _runtime.NoRuntime:
-        return None
-
-
-def _restore_runtime(ours: _runtime.Runtime, previous: _runtime.Runtime | None) -> None:
-    """Uninstall ours, putting back what was there (a worker that fails to start must not
-    take away the runtime of one already serving in this process)."""
-    if _current_runtime() is ours:
-        _runtime.uninstall(ours)
-        if previous is not None:
-            _runtime.install(previous)
+def with_kontra_passthrough(runner: WorkflowRunner | None) -> WorkflowRunner:
+    """``runner`` with ``kontra`` passed through when it is Temporal's sandbox (yours or the
+    default), :func:`workflow_runner` when there is none; any other runner is yours, kept as
+    it is."""
+    if runner is None:
+        return workflow_runner()
+    if not isinstance(runner, SandboxedWorkflowRunner):
+        return runner
+    if _PASSTHROUGH in runner.restrictions.passthrough_modules:
+        return runner
+    return dataclasses.replace(
+        runner, restrictions=runner.restrictions.with_passthrough_modules(_PASSTHROUGH)
+    )
 
 
 def _quiet_url_logs() -> None:
@@ -202,13 +175,6 @@ async def _settle_core_threads() -> None:
         await asyncio.sleep(0.001)
 
 
-def _home_dir(profile: Profile, home: str | Path | None) -> Path:
-    """Where the profile lives: ``jwks.json`` is cached next to it."""
-    if profile.home is not None:
-        return profile.home
-    return Path(home).expanduser() if home is not None else kontra_home()
-
-
 def _dedupe(items: Sequence[Any]) -> list[Any]:
     out: list[Any] = []
     for item in items:
@@ -225,6 +191,8 @@ class Worker:
     """
 
     def __init__(self, offerings: Sequence[BoundOffering], **kwargs: Unpack[WorkerConfig]) -> None:
+        from kontra.plugin import check_offerings
+
         for name in kwargs:
             if name == "task_queue":
                 raise TypeError(
@@ -241,26 +209,10 @@ class Worker:
                     f"Worker() got an unexpected keyword argument {name!r}; it accepts "
                     "offerings= and the keywords of temporalio.worker.Worker"
                 )
-        bound = list(offerings)
-        if not bound:
-            raise ValueError("Worker needs at least one offering: offerings=[offering(...)]")
-        keys: set[str] = set()
-        for b in bound:
-            if not isinstance(b, BoundOffering):  # pyright: ignore[reportUnnecessaryIsInstance]
-                raise TypeError(f"offerings must come from kontra.serve.offering(...), got {b!r}")
-            if b.key in keys:
-                raise ValueError(f"{b.key} is bound twice")
-            keys.add(b.key)
-        self._offerings: tuple[BoundOffering, ...] = tuple(bound)
+        self._offerings: tuple[BoundOffering, ...] = check_offerings(offerings)
         self._kwargs: dict[str, Any] = dict(kwargs)
-        # Its workflows were imported before it was made (it holds their classes), so whether
-        # they run an agent is known: then the agents plugin goes on first, as serve() puts it
-        # (decisions I25). A published offering could not pass it: publish refuses temporalio.
-        derived = _agents.plugins(given=self._kwargs.get("plugins"))
-        if derived:
-            self._kwargs["plugins"] = [*derived, *self._kwargs.get("plugins", ())]
+        self._kontra: KontraPlugin | None = None
         self._inner: tuple[temporalio.worker.Worker, ...] = ()
-        self._services: tuple[OfferingService, ...] = ()
         self._stack: contextlib.AsyncExitStack | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         # Events bind to a loop on first wait, not here; aclose() makes fresh ones so a
@@ -268,11 +220,8 @@ class Worker:
         self._stop = asyncio.Event()
         self._ready = asyncio.Event()
         self._client: Client | None = None
-        self._session: Session | None = None
         self._running = False
-        self.progress: ProgressForwarder | None = None
-        self.jobs: JobDirectory | None = None
-        self.verifier: HoldVerifier | None = None
+        self._project: Path | None = None
 
     # ------------------------------------------------------------------ introspection
 
@@ -282,9 +231,26 @@ class Worker:
 
     @property
     def options(self) -> dict[str, Any]:
-        """The temporalio keywords as given, and the agents plugin when the workflows run an
-        agent (a copy)."""
+        """The temporalio keywords as given (a copy): ``plugins`` as passed, before they are
+        routed between the client and the inner workers."""
         return dict(self._kwargs)
+
+    @property
+    def project(self) -> Path | None:
+        """The directory of the ``worker.py`` that runs this Worker -- ``python worker.py``'s
+        (``serve()`` sets it) or ``kontra serve --dir``'s -- else None. Under a dev profile,
+        the graph page's static graphs are drawn from it as the worker starts (decisions
+        I35); a Worker no one set it on (a test's, a seller's own main) draws none."""
+        return self._project
+
+    @project.setter
+    def project(self, directory: str | Path | None) -> None:
+        self._project = Path(directory).expanduser().resolve() if directory is not None else None
+
+    @property
+    def plugin(self) -> KontraPlugin | None:
+        """The :class:`~kontra.plugin.KontraPlugin` this run serves with; None until started."""
+        return self._kontra
 
     @property
     def inner_workers(self) -> tuple[temporalio.worker.Worker, ...]:
@@ -294,14 +260,32 @@ class Worker:
     @property
     def services(self) -> tuple[OfferingService, ...]:
         """The generated Nexus services, in offering order; empty until started."""
-        return self._services
+        return self._kontra.services if self._kontra is not None else ()
 
     @property
     def client(self) -> Client | None:
         """The Temporal client the inner workers use (codec included); None until started."""
         return self._client
 
+    @property
+    def progress(self) -> ProgressForwarder | None:
+        return self._kontra.progress if self._kontra is not None else None
+
+    @property
+    def jobs(self) -> JobDirectory | None:
+        return self._kontra.jobs if self._kontra is not None else None
+
+    @property
+    def verifier(self) -> HoldVerifier | None:
+        return self._kontra.verifier if self._kontra is not None else None
+
     # ------------------------------------------------------------------ starting
+
+    def _routed(self) -> tuple[list[Any], list[Any]]:
+        """``plugins`` split: client plugins (in the seller's order) and worker-only ones."""
+        given = list(self._kwargs.get("plugins", ()))
+        client = [p for p in given if isinstance(p, temporalio.client.Plugin)]
+        return client, [p for p in given if not isinstance(p, temporalio.client.Plugin)]
 
     async def prepare(
         self,
@@ -312,20 +296,30 @@ class Worker:
         home: str | Path | None = None,
         runtime: temporalio.runtime.Runtime | None = None,
         interceptors: Sequence[temporalio.client.Interceptor] = (),
+        stream_upload_budget: float | None = None,
     ) -> None:
-        """Connect, verify and build the inner workers, without polling yet.
+        """Connect and build the inner workers, without polling yet (the plugin's start
+        checks -- JWKS, the hash lock -- run as they start).
 
         ``session``: a logged-in :class:`kontra.auth.Session` (default: ``KONTRA_API_KEY``
         if set, else the profile in ``home`` / ``$KONTRA_HOME``; a key serves as well as a
         login, it only cannot publish). ``client``: a Temporal client to share the connection
-        of (its namespace must be the profile's; the codec is added here). ``gate``: the gate
-        client (default: the session's). The last three exist for tests.
+        of (Kontra's plugin is added to a copy of it: its namespace and codec are replaced).
+        ``gate``: the gate client (default: the session's). The last three exist for tests.
 
         ``runtime`` and ``interceptors``: ``Client.connect``'s, for the connection this
         worker makes. They are how ``kontra serve --metrics`` / ``--otlp`` reach it, not a
         setting of ``worker.py`` (``Worker()`` takes neither). A ``client`` given has its
         own, so passing them with one is a ``TypeError``.
+
+        ``stream_upload_budget``: :class:`~kontra.plugin.KontraPlugin`'s (default:
+        ``$KONTRA_STREAM_UPLOAD_BUDGET``, else the plugin's 2 s). Like the first three, for
+        tests: :meth:`kontra.testing.Marketplace.serve` gives a loaded test machine more, and
+        a seller run as its own process (``python worker.py``) takes it from the environment.
         """
+        from kontra.codec.stream import upload_budget_from_env
+        from kontra.plugin import TARGET, KontraPlugin
+
         if self._stack is not None:
             raise RuntimeError("this Worker is already started")
         if client is not None and (runtime is not None or interceptors):
@@ -333,264 +327,53 @@ class Worker:
                 "runtime and interceptors are for the connection the worker makes; a client "
                 "passed in has its own (Client.connect(runtime=..., interceptors=...))"
             )
+        kontra = KontraPlugin(
+            *self._offerings,
+            session=session,
+            home=home,
+            gate=gate,
+            stream_upload_budget=(
+                upload_budget_from_env() if stream_upload_budget is None else stream_upload_budget
+            ),
+            project=self._project,
+        )
         stack = contextlib.AsyncExitStack()
+        stack.push_async_callback(kontra.aclose)
+        client_plugins, worker_plugins = self._routed()
         try:
-            await self._prepare(
-                stack,
-                session=session,
-                client=client,
-                gate=gate,
-                home=home,
-                runtime=runtime,
-                interceptors=interceptors,
-            )
+            if client is None:
+                client = await Client.connect(
+                    TARGET,
+                    runtime=runtime,
+                    interceptors=list(interceptors),
+                    plugins=[*client_plugins, kontra],
+                )
+            else:
+                await kontra.prepare()  # Client(...) runs no connection hook
+                shared = client.config()
+                shared["plugins"] = [*shared["plugins"], *client_plugins, kontra]
+                client = Client(**shared)
+            inner: list[temporalio.worker.Worker] = []
+            for b in self._offerings:
+                kwargs = dict(self._kwargs)
+                kwargs.pop("plugins", None)
+                # The entry class first: it is how the plugin knows which offering this
+                # worker serves (its own workflows go before it in the final list).
+                kwargs["workflows"] = _dedupe(
+                    [b.entry_workflow, *self._kwargs.get("workflows", ())]
+                )
+                inner.append(
+                    temporalio.worker.Worker(
+                        client,
+                        task_queue=b.offering_id.task_queue,
+                        plugins=worker_plugins,
+                        **kwargs,
+                    )
+                )
         except BaseException:
             await stack.aclose()
-            self._inner, self._services, self._client = (), (), None
-            self._session = None
             raise
-        self._stack = stack
-
-    async def _prepare(
-        self,
-        stack: contextlib.AsyncExitStack,
-        *,
-        session: Session | None,
-        client: Client | None,
-        gate: GateClient | None,
-        home: str | Path | None,
-        runtime: temporalio.runtime.Runtime | None,
-        interceptors: Sequence[temporalio.client.Interceptor],
-    ) -> None:
-        if session is None:
-            session = Session.from_env(home)  # KONTRA_API_KEY, else the profile
-            stack.push_async_callback(session.aclose)
-        profile = await session.resolve()
-        self._session = session
-        gate = gate or session.gate
-        home_dir = _home_dir(profile, home)
-        # This machine's key: $KONTRA_KEY_FILE when a fleet mounts one from a secret,
-        # else <home>/key (decisions I7).
-        identity = session.identity()
-        public_key = public_key_of(identity)
-        me = await gate.me()
-        recipients = [k.public_key for k in me.keys]
-        if public_key not in recipients:
-            raise ServeError(
-                f"the key this worker holds ({public_key}) is not one of {profile.party}'s "
-                f"recipients. Buyers encrypt to the registered set, so this worker could "
-                f"not read a single input. Register it with `kontra recipients add`, or "
-                f"point {KEY_FILE_ENV} at a key that is registered "
-                f"(looked for in {Profile.key_path(home_dir)})."
-            )
-
-        jobs = JobDirectory(gate)
-        stack.push_async_callback(jobs.aclose)
-        kontra_runtime = _runtime.Runtime(
-            party=profile.party,
-            gate=gate,
-            identity=identity,
-            recipient=public_key,
-            recipients=recipients,
-            # A seller whose workflow hires another offering is a buyer there, and that
-            # sub-job's delivery is encrypted to the JOB's key, which `kontra.hire` wrote
-            # under this home (decisions I7). Read from disk so a delivery decoded outside
-            # the hiring client -- a bound artifact, a later activity -- still opens.
-            # Local to this host: a fleet's mounted key is never one of the account's
-            # devices (decisions I25), so a sub-job's key stays where it was hired.
-            more_identities=lambda: tuple(Profile.job_identities(home_dir)),
-            jobs=jobs,
-        )
-        previous = _current_runtime()
-        _runtime.install(kontra_runtime)
-        stack.callback(_restore_runtime, kontra_runtime, previous)
-
-        # Plaintext replies only for the services generated here, by their exact names.
-        # Results and the seller's own copies go to the WHOLE fleet set, not just this
-        # pod's key: another worker, and the seller's laptop, must be able to read them.
-        codec = KontraCodec(
-            identity,
-            recipients,
-            role="seller",
-            buyer_keys=jobs,
-            seller_keys=SellerKeyCache(gate),
-            blobs=GateBlobStore(gate),
-            services=[b.offering_id.service_name for b in self._offerings],
-        )
-        converter = seller_data_converter(codec, plugins=self._kwargs.get("plugins"))
-        # Headers stay out of the codec: the kontra-job header must be readable before any
-        # payload key is known (kontra.serve.interceptors).
-        if client is None:
-            client = await session.connect_temporal(
-                "worker",
-                data_converter=converter,
-                header_codec_behavior=HeaderCodecBehavior.NO_CODEC,
-                runtime=runtime,
-                interceptors=list(interceptors),
-            )
-            # The token refresher dies with the worker, not with a session it may share.
-            stack.push_async_callback(session.release, client)
-        else:
-            config = client.config()
-            config["data_converter"] = converter
-            config["header_codec_behavior"] = HeaderCodecBehavior.NO_CODEC
-            client = Client(**config)
-        if client.namespace != profile.namespace:
-            raise ServeError(
-                f"the Temporal client is for namespace {client.namespace!r}, but "
-                f"{profile.party} serves from {profile.namespace!r}"
-            )
-
-        verifier = HoldVerifier(gate, home=home_dir)
-        await verifier.load()
-        hashes = await self._hash_lock(gate, profile)
-
-        progress = ProgressForwarder(gate, jobs)
-        progress.start()
-        stack.push_async_callback(progress.aclose)
-
-        interceptor = KontraInterceptor(progress)
-        services: list[OfferingService] = []
-        inner: list[temporalio.worker.Worker] = []
-        for b in self._offerings:
-            service = OfferingService(
-                bound=b,
-                namespace=client.namespace,
-                party=profile.party,
-                contract_hash=hashes[b.key],
-                validator=b.validator(),
-                verifier=verifier,
-                jobs=jobs,
-                open_deferred=codec.open_deferred,
-                payload_converter=converter.payload_converter,
-            )
-            kwargs = dict(self._kwargs)
-            kwargs["workflows"] = _dedupe([b.workflow, *self._kwargs.get("workflows", ()), _Batch])
-            kwargs.setdefault("workflow_runner", workflow_runner())
-            kwargs["nexus_service_handlers"] = [
-                service_handler(service),
-                *self._kwargs.get("nexus_service_handlers", ()),
-            ]
-            kwargs["interceptors"] = [interceptor, *self._kwargs.get("interceptors", ())]
-            inner.append(
-                temporalio.worker.Worker(client, task_queue=b.offering_id.task_queue, **kwargs)
-            )
-            services.append(service)
-        self._inner, self._services, self._client = tuple(inner), tuple(services), client
-        self.progress, self.jobs, self.verifier = progress, jobs, verifier
-        for s in services:
-            log.info(
-                "serving %s (contract %s) on task queue %r in namespace %r",
-                s.key,
-                s.contract_hash,
-                s.bound.offering_id.task_queue,
-                s.namespace,
-            )
-
-    async def _hash_lock(self, gate: GateClient, profile: Profile) -> dict[str, str]:
-        """The contract hash of each offering, checked against the catalog (§11.2)."""
-        hashes: dict[str, str] = {}
-        problems: list[str] = []
-        for b in self._offerings:
-            ours = b.contract_hash()
-            hashes[b.key] = ours
-            try:
-                entry: m.CatalogEntry | None = await gate.get_offering(b.key)
-            except GateError as e:
-                if e.status != 404:
-                    raise ServeError(f"cannot check {b.key} in the catalog: {e}") from e
-                entry = None
-            if entry is not None and entry.offering != b.key:
-                entry = None  # the gate resolved to another version: ours is not published
-            if entry is None:
-                open_jobs = await self._open_jobs(gate, b.key)
-                if open_jobs:
-                    # Retired (the catalog no longer lists it), so its hash comes from a job
-                    # hired under it: drifted code must not finish jobs bought for another
-                    # contract any more than it may take new ones (§11.2).
-                    hired = await self._hired_hash(gate, open_jobs[0])
-                    if hired is not None and hired != ours:
-                        problems.append(
-                            f"{b.key}: this code's contract hash is {ours} but its open jobs "
-                            f"were hired under {hired}; the types or offering.yaml changed "
-                            "after publishing -- restore the published code to finish them"
-                        )
-                        continue
-                    log.warning(
-                        "%s is retired but still has %d open job(s); serving it until they "
-                        "finish (no new jobs will come)",
-                        b.key,
-                        len(open_jobs),
-                    )
-                elif profile.dev:
-                    try:
-                        entry = await gate.publish(b.document())
-                    except GateError as e:
-                        problems.append(
-                            f"{b.key} is not published and publishing it failed ({e.message}); "
-                            "run `kontra publish` (it needs your login, confirmed within "
-                            "the hour; in a terminal it asks)"
-                        )
-                        continue
-                    log.info("published %s (dev profile), contract %s", b.key, entry.contract_hash)
-                    if entry.contract_hash != ours:
-                        problems.append(
-                            f"{b.key}: the catalog recorded contract {entry.contract_hash} "
-                            f"for this code's {ours}"
-                        )
-                else:
-                    problems.append(
-                        f"{b.key} is not published: run `kontra publish` in {b.source.parent}"
-                    )
-                continue
-            if entry.contract_hash != ours:
-                problems.append(
-                    f"{b.key}: this code's contract hash is {ours} but the catalog's is "
-                    f"{entry.contract_hash}; the types or offering.yaml changed after "
-                    "publishing -- republish or bump the version"
-                )
-            elif entry.retired:
-                open_jobs = await self._open_jobs(gate, b.key)
-                log.warning(
-                    "%s is retired%s",
-                    b.key,
-                    f" but still has {len(open_jobs)} open job(s); serving them"
-                    if open_jobs
-                    else "; no new jobs will come",
-                )
-        if problems:
-            raise ServeError("refusing to start:\n  " + "\n  ".join(problems))
-        return hashes
-
-    @staticmethod
-    async def _open_jobs(gate: GateClient, key: str) -> list[str]:
-        """The ids of the open jobs of ``key`` sold by us (bounded: for a warning and a
-        hash check)."""
-        found: list[str] = []
-        for state in _OPEN_STATES:
-            cursor: str | None = None
-            for _ in range(_JOB_PAGES):
-                try:
-                    page = await gate.jobs(
-                        as_="seller", state=state.value, cursor=cursor, limit=200
-                    )
-                except GateError as e:
-                    log.warning("could not list open jobs of %s: %s", key, e)
-                    return found
-                found += [j.job_id for j in page.items if j.offering == key]
-                cursor = page.next_cursor
-                if cursor is None:
-                    break
-        return found
-
-    @staticmethod
-    async def _hired_hash(gate: GateClient, job_id: str) -> str | None:
-        """The contract hash ``job_id`` was hired under (None: the gate would not say)."""
-        try:
-            return (await gate.seller_job(job_id)).contract_hash
-        except GateError as e:
-            log.warning("could not read the contract of job %s: %s", job_id, e)
-            return None
+        self._kontra, self._client, self._inner, self._stack = kontra, client, tuple(inner), stack
 
     # ------------------------------------------------------------------ running
 
@@ -604,6 +387,7 @@ class Worker:
         runtime: temporalio.runtime.Runtime | None = None,
         interceptors: Sequence[temporalio.client.Interceptor] = (),
         handle_signals: bool = True,
+        stream_upload_budget: float | None = None,
     ) -> None:
         """Start (see :meth:`prepare`) and serve until :meth:`shutdown`, SIGINT or SIGTERM
         (``handle_signals``, main thread only), then shut down gracefully (temporalio's
@@ -625,13 +409,17 @@ class Worker:
                 home=home,
                 runtime=runtime,
                 interceptors=interceptors,
+                stream_upload_budget=stream_upload_budget,
             )
             with self._signals(handle_signals):
                 try:
                     await self._serve()
+                except ServeError:
+                    raise  # the plugin's refusal, already said
                 except Exception as failure:
                     # Before aclose(), which closes a session the worker made itself.
-                    reason = await _refused(self._session)
+                    kontra = self._kontra
+                    reason = await kontra.refusal() if kontra is not None else None
                     if reason is None:
                         raise
                     raise ServeError(reason) from failure
@@ -752,8 +540,7 @@ class Worker:
     async def aclose(self) -> None:
         """Release what :meth:`prepare` acquired (inner workers that never ran included)."""
         stack, self._stack = self._stack, None
-        self._inner, self._services, self._client = (), (), None
-        self._session = None
+        self._inner, self._client, self._kontra = (), None, None
         try:
             if stack is not None:
                 await stack.aclose()

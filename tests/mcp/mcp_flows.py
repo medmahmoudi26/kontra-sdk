@@ -51,6 +51,8 @@ class WordsFlow:
             raise ApplicationError(FAIL_MESSAGE, non_retryable=True)
         text = await workflow.execute_activity(upper, job.text, start_to_close_timeout=_T)
         if job.mode == "beats":
+            # Progress is live (decisions I31): a moment for the buyer to start listening.
+            await workflow.sleep(timedelta(seconds=2))
             await workflow.execute_activity(beat, job.beats, start_to_close_timeout=_T)
         if job.mode == "stuck":
             await workflow.execute_activity(halfway, start_to_close_timeout=_T)

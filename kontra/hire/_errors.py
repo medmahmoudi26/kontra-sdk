@@ -29,6 +29,8 @@ __all__ = [
     "PriceAboveMax",
     "QuoteRejected",
     "SellerBusy",
+    "StreamInterrupted",
+    "StreamItemInvalid",
     "from_failure",
 ]
 
@@ -202,6 +204,32 @@ class JobKeyMissing(KontraError):
         self.job_id, self.reason, self.buyer_key = job_id, reason, buyer_key
 
 
+class StreamInterrupted(KontraError):
+    """The gate's relay of the job's stream stopped before the job ended (``reason``: the
+    job's ``history_budget`` was spent, or ``relay_failed``: the seller's worker answered
+    something that is not a Kontra stream). What was relayed before it was yielded; the job
+    itself goes on (decisions I31)."""
+
+    wire_type = _PREFIX + "StreamInterrupted"
+
+    def __init__(self, message: str, *, job_id: str | None = None, reason: str = "") -> None:
+        super().__init__(message, job_id=job_id, reason=reason)
+        self.job_id, self.reason = job_id, reason
+
+
+class StreamItemInvalid(KontraError):
+    """An item of the job's stream decrypted but is not the ``type`` it was read as (or not
+    JSON at all). Read with ``type=dict`` to see it anyway."""
+
+    wire_type = _PREFIX + "StreamItemInvalid"
+
+    def __init__(
+        self, message: str, *, job_id: str | None = None, topic: str = "", offset: int = -1
+    ) -> None:
+        super().__init__(message, job_id=job_id, topic=topic, offset=offset)
+        self.job_id, self.topic, self.offset = job_id, topic, offset
+
+
 _BY_TYPE: dict[str, type[KontraError]] = {
     c.wire_type: c
     for c in (
@@ -215,6 +243,8 @@ _BY_TYPE: dict[str, type[KontraError]] = {
         JobFailed,
         InvalidDelivery,
         JobKeyMissing,
+        StreamInterrupted,
+        StreamItemInvalid,
     )
 }
 

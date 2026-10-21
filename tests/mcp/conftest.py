@@ -1,6 +1,7 @@
 """Fixtures for ``kontra.mcp``: one Temporal dev server per test process (shared with the
 other suites). Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once
-into the temp directory; with neither the binary nor the network these tests are skipped."""
+and checksum-verified (``kontra.devgate.temporal_cli``); with neither the binary nor the
+network these tests are skipped."""
 
 from __future__ import annotations
 

@@ -5,14 +5,17 @@ seller does after ``kontra login`` (or ``kontra dev``)."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import importlib.util
 import os
 import signal
 import subprocess
 import sys
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 from typing import Any, TypeVar
 
 import temporalio.api.enums.v1 as enums
@@ -31,8 +34,17 @@ _T = TypeVar("_T")
 
 REPO = Path(__file__).resolve().parents[2]
 EXAMPLES = REPO / "examples"
-#: The sellers, by directory. Their offering names start with ``acme/``.
-SELLERS = ("enrich", "legacy-actor", "hello", "chef-agents", "chef-claude", "sweep")
+#: The sellers, by directory. Their offering names start with ``acme/``. ``recon-harness``
+#: sells a bound handler (an agent's one typed entry); every other one a workflow.
+SELLERS = (
+    "enrich",
+    "legacy-actor",
+    "hello",
+    "chef-agents",
+    "chef-claude",
+    "sweep",
+    "recon-harness",
+)
 #: The ones the package's marketplace serves for every test. The chefs run in their own
 #: tests, each with what its worker dials: a local model server, a stand-in ``claude``.
 SERVED = ("enrich", "legacy-actor", "hello", "sweep")
@@ -184,15 +196,48 @@ class Market:
 
 def seller_env(home: Path, sites: Sites) -> dict[str, str]:
     """The seller processes' environment: the party's profile, every heartbeat forwarded
-    one by one (acceptance 13 counts them), the test sites' CA trusted for HTTPS, and their
+    one by one (acceptance 13 counts them) with the stream upload budget a loaded test
+    machine needs (Marketplace's 8 s: past 2 s an item is a stub, a gap the counts see), the test sites' CA trusted for HTTPS, and their
     address (127.0.0.1) allowed as a destination. Nothing of OpenAI's: no seller here needs
-    an ``OPENAI_API_KEY``."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("KONTRA_", "OPENAI_"))}
+    an ``OPENAI_API_KEY``; and no model endpoint (``LLM_*``), so a seller that would dial one
+    answers with its scripted model unless the test names one."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("KONTRA_", "OPENAI_", "LLM_"))}
     env.update(
         KONTRA_HOME=str(home),
         KONTRA_PROGRESS_INTERVAL="0",
+        KONTRA_STREAM_UPLOAD_BUDGET="8",
         SSL_CERT_FILE=str(sites.ca_file),
         PYTHONUNBUFFERED="1",
         **ALLOW_LOCAL_SITES,
     )
     return env
+
+
+@contextlib.asynccontextmanager
+async def serving(market: Market, name: str, log: Path, **env: str) -> AsyncGenerator[Seller]:
+    """``examples/<name>``'s ``python worker.py`` as ``acme`` for the block (its log's tail in
+    the report if a test fails), stopped gracefully after it."""
+    environ = seller_env(market.seller.home, market.sites)
+    environ.update(env)
+    seller = Seller(name, environ, log)
+    market.sellers[name] = seller
+    seller.start()
+    try:
+        await seller.wait_ready(market.seller_client())
+        yield seller
+    finally:
+        await seller.stop()
+
+
+def example_module(name: str, module: str) -> ModuleType:
+    """``examples/<name>/<module>.py`` loaded under a name of its own (``<name>_<module>``,
+    never ``models``: every example has one), for a test that reads its types as a buyer's
+    own would. Only a module that imports nothing from beside it."""
+    spec = importlib.util.spec_from_file_location(
+        f"{name.replace('-', '_')}_{module}", EXAMPLES / name / f"{module}.py"
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded

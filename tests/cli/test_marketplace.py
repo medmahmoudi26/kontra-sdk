@@ -132,6 +132,7 @@ async def test_publish_prints_the_contract_hash_and_endpoint(shop: Shop) -> None
 
     again = await shop.seller.ok("publish", "--dir", str(shop.project))
     assert f"contract  {entry['contract_hash']}" in again.stdout
+    assert "temporal-agent-harness" not in again.stderr  # a workflow entry: nothing to compare
     assert f"endpoint  {entry['endpoint']}" in again.stdout  # the same version, the same endpoint
 
     contract = await shop.seller.ok("contract", "--dir", str(shop.project))
@@ -160,6 +161,45 @@ async def test_publish_refuses_an_offering_of_another_party(shop: Shop) -> None:
     result = await buyer.run("publish", "--dir", str(shop.project))
     assert result.exit_code == 1, explain(result)
     assert f"names the party {shop.party!r}" in result.stderr
+
+
+async def test_publish_warns_where_a_handlers_contract_and_the_harness_schema_differ(
+    shop: Shop,
+) -> None:
+    """Decisions I33 through the CLI: one handler of a harness agent publishes like any
+    offering, after one warning on stderr naming where the contract buyers get and the
+    harness's schema for that handler differ: here an ``extra="allow"`` model, which the
+    contract closes (``tests/contract/test_harness.py`` has the comparison itself)."""
+    project = shop.root / "recon"
+    project.mkdir()
+    facts = {
+        "name": f"{shop.party}/recon",
+        "version": "1.0.0",
+        "description": "Echoes an open model, one turn of an agent",
+        "max_duration": "10m",
+        "review_window": "1h",
+        "max_output_bytes": "1MB",
+        "artifact_retention": "1d",
+    }
+    (project / "offering.yaml").write_text(
+        "".join(f"{k}: {json.dumps(v)}\n" for k, v in facts.items())
+    )
+    (project / "worker.py").write_text(
+        "from kontra import serve\n"
+        "from tests.contract.harness_zoo import Zoo, allow_quote\n\n"
+        "serve(Zoo.allow, quote=allow_quote)\n"
+    )
+    result = await shop.seller.ok("publish", "--dir", str(project))
+    assert f"published {shop.party}/recon@1.0.0" in result.stdout
+    warning, *lines = result.stderr.splitlines()
+    assert warning.startswith(
+        f"warning: {shop.party}/recon@1.0.0 (Zoo.allow): the contract differs from "
+        "temporal-agent-harness's schema for this handler in 2 places."
+    )
+    assert lines[:2] == [
+        "  input  $defs.Allow.additionalProperties: contract false, harness true",
+        "  output $defs.Allow.additionalProperties: contract false, harness true",
+    ]
 
 
 async def test_a_stale_dev_login_confirms_at_once_and_publishes(

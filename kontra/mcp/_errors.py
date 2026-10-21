@@ -159,10 +159,19 @@ def tool_error(err: BaseException) -> tuple[str, str, dict[str, Any]]:
         case GateError():
             message = err.message
             if err.status == 401:
-                message += " (log in again: kontra login)"
+                from kontra.profile import profile_is_dev
+
+                message += (
+                    " (the dev gate restarted? run kontra dev up)"
+                    if profile_is_dev()
+                    else " (log in again: kontra login)"
+                )
             return err.code, message, {"status": err.status, **(err.detail or {})}
         case httpx.TransportError():
-            return "gate_unreachable", f"the Kontra gate did not answer: {err}", {}
+            from kontra.profile import profile_is_dev
+
+            hint = " (is the dev stack up? run kontra dev up)" if profile_is_dev() else ""
+            return "gate_unreachable", f"the Kontra gate did not answer: {err}{hint}", {}
         case TemporalUnavailable():
             return "temporal_unavailable", f"Temporal could not be reached: {err}", {}
         case RPCError():

@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
@@ -53,11 +53,16 @@ from kontra import _control as control_module
 from kontra import escrow
 from kontra._control import (
     EXECUTE_OPERATION,
+    HANDLER_BAD_REQUEST,
+    HANDLER_UPSTREAM_TIMEOUT,
     HOLD_HEADER,
     OCCUPY_TASK_QUEUE,
     OCCUPY_WORKFLOW_TYPE,
     BuyerCall,
     BuyerLookupError,
+    CallFailure,
+    CallRecord,
+    CallStatus,
     Control,
     ObservationIncomplete,
     Occupation,
@@ -65,6 +70,8 @@ from kontra._control import (
     hold_digest,
 )
 from kontra.contract.names import new_endpoint_name
+from kontra.engine import BuyerStart, Reach
+from kontra.engine.temporal import reach_of
 from kontra.escrow import (
     BUYER_CANCEL_REASON,
     NOT_FROM_BUYER_REASON,
@@ -257,7 +264,6 @@ def a_job(now: datetime) -> JobRecord:
         offering="acme/svc@1.0.0",
         buyer="bob",
         seller="acme",
-        seller_ns="acme",
         amount=Money(1000, "USD"),
         max_duration=timedelta(hours=1),
         review_window=timedelta(hours=1),
@@ -282,7 +288,7 @@ async def test_the_buyers_script_call_is_verified_and_delivers(market: Market) -
     call = market.call(token)
 
     obs, result = await market.control.observe(market.seller_ns, wf, call, None)
-    assert (obs.status, obs.provenance, obs.run_id) == (
+    assert (obs.status, obs.provenance, obs.pin) == (
         ObservedStatus.COMPLETED,
         Provenance.VERIFIED,
         run,
@@ -295,7 +301,7 @@ async def test_the_buyers_script_call_is_verified_and_delivers(market: Market) -
 
     now = datetime.now(UTC)
     job, effects = escrow.observe(a_job(now), obs, now)
-    assert (job.state, job.escrow, job.run_id) == (JobState.COMPLETED, Escrow.HELD, run)
+    assert (job.state, job.escrow, job.pin) == (JobState.COMPLETED, Escrow.HELD, run)
     assert job.delivery_sha256 == obs.result_sha256
     assert effects == []
 
@@ -321,7 +327,7 @@ async def test_a_call_for_another_job_endpoint_service_or_buyer_does_not_count(
     obs, _ = await market.control.observe(market.seller_ns, wf, market.call("nope"), None)
     now = datetime.now(UTC)
     job, effects = escrow.observe(a_job(now), obs, now)
-    assert (job.state, job.run_id, effects) == (JobState.SUBMITTED, None, [])
+    assert (job.state, job.pin, effects) == (JobState.SUBMITTED, None, [])
     late = job.deadline
     job, effects = escrow.observe(job, obs, late)
     assert (job.state, job.escrow, job.reason) == (
@@ -337,7 +343,7 @@ async def test_the_buyers_workflow_call_is_verified(market: Market) -> None:
     wf = await market.workflow_hire(token)
     run = await market.wait(wf, WorkflowExecutionStatus.COMPLETED)
     obs, result = await market.control.observe(market.seller_ns, wf, market.call(token), None)
-    assert (obs.status, obs.provenance, obs.run_id) == (
+    assert (obs.status, obs.provenance, obs.pin) == (
         ObservedStatus.COMPLETED,
         Provenance.VERIFIED,
         run,
@@ -370,7 +376,7 @@ async def test_a_continue_as_new_chain_is_followed_from_its_first_run(market: Ma
     assert root != last
     call = market.call(token)
     obs, result = await market.control.observe(market.seller_ns, wf, call, None)
-    assert (obs.status, obs.provenance, obs.run_id) == (
+    assert (obs.status, obs.provenance, obs.pin) == (
         ObservedStatus.COMPLETED,
         Provenance.VERIFIED,
         root,
@@ -397,7 +403,7 @@ async def test_a_long_chains_delivery_is_seen_by_a_gate_that_never_walked_it(
     for pinned in (None, root):
         fresh = Control(market.control.client, market.control.http_base)
         obs, result = await fresh.observe(market.seller_ns, wf, call, pinned)
-        assert (obs.status, obs.provenance, obs.run_id) == (
+        assert (obs.status, obs.provenance, obs.pin) == (
             ObservedStatus.COMPLETED,
             Provenance.VERIFIED,
             root,
@@ -405,7 +411,7 @@ async def test_a_long_chains_delivery_is_seen_by_a_gate_that_never_walked_it(
         assert stored_text(result) == "CAN0"
 
     now = datetime.now(UTC)
-    working = replace(a_job(now), state=JobState.WORKING, run_id=root, started_at=now)
+    working = replace(a_job(now), state=JobState.WORKING, pin=root, started_at=now)
     job, _ = escrow.observe(working, obs, now)
     assert job.state is JobState.COMPLETED
     with pytest.raises(EscrowError):  # the buyer's cancel comes too late
@@ -437,7 +443,7 @@ async def test_a_pinned_chain_left_behind_is_followed_over_several_observations(
     else:
         raise AssertionError("the chain's end was never reached")
     assert incomplete >= 1
-    assert (obs.status, obs.provenance, obs.run_id) == (
+    assert (obs.status, obs.provenance, obs.pin) == (
         ObservedStatus.COMPLETED,
         Provenance.VERIFIED,
         root,
@@ -644,14 +650,14 @@ async def test_terminate_and_restart_does_not_move_escrow(market: Market) -> Non
     first = await market.wait(wf, WorkflowExecutionStatus.RUNNING)
     call = market.call(token)
     obs, _ = await market.control.observe(market.seller_ns, wf, call, None)
-    assert (obs.status, obs.provenance, obs.run_id) == (
+    assert (obs.status, obs.provenance, obs.pin) == (
         ObservedStatus.RUNNING,
         Provenance.VERIFIED,
         first,
     )
     now = datetime.now(UTC)
     job, _ = escrow.observe(a_job(now), obs, now)
-    assert (job.state, job.run_id) == (JobState.WORKING, first)
+    assert (job.state, job.pin) == (JobState.WORKING, first)
 
     # The seller terminates the buyer's run and completes a new one of the same id with
     # everything the buyer's call gave it. The same request id is deduplicated while the
@@ -668,8 +674,8 @@ async def test_terminate_and_restart_does_not_move_escrow(market: Market) -> Non
     assert await market.start_request_ids(wf, second) == [request_id]
 
     # Escrow follows the run it pinned: terminated, so the job fails and refunds.
-    obs, result = await market.control.observe(market.seller_ns, wf, call, job.run_id)
-    assert (obs.status, obs.run_id, result) == (ObservedStatus.TERMINATED, first, None)
+    obs, result = await market.control.observe(market.seller_ns, wf, call, job.pin)
+    assert (obs.status, obs.pin, result) == (ObservedStatus.TERMINATED, first, None)
     job, effects = escrow.observe(job, obs, datetime.now(UTC))
     assert (job.state, job.escrow, job.reason) == (
         JobState.FAILED,
@@ -681,7 +687,7 @@ async def test_terminate_and_restart_does_not_move_escrow(market: Market) -> Non
     # Unpinned (the gate never saw the first run), the new run is still not the buyer's:
     # the buyer's operation recorded the first run as the one its call started.
     obs, result = await market.control.observe(market.seller_ns, wf, call, None)
-    assert (obs.status, obs.run_id, obs.provenance, result) == (
+    assert (obs.status, obs.pin, obs.provenance, result) == (
         ObservedStatus.COMPLETED,
         second,
         Provenance.NOT_FROM_BUYER,
@@ -703,7 +709,7 @@ async def test_a_pinned_chain_ignores_every_other_run_of_the_id(market: Market) 
     assert later != first
     await market.wait(wf, WorkflowExecutionStatus.COMPLETED)
     obs, result = await market.control.observe(market.seller_ns, wf, market.call(token), first)
-    assert (obs.status, obs.run_id, obs.provenance) == (
+    assert (obs.status, obs.pin, obs.provenance) == (
         ObservedStatus.COMPLETED,
         first,
         Provenance.VERIFIED,
@@ -818,7 +824,7 @@ async def test_occupy_job_closes_the_id_to_the_handlers_start(market: Market) ->
     job = a_job(now)
     assert escrow.observe(job, obs, now) == (job, [])  # not the seller's terminated run
     late, _ = escrow.observe(job, obs, job.deadline)
-    assert (late.escrow, late.reason, late.run_id) == (Escrow.REFUNDED, OCCUPIED_REASON, None)
+    assert (late.escrow, late.reason, late.pin) == (Escrow.REFUNDED, OCCUPIED_REASON, None)
 
     # Idempotent: a retried cancel finds its own placeholder; still one run.
     assert await market.control.occupy_job(market.seller_ns, wf, BUYER_CANCEL_REASON) is (
@@ -920,7 +926,7 @@ async def test_a_buyer_cancelling_its_own_script_call_is_read_from_its_records(
     obs, _ = await market.control.observe(market.seller_ns, wf, call, None)
     now = datetime.now(UTC)
     working, _ = escrow.observe(a_job(now), obs, now)
-    assert working.run_id == run
+    assert working.pin == run
     await market.buyer.workflow_service.request_cancel_nexus_operation_execution(
         RequestCancelNexusOperationExecutionRequest(
             namespace=market.buyer_ns,
@@ -960,7 +966,7 @@ async def test_a_buyer_cancelling_its_own_script_call_is_read_from_its_records(
     await market.wait(wf, WorkflowExecutionStatus.CANCELED)
     obs, _ = await market.control.observe(market.seller_ns, wf, market.call(token), run)
     assert (obs.status, obs.buyer_canceled) == (ObservedStatus.CANCELED, False)
-    job, _ = escrow.observe(working, replace(obs, run_id=working.run_id), datetime.now(UTC))
+    job, _ = escrow.observe(working, replace(obs, pin=working.pin), datetime.now(UTC))
     assert job.reason == "canceled"
 
 
@@ -1208,3 +1214,104 @@ async def test_a_buyers_unreadable_namespace_is_its_own_error(market: Market) ->
     with pytest.raises(TemporalError) as err:
         await busy_seller.observe(market.seller_ns, script, market.call(token), None)
     assert not isinstance(err.value, BuyerLookupError)
+
+
+# --------------------------------------------------------------------------- how far a call got
+
+
+async def _call_until(market: Market, op: str, done: Callable[[CallRecord], bool]) -> CallRecord:
+    """The buyer's standalone call ``op`` as the frontend records it, once ``done`` holds."""
+    record: CallRecord | None = None
+    for _ in range(300):
+        record = await market.control.describe_call(market.buyer_ns, op)
+        if record is not None and done(record):
+            return record
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"{op} never got there: {record}")
+
+
+async def test_how_far_a_buyers_call_got_is_read_from_its_own_record(market: Market) -> None:
+    """Decisions I40, kontra-cloud's ``describe_operation`` ported into the control plane:
+    :meth:`Control.describe_call` reads the buyer's standalone call as server 1.32 records
+    it, and ``reach_of`` maps it -- none at all; a call the handler took, with its times and
+    the buyer's cancel request; a refusal (``BAD_REQUEST``, final); a call no worker answers
+    (``UPSTREAM_TIMEOUT``, about 10 s in); one the buyer terminated before any attempt
+    finished. A namespace that does not exist cannot say."""
+    control = market.control
+    assert await control.describe_call(market.buyer_ns, unique("op")) is None
+    with pytest.raises(BuyerLookupError):
+        await control.describe_call(unique("nobody"), unique("op"))
+
+    token, op = unique("hold"), unique("op")
+    call = market.call(token)
+    wf = await market.script_hire(token, "slow", operation_id=op)
+    await market.wait(wf, WorkflowExecutionStatus.RUNNING)
+    taken = await _call_until(market, op, lambda r: r.started)
+    assert taken.is_call_of(call)
+    assert not taken.is_call_of(market.call("another job's hold"))
+    assert (taken.status, taken.failure, taken.cancel_requested) == (
+        CallStatus.RUNNING,
+        None,
+        False,
+    )
+    assert taken.scheduled_at is not None
+    assert taken.expires_at is not None
+    assert abs(taken.expires_at - taken.scheduled_at - timedelta(minutes=5)) < timedelta(seconds=5)
+    assert reach_of(taken, call)[0] is Reach.STARTED
+    await market.buyer.workflow_service.request_cancel_nexus_operation_execution(
+        RequestCancelNexusOperationExecutionRequest(
+            namespace=market.buyer_ns, operation_id=op, request_id=str(uuid.uuid4())
+        )
+    )
+    asked = await _call_until(market, op, lambda r: r.cancel_requested)
+    assert reach_of(asked, call) == (
+        Reach.STARTED,
+        BuyerStart(asked.scheduled_at, asked.expires_at, withdrawal_asked=True),
+    )
+
+    async def start(op: str, endpoint: str, operation: str = EXECUTE_OPERATION) -> None:
+        await control.start_operation(
+            market.buyer_ns,
+            op,
+            endpoint,
+            market.service,
+            operation,
+            plan_payload("x"),
+            {HOLD_HEADER: token},
+            timedelta(minutes=5),
+        )
+
+    bad = unique("op")
+    await start(bad, market.endpoint, "bad")  # the handler refuses it: BAD_REQUEST
+    refused = await _call_until(market, bad, lambda r: r.status is not CallStatus.RUNNING)
+    # This handler leaves the retry behaviour unset (kontra.serve's says final): a refusal
+    # either way, as judge_call read it.
+    assert (refused.status, refused.started, refused.failure) == (
+        CallStatus.FAILED,
+        False,
+        CallFailure(HANDLER_BAD_REQUEST, final=False),
+    )
+    assert reach_of(refused, call)[0] is Reach.NEVER_DISPATCHED  # not the job's ``execute``
+    assert reach_of(replace(refused, operation=EXECUTE_OPERATION), call)[0] is Reach.REFUSED
+
+    absent = new_endpoint_name()  # an endpoint whose task queue no worker polls
+    await control.create_endpoint(absent, market.seller_ns, f"{market.seller_ns}/absent@1.0.0")
+    nobody = BuyerCall(market.buyer_ns, absent, market.service, call.holds)
+    lost, gone = unique("op"), unique("op")
+    await start(lost, absent)
+    await start(gone, absent)
+    await market.buyer.workflow_service.terminate_nexus_operation_execution(
+        TerminateNexusOperationExecutionRequest(
+            namespace=market.buyer_ns, operation_id=gone, request_id=str(uuid.uuid4())
+        )
+    )
+    withdrawn = await _call_until(market, gone, lambda r: r.status is CallStatus.TERMINATED)
+    assert (withdrawn.started, withdrawn.failure) == (False, None)
+    assert reach_of(withdrawn, nobody)[0] is Reach.WITHDRAWN
+    unanswered = await _call_until(market, lost, lambda r: r.failure is not None)
+    assert (unanswered.status, unanswered.started, unanswered.failure) == (
+        CallStatus.RUNNING,
+        False,
+        CallFailure(HANDLER_UPSTREAM_TIMEOUT),
+    )
+    assert reach_of(unanswered, nobody)[0] is Reach.UNANSWERED

@@ -99,6 +99,16 @@ def _resolve(home: Path | str | None) -> Path:
     return Path(home).expanduser() if home is not None else kontra_home()
 
 
+def profile_is_dev(home: Path | str | None = None) -> bool:
+    """Whether the profile in ``home`` is a dev profile (False when there is none, or it cannot
+    be read). For dev-aware hints: a dev profile is told ``kontra dev up``, never ``kontra login``
+    (decisions I34, OD14)."""
+    try:
+        return Profile.load(home).dev
+    except ProfileError:
+        return False
+
+
 def _ensure_dir(home: Path) -> None:
     """Create ``home`` as 0700. An existing directory is left alone: ``KONTRA_HOME`` may
     point somewhere shared, and the files inside are 0600 whatever the directory is."""
@@ -258,7 +268,8 @@ class Profile(BaseModel):
         except FileNotFoundError:
             raise NotLoggedIn(
                 f"not logged in: there is no profile at {path}. Run `kontra login` "
-                "(or point KONTRA_HOME at the directory that has one)."
+                "(or point KONTRA_HOME at the directory that has one), or `kontra dev up` "
+                "for a local dev stack."
             ) from None
         try:
             profile = cls.model_validate_json(raw)

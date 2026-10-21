@@ -1,4 +1,5 @@
-"""The batch tests' parent workflow, through the façade: one case per call."""
+"""The batch tests' parent workflow, in vanilla temporalio plus the optional helper
+(:mod:`kontra.contrib.parallel`): one case per call."""
 
 from __future__ import annotations
 
@@ -6,13 +7,14 @@ import asyncio
 from datetime import timedelta
 from typing import Any
 
-from kontra import RetryPolicy, workflow
+from temporalio import workflow
+from temporalio.common import RetryPolicy
 
-from . import acts
-from .models import Tally
+from kontra.contrib.parallel import execute_activities_in_parallel
 
 with workflow.unsafe.imports_passed_through():
-    from . import configured
+    from . import acts, configured
+    from .models import Tally
 
 _T = timedelta(seconds=30)
 
@@ -21,7 +23,7 @@ _T = timedelta(seconds=30)
 class Parent:
     @workflow.run
     async def run(self, case: str, n: int) -> Any:
-        par = workflow.execute_activities_in_parallel
+        par = execute_activities_in_parallel
         if case == "items":
             return await par(acts.double, items=list(range(n)), start_to_close_timeout=_T)
         if case == "offsets":

@@ -25,10 +25,11 @@ crosses a seam updates that seam's test **in the same PR**.
 | # | Seam | Contract | Test |
 |---|---|---|---|
 | ① | Temporal frontend | Temporal's protocol + the §10.4 policy in `temporal/authorizer` | `temporal/authorizer` Go deny matrix + `tests/temporal` over the wire (required) |
-| ② | Gate HTTP API | `kontra/gate_client/models.py` + `routes.py` | `tests/gate_client/test_routes.py`; the gate's OpenAPI snapshot in `kontra-cloud` |
+| ② | Gate HTTP API | `kontra/gate_client/models.py` + `routes.py` | `tests/gate_client/test_routes.py` (the dev gate `kontra.devgate.DevGate` serves every row); the gate's OpenAPI snapshot in `kontra-cloud` |
 | ③ | Contract document | `kontra/contract` + `spec/` | golden `examples/*/contract.yaml` reproduced byte for byte |
 | ④ | Ledger | `kontra/ledger.py` Protocol | `kontra.testing.ledger_contract` against every adapter |
-| ⑤ | Codec | `kontra/codec` | round trips + the marker-string scan of bucket, history, a worker's metrics endpoint and its exported spans, and the dev graph page's routes |
+| ⑤ | Codec | `kontra/codec` | round trips + the marker-string scan of bucket, history, a worker's metrics endpoint and its exported spans, the dev graph page's routes, and a job's stream: the stream envelope in history (references only), the job's stream blobs in the bucket, the relayed SSE bytes and the gate's stream store (`tests/serve/test_streams.py`) |
+| ⑥ | Engine | the `kontra.engine` Protocol (gate↔engine only; never a workflow-authoring surface, `docs/decisions.md` I32) | `kontra.testing.engine_contract` against every adapter (`FakeEngine`; `TemporalEngine` on the dev server, `tests/engine`; isolation and the relay credential over the wire, `tests/temporal`) |
 
 ## Rules that keep the design honest
 
@@ -39,20 +40,39 @@ crosses a seam updates that seam's test **in the same PR**.
   assigned by the catalog; nothing derives an offering from one or authorizes by its shape
   (`docs/decisions.md` I1, I3). Validate typed input with anchored `fullmatch`, never `re.match`.
 - `kontra/escrow.py` holds the job rules as pure functions; both gates (real and fake) use it.
-- Seller `workflows.py` and `activities.py` reach Temporal only through the façade (D1, `docs/decisions.md`
-  I20): `from kontra import workflow, activity, RetryPolicy, ApplicationError, Page`, never `temporalio`
-  or `nexusrpc`, never `import kontra`, never the serving stack. The façade is Temporal's own objects, so
-  `from temporalio import workflow` in its place still runs on any Temporal. `models.py` may use
-  `kontra.types.Artifact`. `grep -r "import kontra" examples/*/workflows.py examples/*/activities.py`
-  must print nothing; `tests/examples/test_imports.py` checks the rest.
+- The gate reaches an engine only through `kontra.engine` (seam ⑥): the engine is a property of
+  the offering version, fixed at publish (`PublishRequest.engine`, beside the contract hash, never
+  in a buyer's view). The Protocol never grows a workflow-authoring member (`MEMBERS` is pinned by
+  a test; `engine.execute_activity(...)` is the façade crawling back), names no Temporal concept
+  in its types, and hands the gate content only as `Sealed`/`SealedPayload`. A job handle is
+  opaque bytes only its adapter parses, strictly, before any I/O; it never authorizes anything.
+  `kontra.engine.temporal` is the only adapter; seller code stays native `temporalio`.
+- Seller `workflows.py` and `activities.py` are vanilla Temporal (`docs/decisions.md` I29): they import
+  `temporalio` directly and nothing from `kontra`, so deleting `worker.py` leaves code that runs on any
+  Temporal worker, unmodified. `worker.py` is the one file of an offering that imports `kontra`
+  (`serve`, or `KontraPlugin` on the seller's own client); besides it, `quote.py` takes only
+  `kontra.serve.Quote` and `models.py` only `kontra.types` (`Artifact`). No `kontra.temporal` re-export
+  namespace (rejected in I29). `grep -rE '^\s*(from|import)\s+kontra\b' examples/*/workflows.py
+  examples/*/activities.py` must print nothing; `tests/examples/test_imports.py` checks the rest (and
+  runs `examples/hello` without `worker.py` on a plain Temporal worker).
+- Kontra never imports `temporal_agent_harness` at runtime: `kontra/serve/turn.py` holds the harness's
+  wire shape as constants, checked against the harness in `tests/serve/test_turn.py`, and
+  `kontra/contract/harness.py` reads its schema through its CLI (`tests/contract/test_harness.py`).
 - Every seam has a fake in `kontra.testing`, so a seller tests a full lifecycle without containers.
+- The dev gate is `kontra.devgate` (`kontra dev`), in process and loopback only; the prod gate stays
+  in `kontra-cloud` and is never imported here (`docs/decisions.md` I34). `kontra.testing.FakeGate`
+  is `kontra.devgate.DevGate`. `kontra dev` never reads the environment for a mode and never suggests
+  `kontra login`; its ports come from its settings and flags, so `KONTRA_DEV_*_PORT` are the e2e
+  stack's (`compose.yaml`, driven by `make e2e`), not `kontra dev`'s.
 - The PyPI distribution is `kontra-sdk`; `kontra` on PyPI is someone else's package. Never add a bare
   `kontra` dependency anywhere.
 
 ## Commands
 
 `make check` runs exactly what CI runs: ruff, pyright (strict), the unit tests, the seam tests, and the
-Authorizer's Go tests. `make e2e` brings up `kontra dev` (compose) and runs `tests/e2e`.
+Authorizer's Go tests. `make e2e` brings up the e2e stack (`make stack-up`: `compose.yaml`, the prod
+gate image) and runs `tests/e2e`; `kontra dev up` runs no containers (`kontra.devgate`, `docs/decisions.md`
+I34), and acceptance 1's no-container half runs in `make test`.
 
 ## Issue tracker
 
