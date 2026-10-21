@@ -1,8 +1,9 @@
 """Fixtures for ``kontra.serve``: one Temporal dev server per test process (shared with the
 other suites through :func:`acquire_shared_dev_server`).
 
-Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once into the temp
-directory; with neither the binary nor the network, the end-to-end tests are skipped."""
+Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once and
+checksum-verified (``kontra.devgate.temporal_cli``); with neither the binary nor the network,
+the end-to-end tests are skipped."""
 
 from __future__ import annotations
 

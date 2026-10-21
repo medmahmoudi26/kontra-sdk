@@ -1,0 +1,1 @@
+{"agent_id": "a1b2c3", "event": {"reason": "the subagent's stream was not readable", "subagent_id": "a1b2c3-d4e5f6", "type": "subagent_stream_unavailable", "workflow_id": "cert-checker-subagent-0199f0a1-9d43-7f71-8c55-4e6f8a0b2c34"}, "message_id": "m-0199f0a1", "timestamp": 1760950000.0, "turn_id": "t-0199f0a1", "turn_number": 1}

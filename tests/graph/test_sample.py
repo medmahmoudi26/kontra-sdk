@@ -41,8 +41,8 @@ from pydantic import (
     model_validator,
 )
 
-from kontra._parallel import Page
 from kontra._sample import Unsampleable, draw, from_schema, mode, sample
+from kontra.contrib.parallel import Page
 from kontra.types import Artifact
 
 

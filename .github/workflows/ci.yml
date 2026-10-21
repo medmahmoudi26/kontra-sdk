@@ -6,8 +6,10 @@
 # policy: the Go deny matrix and the same cells over the wire against the real server
 # binary (docs/security.md).
 #
-# e2e runs after all of them against `kontra dev` (compose: the Temporal image built here,
-# the published gate image). The gate is private (kontra-cloud): `gate-image` checks that its
+# e2e runs after all of them against the e2e stack (compose.yaml through the Makefile: the
+# Temporal image built here, the published gate image; `kontra dev up` runs no containers and is
+# covered on every pull request by `make test`). The gate is private (kontra-cloud): `gate-image`
+# checks that its
 # image can be read first, and when it cannot, says so in a warning and the run summary and
 # e2e shows as skipped -- it never passes by quietly running nothing. While the image is
 # private, a pull request from a fork is skipped the same way, and says why: its code would
@@ -287,15 +289,14 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
       - run: make sync
-      - name: kontra dev up, then tests/e2e (make e2e)
+      - name: The e2e stack, then tests/e2e (make e2e)
         run: |
-          export KONTRA_HOME="$RUNNER_TEMP/kontra-home"
           export KONTRA_TEMPORAL_IMAGE="$TEMPORAL_IMAGE"
           export KONTRA_GATE_IMAGE="$GATE_IMAGE"
           make e2e
       - name: Stack logs
         if: failure()
-        run: KONTRA_HOME="$RUNNER_TEMP/kontra-home" .venv/bin/kontra dev logs --tail 300
-      - name: kontra dev down
+        run: make stack-logs TAIL=300
+      - name: Stack down
         if: always()
-        run: KONTRA_HOME="$RUNNER_TEMP/kontra-home" .venv/bin/kontra dev down --volumes
+        run: make stack-down

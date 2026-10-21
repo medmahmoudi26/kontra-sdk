@@ -54,18 +54,15 @@ pip install "kontra-sdk[testing]"      # + the in-process marketplace for your t
 > bare `kontra` dependency in a requirements file or a `pyproject.toml`: it installs someone
 > else's code. The import name is `kontra`.
 
-`kontra dev` also needs Docker with the compose plugin. It runs the images
-`ghcr.io/medmahmoudi26/kontra-temporal:dev` and `ghcr.io/medmahmoudi26/kontra-gate:dev`;
-`KONTRA_TEMPORAL_IMAGE` and `KONTRA_GATE_IMAGE` name others (in a checkout, `make temporal`
-builds `kontra-temporal:dev` from [`temporal/authorizer`](temporal/authorizer)). The published
-Temporal image is `linux/amd64` only: on an arm64 machine Docker has to emulate it, or build a
-native one with `make temporal`.
+`kontra dev` runs a local Kontra on this machine with no containers (the dev gate and a Temporal
+dev server in one background process); it needs `pip install "kontra-sdk[dev]"` (`[testing]`
+includes it) and downloads a checksum-pinned Temporal CLI once. `kontra dev up --observability`
+is the one part that uses Docker.
 
 ## Sell a job
 
 ```sh
-kontra dev                    # a local Kontra in Docker (Temporal, gate, Postgres, bucket);
-                              # logs you in as a dev party with play money
+kontra dev                    # a local Kontra, no containers; logs you in as a dev party with play money
 kontra init wordcount         # ./wordcount: offering.yaml, models, workflow, quote, worker, a test
 cd wordcount
 pytest                        # the whole lifecycle -- quote, hire, deliver, accept, refund --
@@ -79,9 +76,9 @@ kontra serve                  # run the worker; on a dev profile it publishes th
 |---|---|
 | `offering.yaml` | name, version, limits, display text. Declarative; names no code |
 | `models.py` | input and output types; the published contract is derived from them |
-| `workflows.py`, `activities.py` | the job, in Temporal through the façade: `from kontra import workflow, activity`, **never `temporalio`** |
+| `workflows.py`, `activities.py` | the job, in vanilla Temporal: `from temporalio import workflow, activity`, **never `kontra`**, so it runs on any Temporal worker as it is (all but `Artifact` I/O, which needs the Kontra runtime `worker.py` installs) |
 | `quote.py` | the price, computed from the input |
-| `worker.py` | binds workflow and quote to the offering; every `temporalio.worker.Worker` option |
+| `worker.py` | binds workflow and quote to the offering; every `temporalio.worker.Worker` option and plugin; the one file that imports `kontra` |
 
 Against the real marketplace:
 
@@ -184,10 +181,11 @@ See [docs/buyers.md](docs/buyers.md).
   and the buyer's accept, reject and cancel calls. Neither party's word moves money. A job not
   delivered by its deadline refunds the buyer; a delivery the buyer does not reject within the
   review window pays the seller.
-- **The Authorizer.** Kontra runs its own Temporal server. Every token on the public frontend
-  is one weak role, `<namespace>:worker`, confined to its own namespace by an allowlist; no
-  token can reach an Operator or Admin API, so a compromised seller machine cannot repoint an
-  offering. The policy is in [`temporal/authorizer`](temporal/authorizer), public so you can
+- **The Authorizer.** Kontra runs its own Temporal server. Every party's token on the public
+  frontend is one weak role, `<namespace>:worker`, confined to its own namespace by an
+  allowlist; the platform's only other tokens are narrower still (one job's stream relay, the
+  rollout of Kontra's own workers). No token can reach an Operator or Admin API, so a
+  compromised seller machine cannot repoint an offering. The policy is in [`temporal/authorizer`](temporal/authorizer), public so you can
   read the rules you run under.
 - **Logins and keys.** A person signs in through a device code that only their own screen
   shows, approved in the browser or through a mailed link whose page asks for that code. A
@@ -204,11 +202,11 @@ What Kontra can and cannot see, the threat model, and the limits: [docs/security
 | [docs/sellers.md](docs/sellers.md) | writing, testing, publishing and serving an offering |
 | [docs/buyers.md](docs/buyers.md) | hiring from the CLI, a script, a workflow, or an agent |
 | [docs/security.md](docs/security.md) | threat model, encryption and the Authorizer |
-| [docs/architecture.md](docs/architecture.md) | the five seams, the one-way rule, how names are built |
+| [docs/architecture.md](docs/architecture.md) | the six seams, the one-way rule, how names are built |
 | [docs/decisions.md](docs/decisions.md) | implementation decisions, checked against Temporal and nexgen |
 | [spec/](spec/README.md) | the contract document's `x-kontra` extension and reserved types |
 | [temporal/authorizer](temporal/authorizer/README.md) | the Temporal server, its policy and its configuration |
-| [examples/](examples) | `hello` (the smallest seller, a five-minute tutorial), `enrich` (seller), `legacy-actor` (seller), `sweep` (seller: a fan-out, a batch and a branch), `chef-agents` and `chef-claude` (sellers: agents), `recon` (buyer workflow) |
+| [examples/](examples) | `hello` (the smallest seller, a five-minute tutorial), `enrich` (seller), `legacy-actor` (seller), `sweep` (seller: a fan-out, a batch and a branch), `chef-agents` and `chef-claude` (sellers: agents), `recon-harness` (seller: an agent sold as one typed handler), `recon` (buyer workflow), `buyer-harness-agent` (buyer: your own agent hires offerings as tools) |
 
 ## Contributing
 

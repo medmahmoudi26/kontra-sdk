@@ -31,11 +31,19 @@ from functools import total_ordering
 
 __all__ = [
     "HANDLE_MAX",
+    "PLATFORM_NAMESPACE",
+    "PROGRESS_TOPIC",
     "RESERVED_HANDLES",
+    "RESERVED_TOPIC_PREFIX",
+    "STREAM_OFFSET_QUERY",
+    "STREAM_POLL_UPDATE",
+    "STREAM_PUBLISH_SIGNAL",
+    "WORKER_CONTROLLER_SUBJECT",
     "NameError_",
     "OfferingId",
     "OfferingRef",
     "Version",
+    "agent_workflow_id",
     "batch_workflow_id",
     "is_endpoint_name",
     "is_handle",
@@ -44,6 +52,7 @@ __all__ = [
     "job_workflow_id",
     "new_endpoint_name",
     "new_job_id",
+    "relay_subject",
     "validate_handle",
 ]
 
@@ -62,6 +71,8 @@ _REF_RE = re.compile(
 _HEX32_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
 _ENDPOINT_RE = re.compile(r"k[0-9a-f]{32}", re.ASCII)
 _JOB_WF_PREFIX = "job-"
+#: What follows ``job-<id>`` in the id of a bound-handler job's agent child.
+_AGENT_SUFFIX = "/agent"
 
 #: Handles a party may never take: Temporal's own namespaces, and the platform's names.
 RESERVED_HANDLES = frozenset(
@@ -288,13 +299,57 @@ def job_workflow_id(job_id: str) -> str:
     return _JOB_WF_PREFIX + job_id
 
 
+#: Temporal identities that are not parties. Each contains "/", which no handle can
+#: (``_HANDLE``), so no party token's ``sub`` is ever one of them (temporal/authorizer,
+#: decisions I30).
+WORKER_CONTROLLER_SUBJECT = "platform/worker-controller"
+#: Kontra's own Temporal namespace (KON-15); a reserved handle, so no party can take it.
+PLATFORM_NAMESPACE = "kontra-system"
+#: The two workflow-stream handlers a relay may use (``temporalio.contrib.workflow_streams``
+#: wire names, Public Preview; pinned by tests/contract/test_names.py). The gate depends on
+#: these names, never on the contrib package.
+STREAM_POLL_UPDATE = "__temporal_workflow_stream_poll"
+STREAM_OFFSET_QUERY = "__temporal_workflow_stream_offset"
+#: The stream's publish signal: what a seller's publishers (and Kontra's progress forwarder
+#: and turn mirror) send to ``job-<id>``. Never a relay's: the authorizer refuses it one.
+STREAM_PUBLISH_SIGNAL = "__temporal_workflow_stream_publish"
+#: The topic of a job's stream that carries the seller's heartbeats as progress
+#: (:class:`kontra.serve.progress.ProgressForwarder`): relayed for every job, whatever the
+#: offering lists (decisions I31).
+PROGRESS_TOPIC = "kontra.progress"
+#: Topic names an offering may not list (``offering.yaml`` ``streams:``): Kontra's own.
+RESERVED_TOPIC_PREFIX = "kontra."
+
+
+def relay_subject(namespace: str, job_id: str) -> str:
+    """The Temporal subject of the gate's stream relay for one job:
+    ``relay/<namespace>/job-<job id>``.
+
+    Constructed, never parsed (I1): the authorizer rebuilds it from a request's namespace and
+    workflow id and compares the whole string (temporal/authorizer ``RelaySubject``). The
+    namespace must be a party's (a handle, not a reserved one) and the job id a job id, so
+    neither part holds a ``/`` and only one job's requests rebuild it.
+    """
+    validate_handle(namespace, what="namespace")
+    return "relay/" + namespace + "/" + job_workflow_id(job_id)
+
+
 def batch_workflow_id(parent_workflow_id: str, activity: str, token: str) -> str:
     """The id of the ``kontra.batch.v1`` child a workflow starts for
-    ``execute_activities_in_parallel(activity, ...)``: the parent's id, the activity's
-    Temporal name, and ``token`` (one ``workflow.uuid4()`` of the parent's, so batching the
-    same activity twice in one run gets two ids). Never the shape of a job's workflow id,
-    so :func:`job_id_from_workflow_id` reads none from it."""
+    ``execute_activities_in_parallel(activity, ...)`` (:mod:`kontra.contrib.parallel`): the
+    parent's id, the activity's Temporal name, and ``token`` (one ``workflow.uuid4()`` of the
+    parent's, so batching the same activity twice in one run gets two ids). Never the shape
+    of a job's workflow id, so :func:`job_id_from_workflow_id` reads none from it."""
     return f"{parent_workflow_id}/batch/{activity}/{token}"
+
+
+def agent_workflow_id(job_id: str) -> str:
+    """The id of the agent workflow a bound-handler job runs its one turn in
+    (:mod:`kontra.serve.turn`): a child of the job's ``job-<id>`` wrapper. Never the shape of a
+    job's workflow id, so :func:`job_id_from_workflow_id` reads none from it and the codec
+    encrypts the agent's payloads to the seller alone -- the buyer receives the job's result
+    from the wrapper, never the agent's history."""
+    return job_workflow_id(job_id) + _AGENT_SUFFIX
 
 
 def job_id_from_workflow_id(workflow_id: object) -> str | None:

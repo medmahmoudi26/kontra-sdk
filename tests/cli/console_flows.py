@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
-from kontra import ApplicationError, RetryPolicy, activity, workflow
+from temporalio import activity, workflow
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
 
 #: How long each attempt of :func:`flaky` runs: long enough for a stream polling every
 #: 0.2 s to see it running.
@@ -85,4 +87,25 @@ class BackoffFlow:
             text,
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=RetryPolicy(initial_interval=BACKOFF),
+        )
+
+
+@workflow.defn(name="AgentLike")
+class AgentLike:
+    """Stands in for the agent a handler offering's job starts as its child."""
+
+    @workflow.run
+    async def run(self, text: str) -> str:
+        return text
+
+
+@workflow.defn(name="kontra.turn.v1")
+class TurnLike:
+    """Stands in for a handler offering's job (``kontra.serve.turn.TURN_WORKFLOW``): the
+    page tells its runs by that type alone."""
+
+    @workflow.run
+    async def run(self, text: str) -> str:
+        return await workflow.execute_child_workflow(
+            AgentLike.run, text, id=f"{workflow.info().workflow_id}-agent"
         )

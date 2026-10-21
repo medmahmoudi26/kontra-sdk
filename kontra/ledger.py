@@ -30,6 +30,7 @@ from typing import Protocol, runtime_checkable
 
 __all__ = [
     "CURRENCIES",
+    "MAX_MINOR",
     "PLATFORM_PARTY",
     "WORLD_PARTY",
     "Account",
@@ -59,6 +60,12 @@ __all__ = [
 #: ISO-4217-style code -> number of minor-unit digits. ``USDC`` is listed for the chain
 #: adapter (§9.1); v1 settles only ``USD``.
 CURRENCIES: Mapping[str, int] = {"USD": 2, "USDC": 6}
+
+#: The largest ``amount_minor`` a call may carry: §9.1 stores amounts as a Postgres
+#: ``bigint``. A price is the seller's to choose (its quote), so an adapter refuses anything
+#: larger with ``InvalidAmount`` rather than failing in its database driver, and every
+#: adapter refuses the same amounts (acceptance criterion 9).
+MAX_MINOR = 2**63 - 1
 
 #: Receives the platform fee at release (§9.5). A reserved handle; never a buyer or seller.
 PLATFORM_PARTY = "kontra"

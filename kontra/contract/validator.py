@@ -10,7 +10,7 @@ inside the document -- the registry can retrieve nothing.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from jsonschema import ValidationError
 from referencing import Registry, Resource
@@ -91,6 +91,39 @@ class InputValidator:
     def validate_output(self, value: Any) -> None:
         """The ``execute`` output, as JSON."""
         self._check(self._output, value, "output")
+
+    def output_problems(self, value: Any) -> list[tuple[str, str]]:
+        """What keeps ``value`` (JSON) from being the ``execute`` output, each a path and
+        what is wrong there, quoting the contract and never the value: for a job's failure
+        or a seller's log, where the value is the buyer's result. Empty when it is one."""
+        try:
+            check_json_value(value, max_depth=MAX_VALUE_DEPTH)
+            errors: list[ValidationError] = sorted(
+                self._output.iter_errors(value),
+                key=lambda e: (list(map(str, e.absolute_path)), str(e.validator)),
+            )
+        except ContractError:
+            return [("output", "is not plain JSON, or is nested too deeply")]
+        except RecursionError:
+            return [("output", "is too deeply nested to validate")]
+        out: list[tuple[str, str]] = []
+        for e in errors:
+            path = join_path("output", *e.absolute_path)
+            if e.validator == "required" and isinstance(e.instance, dict):
+                present = cast(dict[str, Any], e.instance)
+                out += [
+                    (join_path(path, name), "is missing")
+                    for name in cast(list[str], e.validator_value)
+                    if name not in present
+                ]
+            elif e.validator == "type":
+                out.append((path, f"is not of type {e.validator_value}"))
+            elif e.validator == "additionalProperties":
+                out.append((path, "has a member the contract does not declare"))
+            else:
+                out.append((path, f"breaks its {e.validator}"))
+        # jsonschema reports a missing member once per member, each against the object
+        return sorted(dict.fromkeys(out))
 
     def validate_quote(self, value: Any) -> None:
         """A ``quote`` answer, as JSON (``#/$defs/KontraQuote``)."""

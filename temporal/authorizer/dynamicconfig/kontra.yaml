@@ -95,6 +95,19 @@ limit.numPendingCancelRequests.error:
 nexusoperation.limit.operation.concurrencyPerWorkflow.max:
   - value: 100
 
+# --- Per-namespace update limits (decisions I30) ------------------------------------
+# Temporal's defaults, pinned here so that the bounds I30 states do not move with
+# Temporal's. A workflow holds at most maxInFlightUpdates updates in flight (admitted, not
+# yet completed) at once, so a relay token's requests, each at most RelayRequestMax (4 KiB),
+# add at most 40 KiB to one workflow task, far below the 4 MiB gRPC message it must fit
+# in. A higher value raises that bound; zero turns the limit, and the bound, off.
+history.maxInFlightUpdates:
+  - value: 10
+# A run receives at most maxTotalUpdates updates in all, and every relay poll spends one;
+# a lower per-namespace value is a mitigation I30 records, not adopts.
+history.maxTotalUpdates:
+  - value: 2000
+
 # --- Global (the same for every namespace) -----------------------------------------
 limit.maxIDLength:
   - value: 255

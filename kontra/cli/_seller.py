@@ -40,6 +40,53 @@ def _pick(bound: tuple[Any, ...], only: str | None) -> list[Any]:
     return chosen
 
 
+def _check_harness(chosen: list[Any]) -> None:
+    """Warn, on stderr, where a bound handler's contract and temporal-agent-harness's schema
+    for the same handler differ (decisions I33): the contract is what buyers get, the harness's
+    schema what the seller's harness-codegen types come from. Both describe the input as
+    validated and the output as serialized (I38), so they agree but for an ``extra="allow"``
+    model (``open``: the seller's to change) and a bug in one emitter (to report), as the
+    notes after the lines say. Silent for a workflow entry, when the harness is not
+    installed, and when the two agree. Run inside ``load_worker``, so the harness imports the
+    agent's module where worker.py found it."""
+    from kontra.contract import harness
+
+    handlers = [b for b in chosen if b.agent is not None and b.handler is not None]
+    if not handlers or not harness.harness_installed():
+        return
+    schemas: dict[str, dict[str, Any] | str] = {}
+    for b in handlers:
+        label = f"{b.key} ({b.agent.__name__}.{b.handler})"
+        try:
+            target = harness.agent_target(b.agent)
+            if target not in schemas:
+                try:
+                    schemas[target] = harness.harness_schema(target, cwd=b.source.parent)
+                except harness.HarnessSchemaError as e:
+                    schemas[target] = str(e)  # once per agent, however many handlers it sells
+            schema = schemas[target]
+            if isinstance(schema, str):
+                raise harness.HarnessSchemaError(schema)
+            found = harness.compare_handler(b.document(), schema, b.handler)
+        except harness.HarnessSchemaError as e:
+            click.echo(
+                f"warning: {label}: cannot compare the contract with "
+                f"{harness.HARNESS_SCRIPT}'s schema: {printable(str(e))}",
+                err=True,
+            )
+            continue
+        if not found:
+            continue
+        click.echo(
+            f"warning: {label}: the contract differs from {harness.HARNESS_SCRIPT}'s schema "
+            f"for this handler in {len(found)} place{'s' if len(found) > 1 else ''}. Buyers get "
+            "the contract (`kontra pull`); your harness-codegen types follow the harness's:",
+            err=True,
+        )
+        for line in harness.describe(found):
+            click.echo(f"  {printable(line)}", err=True)
+
+
 @click.command()
 @click.argument("name")
 @click.option(
@@ -98,6 +145,7 @@ def contract(
         if output is not None and len(chosen) > 1:
             fail(f"worker.py binds {len(chosen)} offerings; pick one with --offering for -o")
         docs = [b.document() for b in chosen]
+        _check_harness(chosen)
     if nexgen:
         docs = [nexgen_view(d) for d in docs]
     if as_json:
@@ -118,20 +166,22 @@ def contract(
 def publish(directory: Path, only: str | None, as_json: bool) -> None:
     """Publish worker.py's offerings to the catalog (needs your login, confirmed within the
     hour: a terminal asks in place)."""
-    from kontra.cli._seller_code import check_project
+    from kontra._compat import temporalio_warning
     from kontra.contract import contract_hash
     from kontra.gate_client import models as m
 
-    root = directory.resolve()
-    refused = "\n".join("  " + f.render(root) for f in check_project(root))
+    # Before worker.py is imported: a temporalio outside the tested range may be why it
+    # fails to (decisions I29). Publishing is not refused for it; serving is.
+    outside = temporalio_warning()
+    if outside is not None:
+        click.echo(f"warning: {outside}", err=True)
     with load_worker(directory) as worker:
         chosen = _pick(worker.offerings, only)
+        _check_harness(chosen)
 
         async def go() -> list[m.CatalogEntry]:
             async with cli_session() as session:
                 profile = await session.resolve()
-                if refused and not profile.dev:  # kontra dev is the seller's own
-                    fail("seller code must stay behind the kontra façade:\n" + refused)
                 # No key is sealed into a document any more (spec v2, decisions I7), so
                 # publishing needs none: a seller may add or revoke a recipient without
                 # republishing.
@@ -144,13 +194,20 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
                 entries: list[m.CatalogEntry] = []
                 for b in chosen:
                     doc = b.document()
-                    entry = await session.gate.publish(doc)
+                    # streams and the engine: beside the document, never in it (catalog
+                    # data, I31, I32).
+                    entry = await session.gate.publish(doc, streams=b.streams, engine=b.engine)
                     ours = contract_hash(doc)
                     if (entry.offering, entry.contract_hash) != (b.key, ours):
                         fail(
                             f"the catalog recorded {printable(entry.offering)} with contract "
                             f"{printable(entry.contract_hash)} for {b.key} {ours}; `kontra serve` "
                             "would refuse it -- check the gate"
+                        )
+                    if tuple(sorted(entry.streams)) != b.streams:
+                        fail(
+                            f"the catalog recorded streams {printable(str(entry.streams))} for "
+                            f"{b.key}, not {list(b.streams)}; `kontra serve` would refuse it"
                         )
                     entries.append(entry)
                 return entries
@@ -164,6 +221,8 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
         click.echo(f"  contract  {printable(e.contract_hash)}")
         click.echo(f"  endpoint  {printable(e.endpoint)}")
         click.echo(f"  queue     {printable(e.task_queue)}")
+        if e.streams:
+            click.echo(f"  streams   {printable(', '.join(e.streams))}")
 
 
 @click.command()
@@ -184,6 +243,7 @@ def serve(directory: Path, metrics: str | None, otlp: str | None) -> None:
     it gracefully)."""
     import logging
 
+    from kontra._compat import temporalio_warning
     from kontra.serve.telemetry import TelemetryError, metrics_runtime, otlp_logs, otlp_tracing
 
     if not logging.getLogger().handlers:
@@ -204,8 +264,16 @@ def serve(directory: Path, metrics: str | None, otlp: str | None) -> None:
         log.info("serving the Temporal SDK's metrics at http://%s/metrics", metrics)
     if tracing is not None:
         log.info("exporting traces and logs to %s", otlp)
+    # Before worker.py is imported (it may fail to on another temporalio); the worker
+    # itself then refuses to start (kontra.plugin.KontraPlugin.prepare).
+    outside = temporalio_warning()
+    if outside is not None:
+        log.warning("%s", outside)
     try:
         with load_worker(directory) as worker:
+            # The project it serves: under a dev profile, the graph page's static graphs
+            # are drawn from it (decisions I35).
+            worker.project = directory
             worker.run(
                 runtime=runtime, interceptors=[tracing.interceptor] if tracing is not None else []
             )

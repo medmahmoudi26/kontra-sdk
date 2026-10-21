@@ -15,7 +15,7 @@ class Order(BaseModel):
     #: Heartbeats the ``beat`` activity sends (async), then ``sync_beat`` (in a thread).
     beats: int = Field(default=0, ge=0, le=500)
     sync_beats: int = Field(default=0, ge=0, le=50)
-    #: Wait for the ``release`` signal before returning.
+    #: Wait for the ``release`` signal before doing anything.
     hold: bool = False
 
 

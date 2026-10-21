@@ -8,8 +8,8 @@ plaintext for the gate (decisions I4, I7) -- for the service the worker generate
 exact name. On the calling side, a result that arrives in plaintext is a leak and is refused
 (FIXUPS #1/#21); a refusal of ``execute`` is plaintext by design and marked as such.
 
-The server binary is ``KONTRA_TEMPORAL_CLI`` if set, else temporalio downloads CLI v1.9.1
-(cached in the temp directory); with neither available the test is skipped.
+The server binary is ``KONTRA_TEMPORAL_CLI`` if set, else CLI 1.9.1, downloaded once and
+checksum-verified (kontra.devgate.temporal_cli); with neither available the test is skipped.
 """
 
 from __future__ import annotations

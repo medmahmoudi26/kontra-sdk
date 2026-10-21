@@ -2,8 +2,10 @@
 over the local sites (:mod:`.sites`). Pages that miss headers, or do not answer, are scored;
 a sweep of pages that send every header is all clear. The report is downloaded and read,
 and the job's own history, read back with :func:`kontra.graph.parse`, is the path through
-the README's graph that the job took: one fan-out group, one batch node, then ``score`` or
-``all_clear``."""
+the README's graph that the job took: one fan-out group, then the per-URL checks -- one
+activity node, in one parallel group, since fewer URLs than the workflow lets open start in
+one workflow task -- then ``score`` or ``all_clear``. The checks are activities of the job's
+own workflow (vanilla Temporal, no child workflow)."""
 
 from __future__ import annotations
 
@@ -13,7 +15,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from temporalio.api.enums.v1 import EventType
 
 from kontra import graph
 from kontra.contract.names import job_workflow_id
@@ -26,7 +27,7 @@ from .support import START, Market
 pytestmark = [pytest.mark.temporal, pytest.mark.asyncio(loop_scope="package")]
 
 OFFERING = "acme/sweep"
-BATCH = "kontra.batch.v1[check_headers]"
+CHECK = "check_headers"
 ALL = [
     "strict-transport-security",
     "content-security-policy",
@@ -44,19 +45,11 @@ def _origin(url: str) -> str:
 
 
 async def _job_graph(market: Market, job_id: str) -> graph.Graph:
-    """The job's run, as the seller's namespace holds it, with its batch child's history."""
+    """The job's run, as the seller's namespace holds it (it starts no child)."""
     client = market.seller_client()
     workflow_id = job_workflow_id(job_id)
     history = await client.get_workflow_handle(workflow_id).fetch_history()
-    children: dict[str, Any] = {}
-    for e in history.events:
-        if e.event_type == EventType.EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_STARTED:
-            child = e.child_workflow_execution_started_event_attributes.workflow_execution
-            found = await client.get_workflow_handle(
-                child.workflow_id, run_id=child.run_id
-            ).fetch_history()
-            children[child.workflow_id] = found.to_json_dict()
-    return graph.parse(history.to_json_dict(), workflow_id=workflow_id, children=children)
+    return graph.parse(history.to_json_dict(), workflow_id=workflow_id)
 
 
 def _edges(g: graph.Graph) -> set[tuple[str, str]]:
@@ -69,9 +62,9 @@ def _path(branch: str) -> set[tuple[str, str]]:
         ("start", "plan"),
         ("plan", "fetch_robots"),
         ("plan", "fetch_security_txt"),
-        ("fetch_robots", BATCH),
-        ("fetch_security_txt", BATCH),
-        (BATCH, branch),
+        ("fetch_robots", CHECK),
+        ("fetch_security_txt", CHECK),
+        (CHECK, branch),
         (branch, "write_report"),
         ("write_report", "end"),
     }
@@ -146,8 +139,9 @@ async def test_sweep_end_to_end(market: Market, tmp_path: Path) -> None:
     assert _edges(g) == _path("score")
     groups = {n["id"]: n["group"] for n in g["nodes"]}
     assert groups["fetch_robots"] == groups["fetch_security_txt"]  # one parallel group
-    [batch] = [n for n in g["nodes"] if n["kind"] == "child"]
-    assert (batch["id"], batch["label"]) == (BATCH, "execute_activities_in_parallel(check_headers)")
+    assert not [n for n in g["nodes"] if n["kind"] == "child"]
+    [check] = [n for n in g["nodes"] if n["name"] == CHECK]
+    assert (check["id"], check["kind"], check["label"]) == (CHECK, "activity", CHECK)
 
     view = await job.accept()
     assert (view.state, view.escrow) == (m.JobState.COMPLETED, m.Escrow.RELEASED)

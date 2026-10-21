@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from temporalio import workflow
 from kontra.codec.age import generate_identity
 from kontra.contract import ContractError, OfferingError, nexgen_view, to_yaml
 from kontra.serve import BindingError, Quote, offering
+from kontra.serve.offering import engine_for
 
 from . import seller
 from .flows import UpperFlow
@@ -218,3 +220,41 @@ def test_schema_first(tmp_path: Path) -> None:
         edited.validator().validate({"text": "x" * 11})
     with pytest.raises(ContractError, match="cannot read the contract"):
         offering(path, workflow=UpperFlow, quote=seller.quote, contract="missing.yaml")
+
+
+# --------------------------------------------------------------------------- the engine
+
+
+def test_the_engine_is_derived_from_the_entry_and_kept_out_of_the_contract(
+    tmp_path: Path,
+) -> None:
+    """Seam ⑥ (decisions I32): everything ``kontra.serve`` binds is temporalio code, so it
+    runs on ``temporal``; the engine goes beside the contract (``PublishRequest.engine``),
+    never in it, so no document or hash depends on it (owner decision OD4 of #55)."""
+    path = write_offering(tmp_path, unique_version())
+    derived = seller.bind(path)
+    named = offering(path, workflow=UpperFlow, quote=seller.quote, engine="temporal")
+    assert derived.engine == named.engine == "temporal"
+    assert named.document() == derived.document()
+    assert named.contract_hash() == derived.contract_hash()
+    assert "engine" not in derived.document()["x-kontra"]
+    assert '"engine"' not in to_yaml(derived.document())
+
+
+@pytest.mark.parametrize("engine", ["golem", "Temporal", "", "temporal "])
+def test_an_engine_that_is_not_the_entrys_is_refused(tmp_path: Path, engine: str) -> None:
+    path = write_offering(tmp_path, unique_version())
+    with pytest.raises(ValueError, match="engine"):
+        offering(path, workflow=UpperFlow, quote=seller.quote, engine=engine)
+
+
+def test_engine_for_every_kind_of_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert engine_for("workflow") == engine_for("handler") == "temporal"
+    assert engine_for("handler", "temporal") == "temporal"
+    with pytest.raises(ValueError, match="is not an engine"):
+        engine_for("workflow", "golem")
+    # A known engine that is not the entry's: the code decides what it runs on.
+    module = importlib.import_module("kontra.serve.offering")
+    monkeypatch.setattr(module, "ENGINE_NAMES", ("temporal", "golem"))
+    with pytest.raises(ValueError, match="runs on the 'temporal' engine"):
+        engine_for("workflow", "golem")

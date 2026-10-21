@@ -1,0 +1,26 @@
+{
+  "platform_namespace": "kontra-system",
+  "relay": [
+    {
+      "namespace": "acme",
+      "job_id": "0123456789abcdef0123456789abcdef",
+      "workflow_id": "job-0123456789abcdef0123456789abcdef",
+      "subject": "relay/acme/job-0123456789abcdef0123456789abcdef"
+    },
+    {
+      "namespace": "a",
+      "job_id": "00000000000000000000000000000000",
+      "workflow_id": "job-00000000000000000000000000000000",
+      "subject": "relay/a/job-00000000000000000000000000000000"
+    },
+    {
+      "namespace": "x-1-y2",
+      "job_id": "ffffffffffffffffffffffffffffffff",
+      "workflow_id": "job-ffffffffffffffffffffffffffffffff",
+      "subject": "relay/x-1-y2/job-ffffffffffffffffffffffffffffffff"
+    }
+  ],
+  "stream_offset_query": "__temporal_workflow_stream_offset",
+  "stream_poll_update": "__temporal_workflow_stream_poll",
+  "worker_controller_subject": "platform/worker-controller"
+}

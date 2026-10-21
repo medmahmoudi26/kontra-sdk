@@ -1,5 +1,13 @@
 """``kontra graph``: the static graph of worker.py's workflows, from mock runs (decisions
-I27; kontra-sdk#42).
+I27, I35; kontra-sdk#42, #56).
+
+A hidden command: the graph page's static graphs are drawn by ``kontra serve`` under a dev
+profile, which runs this command in a child process when an offering's contract or the
+project's code changed (:class:`kontra._graphs.Refresh`), with two hidden flags of its own:
+``--code-hash``, the worker's, to save the graph under, and ``--background``, which words what
+it says for the worker's log (no ``--input`` to suggest there). It stays, with its flags, as
+that child's entry point and for the examples' README graphs (``tests/graph/test_cli.py``),
+never in ``kontra --help``.
 
 Temporal keeps no definition of a workflow, only what each run did (I26), so the graph of
 code nobody has run yet comes from runs nobody pays for: :mod:`kontra.cli._mock` runs each
@@ -12,19 +20,16 @@ found for, and, once for the worker, the activities it registers that no run of 
 offering scheduled.
 
 With a profile in ``$KONTRA_HOME``, each offering's graph is also saved where ``kontra dev``'s
-graph page (#43) reads it (:func:`save_static`, :func:`load_static`): that page is served by
-a process that has no access to the seller's project, and paints a live run on this graph.
+graph page (#43) reads it, with the contract hash and the code hash of the code it was drawn
+from (:func:`kontra._graphs.save_static`): that page is served by a process that has no access to
+the seller's project, and paints a live run on this graph.
 """
 
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
-import os
 import signal
-import stat
-import tempfile
 import threading
 from collections.abc import Generator
 from pathlib import Path
@@ -33,99 +38,28 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from kontra._graphs import (
+    GRAPHS_DIR,
+    code_hash,
+    load_static,
+    read_static,
+    save_static,
+    static_path,
+)
 from kontra.cli._common import emit_json, fail, read_input
-from kontra.cli._seller import _DIR, _OFFERING, _pick
+from kontra.cli._seller import _DIR, _pick
 
 if TYPE_CHECKING:
     from kontra.cli._mock import Explored
     from kontra.graph import Graph
 
-__all__ = ["GRAPHS_DIR", "graph", "load_static", "save_static", "static_path"]
+__all__ = ["GRAPHS_DIR", "graph", "load_static", "read_static", "save_static", "static_path"]
 
-#: Where the static graphs live, under ``$KONTRA_HOME``.
-GRAPHS_DIR = "graphs"
-_STATIC_VERSION = 1
-#: The largest static graph :func:`load_static` reads.
-_STATIC_MAX = 16 * 1024 * 1024
 _START, _END = "start", "end"  # kontra.graph.START, END, without importing it for --help
-#: What a project that runs an agent imports and the ``[agents]`` extra installs.
+#: What a project that runs an OpenAI agent imports: its own dependency
+#: (``temporalio-openai-agents``), which ``kontra graph`` needs to run it.
 _AGENT_MODULES = ("agents", "openai")
-
-
-def static_path(home: Path, task_queue: str) -> Path:
-    """Where the static graph of the offering served on ``task_queue`` lives: named by the
-    queue's SHA-256, so no part of the name comes from anyone's text."""
-    return home / GRAPHS_DIR / f"{hashlib.sha256(task_queue.encode()).hexdigest()}.json"
-
-
-def save_static(
-    home: Path, task_queue: str, *, offering: str, runs: int, seed: int, graph: Graph
-) -> Path:
-    """Write the static graph of the offering served on ``task_queue`` (``kontra serve``'s
-    task queue for it, exactly), atomically: a temporary file, mode 0600, renamed into place,
-    in a directory made 0700."""
-    path = static_path(home, task_queue)
-    if not path.parent.is_dir():
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)  # mkdir's mode is filtered by the umask
-    document = {
-        "version": _STATIC_VERSION,
-        "task_queue": task_queue,
-        "offering": offering,
-        "runs": runs,
-        "seed": seed,
-        "graph": graph,
-    }
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-")
-    try:
-        os.chmod(tmp, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2, sort_keys=True)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(tmp)
-    return path
-
-
-def load_static(home: Path, task_queue: str) -> Graph | None:
-    """The static graph saved for ``task_queue``, or None: no file, one that is not a
-    regular file, too large, not JSON, not this version, or saved for another task queue
-    (the stored ``task_queue`` must equal the given one exactly; the file name is only its
-    hash)."""
-    path = static_path(home, task_queue)
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(path, flags)  # non-blocking: a FIFO planted there cannot hang the page
-    except OSError:
-        return None
-    try:
-        with os.fdopen(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                return None
-            raw = f.read(_STATIC_MAX + 1)
-    except OSError:
-        return None
-    if len(raw) > _STATIC_MAX:
-        return None
-    try:
-        document: object = json.loads(raw)
-    except (ValueError, RecursionError):
-        return None
-    if not isinstance(document, dict):
-        return None
-    found: dict[str, Any] = document  # pyright: ignore[reportUnknownVariableType]
-    saved_graph = found.get("graph")
-    if (
-        found.get("version") != _STATIC_VERSION
-        or found.get("task_queue") != task_queue
-        or not isinstance(saved_graph, dict)
-    ):
-        return None
-    return saved_graph  # pyright: ignore[reportUnknownVariableType]
+_AGENT_DEPENDENCY = "temporalio-openai-agents"
 
 
 # --------------------------------------------------------------------------- signals
@@ -181,9 +115,12 @@ def _mock_runs(n: int) -> str:
     return f"{n} mock run" if n == 1 else f"{n} mock runs"
 
 
-def _inputs(bound: Any, given: object, source: str | None, runs: int, seed: int) -> list[Any]:
+def _inputs(
+    bound: Any, given: object, source: str | None, runs: int, seed: int, *, background: bool
+) -> list[Any]:
     """Each run's input for ``bound``: ``given`` (from ``--input``), checked against the
-    workflow's input type, else one sampled in each run's mode."""
+    workflow's input type, else one sampled in each run's mode. ``kontra serve``'s child
+    (``background``) is not told of ``--input``: the worker that logs it has none."""
     from pydantic import TypeAdapter, ValidationError
 
     from kontra._sample import Unsampleable, draw
@@ -193,6 +130,11 @@ def _inputs(bound: Any, given: object, source: str | None, runs: int, seed: int)
         try:
             return [draw(bound.input_type, i, seed) for i in range(runs)]
         except Unsampleable as e:
+            if background:
+                fail(
+                    f"cannot sample a valid {name} ({e}), so the graph page draws only what "
+                    "each run did"
+                )
             fail(f"cannot sample a valid {name} ({e}); give one with --input FILE")
     try:
         TypeAdapter(bound.input_type).validate_json(json.dumps(given))
@@ -204,18 +146,23 @@ def _inputs(bound: Any, given: object, source: str | None, runs: int, seed: int)
     return [given] * runs
 
 
-def _never_scheduled(explored: list[Explored], every_offering: bool) -> None:
+def _never_scheduled(explored: list[Explored], every_offering: bool, background: bool) -> None:
     """The worker's activities no run scheduled: once for the worker, since one offering's
     runs never schedule another's activities."""
     if not explored or not explored[0].never_scheduled:
         return
     offerings = ", ".join(e.offering for e in explored)
     runs = sum(e.runs for e in explored)
+    if every_offering:
+        left_out = ""
+    elif background:  # kontra serve drew only the offerings whose graph was out of date
+        left_out = ", or the worker's offerings whose graph was current"
+    else:
+        left_out = ", or the worker's offerings --offering left out"
     _warn(
         f"{offerings}: never scheduled in {_mock_runs(runs)}: "
         f"{', '.join(explored[0].never_scheduled)} — branches on timers, signals or inputs "
-        "the runs did not reach"
-        + ("" if every_offering else ", or the worker's offerings --offering left out")
+        f"the runs did not reach{left_out}"
     )
 
 
@@ -245,9 +192,24 @@ def _warnings(e: Explored, timeout: float) -> None:
         )
 
 
-@click.command()
+def _chosen(bound: tuple[Any, ...], only: tuple[str, ...]) -> list[Any]:
+    """The offerings ``--offering`` names (each one at least once), in the worker's order;
+    every bound offering without it."""
+    if not only:
+        return list(bound)
+    picked = [b for name in only for b in _pick(bound, name)]
+    return [b for b in bound if any(b is p for p in picked)]
+
+
+@click.command(hidden=True)
 @_DIR
-@_OFFERING
+@click.option(
+    "--offering",
+    "only",
+    metavar="NAME@VERSION",
+    multiple=True,
+    help="Only this offering of the worker (default: every bound offering); repeatable.",
+)
 @click.option(
     "--runs",
     default=8,
@@ -281,9 +243,22 @@ def _warnings(e: Explored, timeout: float) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @click.option("--mermaid", is_flag=True, help="A Mermaid flowchart per offering.")
 @click.option("--no-save", is_flag=True, help="Do not save the graph for kontra dev's graph page.")
+@click.option(
+    "--code-hash",
+    "drawn_from",
+    hidden=True,
+    help="The code hash to save the graph under: the serving worker's (decisions I35); "
+    "default: the project's, as imported here.",
+)
+@click.option(
+    "--background",
+    is_flag=True,
+    hidden=True,
+    help="Run by kontra serve for the graph page: what it says is worded for the worker's log.",
+)
 def graph(
     directory: Path,
-    only: str | None,
+    only: tuple[str, ...],
     runs: int,
     seed: int,
     source: str | None,
@@ -291,10 +266,11 @@ def graph(
     as_json: bool,
     mermaid: bool,
     no_save: bool,
+    drawn_from: str | None,
+    background: bool,
 ) -> None:
     """Print the static graph of worker.py's workflows, from mock runs in Temporal's
     time-skipping test server (every activity answered with a sampled value of its type)."""
-    from kontra import _agents
     from kontra.cli._common import run
     from kontra.cli._mock import explore
     from kontra.cli._project import load_worker
@@ -306,20 +282,23 @@ def graph(
     given = read_input(source) if source is not None else None
     try:
         with load_worker(directory) as worker:
-            chosen = _pick(worker.offerings, only)
+            chosen = _chosen(worker.offerings, only)
+            hashes = {b.key: b.contract_hash() for b in chosen}
+            code = drawn_from or code_hash(directory)
             every_offering = len(chosen) == len(worker.offerings)
-            inputs = [_inputs(b, given, source, runs, seed) for b in chosen]
+            inputs = [_inputs(b, given, source, runs, seed, background=background) for b in chosen]
             with _stopped_like_ctrl_c():
                 explored = run(lambda: explore(worker, chosen, inputs, seed=seed, deadline=timeout))
     except ModuleNotFoundError as err:
-        # An agent workflow's project imports `agents`: without the extra it cannot even
-        # be imported, so it cannot be run either.
-        if (err.name or "").partition(".")[0] in _AGENT_MODULES:
-            fail(f"{directory} runs an agent, which needs the extra: {_agents.EXTRA} ({err})")
-        raise
-    except TypeError as err:  # `agents` imported, Temporal's integration not installed
-        if _agents.imported() and not _agents.AVAILABLE:
-            fail(str(err))
+        # An agent workflow's project imports `agents` (and worker.py Temporal's
+        # integration): without the seller's dependency installed here it cannot even be
+        # imported, so it cannot be run either.
+        top = (err.name or "").partition(".")[0]
+        if top in _AGENT_MODULES or (err.name or "").startswith("temporalio.openai_agents"):
+            fail(
+                f"{directory} runs an agent: install the project's own dependency here "
+                f"(pip install {_AGENT_DEPENDENCY}) ({err})"
+            )
         raise
 
     if as_json:
@@ -345,7 +324,7 @@ def graph(
             for a, b in _edges(found.graph):
                 click.echo(f"  {a} → {b}")
         _warnings(found, timeout)
-    _never_scheduled(explored, every_offering)
+    _never_scheduled(explored, every_offering, background)
     home = kontra_home()
     if no_save or not (home / PROFILE_FILE).is_file():
         return
@@ -354,6 +333,8 @@ def graph(
             home,
             found.task_queue,
             offering=found.offering,
+            contract_hash=hashes[found.offering],
+            code_hash=code,
             runs=found.runs,
             seed=seed,
             graph=found.graph,
