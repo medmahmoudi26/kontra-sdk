@@ -369,6 +369,7 @@ def _served(project: Path) -> tuple[str, str, str]:
 
 #: What a serving worker logs as it spawns the child that draws the graph page's graph.
 _SPAWNED = "drawing the graph page's static graph of acme/hello@0.1.0 in the background"
+_DREW = "drew the graph page's static graph of acme/hello@0.1.0"
 
 
 class _Serving:
@@ -411,16 +412,18 @@ class _Serving:
 
 def _drawn(home: Path, served: tuple[str, str, str], serving: _Serving) -> dict[str, Any]:
     """The graph stored for ``served`` (its task queue, contract hash and code hash), once
-    the serving worker drew it."""
+    the serving worker drew it -- and said so: the child saves the graph before it exits, and
+    the worker logs only once it has, so the file alone can come first."""
     from kontra._graphs import read_static
 
     queue, contract_hash, code_hash = served
     end = time.monotonic() + 240
     while True:
         found = read_static(home, queue)
-        if found is not None and (found.contract_hash, found.code_hash) == (
-            contract_hash,
-            code_hash,
+        if (
+            found is not None
+            and (found.contract_hash, found.code_hash) == (contract_hash, code_hash)
+            and serving.text().count(_DREW) == 1
         ):
             return dict(found.graph)
         assert time.monotonic() < end, f"no graph for {served}:\n{serving.text()}"
@@ -462,7 +465,6 @@ def test_kontra_serve_draws_the_graph_page_s_graph_again_when_the_code_changes(
         with _Serving(project, env, tmp_path / "serve-1.log") as one:
             drawn = _drawn(home, first, one)
         assert one.text().count(_SPAWNED) == 1, one.text()
-        assert "drew the graph page's static graph of acme/hello@0.1.0" in one.text()
         assert "greet" in {n["name"] for n in drawn["nodes"]}
         drawn_at = static_path(home, queue).stat().st_mtime_ns
 
