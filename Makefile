@@ -7,7 +7,8 @@
 #   make sync        install the locked environment into .venv (run once, and after a lock change)
 #   make check       lint + typecheck + test + seams + deny-matrix
 #   make temporal    build the Temporal server binary and the kontra-temporal:dev image
-#   make e2e         tests/e2e against `kontra dev` (Docker, the Temporal image, the gate image)
+#   make e2e         tests/e2e against the e2e stack (make stack-up: compose.yaml, the prod gate
+#                    image); `kontra dev up` runs no containers (kontra.devgate)
 #
 # `make help` lists every target.
 
@@ -25,7 +26,7 @@ BIN := .venv/bin
 # -ra: name every skip, so a test that did not run is visible in CI's log.
 PYTEST_FLAGS ?= -q -ra
 
-# The seam tests, ② to ⑤ (CLAUDE.md, PRD §19.1). They run as their own CI job so that a
+# The seam tests, ② to ⑥ (CLAUDE.md, PRD §19.1). They run as their own CI job so that a
 # seam break is named as one; `test` runs everything else, so nothing runs twice.
 #   ② gate HTTP API   tests/gate_client/test_routes.py
 #   ③ contract        tests/contract (derivation, canonical form, hash, validation)
@@ -33,14 +34,17 @@ PYTEST_FLAGS ?= -q -ra
 #   ④ ledger          tests/ledger (the §9.3 suite, and its teeth)
 #   ⑤ codec           tests/codec, tests/artifacts (round trips, marker scans of history, bucket,
 #                     a worker's metrics and spans, and the dev graph page's routes)
-# Seam ① is `deny-matrix` below.
+#   ⑥ engine          tests/engine (the engine contract and its teeth against FakeEngine, and
+#                     against TemporalEngine on a dev server; the Protocol's pins)
+# Seam ① is `deny-matrix` below (it also runs seam ⑥'s isolation over the wire).
 SEAM_TESTS := \
 	tests/gate_client/test_routes.py \
 	tests/contract \
 	tests/examples/test_golden.py \
 	tests/ledger \
 	tests/codec \
-	tests/artifacts
+	tests/artifacts \
+	tests/engine
 WIRE_TESTS := tests/temporal
 E2E_TESTS := tests/e2e
 
@@ -129,7 +133,7 @@ test: venv-present $(KONTRA_TEMPORAL_CLI) ## The unit tests: everything but the 
 	$(BIN)/pytest -m "$(UNIT_MARKERS)" $(UNIT_IGNORES) $(PYTEST_FLAGS) tests
 
 .PHONY: seams
-seams: venv-present $(KONTRA_TEMPORAL_CLI) ## The seam tests ② to ⑤ (gate API, contract, ledger, codec)
+seams: venv-present $(KONTRA_TEMPORAL_CLI) ## The seam tests ② to ⑥ (gate API, contract, ledger, codec, engine)
 	$(BIN)/pytest -m "$(UNIT_MARKERS)" $(PYTEST_FLAGS) $(SEAM_TESTS)
 
 .PHONY: deny-matrix
@@ -164,32 +168,43 @@ temporal: $(TEMPORAL_BIN) ## Build the server binary and the local image kontra-
 .PHONY: temporal-cli
 temporal-cli: $(KONTRA_TEMPORAL_CLI) ## Download the Temporal CLI the dev-server tests use (checksum-verified)
 
-$(TEMPORAL_CLI):
-	@sha='$(TEMPORAL_CLI_SHA256_$(HOST_OS)_$(HOST_ARCH))'; \
-	if [ -z "$$sha" ]; then echo "no pinned Temporal CLI for $(HOST_OS)/$(HOST_ARCH); set KONTRA_TEMPORAL_CLI" >&2; exit 1; fi; \
-	tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
-	url='https://github.com/temporalio/cli/releases/download/v$(TEMPORAL_CLI_VERSION)/temporal_cli_$(TEMPORAL_CLI_VERSION)_$(HOST_OS)_$(HOST_ARCH).tar.gz'; \
-	echo "downloading $$url"; \
-	curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$$tmp/cli.tar.gz" "$$url"; \
-	if command -v sha256sum >/dev/null; then got="$$(sha256sum "$$tmp/cli.tar.gz")"; else got="$$(shasum -a 256 "$$tmp/cli.tar.gz")"; fi; \
-	if [ "$${got%% *}" != "$$sha" ]; then echo "Temporal CLI checksum mismatch: got $${got%% *}, want $$sha" >&2; exit 1; fi; \
-	tar --no-same-owner -xzf "$$tmp/cli.tar.gz" -C "$$tmp" temporal; \
-	mkdir -p "$(@D)"; mv "$$tmp/temporal" "$@"; chmod 0755 "$@"; \
-	echo "Temporal CLI $(TEMPORAL_CLI_VERSION) at $@"
+# One pin, one downloader (decisions I34, OD10): the checksum-verified download lives in
+# kontra.devgate.temporal_cli, which `kontra dev up` and the dev-server tests use too. The
+# TEMPORAL_CLI_SHA256_* above stay (a test pins them equal to the module's).
+$(TEMPORAL_CLI): | venv-present
+	$(BIN)/python -m kontra.devgate.temporal_cli fetch
+
+# --- The e2e stack (compose.yaml: the prod gate image, the Authorizer, Postgres, SeaweedFS) --
+# It is NOT `kontra dev`: the dev path runs the in-process kontra.devgate with no containers.
+# The stack runs as project kontra-e2e on 18080/17233/18333/15432/18233 (KONTRA_DEV_*_PORT,
+# which `kontra dev` does not read, OD8), so `make e2e` and `kontra dev up` coexist.
+export KONTRA_DEV_GATE_PORT ?= 18080
+export KONTRA_DEV_TEMPORAL_PORT ?= 17233
+export KONTRA_DEV_S3_PORT ?= 18333
+export KONTRA_DEV_PG_PORT ?= 15432
+export KONTRA_DEV_UI_PORT ?= 18233
+
+.PHONY: stack-up
+stack-up: venv-present ## Bring the e2e stack up (compose.yaml; waits until Temporal takes a dev party's token)
+	$(BIN)/python -m tests.e2e.stack up $(if $(UI),--ui)
+
+.PHONY: stack-down
+stack-down: venv-present ## Stop the e2e stack and delete its data and credentials
+	$(BIN)/python -m tests.e2e.stack down
+
+.PHONY: stack-logs
+stack-logs: venv-present ## The e2e stack's logs (SERVICES="gate temporal", TAIL=300)
+	$(BIN)/python -m tests.e2e.stack logs --tail $(or $(TAIL),200) $(SERVICES)
 
 .PHONY: e2e
 # $(KONTRA_TEMPORAL_CLI) because acceptance 1 scaffolds a project and runs ITS tests, and
-# `kontra.testing.Marketplace` starts a Temporal dev server from that CLI. Every other
-# suite declares it; e2e did not, and nothing noticed while the job was skipped -- on a
-# machine that had run `make test` once the cache was already warm, and on a fresh runner
-# the scaffolded project failed with "ephemeral server executable does not exist".
-e2e: venv-present $(KONTRA_TEMPORAL_CLI) ## tests/e2e against `kontra dev` (brings the stack up; `kontra dev down` stops it)
+# `kontra.testing.Marketplace` starts a Temporal dev server from that CLI.
+e2e: venv-present $(KONTRA_TEMPORAL_CLI) ## tests/e2e against the e2e stack (make stack-down stops it)
 	@test -d $(E2E_TESTS) || { echo "$(E2E_TESTS) does not exist: there are no end-to-end tests to run" >&2; exit 1; }
 	@docker image inspect "$$KONTRA_TEMPORAL_IMAGE" >/dev/null 2>&1 || [[ "$$KONTRA_TEMPORAL_IMAGE" == */* ]] || \
 		{ echo "image $$KONTRA_TEMPORAL_IMAGE not found: run \`make temporal\`, or set KONTRA_TEMPORAL_IMAGE" >&2; exit 1; }
-	@# Acceptance 1 counts the stack's start (`kontra dev` on a fresh machine starts it):
-	@# KONTRA_E2E_UP_SECONDS hands this `up`'s wall time to the session.
-	start=$$(date +%s); $(BIN)/kontra dev up; \
+	@# Acceptance 1 counts the stack's start; KONTRA_E2E_UP_SECONDS hands its wall time to the session.
+	start=$$(date +%s); $(MAKE) --no-print-directory stack-up; \
 	KONTRA_E2E_UP_SECONDS=$$(( $$(date +%s) - start )) $(BIN)/pytest -m e2e $(PYTEST_FLAGS) $(E2E_TESTS)
 
 .PHONY: clean

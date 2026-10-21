@@ -16,10 +16,12 @@ Security problems do not go in pull requests or issues: see [SECURITY.md](SECURI
 ## Set up
 
 You need [uv](https://docs.astral.sh/uv/), Go (the version in `temporal/authorizer/go.mod`;
-`GOTOOLCHAIN=auto` fetches it), and Docker for `kontra dev` and the images.
+`GOTOOLCHAIN=auto` fetches it), and Docker for the e2e stack and the images (`kontra dev` runs
+no containers).
 
 ```sh
-make sync      # .venv from uv.lock: Python 3.12, every extra, the dev group
+make sync      # .venv from uv.lock: Python 3.12, every extra, the dev group (which carries
+               # temporalio-openai-agents and temporal-agent-harness for the agent tests)
 make check     # what CI runs
 ```
 
@@ -35,7 +37,7 @@ order, so a green `make check` is a green pull request:
 | `lint` | `make lint` | `ruff check`, `ruff format --check`, and `.github/scripts/check_docs.py` |
 | `typecheck` | `make typecheck` | `pyright`, strict, over `kontra/` |
 | `test` | `make test` | the unit tests (pytest), with a real Temporal dev server |
-| `seams` | `make seams` | the seam tests ② to ⑤: gate API, contract and golden files, ledger, codec |
+| `seams` | `make seams` | the seam tests ② to ⑥: gate API, contract and golden files, ledger, codec, engine |
 | `deny-matrix` | `make deny-matrix` | seam ①: `go vet` and `go test` in `temporal/authorizer`, then `tests/temporal` over the wire against the locally built server |
 
 Notes:
@@ -62,23 +64,22 @@ Notes:
 ```sh
 make temporal          # bin/kontra-temporal and the image kontra-temporal:dev (off Linux,
                        # the image compiles its own server: the multi-stage Dockerfile)
-make e2e               # `kontra dev up` with that image, then tests/e2e
-kontra dev down        # when you are done (--volumes also drops the data)
+make e2e               # make stack-up with that image, then tests/e2e
+make stack-down        # when you are done (deletes the stack's data and credentials)
 ```
 
-`make e2e` uses `KONTRA_TEMPORAL_IMAGE` (default `kontra-temporal:dev`) and
-`KONTRA_GATE_IMAGE` (default: compose's, `ghcr.io/medmahmoudi26/kontra-gate:dev`). If your
-`KONTRA_HOME` holds a real login, `kontra dev` refuses to replace it: run with
-`KONTRA_HOME=~/.kontra-dev`. The suite ends with `kontra dev down --volumes`, which deletes
-the data of this machine's one dev stack (the compose project is `kontra-dev` whatever the
-home): do not run it next to a dev stack whose data you want to keep.
+`make e2e` uses `KONTRA_TEMPORAL_IMAGE` (default `kontra-temporal:dev`) and `KONTRA_GATE_IMAGE`
+(default: compose's, `ghcr.io/medmahmoudi26/kontra-gate:dev`). The e2e stack is the compose
+project `kontra-e2e` on 18080/17233/18333/15432 (`KONTRA_DEV_*_PORT`), separate from `kontra dev`
+(which runs no containers). The suite ends with `make stack-down`, which deletes its data. The
+no-container `kontra dev` path is covered on every pull request by `make test`.
 [docs/acceptance.md](docs/acceptance.md) maps each PRD §16 criterion to the tests that prove
 it, end to end and below, with the last full run.
 
 ## Rules every change keeps
 
-- **Seams.** A change that crosses one of the five seams updates that seam's test in the same
-  pull request (table in [docs/architecture.md](docs/architecture.md#the-five-seams)). A golden
+- **Seams.** A change that crosses one of the six seams updates that seam's test in the same
+  pull request (table in [docs/architecture.md](docs/architecture.md#the-six-seams)). A golden
   contract that changes is a contract change: regenerate it with
   `UPDATE_GOLDEN=1 pytest tests/examples/test_golden.py` and explain the diff in the PR.
 - **The one-way rule.** This package never imports the platform; it speaks HTTP to the gate
@@ -90,14 +91,23 @@ it, end to end and below, with the last full run.
 - **Validate what people type** with anchored `re.fullmatch` and length limits. Never
   `re.match` with `$` (it accepts a trailing newline), and never strip or normalise before
   validating.
-- **D1.** Seller `workflows.py` and `activities.py` import nothing from `kontra`;
-  `grep -r "import kontra" examples/*/workflows.py examples/*/activities.py` prints nothing.
+- **Sellers write native Temporal** (D1 as the PRD wrote it; decisions I29). Seller
+  `workflows.py` and `activities.py` import `temporalio` directly and nothing from `kontra`;
+  `worker.py` is the one file that imports `kontra` (`quote.py` takes `kontra.serve.Quote`,
+  `models.py` may use `kontra.types`). `grep -rE '^\s*(from|import)\s+kontra\b'
+  examples/*/workflows.py examples/*/activities.py` prints nothing. Never add a Temporal
+  re-export to `kontra`. Kontra never imports `temporal_agent_harness` at runtime.
 - **Dependencies.** The distribution is `kontra-sdk`; never add a bare `kontra` dependency
   anywhere (PyPI `kontra` is an unrelated project). Add a dependency in `pyproject.toml`, run
   `uv lock`, and commit both files.
 - **Temporal upgrades** (`temporalio`, `go.temporal.io/server`) are deliberate: re-run the
   callback guard's carrier sweep and the wire suite, and read the upstream changes to Nexus
   completions ([docs/security.md](docs/security.md#the-callback-guard-and-the-upstream-nexus-completion-issue)).
+  `temporalio` is a declared range (`>=1.34,<1.38`, in `pyproject.toml` and `kontra/_compat.py`,
+  which a test keeps equal). The lock stays on the minor the suite last passed on (1.34, today
+  the only release in the range, so 1.35 to 1.37 are admitted untested): when a new minor
+  ships, a PR moves the lock to it with a green suite, and the range widens past 1.38 only
+  that way.
 - **Tests for behaviour.** Every behaviour a change adds has a test; no stubs, `TODO`s or
   `NotImplementedError` left behind. pyright strict stays clean on `kontra/`.
 - **Docstrings say why**, briefly. The code already says what.

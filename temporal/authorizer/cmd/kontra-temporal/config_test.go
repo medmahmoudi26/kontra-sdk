@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -187,6 +188,43 @@ func TestDefaultDynamicConfigIsValid(t *testing.T) {
 	for _, want := range []string{"nexusoperation.enableStandalone", "history.enableChasm", "system.enableCrossNamespaceCommands"} {
 		if !strings.Contains(string(kontradc.Default), want+":") {
 			t.Errorf("default dynamic config lacks %s", want)
+		}
+	}
+}
+
+// TestUpdateLimitsArePinned: the relay's request cap keeps what a relay token's requests
+// add to one workflow task under 40 KiB only while a workflow holds at most 10 updates in
+// flight (decisions I30), so the default file sets that limit, and a run's total, itself
+// rather than inheriting Temporal's defaults: reading the value back alone would pass with
+// the key removed. Read through Temporal's own accessors too, so a key Temporal does not
+// read under that name, or as that type, fails here.
+func TestUpdateLimitsArePinned(t *testing.T) {
+	loaded := dynamicconfig.LoadYamlFile(kontradc.Default)
+	if err := errors.Join(append(loaded.Errors, loaded.Warnings...)...); err != nil {
+		t.Fatal(err)
+	}
+	file := dynamicconfig.NewMemoryClient()
+	for key, values := range loaded.Map {
+		file.OverrideValue(key, values)
+	}
+	collection := dynamicconfig.NewCollection(pinnedClient{file: file}, log.NewNoopLogger())
+	for _, tc := range []struct {
+		name    string
+		setting dynamicconfig.NamespaceIntSetting
+		want    int
+	}{
+		{"history.maxInFlightUpdates", dynamicconfig.WorkflowExecutionMaxInFlightUpdates, 10},
+		{"history.maxTotalUpdates", dynamicconfig.WorkflowExecutionMaxTotalUpdates, 2000},
+	} {
+		if tc.setting.Key() != dynamicconfig.MakeKey(tc.name) {
+			t.Fatalf("Temporal reads %s as %s", tc.name, tc.setting.Key())
+		}
+		got := loaded.Map[tc.setting.Key()]
+		if len(got) != 1 || got[0].Value != tc.want || got[0].Constraints != (dynamicconfig.Constraints{}) {
+			t.Errorf("%s: the default file sets %+v, want %d for every namespace", tc.name, got, tc.want)
+		}
+		if v := tc.setting.Get(collection)("acme"); v != tc.want {
+			t.Errorf("%s is %d for a namespace, want %d", tc.name, v, tc.want)
 		}
 	}
 }

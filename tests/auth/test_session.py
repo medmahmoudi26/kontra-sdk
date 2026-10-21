@@ -110,14 +110,36 @@ async def test_401_forces_a_refresh_and_the_call_is_retried(
 
 
 async def test_a_spent_refresh_token_means_log_in_again(
-    home: Path, gate: FakeGate, clock: FakeClock
+    tmp_path: Path, gate: FakeGate, clock: FakeClock
 ) -> None:
+    make_profile(dev=False).save(tmp_path)  # a real login
     gate.refresh_token = "someone-else-rotated-it"
-    async with session(home, gate, clock) as s:
+    async with session(tmp_path, gate, clock) as s:
         with pytest.raises(NotLoggedIn, match="kontra login") as ei:
             await s.gate.me()
     assert isinstance(ei.value.__cause__, GateError)
     assert ei.value.__cause__.code == "invalid_grant"
+
+
+async def test_a_dev_profile_is_sent_to_kontra_dev_up_never_kontra_login(
+    tmp_path: Path, gate: FakeGate, clock: FakeClock
+) -> None:
+    """A dev gate that forgot the session (it restarted: in memory by default) is fixed by
+    ``kontra dev up``, which mints the profile again; ``kontra login`` would ask for an email
+    (decisions I34 §11, OD14)."""
+    make_profile(dev=True).save(tmp_path)
+    gate.refresh_token = "a-gate-that-restarted"
+    async with session(tmp_path, gate, clock) as s:
+        with pytest.raises(NotLoggedIn, match="run `kontra dev up`") as ei:
+            await s.gate.me()
+    assert "kontra login" not in str(ei.value)
+    assert isinstance(ei.value.__cause__, GateError)
+    # A dev profile that holds no session at all says the same.
+    make_profile(dev=True, refresh_token=None).save(tmp_path)
+    async with session(tmp_path, gate, clock) as s:
+        with pytest.raises(NotLoggedIn, match="run `kontra dev up`") as ei:
+            await s.gate.me()
+    assert "kontra login" not in str(ei.value)
 
 
 async def test_other_gate_errors_on_refresh_propagate(home: Path, clock: FakeClock) -> None:

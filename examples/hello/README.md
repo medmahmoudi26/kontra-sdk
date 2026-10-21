@@ -12,10 +12,10 @@ before you sell your own.
 |---|---|
 | `offering.yaml` | name, version, limits, display text: declarative, no code names |
 | `models.py` | `HelloInput` (`name`, 1 to 100 characters) and `HelloOutput` (`greeting`); the published contract is derived from them |
-| `workflows.py` | `HelloFlow`: runs the one activity, with a timeout and retries; Temporal through `from kontra import workflow` |
-| `activities.py` | `greet`, the work itself; Temporal through `from kontra import activity` |
+| `workflows.py` | `HelloFlow`: runs the one activity, with a timeout and retries; vanilla Temporal (`from temporalio import workflow`), no `kontra` import |
+| `activities.py` | `greet`, the work itself; a plain `temporalio` activity |
 | `quote.py` | the price: 0.01 USD whatever the name, and a refusal for a blank one |
-| `worker.py` | `serve(HelloFlow, ...)`: the binding of workflow and quote to the offering, and all worker tuning |
+| `worker.py` | `serve(HelloFlow, ...)`: the binding of workflow and quote to the offering, and all worker tuning; the one file that imports `kontra`, and it finds `greet` itself |
 | `input.json` | a sample input, for `kontra quote` and `kontra hire` |
 | `contract.yaml` | the derived contract document, kept as a golden file (seam ③) |
 
@@ -103,7 +103,7 @@ asyncio.run(main())
 
 ## Without an invitation
 
-`kontra dev` runs a local Kontra in Docker, with play money, and logs you in to it. Log in as
+`kontra dev` runs a local Kontra with no containers, with play money, and logs you in to it. Log in as
 `acme` and this directory runs unchanged: on a dev profile, `kontra serve` publishes the
 offering itself.
 
@@ -115,10 +115,10 @@ kontra hire acme/hello -f input.json --max-price 0.01 --wait --accept
 
 ## Its graph
 
-`kontra graph --mermaid`, from this directory, draws the workflow from mock runs: Temporal's
-test server runs it eight times, every activity answered with a value of the type it
-declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against the
-command:
+Under a dev profile, `kontra serve` draws the workflow for `kontra dev`'s graph page from mock
+runs: Temporal's test server runs it eight times, every activity answered with a value of the
+type it declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against
+those runs:
 
 ```mermaid
 %% acme/hello@0.1.0

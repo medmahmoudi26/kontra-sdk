@@ -101,7 +101,7 @@ async def never_delivered(dev_server: DevServer, tmp_path: Path) -> None:
     short = tmp_path / "offering.yaml"
     yaml = (ROOT / "offering.yaml").read_text()
     short.write_text(re.sub(r"(?m)^max_duration:.*$", "max_duration: 3s", yaml))
-    bound = offering(short, workflow={{Class}}Flow, quote=quote)
+    bound = offering(short, entry={{Class}}Flow, quote=quote)
     seller_worker = Worker(offerings=[bound], activities=[count_words])
     party = bound.offering_id.party
     async with Marketplace(dev_server=dev_server) as mp:

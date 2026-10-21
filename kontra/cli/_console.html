@@ -7,7 +7,7 @@
 <link rel="icon" href="data:,">
 <title>Kontra Run Graph</title>
 <style nonce="__NONCE__">
-/* kontra dev's run graph: the whole workflow (kontra graph's static layer), the live run painted on it.
+/* kontra dev's run graph: the whole workflow (the static layer kontra serve draws), the live run painted on it.
    Served by the dev codec server on loopback; no external resources (its CSP allows none). */
 :root{
   --ground:#f2f4f2;--panel:#ffffff;--ink:#1a1f1c;--mute:#5f6b65;--line:#d6dcd8;--edge:#9aa49f;--ghost:#b3bbb7;
@@ -88,34 +88,104 @@ pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 var(--mon
 .grp{fill:var(--group);stroke:var(--accent);stroke-opacity:.45;stroke-dasharray:4 4}
 .grp-label{font:600 9.5px var(--mono);letter-spacing:.08em;fill:var(--accent);opacity:.8;text-transform:uppercase}
 .node{cursor:pointer;outline:none}
-.node .box{fill:var(--panel);stroke:var(--edge);stroke-width:1.4}
-.node .stripe{fill:var(--ghost)}
-.node .inner{fill:none;stroke:var(--edge);stroke-width:1}
-.node .name{font:600 12.5px var(--mono);fill:var(--ink)}
-.node .meta{font:11px var(--sans);fill:var(--mute)}
+.node>.box{fill:var(--panel);stroke:var(--edge);stroke-width:1.4}
+.node>.stripe{fill:var(--ghost)}
+.node>.inner{fill:none;stroke:var(--edge);stroke-width:1}
+.node>.name{font:600 12.5px var(--mono);fill:var(--ink)}
+.node>.meta{font:11px var(--sans);fill:var(--mute)}
 .node .badge rect{fill:var(--panel);stroke-width:1.2}
 .node .badge text{font:700 10.5px var(--mono)}
-.node.s-completed .box{stroke:var(--ok)}.node.s-completed .stripe{fill:var(--ok)}
-.node.s-running .box{stroke:var(--run);stroke-dasharray:6 3}.node.s-running .stripe{fill:var(--run)}
-.node.s-scheduled .box{stroke:var(--wait);stroke-dasharray:2 3}.node.s-scheduled .stripe{fill:var(--wait)}
-.node.s-failed .box,.node.s-timed_out .box,.node.s-terminated .box{stroke:var(--bad)}
-.node.s-failed .stripe,.node.s-timed_out .stripe,.node.s-terminated .stripe{fill:var(--bad)}
-.node.s-canceled .box{stroke:var(--mute)}
-.node.s-unreached .box,.node.s-pending .box{stroke:var(--ghost);stroke-dasharray:2 3}
-.node.s-unreached .name,.node.s-pending .name{fill:var(--mute)}
-.node.k-local .box{stroke-dasharray:5 3}
-.node.sel .box{stroke-width:2.6}
-.node:focus-visible .box{stroke:var(--accent);stroke-width:2.6}
-.node:hover .box{stroke-width:2.2}
+.node.s-completed>.box{stroke:var(--ok)}.node.s-completed>.stripe{fill:var(--ok)}
+.node.s-running>.box{stroke:var(--run);stroke-dasharray:6 3}.node.s-running>.stripe{fill:var(--run)}
+.node.s-scheduled>.box{stroke:var(--wait);stroke-dasharray:2 3}.node.s-scheduled>.stripe{fill:var(--wait)}
+.node.s-failed>.box,.node.s-timed_out>.box,.node.s-terminated>.box{stroke:var(--bad)}
+.node.s-failed>.stripe,.node.s-timed_out>.stripe,.node.s-terminated>.stripe{fill:var(--bad)}
+.node.s-canceled>.box{stroke:var(--mute)}
+.node.s-unreached>.box,.node.s-pending>.box{stroke:var(--ghost);stroke-dasharray:2 3}
+.node.s-unreached>.name,.node.s-pending>.name{fill:var(--mute)}
+.node.k-local>.box{stroke-dasharray:5 3}
+.node.sel>.box{stroke-width:2.6}
+.node:focus-visible>.box{stroke:var(--accent);stroke-width:2.6}
+.node:hover>.box{stroke-width:2.2}
 .bad-t{fill:var(--bad)}.wait-t{fill:var(--wait)}.run-t{fill:var(--run)}.mute-t{fill:var(--mute)}
 .badge .bad-s{stroke:var(--bad)}.badge .wait-s{stroke:var(--wait)}.badge .mute-s{stroke:var(--line)}
+.badge .wait-s.needs{fill:color-mix(in srgb,var(--wait) 12%,var(--panel))}
 .term circle{fill:var(--panel);stroke:var(--edge);stroke-width:1.4}
 .term text{font:600 10px var(--mono);fill:var(--mute);letter-spacing:.04em}
 .term.done circle{stroke:var(--ok)}
 .arrow{fill:var(--edge)}.arrow-dim{fill:var(--ghost)}
 @media (prefers-reduced-motion:no-preference){
-  .node.s-running .box{animation:march 1.1s linear infinite}
+  .node.s-running>.box{animation:march 1.1s linear infinite}
   @keyframes march{to{stroke-dashoffset:-18}}
+}
+/* the agent session pane, beside the graph (decisions I36): the same tokens, one page */
+@media (min-width:901px){.split.agent{grid-template-columns:minmax(0,1fr) 420px}}
+.controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.controls button{display:inline-flex;align-items:center;gap:6px;font:500 13px/1 var(--sans);padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--ink);cursor:pointer}
+.controls button:hover{border-color:var(--accent)}
+h1 .off{color:var(--accent)}
+.ind{display:inline-flex;align-items:center;gap:5px;font:500 12px/1 var(--mono);color:var(--mute);white-space:nowrap}
+.ind::before{content:"\25c9";color:var(--ok)}
+.ind.off::before{color:var(--ghost)}
+.rightcol{display:flex;flex-direction:column;gap:14px;min-width:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);min-width:0;display:flex;flex-direction:column}
+#session{display:flex;flex-direction:column;min-height:0;flex:1 1 auto}
+/* wide: the column stays in view, as tall as the room below its top (fit(), from the page's
+   script); the session takes what the node pane does not need, and scrolls on its own */
+@media (min-width:901px){
+  .rightcol{position:sticky;top:12px;max-height:calc(100vh - 24px)}
+  .rightcol.fitted{max-height:none}
+  .rightcol>.card{flex:0 1 auto;min-height:0}
+  .rightcol .rows-wrap{overflow:auto;flex:1 1 auto;min-height:0}
+  .rightcol.fitted .pane{position:static;flex:0 0 auto;max-height:50%;overflow:auto}
+}
+.chead{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line)}
+.chead h2{margin:0;font:600 12px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--mute)}
+.strm{font:500 11.5px/1 var(--mono);color:var(--mute);display:inline-flex;gap:5px;align-items:center;white-space:nowrap}
+.strm::before{content:"\25c9";color:var(--ok)}
+.strm.off::before{color:var(--ghost)}
+.rows-wrap{padding:4px 0 6px;min-height:0}
+.turnhead{display:flex;gap:6px;align-items:baseline;padding:9px 14px 5px;color:var(--mute);font:12.5px/1.3 var(--mono);white-space:nowrap}
+.turnhead b{color:var(--ink);font-weight:600}
+.turnhead .sig{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.turnhead .tstatus{margin-left:auto}
+.row{display:grid;grid-template-columns:16px minmax(0,1fr) auto;gap:8px;align-items:baseline;padding:3px 14px 3px 11px;border-left:3px solid transparent}
+.row.islink{cursor:pointer}
+.row.islink:hover,.row.isbody:hover{background:var(--code)}
+.row.isbody{cursor:pointer}
+.row.sel{background:color-mix(in srgb,var(--accent) 9%,var(--panel));border-left-color:var(--accent)}
+.row.nest{padding-left:33px}
+.row.nest.d2{padding-left:55px}.row.nest.d3{padding-left:77px}
+.row.nest .g::before{content:"\2514\00a0";color:var(--ghost);margin-left:-14px}
+.row .g{font-family:var(--mono);color:var(--mute);text-align:center;white-space:nowrap}
+.row .mid{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .lbl{font:600 12.5px/1.4 var(--mono);color:var(--ink)}
+.row .sum{color:var(--mute);font-size:12.5px}
+.row .rt{font:11px/1 var(--mono);color:var(--mute);font-variant-numeric:tabular-nums;white-space:nowrap;display:inline-flex;gap:6px;align-items:center}
+.row.working .g{color:var(--run)}.row.scheduled .g{color:var(--wait)}
+.row.completed .g{color:var(--ok)}
+.row.failed .g,.row.failed .lbl{color:var(--bad)}
+.row.generic .lbl{font-weight:500;color:var(--mute)}
+.usage{font:10.5px/1 var(--mono);color:var(--mute);border:1px solid var(--line);border-radius:4px;padding:2px 5px}
+.subnote{padding:2px 14px 4px 47px;color:var(--mute);font:11.5px/1.4 var(--mono)}
+.subnote a{color:var(--accent)}
+.appr{margin:3px 14px 8px 38px;border:1px solid color-mix(in srgb,var(--wait) 45%,transparent);background:color-mix(in srgb,var(--wait) 7%,var(--panel));border-radius:7px;padding:9px 11px;display:flex;flex-direction:column;gap:7px}
+.appr .to{font:12.5px/1.35 var(--mono);color:var(--ink);overflow-wrap:anywhere}
+.appr .act{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.appr .note{color:var(--mute);font-size:11.5px;line-height:1.35}
+.sfooter{display:flex;flex-wrap:wrap;gap:4px 14px;padding:10px 14px;border-top:1px solid var(--line);color:var(--mute);font:11.5px/1.45 var(--mono)}
+.sfooter .key{font-variant-numeric:tabular-nums;color:var(--ink)}
+.sess-empty{padding:14px;color:var(--mute);font-size:13px}
+.sess-empty p{margin:0}
+.pane h2{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.pane h2 .k{font:600 11px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--mute)}
+.pane h2 .pill{margin-left:auto}
+/* a child drawn nested: its own graph inside its node */
+.node.compound>.box{fill:color-mix(in srgb,var(--group) 60%,var(--panel))}
+.nest-label{font:600 9.5px var(--mono);letter-spacing:.08em;fill:var(--accent);opacity:.8;text-transform:uppercase}
+@media (prefers-reduced-motion:no-preference){
+  .node.flash>.box{animation:nodeflash 1.2s ease-out}
+  @keyframes nodeflash{0%{stroke-width:5;stroke:var(--accent)}100%{stroke-width:2.6}}
 }
 </style>
 </head>
@@ -125,9 +195,12 @@ pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 var(--mon
     <div class="ident">
       <span class="kicker"><a id="to-runs" href="?">kontra dev · runs</a> / graph</span>
       <h1 id="wf-type">Loading…</h1>
-      <div class="sub"><code id="wf-id"></code><span id="wf-status" class="pill" hidden></span><span id="wf-time"></span></div>
+      <div class="sub"><code id="wf-id"></code><span id="wf-status" class="pill" hidden></span><span id="ind" class="ind off" hidden>/api/events</span><span id="sess-queue"></span><span id="sess-run"></span><span id="wf-time"></span></div>
     </div>
-    <nav id="wf-links" class="links" aria-label="This run elsewhere"></nav>
+    <div class="controls">
+      <button id="replay" type="button" hidden>↺ Replay</button>
+      <nav id="wf-links" class="links" aria-label="This run elsewhere"></nav>
+    </div>
   </header>
   <p id="notice" class="notice" hidden></p>
   <div id="graph-view" hidden>
@@ -141,9 +214,16 @@ pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 var(--mon
       <span><i class="k-child"></i>child workflow / batch</span>
       <span><i class="k-timer"></i>timer</span>
     </div>
-    <div class="split">
+    <div id="split" class="split">
       <main id="canvas" class="canvas" aria-label="Workflow graph"></main>
-      <aside id="pane" class="pane" aria-live="polite"><p class="pane-empty">Select a step to see its attempts, timing, input and result, and to open it in Temporal UI, its logs or its trace.</p></aside>
+      <div id="rightcol" class="rightcol">
+        <section id="session-card" class="card" hidden aria-label="Agent session">
+          <header class="chead"><h2>Session</h2><span id="strm" class="strm off" hidden></span></header>
+          <div id="session"></div>
+          <div id="session-footer" class="sfooter" hidden></div>
+        </section>
+        <aside id="pane" class="pane" aria-live="polite"><p class="pane-empty">Select a step to see its attempts, timing, input and result, and to open it in Temporal UI, its logs or its trace.</p></aside>
+      </div>
     </div>
   </div>
   <section id="runs-view" class="runs" hidden aria-label="Recent runs"></section>
@@ -155,6 +235,8 @@ pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 var(--mon
 const START = "start", END = "end";
 const SVGNS = "http://www.w3.org/2000/svg";
 const H = 54, R = 20, GX = 60, GY = 20;
+// A child drawn nested (the agent child): its header band, and the padding round its own graph.
+const BOX_HEAD = 78, BOX_PAD = 16;
 let W = 184; // narrower in a vertical layout, to fit the screen
 
 // ------------------------------------------------------------------ transport
@@ -170,15 +252,19 @@ const api = window.KONTRA_CONSOLE || {
   },
   qs(w, r, extra) { const q = new URLSearchParams({ w }); if (r) q.set("r", r); for (const [k, v] of Object.entries(extra || {})) q.set(k, v); return q.toString(); },
   workflows() { return this.json("/api/workflows"); },
-  graph(w, r) { return this.json(`/api/graph?${this.qs(w, r)}`); },
+  // Both panes from one fetch, behind the header (OD2): {graph, session}.
+  session(w, r) { return this.json(`/api/session?${this.qs(w, r)}`, { "X-Kontra-Console": "1" }); },
   io(w, r, node) { return this.json(`/api/io?${this.qs(w, r, { node })}`, { "X-Kontra-Console": "1" }); },
-  subscribe(w, r, onGraph, onEnd, onLost) {
-    const es = new EventSource(`/api/graph/events?${this.qs(w, r)}`);
-    es.addEventListener("graph", ev => { try { onGraph(JSON.parse(ev.data)); } catch (_) { /* a torn frame: the next one repaints */ } });
-    es.addEventListener("end", () => { es.close(); onEnd && onEnd(); });
+  ioEvent(w, r, offset) { return this.json(`/api/io?${this.qs(w, r, { event: String(offset) })}`, { "X-Kontra-Console": "1" }); },
+  subscribe(w, r, on) {
+    // A change signal only: each session-stat sends the page back to /api/session.
+    const es = new EventSource(`/api/events?${this.qs(w, r)}`);
+    es.addEventListener("session-stat", ev => { try { on.stat(JSON.parse(ev.data)); } catch (_) { /* a torn frame: the next one says it again */ } });
+    es.addEventListener("end", () => { es.close(); on.end(); });
+    es.addEventListener("open", () => on.open());
     // EventSource reconnects by itself; once the server refuses (too many pages open, the
     // codec server stopped) it gives up, and the page says so.
-    es.addEventListener("error", () => { if (es.readyState === EventSource.CLOSED && onLost) onLost(); });
+    es.addEventListener("error", () => { if (es.readyState === EventSource.CLOSED) on.lost(); else on.end(); });
     return () => es.close();
   },
   href(w, r) { return w ? `?${this.qs(w, r)}` : "?"; },
@@ -239,20 +325,72 @@ function fit(text, px, face) {
 
 // ------------------------------------------------------------------ state
 let G = null, selected = null, closeStream = null, ioCache = new Map(), running = false;
+// The agent session (S), the run it belongs to, the SSE indicator and the one fetch in flight.
+let S = null, curW = null, curR = null, streamOpen = false, fetching = null, again = false, shownEvent = null;
+// The graph as drawn (G, and a placeholder for a tool call waiting on an approval), and the
+// node each pending approval's row links to.
+let D = null, needs = new Map(), subs = new Set();
 
 function stateOf(n) {
   if (n.reached === false) return running ? "pending" : "unreached";
   return n.status || "pending";
 }
+// Every row of the session, nested ones included, in the order the pane draws them.
+function allRows(rows) { return (rows || []).flatMap(r => [r, ...allRows(r.children)]); }
+function sessionRows() { return S && !S.empty ? S.turns.flatMap(t => allRows(t.rows)) : []; }
+// The child nodes a handoff row links to: the subagents' own.
+function subagentNodes() { return new Set(sessionRows().filter(r => r.label === "handoff" && r.node).map(r => r.node)); }
+// A tool call waiting on its approval (the wireframe's "needs ✓"): the agent's node of that
+// tool when one is drawn and not done, else a placeholder after the agent's latest step.
+function agentLayer(g) { // the agent's own steps: inside its child (case a), else the run's own
+  if (!S || S.empty) return undefined;
+  if (S.agent.case !== "a") return null;
+  const host = g.nodes.find(n => n.kind === "child" && n.ref && n.ref.workflow_id === S.agent.workflow_id);
+  return host ? host.id : undefined;
+}
+function needsOf(g) {
+  const out = new Map(), layer = agentLayer(g);
+  if (layer === undefined) return out;
+  for (const row of sessionRows()) {
+    if (row.label !== "approval.requested" || !row.pending || !row.tool_id) continue;
+    const drawn = g.nodes.find(n => (n.parent ?? null) === layer && n.name === row.tool_name && n.status !== "completed" && n.status !== "failed");
+    out.set(row.tool_id, drawn ? drawn.id : `needs ✓ ${row.tool_id}`);
+  }
+  return out;
+}
+function withNeeds(g) {
+  const wants = needsOf(g), layer = agentLayer(g);
+  if (!wants.size) return g;
+  const nodes = g.nodes.map(n => ([...wants.values()].includes(n.id) ? { ...n, needs: true } : n)), edges = [...g.edges];
+  for (const row of sessionRows()) {
+    const id = wants.get(row.tool_id);
+    if (!id || nodes.some(n => n.id === id)) continue;
+    const mine = nodes.filter(n => (n.parent ?? null) === layer && n.reached !== false && !n.placeholder);
+    const last = mine.reduce((a, n) => (a && (ms((a.t || {}).scheduled) || 0) >= (ms((n.t || {}).scheduled) || 0) ? a : n), null);
+    nodes.push({ id, name: row.tool_name, label: row.tool_name, kind: "activity", status: "pending", parent: layer, needs: true, placeholder: true, t: {} });
+    edges.push({ from: last ? last.id : START, to: id, parent: layer, reached: false });
+  }
+  return { ...g, nodes, edges };
+}
 
 // ------------------------------------------------------------------ layout
-function layout(g, vertical) {
-  const nodes = g.nodes.filter(n => typeof n.id === "string");
+// One level of the graph: the run's own nodes (parent null), or a nested child's (parent its node
+// id). A node that holds a nested child is sized to that child's own layout, drawn inside it.
+function layout(g, vertical, parent) {
+  const nodes = g.nodes.filter(n => typeof n.id === "string" && (n.parent ?? null) === parent);
   const ids = [START, ...nodes.map(n => n.id)];
-  const hasEnd = g.edges.some(e => e.to === END);
+  const own = g.edges.filter(e => (e.parent ?? null) === parent);
+  const hasEnd = own.some(e => e.to === END);
   if (hasEnd) ids.push(END);
   const index = new Map(ids.map((id, i) => [id, i]));
-  const edges = g.edges.filter(e => index.has(e.from) && index.has(e.to));
+  const edges = own.filter(e => index.has(e.from) && index.has(e.to));
+  const inner = new Map();
+  for (const n of nodes) if (g.nodes.some(m => m.parent === n.id)) inner.set(n.id, layout(g, true, n.id));
+  const size = id => {
+    if (id === START || id === END) return { w: 2 * R, h: 2 * R };
+    const L = inner.get(id);
+    return L ? { w: Math.max(W, L.width + 2 * BOX_PAD), h: L.height + BOX_HEAD + BOX_PAD } : { w: W, h: H };
+  };
   const out = new Map(ids.map(id => [id, []]));
   for (const e of edges) out.get(e.from).push(e);
   for (const list of out.values()) list.sort((a, b) => index.get(a.to) - index.get(b.to));
@@ -297,11 +435,23 @@ function layout(g, vertical) {
     L.sort((a, b) => gmean(groupOf(a)) - gmean(groupOf(b)) || groupOf(a).localeCompare(groupOf(b)) || bary(a) - bary(b) || index.get(a) - index.get(b));
     L.forEach((id, k) => place.set(id, k));
   }
-  const pos = new Map();
-  levels.forEach((L, li) => (L || []).forEach((id, k) => {
-    const along = li * (vertical ? H + GY + 26 : W + GX), across = (k - (L.length - 1) / 2) * (vertical ? W + 16 : H + GY);
-    pos.set(id, vertical ? { x: across, y: along } : { x: along, y: across });
-  }));
+  // Places: levels one after another along the flow, each as deep as its largest node. A node
+  // no larger than a node's room is centred in it, a larger one (a nested child) hangs from its
+  // top: a graph with nothing nested is laid out exactly as it always was.
+  const pos = new Map(), slot = vertical ? H : W, room = vertical ? W : H;
+  const along = id => (vertical ? size(id).h : size(id).w), across = id => Math.max(room, vertical ? size(id).w : size(id).h);
+  let lead = -slot / 2;
+  levels.forEach(L => {
+    if (!L) return;
+    const gap = vertical ? 16 : GY, total = L.reduce((s, id) => s + across(id), 0) + gap * (L.length - 1);
+    let x = -total / 2;
+    for (const id of L) {
+      const c = lead + Math.max(slot, along(id)) / 2, a = x + across(id) / 2;
+      x += across(id) + gap;
+      pos.set(id, vertical ? { x: a, y: c } : { x: c, y: a });
+    }
+    lead += Math.max(slot, ...L.map(along)) + (vertical ? GY + 26 : GX);
+  });
   // Parallel groups: two or more nodes of one workflow task side by side in a level.
   const groups = [];
   for (const L of levels) {
@@ -310,136 +460,172 @@ function layout(g, vertical) {
     for (const id of L) { const n = byId.get(id); if (n && n.group != null) (by.get(n.group) || by.set(n.group, []).get(n.group)).push(id); }
     for (const [gid, members] of by) if (members.length > 1) groups.push({ id: gid, members });
   }
-  return { ids, byId, edges, back, pos, groups, vertical, hasEnd, widest: Math.max(1, ...levels.map(l => (l ? l.length : 0))) };
+  const ps = [...pos.entries()];
+  const minX = Math.min(...ps.map(([id, p]) => p.x - size(id).w / 2)), maxX = Math.max(...ps.map(([id, p]) => p.x + size(id).w / 2));
+  const minY = Math.min(...ps.map(([id, p]) => p.y - size(id).h / 2)), maxY = Math.max(...ps.map(([id, p]) => p.y + size(id).h / 2));
+  return { ids, byId, edges, back, pos, size, inner, groups, vertical, hasEnd, minX, maxX, minY, maxY,
+    width: maxX - minX, height: maxY - minY, widest: Math.max(1, ...levels.map(l => (l ? l.length : 0))) };
 }
 
 // ------------------------------------------------------------------ drawing
 function anchor(L, id, side) {
-  const p = L.pos.get(id), term = id === START || id === END;
-  const hw = term ? R : W / 2, hh = term ? R : H / 2;
+  const p = L.pos.get(id), s = L.size(id);
+  const hw = s.w / 2, hh = s.h / 2;
   if (L.vertical) return side === "out" ? { x: p.x, y: p.y + hh } : side === "in" ? { x: p.x, y: p.y - hh } : { x: p.x + hw, y: p.y };
   return side === "out" ? { x: p.x + hw, y: p.y } : side === "in" ? { x: p.x - hw, y: p.y } : { x: p.x, y: p.y + hh };
 }
-function draw(g) {
-  // Left to right when it fits the canvas, else top to bottom with nodes narrowed to fit.
+function draw(base) {
+  // Top to bottom beside a session (the wireframe's), or when left to right does not fit the
+  // canvas; nodes narrowed to fit.
+  const g = withNeeds(base);
+  D = g; subs = subagentNodes();
   const avail = Math.max(280, $("canvas").clientWidth - 2);
   W = 184;
-  let vertical = matchMedia("(max-width: 640px)").matches;
-  let L = layout(g, vertical);
-  if (!vertical) {
-    const across = [...L.pos.values()].map(p => p.x);
-    vertical = Math.max(...across) - Math.min(...across) + W + 48 > avail;
+  const nested = g.nodes.some(n => n.parent != null);
+  let vertical = matchMedia("(max-width: 640px)").matches || (S && !S.empty) || nested;
+  let L = layout(g, vertical, null), box;
+  if (!nested) {
+    // Nothing nested: laid out, narrowed and framed exactly as the page did before it had a session.
+    if (!vertical) { const across = [...L.pos.values()].map(p => p.x); vertical = Math.max(...across) - Math.min(...across) + W + 48 > avail; }
+    if (vertical) { W = Math.max(120, Math.min(184, Math.floor((avail - 48 - (L.widest - 1) * 16) / L.widest))); L = layout(g, true, null); }
+    const xs = [...L.pos.values()].map(p => p.x), ys = [...L.pos.values()].map(p => p.y);
+    box = { minX: Math.min(...xs) - W / 2 - 24, maxX: Math.max(...xs) + W / 2 + 24, minY: Math.min(...ys) - H / 2 - 30, maxY: Math.max(...ys) + H / 2 + 24, legacy: true };
+  } else {
+    if (!vertical && L.width + 48 > avail) { vertical = true; L = layout(g, true, null); }
+    if (vertical && L.width + 48 > avail) {
+      W = Math.max(120, Math.min(184, Math.floor(184 * (avail - 48) / L.width)));
+      L = layout(g, true, null);
+    }
+    box = { minX: L.minX - 24, maxX: L.maxX + 24, minY: L.minY - 30, maxY: L.maxY + 24 };
   }
-  if (vertical) {
-    W = Math.max(120, Math.min(184, Math.floor((avail - 48 - (L.widest - 1) * 16) / L.widest)));
-    L = layout(g, true);
-  }
-  const xs = [...L.pos.values()].map(p => p.x), ys = [...L.pos.values()].map(p => p.y);
-  let minX = Math.min(...xs) - W / 2 - 24, maxX = Math.max(...xs) + W / 2 + 24;
-  let minY = Math.min(...ys) - H / 2 - 30, maxY = Math.max(...ys) + H / 2 + 24;
   const svg = sv("svg", { xmlns: SVGNS, role: "group", "aria-label": `${g.workflow?.type || "Workflow"} graph` });
   const defs = sv("defs");
   for (const [id, cls] of [["arr", "arrow"], ["arr-dim", "arrow-dim"]])
     defs.append(sv("marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, sv("path", { d: "M0,0 L10,5 L0,10 z", class: cls })));
   svg.append(defs);
+  const top = sv("g");
+  drawLayout(L, top, box, g);
+  svg.append(top);
+  svg.setAttribute("viewBox", `${box.minX} ${box.minY} ${box.maxX - box.minX} ${box.maxY - box.minY}`);
+  svg.setAttribute("width", Math.ceil(box.maxX - box.minX));
+  svg.setAttribute("height", Math.ceil(box.maxY - box.minY));
+  const focused = document.activeElement && document.activeElement.getAttribute && document.activeElement.getAttribute("data-id");
+  $("canvas").replaceChildren(svg);
+  if (focused) { const f = svg.querySelector(`[data-id="${CSS.escape(focused)}"]`); f && f.focus({ preventScroll: true }); }
+}
+// One layout's groups, edges, terminals and nodes into `into`; a node holding a nested child draws
+// that child's layout inside it. `box` grows to what is drawn (the root's alone sets the view).
+function drawLayout(L, into, box, g) {
   const layer = { grp: sv("g"), edge: sv("g"), node: sv("g") };
-  svg.append(layer.grp, layer.edge, layer.node);
-  // parallel groups
+  into.append(layer.grp, layer.edge, layer.node);
+  const ys = [...L.pos.values()].map(p => p.y);
   for (const grp of L.groups) {
-    const ps = grp.members.map(id => L.pos.get(id));
-    const x0 = Math.min(...ps.map(p => p.x)) - W / 2 - 10, x1 = Math.max(...ps.map(p => p.x)) + W / 2 + 10;
-    const y0 = Math.min(...ps.map(p => p.y)) - H / 2 - 20, y1 = Math.max(...ps.map(p => p.y)) + H / 2 + 10;
+    const ps = grp.members.map(id => [L.pos.get(id), L.size(id)]);
+    const x0 = Math.min(...ps.map(([p, s]) => p.x - s.w / 2)) - 10, x1 = Math.max(...ps.map(([p, s]) => p.x + s.w / 2)) + 10;
+    const y0 = Math.min(...ps.map(([p, s]) => p.y - s.h / 2)) - 20, y1 = Math.max(...ps.map(([p, s]) => p.y + s.h / 2)) + 10;
     layer.grp.append(sv("rect", { class: "grp", x: x0, y: y0, width: x1 - x0, height: y1 - y0, rx: 10 }),
       sv("text", { class: "grp-label", x: x0 + 10, y: y0 + 13 }, "parallel · one task"));
-    minY = Math.min(minY, y0 - 8);
+    box.minY = Math.min(box.minY, y0 - 8);
   }
-  // edges
   let detour = 0;
   for (const e of L.edges) {
     const dim = e.reached === false;
     const attrs = { class: `edge${dim ? " dim" : ""}`, "marker-end": `url(#${dim ? "arr-dim" : "arr"})` };
     let d;
     if (e.from === e.to) { // a loop over one call site
-      const p = L.pos.get(e.from);
-      d = vertical ? `M${p.x + W / 2},${p.y - 12} C${p.x + W / 2 + 40},${p.y - 30} ${p.x + W / 2 + 40},${p.y + 30} ${p.x + W / 2},${p.y + 12}`
-                   : `M${p.x - 16},${p.y - H / 2} C${p.x - 24},${p.y - H / 2 - 40} ${p.x + 24},${p.y - H / 2 - 40} ${p.x + 16},${p.y - H / 2}`;
+      const p = L.pos.get(e.from), s = L.size(e.from);
+      d = L.vertical ? `M${p.x + s.w / 2},${p.y - 12} C${p.x + s.w / 2 + 40},${p.y - 30} ${p.x + s.w / 2 + 40},${p.y + 30} ${p.x + s.w / 2},${p.y + 12}`
+                     : `M${p.x - 16},${p.y - s.h / 2} C${p.x - 24},${p.y - s.h / 2 - 40} ${p.x + 24},${p.y - s.h / 2 - 40} ${p.x + 16},${p.y - s.h / 2}`;
       attrs.class += " back";
-      if (!vertical) minY = Math.min(minY, p.y - H / 2 - 40);
+      if (!L.vertical) box.minY = Math.min(box.minY, p.y - s.h / 2 - 40);
+      else if (!box.legacy) box.maxX = Math.max(box.maxX, p.x + s.w / 2 + 50);
     } else if (L.back.has(e)) { // back to an earlier step: around the graph
       const a = anchor(L, e.from, "side"), b = anchor(L, e.to, "side");
       detour += 14;
-      if (vertical) { const x = Math.max(a.x, b.x) + 30 + detour; d = `M${a.x},${a.y} C${x},${a.y} ${x},${b.y} ${b.x},${b.y}`; maxX = Math.max(maxX, x + 10); }
-      else { const y = Math.max(...ys) + H / 2 + 26 + detour; d = `M${a.x},${a.y} C${a.x},${y} ${b.x},${y} ${b.x},${b.y}`; maxY = Math.max(maxY, y + 10); }
+      if (L.vertical) { const x = Math.max(a.x, b.x) + 30 + detour; d = `M${a.x},${a.y} C${x},${a.y} ${x},${b.y} ${b.x},${b.y}`; box.maxX = Math.max(box.maxX, x + 10); }
+      else { const y = Math.max(...ys) + H / 2 + 26 + detour; d = `M${a.x},${a.y} C${a.x},${y} ${b.x},${y} ${b.x},${b.y}`; box.maxY = Math.max(box.maxY, y + 10); }
       attrs.class += " back";
     } else {
       const a = anchor(L, e.from, "out"), b = anchor(L, e.to, "in");
-      if (vertical) { const k = Math.max(18, (b.y - a.y) / 2); d = `M${a.x},${a.y} C${a.x},${a.y + k} ${b.x},${b.y - k} ${b.x},${b.y}`; }
+      if (L.vertical) { const k = Math.max(18, (b.y - a.y) / 2); d = `M${a.x},${a.y} C${a.x},${a.y + k} ${b.x},${b.y - k} ${b.x},${b.y}`; }
       else { const k = Math.max(18, (b.x - a.x) / 2); d = `M${a.x},${a.y} C${a.x + k},${a.y} ${b.x - k},${b.y} ${b.x},${b.y}`; }
     }
     layer.edge.append(sv("path", { ...attrs, d }));
   }
-  // start / end
   for (const id of [START, END]) {
     if (!L.pos.has(id)) continue;
     const p = L.pos.get(id);
-    const done = id === START || (G.workflow && G.workflow.status === "completed");
+    const done = id === START || (G.workflow && G.workflow.status === "completed") || (L.parentStatus === "completed");
     layer.node.append(sv("g", { class: `term${done ? " done" : ""}`, transform: `translate(${p.x},${p.y})` },
       sv("circle", { r: R }), sv("text", { "text-anchor": "middle", y: 3.5 }, id)));
   }
-  // nodes
   const now = api.now(), faces = { name: font("name"), meta: font("meta") };
   for (const [id, n] of L.byId) {
     if (!L.pos.has(id)) continue;
-    const p = L.pos.get(id), st = stateOf(n);
+    const p = L.pos.get(id), st = stateOf(n), s = L.size(id), inner = L.inner.get(id);
     const kind = n.kind === "local_activity" ? " k-local" : "";
     const label = title(n);
     const meta = metaLine(n, st, now);
-    const g1 = sv("g", { class: `node s-${st}${kind}${selected === id ? " sel" : ""}`, transform: `translate(${p.x},${p.y})`,
+    const g1 = sv("g", { class: `node s-${st}${kind}${inner ? " compound" : ""}${selected === id ? " sel" : ""}`, transform: `translate(${p.x},${p.y})`,
       tabindex: 0, role: "button", "data-id": id,
       "aria-label": `${label}, ${KIND[n.kind] || n.kind}${isBatch(n) ? " batch" : ""}, ${STATUS[st] || st}${n.attempt > 1 ? `, attempt ${n.attempt}` : ""}` });
     g1.append(sv("title", {}, `${n.label || n.name}${n.id !== n.name ? `  (${n.id})` : ""}`));
     const rx = n.kind === "timer" ? H / 2 : 7;
+    // A node's own drawing sits in its top H (all of it, but for a nested child's box).
+    const hy = -s.h / 2 + H / 2;
     if (n.kind === "nexus") {
       const c = 10, x0 = -W / 2, x1 = W / 2, y0 = -H / 2, y1 = H / 2;
       g1.append(sv("path", { class: "box", d: `M${x0 + c},${y0} H${x1 - c} L${x1},${y0 + c} V${y1 - c} L${x1 - c},${y1} H${x0 + c} L${x0},${y1 - c} V${y0 + c} Z` }));
     } else {
-      g1.append(sv("rect", { class: "box", x: -W / 2, y: -H / 2, width: W, height: H, rx }));
+      g1.append(sv("rect", { class: "box", x: -s.w / 2, y: -s.h / 2, width: s.w, height: s.h, rx: inner ? 10 : rx }));
     }
-    if (n.kind === "child") g1.append(sv("rect", { class: "inner", x: -W / 2 + 4, y: -H / 2 + 4, width: W - 8, height: H - 8, rx: 4 }));
-    if (n.kind !== "timer") g1.append(sv("rect", { class: "stripe", x: -W / 2 + (n.kind === "child" ? 7 : 4), y: -H / 2 + 9, width: 3.5, height: H - 18, rx: 1.75 }));
-    const tx = -W / 2 + (n.kind === "timer" ? 20 : 16);
-    g1.append(sv("text", { class: "name", x: tx, y: -3 }, fit(label, W - (tx + W / 2) - 12, faces.name)));
-    g1.append(sv("text", { class: "meta", x: tx, y: 14 }, fit(meta, W - (tx + W / 2) - 6, faces.meta)));
+    if (n.kind === "child" && !inner) g1.append(sv("rect", { class: "inner", x: -W / 2 + 4, y: -H / 2 + 4, width: W - 8, height: H - 8, rx: 4 }));
+    const lx = -s.w / 2;
+    if (n.kind !== "timer") g1.append(sv("rect", { class: "stripe", x: lx + (n.kind === "child" ? 7 : 4), y: hy - H / 2 + 9, width: 3.5, height: H - 18, rx: 1.75 }));
+    const tx = lx + (n.kind === "timer" ? 20 : 16);
+    const room = (inner ? s.w : W) - (tx - lx);
+    g1.append(sv("text", { class: "name", x: tx, y: hy - 3 }, fit(label, room - 12, faces.name)));
+    g1.append(sv("text", { class: "meta", x: tx, y: hy + 14 }, fit(inner ? meta.replace(/^child · /, "agent child · ") : meta, room - 6, faces.meta)));
     // badges: retries, fan-out width, iterations
     const badges = [];
     if (n.attempt > 1) badges.push([`×${n.attempt}`, st === "failed" || st === "timed_out" ? "bad" : "wait"]);
     if (n.parallel > 1) badges.push([`∥${n.parallel}`, "mute"]);
     if (n.count > 1 && n.count > (n.parallel || 1)) badges.push([`↻${Math.round(n.count / Math.max(1, n.parallel || 1))}`, "mute"]);
-    let bx = W / 2 - 4;
+    if (n.needs) badges.push(["needs ✓", "wait"]); // a tool call waiting on an approval
+    let bx = s.w / 2 - 4;
     for (const [text, tone] of badges) {
       const bw = 10 + text.length * 7.2;
       bx -= bw;
-      g1.append(sv("g", { class: "badge", transform: `translate(${bx},${-H / 2 - 9})` },
-        sv("rect", { class: `${tone}-s`, width: bw, height: 17, rx: 8.5 }),
+      g1.append(sv("g", { class: "badge", transform: `translate(${bx},${-s.h / 2 - 9})` },
+        sv("rect", { class: `${tone}-s${text.startsWith("needs") ? " needs" : ""}`, width: bw, height: 17, rx: 8.5 }),
         sv("text", { class: `${tone}-t`, x: bw / 2, y: 12.2, "text-anchor": "middle" }, text)));
       bx -= 4;
     }
-    g1.addEventListener("click", () => select(id));
-    g1.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); select(id); } });
+    g1.addEventListener("click", ev => { ev.stopPropagation(); select(id); });
+    g1.addEventListener("keydown", ev => { if (ev.target === g1 && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); select(id); } });
+    if (inner) {
+      // Its own graph, inside it: laid out on its own, then placed under its header.
+      inner.parentStatus = n.status;
+      const ox = -s.w / 2 + BOX_PAD - inner.minX + (s.w - 2 * BOX_PAD - inner.width) / 2;
+      const oy = -s.h / 2 + BOX_HEAD - inner.minY;
+      g1.append(sv("text", { class: "nest-label", x: -s.w / 2 + 16, y: -s.h / 2 + H + 8 }, "inside the agent"));
+      const nest = sv("g", { transform: `translate(${ox},${oy})` });
+      drawLayout(inner, nest, { minX: 0, maxX: 0, minY: 0, maxY: 0 }, g);
+      g1.append(nest);
+    }
     layer.node.append(g1);
   }
-  svg.setAttribute("viewBox", `${minX} ${minY} ${maxX - minX} ${maxY - minY}`);
-  svg.setAttribute("width", Math.ceil(maxX - minX));
-  svg.setAttribute("height", Math.ceil(maxY - minY));
-  const focused = document.activeElement && document.activeElement.getAttribute && document.activeElement.getAttribute("data-id");
-  $("canvas").replaceChildren(svg);
-  if (focused) { const f = svg.querySelector(`[data-id="${CSS.escape(focused)}"]`); f && f.focus({ preventScroll: true }); }
 }
 function metaLine(n, st, now) {
+  if (n.placeholder) return "needs an approval first";
   if (st === "unreached") return "branch not taken";
   if (st === "pending") return "not reached yet";
   const t = n.t || {};
-  const kind = isBatch(n) ? "batch · " : n.kind === "child" ? "child · " : "";
+  // A batch's progress, from its child's own runs (OD3): ≥ while more pages may come.
+  const p = n.progress;
+  const prog = p ? ` · ${p.pages != null ? "pages= · " : ""}${p.done}/${p.bound ? "≥" : ""}${p.total}` : "";
+  if (subs.has(n.id)) return st === "running" || st === "scheduled" ? "child · subagent · handoff · running" : "child · subagent · handoff";
+  const kind = isBatch(n) ? `batch${prog} · ` : n.kind === "child" ? "child · " : "";
   if (st === "running" || st === "scheduled") {
     // Backing off: since the attempt that failed ended, not since the step was first scheduled.
     const backoff = st === "scheduled" && n.attempt > 1;
@@ -455,8 +641,10 @@ function metaLine(n, st, now) {
 // ------------------------------------------------------------------ the pane
 function select(id) {
   selected = selected === id ? null : id;
+  shownEvent = null;
   draw(G);
   pane();
+  reveal(highlightRows()); // a node's rows, brought into view in the session's own box
 }
 function linkRow(links, labels) {
   const row = el("div", { class: "links" });
@@ -480,38 +668,47 @@ function json(v) {
 }
 function pane() {
   const box = $("pane");
-  const n = selected && G.nodes.find(x => x.id === selected);
+  if (shownEvent) return eventPane(shownEvent);
+  const n = selected && (D || G).nodes.find(x => x.id === selected);
   if (!n) { box.replaceChildren(el("p", { class: "pane-empty" }, "Select a step to see its attempts, timing, input and result, and to open it in Temporal UI, its logs or its trace.")); return; }
+  if (n.placeholder) {
+    box.replaceChildren(el("h2", {}, el("span", { class: "k" }, "Node"), title(n), el("span", { class: "pill s-pending" }, "needs ✓")),
+      el("p", { class: "muted" }, "The agent asked to run this tool and waits on an approval: it is scheduled once the call is allowed."));
+    return;
+  }
   const st = stateOf(n), t = n.t || {}, ref = n.ref || {};
   const facts = el("dl", { class: "facts" });
   const fact = (k, v) => { if (v != null && v !== "") facts.append(el("dt", {}, k), el("dd", {}, v)); };
-  fact("Attempt", n.attempt ? (n.attempt > 1 ? `${n.attempt} (retried ${n.attempt - 1}×)` : "1") : null);
-  if (n.count > 1) fact("Ran", n.parallel > 1 ? `${n.count} times, up to ${n.parallel} at once` : `${n.count} times (a loop)`);
+  const kind = isBatch(n) ? `${KIND.child} · batch` : n.parent ? `${KIND[n.kind] || n.kind} · of the agent child` : KIND[n.kind] || n.kind;
+  fact("kind", kind);
+  fact("queue", ref.task_queue);
+  const p = n.progress, items = p ? ` (${p.bound ? "≥" : ""}${p.total} items)` : "";
+  fact("attempt", n.attempt ? (n.attempt > 1 ? `${n.attempt} (retried ${n.attempt - 1}×)${items}` : `1${items}`) : p ? `1${items}` : null);
+  if (p) fact("result", `${p.pages != null ? `${p.pages} page${p.pages === 1 ? "" : "s"} · ` : ""}${p.done} item${p.done === 1 ? "" : "s"} · ${p.failed || 0} fail`);
+  if (n.count > 1) fact("ran", n.parallel > 1 ? `${n.count} times, up to ${n.parallel} at once` : `${n.count} times (a loop)`);
   const closed = ms(t.closed), start = ms(t.scheduled);
-  fact("Duration", closed != null ? dur(start, closed) : start != null && (st === "running" || st === "scheduled") ? `${dur(start, api.now())} so far` : null);
-  fact("Scheduled", t.scheduled ? clock(t.scheduled) : null);
-  fact("Started", t.started ? clock(t.started) : null);
-  fact("Last attempt failed", t.last_failed ? clock(t.last_failed) : null);
-  fact("Closed", t.closed ? clock(t.closed) : null);
-  fact("Task queue", ref.task_queue);
-  fact("Activity id", ref.activity_id);
-  fact(n.kind === "child" ? "Child workflow" : "Workflow", n.kind === "child" ? ref.workflow_id : null);
-  fact("Child run", n.kind === "child" ? ref.run_id : null);
-  fact("Event", ref.event_id != null ? `#${ref.event_id}` : null);
-  fact("Trace", ref.trace_id);
-  const kind = isBatch(n) ? `batch · ${BATCH}` : KIND[n.kind] || n.kind;
-  const parts = [el("h2", {}, title(n)),
-    el("div", { class: "chips" }, el("span", { class: `pill s-${st}` }, STATUS[st] || st), el("span", { class: "chip" }, kind),
-      n.id !== title(n) ? el("span", { class: "chip" }, n.id) : null)];
+  fact("duration", closed != null ? dur(start, closed) : start != null && (st === "running" || st === "scheduled") ? `${dur(start, api.now())} so far` : null);
+  fact("scheduled", t.scheduled ? clock(t.scheduled) : null);
+  fact("started", t.started ? clock(t.started) : null);
+  fact("last attempt failed", t.last_failed ? clock(t.last_failed) : null);
+  fact("closed", t.closed ? clock(t.closed) : null);
+  fact("activity id", ref.activity_id);
+  fact("child workflow", n.kind === "child" ? ref.workflow_id : null);
+  fact("child run", n.kind === "child" ? ref.run_id : null);
+  fact("in", n.within ? n.within.workflow_id : null);
+  fact("event", ref.event_id != null ? `#${ref.event_id}` : null);
+  fact("trace", ref.trace_id);
+  const parts = [el("h2", {}, el("span", { class: "k" }, "Node"), title(n), el("span", { class: `pill s-${st}` }, STATUS[st] || st)),
+    n.id !== title(n) ? el("div", { class: "chips" }, el("span", { class: "chip" }, n.id)) : null].filter(Boolean);
   if (st === "unreached" || st === "pending") {
-    parts.push(el("p", { class: "muted" }, st === "pending"
-      ? "This run has not reached this step yet. It appears because kontra graph's mock runs reached it."
-      : "This run did not take this branch. It appears because kontra graph's mock runs took it."));
+    parts.push(st === "pending"
+      ? el("p", { class: "muted" }, "This run has not reached this step yet. It appears because the mock runs ", el("code", {}, "kontra serve"), " drew the graph from reached it.")
+      : el("p", { class: "muted" }, "This run did not take this branch. It appears because the mock runs ", el("code", {}, "kontra serve"), " drew the graph from took it."));
     box.replaceChildren(...parts);
     return;
   }
   parts.push(facts);
-  const links = linkRow(n.links, [["temporal", n.kind === "child" ? "Child run in Temporal UI" : "Event in Temporal UI"], ["logs", "Logs"], ["trace", "Trace"]]);
+  const links = linkRow(n.links, [["temporal", "temporal ui"], ["logs", "loki"], ["trace", "tempo"]]);
   if (links) parts.push(links);
   const failSlot = el("div"), ioSlot = el("div", { class: "stack" });
   if (n.failure) failSlot.append(failureBox(n, undefined));
@@ -530,6 +727,15 @@ function pane() {
   api.io(G.workflow.workflow_id, G.workflow.run_id, n.id).then(io => { ioCache.set(key, io); show(io); })
     .catch(err => { if (selected === n.id) ioSlot.replaceChildren(el("p", { class: "muted" }, `Payloads unavailable: ${err.message}. Nothing is shown rather than ciphertext.`)); });
 }
+// A row with no node: its event's verbatim body, decoded by the codec server (/api/io?event=).
+function eventPane(row) {
+  const box = $("pane");
+  const slot = el("div", { class: "stack" }, el("p", { class: "muted" }, "Decoding through the codec server…"));
+  box.replaceChildren(el("h2", {}, el("span", { class: "k" }, "Event"), row.label),
+    el("dl", { class: "facts" }, el("dt", {}, "seq"), el("dd", {}, String(row.offset)), el("dt", {}, "at"), el("dd", {}, row.rt || "—")), slot);
+  api.ioEvent(curW, curR, row.offset).then(got => { if (shownEvent === row) slot.replaceChildren(el("h3", {}, "Body"), json(got.body)); })
+    .catch(err => { if (shownEvent === row) slot.replaceChildren(el("p", { class: "muted" }, `Body unavailable: ${err.message}.`)); });
+}
 function failureBox(n, decoded) {
   const f = n.failure || {};
   const recovered = n.status === "completed";
@@ -546,51 +752,244 @@ function failureBox(n, decoded) {
   return box;
 }
 
-// ------------------------------------------------------------------ the header
+// ------------------------------------------------------------------ the session
+// Rows link to graph nodes (OD4): a row selects and flashes its node; a node lights its rows.
+function highlightRows() {
+  document.querySelectorAll("#session .row.sel").forEach(r => r.classList.remove("sel"));
+  const lit = selected ? [...document.querySelectorAll(`#session .row[data-node="${CSS.escape(selected)}"]`)] : [];
+  lit.forEach(r => r.classList.add("sel"));
+  return lit[0] || null;
+}
+// A row chosen (or lit by its node) stays in view: scrolled to inside the rows' own box, which
+// then no longer follows the tail -- the node pane growing under it must not pin it away.
+function reveal(row) {
+  const wrap = row && row.closest(".rows-wrap");
+  if (!wrap) return;
+  requestAnimationFrame(() => {
+    const rb = row.getBoundingClientRect(), wb = wrap.getBoundingClientRect();
+    if (rb.top < wb.top || rb.bottom > wb.bottom) wrap.scrollTop += rb.top - wb.top - wb.height / 3;
+    wrap.dataset.tail = wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 8 ? "1" : "0";
+  });
+}
+function flashNode(id) {
+  const g = $("canvas").querySelector(`.node[data-id="${CSS.escape(id)}"]`);
+  if (!g) return;
+  g.classList.remove("flash"); void g.getBoundingClientRect(); g.classList.add("flash");
+  if (g.scrollIntoView) g.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
+}
+function onRow(row, el) {
+  if (row.node) {
+    selected = row.node; shownEvent = null;
+    draw(G); pane(); highlightRows(); flashNode(row.node);
+  } else if (row.offset != null && !row.nested) {
+    selected = null; shownEvent = row;
+    draw(G); pane(); highlightRows();
+  }
+  reveal(el);
+}
 function header(g) {
   const wf = g.workflow || {};
   running = wf.status === "running";
-  document.title = `${wf.type || "Run"} · Kontra Run Graph`;
-  $("wf-type").textContent = wf.type || "Workflow";
-  $("wf-id").textContent = wf.workflow_id || "";
+  // An agent's run (even one with no events in history yet), not a run that is no agent.
+  const agent = S && S.reason !== "no-agent" && S.agent && S.agent.type ? S.agent : null;
+  document.title = `${agent ? agent.name || agent.type : wf.type || "Run"} · Kontra Run Graph`;
+  if (agent) {
+    // The wireframe's header: the offering, then the agent's handler; KONTRA DEV once.
+    $("wf-type").replaceChildren("KONTRA DEV · ", el("span", { class: "off" }, agent.offering || ""), ` · ${agent.name || agent.type}`);
+  } else $("wf-type").textContent = wf.type || "Workflow";
+  $("to-runs").textContent = agent ? "runs" : "kontra dev · runs";
+  const id = String(wf.workflow_id || "");
+  $("wf-id").textContent = agent && id.length > 24 ? `${id.slice(0, 12)}…${id.slice(-4)}` : id;
+  $("wf-id").title = id;
   const pill = $("wf-status");
   pill.hidden = !wf.status; pill.className = `pill s-${wf.status}`; pill.textContent = STATUS[wf.status] || wf.status || "";
+  // The wireframe's second line is an agent's: a run that is no agent keeps the line it had.
+  $("sess-queue").replaceChildren(...(wf.task_queue ? ["queue ", el("code", {}, wf.task_queue)] : []));
+  $("sess-run").replaceChildren(...(wf.run_id ? ["run ", el("code", { title: wf.run_id }, `${String(wf.run_id).slice(0, 8)}…${String(wf.run_id).slice(-4)}`)] : []));
+  $("sess-queue").hidden = $("sess-run").hidden = !agent;
+  $("ind").hidden = !agent;
   const t = wf.t || {};
   const end = ms(t.closed) ?? (running ? api.now() : null);
   const d = dur(ms(t.started), end);
-  $("wf-time").textContent = t.started ? `started ${clock(t.started)}${d ? ` · ${running ? "running for " : "took "}${d}` : ""}` : "";
-  const nav = linkRow(wf.links, [["temporal", "Temporal UI"], ["logs", "Logs"], ["trace", "Trace"]]);
+  const when = t.started ? `started ${clock(t.started)}${d ? ` · ${running ? "running for " : "took "}${d}` : ""}` : "";
+  // An agent's header is the wireframe's two lines: the clock is the status pill's title there.
+  $("wf-time").textContent = agent ? "" : when;
+  pill.title = agent ? when : "";
+  const nav = linkRow(wf.links, agent ? [["temporal", "Temporal UI"], ["logs", "Grafana"]] : [["temporal", "Temporal UI"], ["logs", "Grafana"], ["trace", "Trace"]]);
   $("wf-links").replaceChildren(...(nav ? nav.childNodes : []));
   const note = $("notice");
   if (g.static_graph === false) {
-    note.replaceChildren("No static graph for this offering yet, so only what this run did is drawn. Run ",
-      el("code", {}, "kontra graph --dir <project>"), " to see every branch, including the ones this run never takes.");
+    if (g.handler) note.replaceChildren("This offering's entry is a handler, so only what this run did is drawn.");
+    else note.replaceChildren("No static graph for this offering yet: start ", el("code", {}, "kontra serve"), " once and it is drawn in the background.");
     note.hidden = false;
   } else note.hidden = true;
 }
+function indicator(open) {
+  $("ind").classList.toggle("off", !open);
+  $("strm").classList.toggle("off", !open);
+}
+function turnHead(turn) {
+  const keys = turn.input_keys || [];
+  // The input's type when the agent says it (its agent_interface), else its first field.
+  const shown = turn.input_type || `${keys.slice(0, 1).join("")}${keys.length > 1 ? ", …" : ""}`;
+  const sig = turn.handler ? ` · ${turn.handler}(${shown})` : "";
+  const h = el("div", { class: "turnhead", title: turn.handler ? `${turn.handler}(${keys.join(", ")})` : null },
+    "── turn ", el("b", {}, String(turn.turn_number ?? "?")), el("span", { class: "sig" }, sig));
+  if (turn.status && turn.status !== "running") h.append(el("span", { class: `tstatus pill s-${turn.status}` }, STATUS[turn.status] || turn.status));
+  return h;
+}
+let lastRt = null; // a row's time is shown when it moved since the row before
+function rowEl(row, nested) {
+  const node = row.node || (row.tool_id ? needs.get(row.tool_id) : null) || null;
+  if (node && !row.node) row = { ...row, node }; // a call waiting on its approval: its "needs ✓" node
+  const cls = ["row", row.state || "", nested ? `nest d${nested}` : "", row.type === "unknown" ? "generic" : "", node ? "islink" : row.offset != null && !nested ? "isbody" : "",
+    selected && selected === node ? "sel" : ""].filter(Boolean).join(" ");
+  const r = el("div", { class: cls, "data-node": node || null, "data-offset": row.offset != null ? String(row.offset) : null, "data-event": row.event_id != null ? String(row.event_id) : null });
+  if (node) r.setAttribute("title", row.node_fallback ? `${node} · linked by name and order: its input is sealed to another key`
+    : nested ? `${node} · in the subagent's own history` : `${node}${row.event_id != null ? ` · event #${row.event_id}` : ""}`);
+  r.append(el("span", { class: "g" }, row.glyph || "·"));
+  const mid = el("span", { class: "mid" }, el("span", { class: "lbl" }, row.label));
+  if (row.summary) mid.append(el("span", { class: "sum" }, " " + row.summary));
+  r.append(mid);
+  const right = el("span", { class: "rt" });
+  if (row.usage) right.append(el("span", { class: "usage", title: "tokens in → out" }, row.usage));
+  if (row.rt && row.rt !== lastRt && !nested) right.append(row.rt);
+  if (!nested) lastRt = row.rt || lastRt;
+  r.append(right);
+  if (node || (row.offset != null && !nested)) {
+    r.tabIndex = 0; r.setAttribute("role", "button");
+    r.addEventListener("click", () => onRow(row, r));
+    r.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); onRow(row, r); } });
+  }
+  return r;
+}
+// An approval or a callback the agent asked for. Here the seller answers it (OD7): the row says
+// so, and offers nothing to press.
+function gate(row, agent) {
+  const panel = el("div", { class: "appr" });
+  panel.append(el("div", { class: "to" }, row.hint ? `${row.tool_name || row.summary} → ${row.hint}` : row.tool_name || row.summary || "tool"));
+  let note;
+  if (!row.pending) note = `answered · ${row.resolution || "resolved"}${row.auto ? ` · auto: ${row.auto}` : ""}`;
+  else if (agent.case === "a") note = "informational: a hired turn ends on it (one hire is one turn)";
+  else if (agent.status !== "running") note = "run ended · unanswered";
+  else note = `waiting on the seller${row.auto ? ` · auto: ${row.auto}` : ""}`;
+  panel.append(el("div", { class: "note" }, note));
+  return panel;
+}
+function emptyState(session) {
+  const msg = { "no-agent": "This offering has no agent session (its entry is not an agent).",
+    "no-events": "No agent events yet — the run has not started its first turn.",
+    "not-in-history": "This run's events are not in history yet: nobody has read its turn_events stream.",
+    "in-bucket": "This job's events are in the bucket, by reference: the codec server holds no gate session to fetch them.",
+    "undecodable": "This run's agent events could not be rendered: the codec server's log says why." }[session.reason] || "No agent session.";
+  return el("div", { class: "sess-empty" }, el("p", {}, msg));
+}
+function rowsOf(wrap, rows, agent, depth) {
+  for (const row of rows) {
+    if (row.type === "truncated") { wrap.append(el("div", { class: "subnote" }, row.summary)); continue; }
+    wrap.append(rowEl(row, depth));
+    // A handoff's own rows under it, a subagent's subagents' under theirs (OD5: at most 3 deep).
+    rowsOf(wrap, row.children || [], agent, Math.min(3, depth + 1));
+    if (row.note) wrap.append(el("div", { class: "subnote" }, row.note));
+    if (row.link) wrap.append(el("div", { class: "subnote" }, el("a", { href: api.href(row.link), target: "_blank", rel: "noopener noreferrer" }, "open the subagent ↗"), ` · ${row.link_reason || ""}`));
+    if (!depth && (row.label === "approval.requested" || row.label === "callback.requested")) wrap.append(gate(row, agent));
+  }
+}
+function renderSession(session) {
+  S = session;
+  const card = $("session-card"), box = $("session"), foot = $("session-footer");
+  // A run that is no agent has no session card: its page is the graph page it always was.
+  card.hidden = session.empty && session.reason === "no-agent";
+  if (card.hidden) return;
+  const agent = session.agent || {};
+  $("strm").hidden = false;
+  $("strm").textContent = `stream ${session.stream || "turn_events"}`;
+  if (session.empty) { box.replaceChildren(emptyState(session)); foot.hidden = true; return; }
+  // A live session follows its tail (the newest row is the one that matters), unless scrolled
+  // up: read before the old rows go (a detached box scrolls nowhere).
+  const old = box.querySelector(".rows-wrap"), same = !!old && old.dataset.run === String(agent.run_id);
+  const tail = !same || old.dataset.tail !== "0", top = same ? old.scrollTop : 0;
+  const wrap = el("div", { class: "rows-wrap", "data-run": String(agent.run_id), "data-tail": tail ? "1" : "0" });
+  // At the bottom it follows; scrolled up by the user, it stays (a box resized as the column
+  // settles scrolls too, and that is no one leaving the tail).
+  const touched = () => { wrap.dataset.user = String(Date.now()); };
+  for (const kind of ["wheel", "touchstart", "keydown", "pointerdown"]) wrap.addEventListener(kind, touched, { passive: true });
+  wrap.addEventListener("scroll", () => {
+    if (wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 8) wrap.dataset.tail = "1";
+    else if (Date.now() - Number(wrap.dataset.user || 0) < 1500) wrap.dataset.tail = "0";
+  }, { passive: true });
+  lastRt = null;
+  for (const turn of session.turns) {
+    wrap.append(turnHead(turn));
+    rowsOf(wrap, turn.rows, agent, 0);
+  }
+  if (old) rowsSeen.unobserve(old);
+  box.replaceChildren(wrap);
+  if (tail) pin(wrap); else wrap.scrollTop = top;
+  rowsSeen.observe(wrap); // and again whenever the box is resized (the node pane, the column)
+  const f = session.footer || {};
+  foot.hidden = false;
+  foot.replaceChildren(el("span", { class: "key" }, `${f.count || 0} events`), el("span", { class: "key" }, `seq ${f.last_offset ?? "—"}`),
+    el("span", {}, "dedupe by seq (the stream offset)"), el("span", {}, `decrypted with ${f.decrypted || "this machine's dev key"}`));
+  highlightRows();
+}
+// A box at its tail stays there as the column around it settles.
+function pin(w) { w.scrollTop = w.scrollHeight; }
+const rowsSeen = new ResizeObserver(entries => { for (const e of entries) if (e.target.dataset.tail === "1") pin(e.target); });
+// Wide: the right column is as tall as the room below where it starts, so the session, its
+// footer and the node pane are in view together (the wireframe's); its rows scroll on their own.
+function fitColumn() {
+  const col = $("rightcol"), on = !!S && !(S.empty && S.reason === "no-agent") && matchMedia("(min-width: 901px)").matches;
+  $("split").classList.toggle("agent", !!S && !(S.empty && S.reason === "no-agent"));
+  col.classList.toggle("fitted", on);
+  col.style.height = on ? `${Math.max(320, innerHeight - ($("split").getBoundingClientRect().top + scrollY) - 12)}px` : "";
+}
 
 // ------------------------------------------------------------------ views
-function paint(g) {
-  G = g;
+function paint(view) {
+  const g = view.graph;
+  G = g; S = view.session || null;
+  needs = needsOf(g);
+  if (selected && !withNeeds(g).nodes.some(n => n.id === selected)) selected = null;
   header(g);
+  if (S) renderSession(S); else $("session-card").hidden = true;
+  fitColumn();
   draw(g);
-  if (selected && !g.nodes.some(n => n.id === selected)) selected = null;
   pane();
+}
+// The one fetch both panes paint from; a stat while it is in flight asks for one more after it.
+function refresh() {
+  if (!curW) return;
+  if (fetching) { again = true; return; }
+  fetching = api.session(curW, curR).then(paint).catch(() => { /* keep the last good paint */ })
+    .finally(() => { fetching = null; if (again) { again = false; refresh(); } });
 }
 async function graphView(w, r) {
   $("graph-view").hidden = false; $("runs-view").hidden = true;
   $("to-runs").href = api.href(null);
-  try { paint(await api.graph(w, r)); } catch (err) { fail(err); return; }
+  let first;
+  try { first = await api.session(w, r); } catch (err) { fail(err); return; }
+  curW = w; curR = r || (first.graph.workflow && first.graph.workflow.run_id) || null;
+  paint(first);
   if (closeStream) closeStream();
-  closeStream = api.subscribe(w, r || G.workflow.run_id, paint, () => {}, () => {
-    if (!running) return;
-    const note = $("notice");
-    note.textContent = "Live updates stopped: the codec server refused or went away. Reload the page to resume.";
-    note.hidden = false;
+  streamOpen = false;
+  closeStream = api.subscribe(w, curR, {
+    stat: () => refresh(),
+    open: () => { streamOpen = true; indicator(true); },
+    end: () => { streamOpen = false; indicator(false); },
+    lost: () => {
+      streamOpen = false; indicator(false);
+      if (!running) return;
+      const note = $("notice");
+      note.textContent = "Live updates stopped: the codec server refused or went away. Reload the page to resume.";
+      note.hidden = false;
+    },
   });
 }
 async function runsView() {
   $("graph-view").hidden = true;
+  curW = null; curR = null; S = null; $("ind").hidden = true;
+  $("sess-queue").replaceChildren(); $("sess-run").replaceChildren();
   $("wf-type").textContent = "Recent runs"; $("wf-id").textContent = ""; $("wf-status").hidden = true; $("wf-time").textContent = "";
   let runs;
   try { runs = await api.workflows(); } catch (err) { fail(err); return; }
@@ -610,11 +1009,11 @@ function fail(err) {
   note.textContent = `Could not load: ${err.message}`;
   note.hidden = false;
 }
-addEventListener("resize", () => { if (G) draw(G); });
+addEventListener("resize", () => { if (G) { fitColumn(); draw(G); } });
 // While the run is open, its clocks keep moving between events.
 setInterval(() => { if (G && running && !document.hidden) { header(G); draw(G); } }, 1000);
 if (api.query.w) graphView(api.query.w, api.query.r); else runsView();
-window.KONTRA_CONSOLE_OPEN = (w, r) => { selected = null; ioCache.clear(); if (w) graphView(w, r); else runsView(); };
+window.KONTRA_CONSOLE_OPEN = (w, r) => { selected = null; shownEvent = null; ioCache.clear(); if (w) graphView(w, r); else runsView(); };
 })();
 </script>
 </body>

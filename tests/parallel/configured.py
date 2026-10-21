@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-from kontra import activity
+from temporalio import activity
 
 FACTOR = int(os.environ.get("BATCH_TEST_FACTOR", "3"))
 

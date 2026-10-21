@@ -1,6 +1,7 @@
 """Fixtures for ``execute_activities_in_parallel``: the process's shared dev server, and a
-running worker on a fresh task queue with the pydantic converter and Kontra's sandbox
-passthrough -- what ``kontra.serve.Worker`` gives a seller, minus the marketplace.
+running worker on a fresh task queue with the pydantic converter and nothing of Kontra's but
+the helper's own plugin (:class:`~kontra.contrib.parallel.ParallelPlugin`): the helper runs
+on any Temporal worker, Temporal's default sandbox included.
 
 Without ``KONTRA_TEMPORAL_CLI`` the dev server is CLI 1.9.1, downloaded once into the temp
 directory; with neither the binary nor the network, these tests are skipped."""
@@ -18,8 +19,7 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
-from kontra._parallel import _Batch
-from kontra.serve.worker import workflow_runner
+from kontra.contrib.parallel import ParallelPlugin
 from kontra.testing.devserver import (
     CLI_ENV,
     DevServer,
@@ -65,15 +65,15 @@ def pydantic_client(client: Client) -> Client:
 
 @asynccontextmanager
 async def serving(client: Client, **kwargs: Any) -> AsyncIterator[tuple[Client, str]]:
-    """A worker for :class:`Parent` and the batch child on a new task queue."""
+    """A worker for :class:`Parent` and (the plugin's) batch child on a new task queue."""
     client = pydantic_client(client)
     task_queue = f"batch-{uuid.uuid4().hex[:8]}"
     async with Worker(
         client,
         task_queue=task_queue,
-        workflows=[Parent, _Batch],
+        workflows=[Parent],
         activities=ACTIVITIES,
-        workflow_runner=workflow_runner(),
+        plugins=[ParallelPlugin()],
         **kwargs,
     ):
         yield client, task_queue

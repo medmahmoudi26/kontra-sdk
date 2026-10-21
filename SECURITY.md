@@ -19,7 +19,8 @@ A useful report says:
 - what an attacker can do, and in which role (seller, buyer, an unauthenticated network
   peer, someone who obtained Kontra's stored data);
 - the affected component and version or commit;
-- how to reproduce it, ideally against `kontra dev` or `kontra.testing.Marketplace`;
+- how to reproduce it, ideally against `kontra dev`, `kontra.testing.Marketplace` or the e2e
+  stack (`make stack-up`);
 - anything you know about a fix.
 
 ## Scope
@@ -31,7 +32,9 @@ In scope, in this repository:
   hide a real flaw;
 - `temporal/authorizer`: the Authorizer, the callback guard, the server binary and the
   `ghcr.io/medmahmoudi26/kontra-temporal` image;
-- `compose.yaml` (`kontra dev`), the examples, and the CI workflows and release process.
+- `kontra.devgate` and `kontra dev` (the dev stack's loopback exposure, decisions I34),
+  `compose.yaml` (the e2e stack), `observability/compose.yaml` (`kontra dev up
+  --observability`), the examples, and the CI workflows and release process.
 
 The hosted platform (the gate, the console) lives in a private repository; report problems
 with it here as well and we will route them.
@@ -47,8 +50,9 @@ Kontra, tell us too: `temporal/authorizer/callbackguard` exists because of one.
 
 ## Testing
 
-Use `kontra dev` (a complete local stack) or `kontra.testing.Marketplace` (in-process) rather
-than the hosted service. Against the hosted service: test only with accounts and data you own,
+Use `kontra dev` or `kontra.testing.Marketplace` (in-process) for the gate's API and escrow,
+and the Authorizer through `make deny-matrix` or the e2e stack (`make e2e`: `kontra dev`'s
+Temporal dev server has no Authorizer), rather than the hosted service. Against the hosted service: test only with accounts and data you own,
 do not read, change or delay other parties' jobs or funds, and stop and report as soon as you
 can show impact. We will not pursue good-faith research that follows these rules.
 

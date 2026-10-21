@@ -73,6 +73,9 @@ _HINTS = {
     "too_many_devices": "remove a device first: `kontra devices list`",
 }
 
+#: Hints that tell a human to log in again; a dev profile is pointed at `kontra dev up` instead.
+_RELOGIN_CODES = frozenset({"invalid_token", "stale_session"})
+
 
 #: C0 and C1 control characters but tab and newline: an escape sequence in a seller's text
 #: (a rejection reason, a failure message) must not drive the buyer's terminal.
@@ -106,10 +109,13 @@ def describe(exc: BaseException) -> str | None:
     from kontra.contract.names import NameError_
     from kontra.gate_client import GateError
     from kontra.ledger import LedgerError
-    from kontra.profile import ProfileError
+    from kontra.profile import ProfileError, profile_is_dev
 
     if isinstance(exc, GateError):
         hint = _HINTS.get(exc.code)
+        if hint and exc.code in _RELOGIN_CODES and profile_is_dev():
+            # A dev profile is never told `kontra login` (decisions I34, OD14).
+            hint = "the dev gate restarted? run `kontra dev up`, then restart what you were running"
         line = f"the gate answered {exc.status} {exc.code}: {exc.message}"
         return f"{line}\n  {hint}" if hint else line
     if isinstance(exc, OfferingError):
@@ -120,7 +126,10 @@ def describe(exc: BaseException) -> str | None:
         where = ""
         with contextlib.suppress(RuntimeError):  # no request attached
             where = f" {exc.request.url.copy_with(query=None)}"
-        return f"cannot reach{where}: {str(exc) or type(exc).__name__}"
+        line = f"cannot reach{where}: {str(exc) or type(exc).__name__}"
+        if profile_is_dev():  # the local dev stack is not up (decisions I34, OD14)
+            return f"{line}\n  is the dev stack up? run `kontra dev up` (`kontra dev status`)"
+        return line
     if isinstance(exc, LoginError):
         return exc.message
     known: tuple[type[BaseException], ...] = (
