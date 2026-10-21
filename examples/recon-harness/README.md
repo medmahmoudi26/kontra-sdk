@@ -87,6 +87,11 @@ the workflow's, as in `../chef-agents`:
   vLLM, OpenRouter, Mistral), for the model `LLM_MODEL` names (default `qwen2.5`), with
   `LLM_API_KEY` if it needs one. It needs `pip install openai`.
 
+The switch is `../chef-agents`' `LLM_BASE_URL`, with two differences: unset, it means the
+scripted model here, not Ollama's default address; and the model's name is `LLM_MODEL`, since
+this worker calls the endpoint itself, where `../chef-agents` takes the OpenAI Agents SDK's
+own `OPENAI_DEFAULT_MODEL`.
+
 The prompt carries what the turn learnt as counts, never the buyer's domains. Pointing the
 worker at a hosted model is still a fact for the buyer: set `uses_hosted_model: true` in
 `offering.yaml` (and bump `version`: it is part of the contract). A model that chooses the

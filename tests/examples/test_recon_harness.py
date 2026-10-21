@@ -47,7 +47,10 @@ asynchronous = pytest.mark.asyncio(loop_scope="package")
 NAME = "recon-harness"
 EXAMPLE = EXAMPLES / NAME
 OFFERING = "acme/recon-harness"
-DOMAINS = ["example.com", "example.org", "example.net", "example.edu"]
+#: By ``fetch_cert``'s rule (activities.py: a host's code points summed, mod 7 expired, mod 5
+#: weak): www.example.co's certificate has expired, www.example.org's and www.example.edu's
+#: are weak, www.example.com's is fine.
+DOMAINS = ["example.com", "example.org", "example.co", "example.edu"]
 #: The README's block starts with the offering, as every example's graph does.
 README_HEADER = "%% acme/recon-harness@0.1.0\n"
 
@@ -104,13 +107,12 @@ async def test_a_hire_is_one_turn_of_the_agent(market: Market, tmp_path: Path) -
             quiet_agent,
         )
 
-    # The typed report: the scripted model's summary, the tools' counts.
+    # The typed report: the scripted model's summary, the tools' counts (the subagent's
+    # among them: one expired, two weak, as DOMAINS says).
     assert isinstance(result, report_type)
-    assert (result.domains, result.targets, result.posted, result.confirmed) == (4, 4, None, None)
-    assert (
-        result.summary
-        == f"done: 4 domains, 4 probed, 3 open, {result.expired} expired, {result.weak} weak"
-    )
+    assert (result.domains, result.targets, result.expired, result.weak) == (4, 4, 1, 2)
+    assert (result.posted, result.confirmed) == (None, None)
+    assert result.summary == "done: 4 domains, 4 probed, 3 open, 1 expired, 2 weak"
 
     # The agent's events, relayed to the buyer: the turn, the model, its tools, the subagent,
     # and last the reply, which is the job's result (the turn mirrors up to it).
@@ -130,8 +132,13 @@ async def test_a_hire_is_one_turn_of_the_agent(market: Market, tmp_path: Path) -
         e[ae.EVENT] for e in streamed if e[ae.EVENT][ae.EVENT_TYPE] == ae.MESSAGE_HANDLER_END
     ]
     assert reply[ae.EVENT_OUTPUT] == result.model_dump(mode="json")
-    tools = [e[ae.EVENT]["tool_name"] for e in streamed if e[ae.EVENT][ae.EVENT_TYPE] == "tool_end"]
-    assert tools == ["plan", "probe"]  # fetch_cert runs in the subagent, on its own stream
+    tools = [
+        (e[ae.EVENT]["tool_name"], e[ae.EVENT]["tool_output"])
+        for e in streamed
+        if e[ae.EVENT][ae.EVENT_TYPE] == "tool_end"
+    ]
+    # fetch_cert runs in the subagent, on its own stream.
+    assert tools == [("plan", "4 targets"), ("probe", "3/4 open")]
 
     # The escrow: held at the quoted price, released to the seller on accept.
     assert (view.state, view.escrow) == (m.JobState.COMPLETED, m.Escrow.RELEASED)

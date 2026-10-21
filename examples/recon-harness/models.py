@@ -64,7 +64,7 @@ class Probed(BaseModel):
     open: int
 
     def __str__(self) -> str:
-        return f"{self.probed}/{self.probed}"
+        return f"{self.open}/{self.probed} open"
 
 
 class CertRequest(BaseModel):
