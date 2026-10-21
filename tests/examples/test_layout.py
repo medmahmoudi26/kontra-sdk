@@ -1,7 +1,7 @@
 """The examples are where the PRD puts them (§14: ``examples/{enrich,recon,legacy-actor}``),
 next to ``examples/hello``, the smallest offering, two agents: ``examples/chef-agents``
 (an agent as workflow code) and ``examples/chef-claude`` (an agent that is a process), and
-``examples/sweep`` (a fan-out, a batch and a branch: what ``kontra graph`` draws). Each
+``examples/sweep`` (a fan-out, a batch and a branch: what the graph page draws). Each
 seller is in the §6.1 project layout, its ``worker.py`` exposing the module-level ``worker``
 that ``kontra serve`` runs, binding one ``acme/`` offering."""
 

@@ -5,14 +5,14 @@ signature is the contract: `kontra publish` derives the published JSON Schema fr
 
 Each value crosses Temporal as one payload (2 MB at most, on a Temporal without kontra's
 codec; `kontra serve`'s codec carries one over 256 KiB in the claim-check bucket): the
-URLs go into the batch's input, the flagged ones into its accumulator, and the sites' files
+URLs come back from `plan` in one, the flagged ones go to `score` in one, and the sites' files
 into the report. So a job is at most 200 URLs of at most 2,048 characters, each written as
 RFC 3986 writes a URL (ASCII; anything else percent-encoded), so one byte each as JSON, and
 what is kept of each site's files is bounded in bytes (activities.py): the largest payload,
 for 200 such URLs on as many sites, stays under 1.7 MB.
 
-`Artifact` is the only Kontra type allowed here (D1): a reference to an encrypted file in
-the claim-check bucket, never the bytes.
+`Artifact` (`kontra.types`) is the one Kontra type a seller's models use (decisions I29): a
+reference to an encrypted file in the claim-check bucket, never the bytes.
 """
 
 from typing import Annotated, Literal
@@ -157,8 +157,8 @@ class Unreachable(BaseModel):
 
 
 class Tally(BaseModel):
-    """The batch's accumulator (`reduce=`): what is kept of every `HeaderCheck`. A page
-    that has every header leaves only a count."""
+    """What the workflow keeps of every `HeaderCheck` (`tally`): a page that has every header
+    leaves only a count."""
 
     checked: int = 0
     flagged: list[Flagged] = Field(default_factory=list[Flagged])

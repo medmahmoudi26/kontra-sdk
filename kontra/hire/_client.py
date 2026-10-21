@@ -34,7 +34,6 @@ import base64
 import binascii
 import contextlib
 import dataclasses
-import json
 import logging
 import math
 import re
@@ -50,7 +49,7 @@ import httpx
 import temporalio.api.enums.v1 as temporal_enums
 import temporalio.api.workflowservice.v1 as temporal_service
 from google.protobuf.message import DecodeError
-from pydantic import BaseModel, PrivateAttr, TypeAdapter
+from pydantic import BaseModel, PrivateAttr, TypeAdapter, ValidationError
 from temporalio.api.common.v1 import Payload
 from temporalio.client import Client, NexusOperationFailureError, NexusOperationHandle
 from temporalio.contrib.pydantic import PydanticPayloadConverter
@@ -64,7 +63,8 @@ from kontra.auth import Session
 from kontra.codec import CodecError, GateBlobStore, KontraCodec, data_converter
 from kontra.codec import age as age_crypto
 from kontra.contract import ContractError, ContractInfo, InputValidator, validate_document
-from kontra.contract.names import NameError_, is_job_id
+from kontra.contract.names import PROGRESS_TOPIC, NameError_, is_job_id
+from kontra.contract.offering import check_topic
 from kontra.gate_client import GateClient, GateError
 from kontra.gate_client import models as m
 from kontra.hire._errors import (
@@ -88,10 +88,11 @@ from kontra.hire._service import (
     outcome_of,
     price_text,
 )
+from kontra.hire._stream import JobStream, decode_item, open_event
 from kontra.ledger import CURRENCIES, Money
 from kontra.profile import NotLoggedIn, Profile, ProfileError
 from kontra.serve.jobs import SellerKeyCache
-from kontra.types import Artifact
+from kontra.types import Artifact, ProgressRecord
 
 __all__ = [
     "Job",
@@ -153,6 +154,10 @@ _OPEN = frozenset({m.JobState.SUBMITTED, m.JobState.WORKING})
 #: One long poll for the start of ``execute`` never waits longer than this.
 _START_POLL_CHUNK = 10.0
 _STAGE_STARTED = temporal_enums.NexusOperationWaitStage.NEXUS_OPERATION_WAIT_STAGE_STARTED
+
+
+#: What a ``kontra.progress`` item is.
+_PROGRESS_RECORD: TypeAdapter[ProgressRecord] = TypeAdapter(ProgressRecord)
 
 
 class TemporalUnavailable(Exception):
@@ -286,11 +291,13 @@ def _unavailable(err: RPCError) -> bool:
 class Progress:
     """One progress event of a job (§8.4).
 
-    ``heartbeat``: the seller's own ``activity.heartbeat(details)``, decrypted with our key;
-    ``percent`` and ``message`` are read from details that are a mapping with those keys.
-    ``history``: liveness the platform reads from workflow history metadata (state, the
-    activities running, how many completed). ``str(p)`` follows the rendering convention:
-    percent and message when the seller gave them, else "alive, in <activity>, at <time>".
+    ``heartbeat``: the seller's own ``activity.heartbeat(details)``, decrypted with our key
+    (an item of the job stream's ``kontra.progress`` topic, decisions I31); ``percent`` and
+    ``message`` are read from details that are a mapping with those keys. ``history``:
+    liveness the platform reads from workflow history metadata (state, the activities
+    running, how many completed). ``seq`` is the event's place in the job's stream at the
+    gate (its cursor). ``str(p)`` follows the rendering convention: percent and message when
+    the seller gave them, else "alive, in <activity>, at <time>".
     """
 
     seq: int
@@ -525,14 +532,38 @@ class Job:
             await asyncio.sleep(delay)
             delay = min(delay * 2, _POLL_MAX)
 
+    @overload
+    def stream(self, topic: str, *, after: int = 0) -> JobStream[Any]: ...
+    @overload
+    def stream(self, topic: str, *, type: type[_T], after: int = 0) -> JobStream[_T]: ...
+    def stream(self, topic: str, *, type: Any = None, after: int = 0) -> JobStream[Any]:
+        """One topic of the job's workflow stream, as the seller publishes it with
+        temporalio's own API, relayed by the gate and decrypted here (decisions I31):
+        ``async for event in job.stream("turn_events", type=AgentEvent)``. ``type``: what
+        each item is validated as -- your own pydantic model (Kontra never imports the
+        seller's), ``dict`` to take any JSON; default: the JSON as it is. A topic the
+        offering does not list (``streams:`` in its catalog entry) is refused by the gate.
+        ``after``: a :attr:`JobStream.cursor` to resume from."""
+        check_topic(topic)
+        adapter: TypeAdapter[Any] = TypeAdapter(type if type is not None else Any)
+        return JobStream(self._kontra, self.job_id, topic, adapter, after)
+
     async def progress(self) -> AsyncIterator[Progress]:
-        """Progress until the job closes: the seller's heartbeats (decrypted with our key)
-        and liveness from history, in order. Server-sent events through the gate."""
+        """Progress until the job closes: the seller's heartbeats (the ``kontra.progress``
+        topic of its stream, decrypted with our key) and liveness from history, in order.
+        Server-sent events through the gate."""
         await self._kontra._ensure_job_key(self.job_id, required=False)
-        events = self._kontra.gate.progress(self.job_id)
+        events = self._kontra.gate.stream(self.job_id, topics=[PROGRESS_TOPIC], history=True)
+        offset = -1
         try:
             async for event in events:
-                yield self._kontra._progress(event)
+                if event.offset is not None:
+                    if event.offset <= offset:
+                        continue  # an item the gate relayed twice
+                    offset = event.offset
+                found = self._kontra._progress(event, self.job_id)
+                if found is not None:
+                    yield found
         finally:
             # A caller that stops early closes this generator: close the stream with it now,
             # not whenever the garbage collector gets to the open HTTP response.
@@ -1682,38 +1713,50 @@ class Kontra:
         bound._identities = (self._identity, *self._job_identities)
         return bound
 
-    def _progress(self, event: m.ProgressEvent) -> Progress:
-        if event.source is m.ProgressSource.HEARTBEAT and event.ciphertext_b64 is not None:
-            details: Any = None
-            try:
-                plain = age_crypto.decrypt(
-                    base64.b64decode(event.ciphertext_b64),
-                    [self._identity, *self._job_identities],
-                )
-                details = json.loads(plain)
-            except (age_crypto.AgeError, binascii.Error, ValueError) as err:
-                log.warning("progress event %d does not decrypt for us: %s", event.seq, err)
-            percent, message = _heartbeat_fields(details)
+    def _progress(self, event: m.StreamEvent, job_id: str = "") -> Progress | None:
+        """One event of ``job_id``'s stream as progress: a ``kontra.progress`` item (the
+        seller's heartbeat, a :class:`~kontra.types.ProgressRecord`) or a history event;
+        None for anything else (a gap, an item not for us)."""
+        if event.kind is m.StreamEventKind.HISTORY:
             return Progress(
-                seq=event.seq,
+                seq=event.cursor,
                 at=event.at,
-                source=event.source,
-                activity=event.activity,
-                percent=percent,
-                message=message,
-                details=details,
+                source=m.ProgressSource.HISTORY,
                 state=event.state,
+                activities_running=tuple(event.activities_running or ()),
+                activities_completed=event.activities_completed,
+                last_event=event.last_event,
+                continue_as_new_count=event.continue_as_new_count,
             )
+        if event.kind is m.StreamEventKind.GAP:
+            if event.offset is None:
+                log.info(
+                    "the gate stopped relaying the stream of job %s (%s); progress goes on "
+                    "from history",
+                    job_id,
+                    event.reason.value if event.reason is not None else "gap",
+                )
+            return None
+        if event.topic != PROGRESS_TOPIC:
+            return None
+        payload = open_event(event, self.identities, job_id)
+        if payload is None:
+            return None
+        try:
+            record: ProgressRecord = decode_item(payload, _PROGRESS_RECORD)
+        except (ValueError, ValidationError) as err:
+            log.warning("progress event %d is not a progress record: %s", event.cursor, err)
+            return None
+        percent, message = _heartbeat_fields(record.details)
         return Progress(
-            seq=event.seq,
-            at=event.at,
-            source=event.source,
-            activity=event.activity,
+            seq=event.cursor,
+            at=record.at,
+            source=m.ProgressSource.HEARTBEAT,
+            activity=record.activity,
+            percent=percent,
+            message=message,
+            details=record.details,
             state=event.state,
-            activities_running=tuple(event.activities_running or ()),
-            activities_completed=event.activities_completed,
-            last_event=event.last_event,
-            continue_as_new_count=event.continue_as_new_count,
         )
 
     # ------------------------------------------------------------------ jobs, money, files

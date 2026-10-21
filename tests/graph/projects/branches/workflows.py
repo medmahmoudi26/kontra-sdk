@@ -4,7 +4,9 @@ activity's result; wait for an approval that only a signal brings (a timer ends 
 import asyncio
 from datetime import timedelta
 
-from kontra import workflow
+from temporalio import workflow
+
+from kontra.contrib.parallel import execute_activities_in_parallel
 
 with workflow.unsafe.imports_passed_through():
     from activities import accept, check, classify, fetch_a, fetch_b, plan, reject, ship
@@ -33,7 +35,7 @@ class BranchesFlow:
             workflow.execute_activity(fetch_a, p, start_to_close_timeout=T),
             workflow.execute_activity(fetch_b, p, start_to_close_timeout=T),
         )
-        checked = await workflow.execute_activities_in_parallel(
+        checked = await execute_activities_in_parallel(
             check, items=p.items, reduce=count, init=0, start_to_close_timeout=T
         )
         verdict = await workflow.execute_activity(classify, checked, start_to_close_timeout=T)

@@ -16,8 +16,19 @@ from typing import Any
 
 from kontra.serve import BoundOffering, Quote, Worker, offering
 
-from .flows import EnrichFlow, ProbeFlow, TextFlow, beat, make_file, quiet, read_doc, upper
-from .models import EnrichInput, ProbeInput, TextJob
+from .flows import (
+    EnrichFlow,
+    FeedFlow,
+    ProbeFlow,
+    TextFlow,
+    beat,
+    feed,
+    make_file,
+    quiet,
+    read_doc,
+    upper,
+)
+from .models import EnrichInput, FeedJob, ProbeInput, TextJob
 
 _versions = itertools.count(1)
 
@@ -97,3 +108,17 @@ def recon_worker(directory: Path) -> Worker:
         write_offering(directory, "acme/enrich"), workflow=EnrichFlow, quote=quote_enrich
     )
     return Worker(offerings=[probe, enrich])
+
+
+async def quote_feed(job: FeedJob) -> Quote:
+    return Quote(price=Decimal("0.05"))
+
+
+def feed_worker(directory: Path) -> tuple[Worker, BoundOffering]:
+    """``acme/feed``, ``streams: [events]``."""
+    bound = offering(
+        write_offering(directory, "acme/feed", streams=["events"]),
+        workflow=FeedFlow,
+        quote=quote_feed,
+    )
+    return Worker(offerings=[bound], activities=[feed]), bound

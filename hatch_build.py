@@ -1,10 +1,12 @@
-"""Put the spec files and the ``kontra dev`` stack inside the package of a wheel.
+"""Put the spec files and ``kontra dev up --observability``'s stack inside a wheel's package.
 
-In a checkout they live outside it (``spec/``, ``compose.yaml`` and the ``observability/``
-and ``docs/dashboards/`` files its profiles mount: one copy each); the sdist carries them
-already inside (``kontra/_spec``, ``kontra/_dev/``), so that it holds the package, the README
-and the licence and nothing else. A wheel built from either tree gets the same files. The stack's
-files keep their places relative to ``compose.yaml``, which names them by relative path.
+In a checkout they live outside it (``spec/`` and the ``observability/`` and
+``docs/dashboards/`` files the observability compose file mounts: one copy each); the sdist
+carries them already inside (``kontra/_spec``, ``kontra/_dev/``), so that it holds the package,
+the README and the licence and nothing else. A wheel built from either tree gets the same files.
+The stack's files keep their places relative to ``observability/compose.yaml``, which names them
+by relative path. The e2e ``compose.yaml`` (the prod gate image) is repository tooling and is not
+shipped (decisions I34).
 """
 
 from __future__ import annotations
@@ -17,7 +19,6 @@ from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 #: checkout path -> path inside the package
 OUTSIDE = {
     "spec": "kontra/_spec",
-    "compose.yaml": "kontra/_dev/compose.yaml",
     "observability": "kontra/_dev/observability",
     "docs/dashboards": "kontra/_dev/docs/dashboards",
 }

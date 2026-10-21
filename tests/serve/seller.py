@@ -11,6 +11,7 @@ from kontra.serve import BoundOffering, Quote, offering
 
 from .flows import UpperFlow, UpperFlowV2
 from .models import Order, OrderV2
+from .streamflows import SellerStreamJob, StreamOrder
 
 #: One cent per character per copy.
 CENTS_PER_CHAR = 1
@@ -44,3 +45,13 @@ async def quote_v2(order: OrderV2) -> Quote:
 def bind_v2(path: str | Path) -> BoundOffering:
     """The same offering.yaml bound to edited types: a different contract hash."""
     return offering(path, workflow=UpperFlowV2, quote=quote_v2)
+
+
+async def quote_stream(order: StreamOrder) -> Quote:
+    return Quote(price=Decimal("0.05"))
+
+
+def bind_stream(path: str | Path) -> BoundOffering:
+    """The seam ⑤ seller (``tests/serve/test_streams.py``): a workflow that hosts its own
+    stream and lists ``events``."""
+    return offering(path, workflow=SellerStreamJob, quote=quote_stream)

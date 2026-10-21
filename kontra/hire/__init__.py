@@ -36,12 +36,15 @@ from kontra.hire._errors import (
     PriceAboveMax,
     QuoteRejected,
     SellerBusy,
+    StreamInterrupted,
+    StreamItemInvalid,
 )
 from kontra.hire._record import Record
 from kontra.hire._service import ServiceClient, service
 
 if TYPE_CHECKING:
     from kontra.hire._client import Job, Kontra, Progress, QuoteResult, TemporalUnavailable
+    from kontra.hire._stream import JobStream
     from kontra.hire._worker import HireActivities, HireWorker, worker
 
 __all__ = [
@@ -54,6 +57,7 @@ __all__ = [
     "Job",
     "JobFailed",
     "JobKeyMissing",
+    "JobStream",
     "Kontra",
     "KontraError",
     "PriceAboveMax",
@@ -63,6 +67,8 @@ __all__ = [
     "Record",
     "SellerBusy",
     "ServiceClient",
+    "StreamInterrupted",
+    "StreamItemInvalid",
     "TemporalUnavailable",
     "service",
     "worker",
@@ -70,6 +76,7 @@ __all__ = [
 
 _LAZY = {
     "Job": "kontra.hire._client",
+    "JobStream": "kontra.hire._stream",
     "Kontra": "kontra.hire._client",
     "Progress": "kontra.hire._client",
     "QuoteResult": "kontra.hire._client",

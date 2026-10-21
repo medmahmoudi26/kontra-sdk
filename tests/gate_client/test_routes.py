@@ -5,7 +5,10 @@ response model."""
 
 from __future__ import annotations
 
+import re
+import tomllib
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -16,7 +19,7 @@ from kontra.gate_client import GateClient
 from kontra.gate_client import models as m
 from kontra.gate_client.routes import BY_NAME, ROUTES, Route
 
-from ._support import NOW, Recorder, event, json_response, minimal, query, sse, static
+from ._support import Recorder, event, json_response, minimal, query, sse, static
 
 JOB = "0123456789abcdef0123456789abcdef"
 KEY_ID = "key_0123456789abcdef"
@@ -80,7 +83,7 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     "devices": (lambda c: c.devices(), {}),
     "add_device": (lambda c: c.add_device("laptop", AGE, "cli"), {}),
     "remove_device": (lambda c: c.remove_device(AGE), {"public_key": AGE}),
-    "publish": (lambda c: c.publish({"nexusrpc": "1.0.0"}), {}),
+    "publish": (lambda c: c.publish({"nexusrpc": "1.0.0"}, streams=["turn_events"]), {}),
     "search": (lambda c: c.search("enrich"), {}),
     "get_offering": (
         lambda c: c.get_offering("acme/enrich@1.2.0"),
@@ -113,13 +116,7 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
         ),
         {},
     ),
-    "progress": (lambda c: _drain(c.progress(JOB)), {"job_id": JOB}),
-    "post_progress": (
-        lambda c: c.post_progress(
-            JOB, m.ProgressPost.model_validate({"at": NOW, "activity": "a", "ciphertext_b64": "AA"})
-        ),
-        {"job_id": JOB},
-    ),
+    "stream": (lambda c: _drain(c.stream(JOB, topics=["turn_events"])), {"job_id": JOB}),
     "create_artifact": (lambda c: c.create_artifact(m.ArtifactCreate(size=10)), {}),
     "complete_artifact": (
         lambda c: c.complete_artifact(
@@ -134,6 +131,12 @@ CALLS: dict[str, tuple[Call, dict[str, str]]] = {
     ),
     "create_blob": (lambda c: c.create_blob(m.BlobCreate(sha256=SHA, size=1)), {}),
     "get_blob": (lambda c: c.get_blob(SHA), {"sha256": SHA}),
+    "create_stream_blobs": (
+        lambda c: c.create_stream_blobs(
+            JOB, m.StreamBlobsCreate(blobs=[m.BlobCreate(sha256=SHA, size=1)])
+        ),
+        {"job_id": JOB},
+    ),
     "balance": (lambda c: c.balance(), {}),
     "topup": (lambda c: c.topup(1000), {}),
     "disputes": (lambda c: c.disputes(), {}),
@@ -194,7 +197,7 @@ async def test_route_conformance(route: Route) -> None:
         assert req.content == b""
     if route.stream:
         assert req.headers["accept"] == "text/event-stream"
-        assert [e.seq for e in result] == [1]
+        assert [e.cursor for e in result] == [1]
     elif route.response is not None:
         assert isinstance(result, route.response)
 
@@ -239,7 +242,7 @@ async def test_empty_path_parameter_is_refused_before_sending() -> None:
         with pytest.raises(ValueError, match="empty"):
             await c.job("")
         with pytest.raises(ValueError, match="empty"):
-            await _drain(c.progress(""))
+            await _drain(c.stream(""))
     assert rec.requests == []
 
 
@@ -395,3 +398,134 @@ async def test_disputes_can_be_paged() -> None:
         await c.disputes()
         await c.disputes(cursor="c3", limit=10)
     assert [query(r) for r in rec.requests] == [{"limit": "50"}, {"cursor": "c3", "limit": "10"}]
+
+
+def test_the_stream_replaces_the_progress_routes() -> None:
+    """#52 (decisions I31): the job's stream is ``GET /v1/jobs/{id}/stream`` (SSE of
+    StreamEvent, the job's parties), and the bespoke progress channel is gone, both verbs."""
+    from kontra.gate_client.routes import BY_NAME, ROUTES
+
+    stream = BY_NAME["stream"]
+    assert (stream.method, stream.path, stream.auth) == ("GET", "/v1/jobs/{job_id}/stream", "party")
+    assert stream.stream is True
+    assert stream.response is m.StreamEvent
+    assert "progress" not in BY_NAME
+    assert "post_progress" not in BY_NAME
+    assert not [r for r in ROUTES if r.path.endswith("/progress")]
+    assert not hasattr(m, "ProgressEvent")
+    assert not hasattr(m, "ProgressPost")
+
+
+# --------------------------------------------------------------------------- the engine (seam ⑥)
+
+
+def test_publish_request_engine_defaults_to_temporal_and_names_only_engines() -> None:
+    """``PublishRequest.engine`` (decisions I32): what the version runs on, beside the
+    document. Absent -- every client before #55 -- it is ``temporal``; a name that is no
+    engine is refused by the model, before any gate code runs."""
+    doc = {"nexusrpc": "1.0.0"}
+    assert m.PublishRequest(document=doc).engine == "temporal"
+    assert m.PublishRequest.model_validate({"document": doc}).engine == "temporal"
+    assert m.PublishRequest.model_validate({"document": doc, "engine": "temporal"}).engine == (
+        "temporal"
+    )
+    for bad in ("golem", "Temporal", "", None, 1):
+        with pytest.raises(ValueError, match="engine"):
+            m.PublishRequest.model_validate({"document": doc, "engine": bad})
+    assert m.ENGINE_NAMES == ("temporal",)
+    assert m.DEFAULT_ENGINE == "temporal"
+    schema = m.PublishRequest.model_json_schema()["properties"]["engine"]
+    assert (schema.get("const") or schema["enum"][0], schema["default"]) == (
+        "temporal",
+        "temporal",
+    )
+
+
+async def test_the_client_omits_the_default_engine() -> None:
+    """Owner decision OD11 of #55: a client of this version sends ``engine`` only when it is
+    not the default, so it still publishes to a gate that predates the field (which refuses
+    an unknown member)."""
+    rec = Recorder(lambda _: json_response(200, minimal(m.CatalogEntry)))
+    async with GateClient("http://gate.test", token=static("t"), transport=rec.transport) as c:
+        await c.publish({"nexusrpc": "1.0.0"})
+        await c.publish({"nexusrpc": "1.0.0"}, engine="temporal")
+    from ._support import body
+
+    assert [body(r) for r in rec.requests] == [
+        {"document": {"nexusrpc": "1.0.0"}, "streams": []},
+        {"document": {"nexusrpc": "1.0.0"}, "streams": []},
+    ]
+    assert "engine" not in m.PublishRequest(document={}).model_dump(mode="json")
+
+
+def test_the_pydantic_floor_has_what_the_client_relies_on() -> None:
+    """OD11's omitted default engine (and ``buyer_key``'s) is ``Field(exclude_if=)``, and the
+    client reads the gate's answers with ``model_validate_json(extra=)``: both pydantic 2.12.
+    On 2.9-2.11 the first is swallowed as an unknown keyword, so ``engine`` is always sent
+    and a gate that predates it refuses the publish. CI installs only the lock, so the
+    floor in pyproject.toml is pinned here."""
+    root = Path(__file__).resolve().parents[2]
+    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+    [spec] = [d for d in project["dependencies"] if re.match(r"pydantic\b", d)]
+    floor = re.search(r">=\s*(\d+)\.(\d+)", spec)
+    assert floor is not None, spec
+    assert (int(floor[1]), int(floor[2])) >= (2, 12), spec
+
+
+def _properties(schema: Any) -> set[str]:
+    """Every property name anywhere in a JSON schema (``$defs`` included)."""
+    found: set[str] = set()
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == "properties" and isinstance(value, dict):
+                found |= set(value)
+            found |= _properties(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            found |= _properties(item)
+    return found
+
+
+#: Every route a buyer reads (and the publish answer, a CatalogEntry): never the engine.
+BUYER_VIEWS = (
+    m.CatalogEntry,
+    m.CatalogSummary,
+    m.CatalogList,
+    m.QuoteView,
+    m.HireView,
+    m.JobView,
+    m.JobList,
+    m.PartyView,
+    m.ResultView,
+    m.SellerJobView,
+    m.WorkersView,
+    m.StreamEvent,
+)
+
+
+@pytest.mark.parametrize("model", BUYER_VIEWS, ids=lambda c: c.__name__)
+def test_no_buyer_facing_model_carries_the_engine(model: type[Any]) -> None:
+    """The engine is a property of the offering that buyers never see (decisions I32)."""
+    assert "engine" not in model.model_fields
+    assert "engine" not in _properties(model.model_json_schema(mode="serialization"))
+
+
+def test_no_route_answers_with_the_engine() -> None:
+    """Walk every modelled response schema: ``engine`` is in none (only PublishRequest, a
+    request, carries it). A route without a response model (the A2A card) is checked on the
+    served bytes (``tests/testing/test_engine_dispatch.py``); the gate's OpenAPI snapshot in
+    kontra-cloud asserts the same."""
+    carried = [
+        r.name
+        for r in ROUTES
+        if r.response is not None
+        and "engine" in _properties(r.response.model_json_schema(mode="serialization"))
+    ]
+    assert carried == []
+    requests = [
+        r.name
+        for r in ROUTES
+        if r.request is not None
+        and "engine" in _properties(r.request.model_json_schema(mode="validation"))
+    ]
+    assert requests == ["publish"]

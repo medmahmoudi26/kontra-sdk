@@ -16,6 +16,7 @@ from kontra.escrow import (
     BUYER_CANCEL_REASON,
     NOT_FROM_BUYER_REASON,
     OCCUPIED_REASON,
+    UNSEALED_REASON,
     EffectKind,
     JobRecord,
     Observation,
@@ -36,7 +37,6 @@ def job() -> JobRecord:
         offering="acme/enrich@1.0.0",
         buyer="bob",
         seller="acme",
-        seller_ns="acme",
         amount=Money(1000, "USD"),
         max_duration=timedelta(hours=1),
         review_window=timedelta(hours=1),
@@ -48,7 +48,7 @@ def job() -> JobRecord:
 def seen(
     status: ObservedStatus,
     provenance: Provenance = Provenance.VERIFIED,
-    run_id: str | None = RUN,
+    pin: str | None = RUN,
     closed_at: datetime | None = None,
     result_sha256: str | None = None,
     result_size: int | None = None,
@@ -57,7 +57,7 @@ def seen(
     return Observation(
         status=status,
         provenance=provenance,
-        run_id=run_id,
+        pin=pin,
         started_at=started_at,
         closed_at=closed_at,
         result_sha256=result_sha256,
@@ -74,7 +74,7 @@ def test_an_observation_is_unverified_unless_the_observer_says_otherwise() -> No
     """The fail-safe default: an observer that does not establish provenance (an old
     gate, a test double) never produces a delivery."""
     obs = Observation(status=ObservedStatus.COMPLETED, result_sha256="x", result_size=1)
-    assert (obs.provenance, obs.run_id) == (Provenance.UNVERIFIED, None)
+    assert (obs.provenance, obs.pin) == (Provenance.UNVERIFIED, None)
     record, effects = escrow.observe(job(), obs, SOON)
     assert (record, effects) == (job(), [])
 
@@ -82,14 +82,14 @@ def test_an_observation_is_unverified_unless_the_observer_says_otherwise() -> No
 def test_a_verified_completion_delivers_and_pins_its_run() -> None:
     obs = seen(ObservedStatus.COMPLETED, closed_at=SOON, result_sha256="abc", result_size=3)
     record, effects = escrow.observe(job(), obs, SOON)
-    assert (record.state, record.escrow, record.run_id) == (JobState.COMPLETED, Escrow.HELD, RUN)
+    assert (record.state, record.escrow, record.pin) == (JobState.COMPLETED, Escrow.HELD, RUN)
     assert (record.delivery_sha256, record.delivery_size) == ("abc", 3)
     assert effects == []
 
 
 def test_a_verified_running_run_is_pinned_while_it_works() -> None:
     record, effects = escrow.observe(job(), seen(ObservedStatus.RUNNING, started_at=T0), SOON)
-    assert (record.state, record.run_id, record.started_at, effects) == (
+    assert (record.state, record.pin, record.started_at, effects) == (
         JobState.WORKING,
         RUN,
         T0,
@@ -110,7 +110,7 @@ def test_a_completion_not_from_the_buyers_call_is_no_delivery(provenance: Proven
         Escrow.REFUNDED,
         NOT_FROM_BUYER_REASON,
     )
-    assert (record.delivered_at, record.delivery_sha256, record.run_id) == (None, None, None)
+    assert (record.delivered_at, record.delivery_sha256, record.pin) == (None, None, None)
     # The run is not the job's, so escrow does not stop it.
     assert [e.kind for e in effects] == [EffectKind.REFUND]
 
@@ -142,21 +142,21 @@ def test_any_other_run_not_from_the_buyers_call_is_as_if_there_were_none(
     assert [e.kind for e in effects] == [EffectKind.REFUND]
 
 
-def test_a_verified_observation_without_a_run_id_is_not_trusted() -> None:
-    obs = seen(ObservedStatus.COMPLETED, run_id=None, closed_at=SOON)
+def test_a_verified_observation_without_a_pin_is_not_trusted() -> None:
+    obs = seen(ObservedStatus.COMPLETED, pin=None, closed_at=SOON)
     assert escrow.observe(job(), obs, SOON) == (job(), [])
 
 
 def test_a_pinned_job_ignores_every_other_run() -> None:
     working, _ = escrow.observe(job(), seen(ObservedStatus.RUNNING), SOON)
-    assert working.run_id == RUN
+    assert working.pin == RUN
     for status in ObservedStatus:
         if status is ObservedStatus.NOT_FOUND:
             continue
-        other = seen(status, run_id="run-the-sellers-own", closed_at=SOON, result_sha256="x")
+        other = seen(status, pin="run-the-sellers-own", closed_at=SOON, result_sha256="x")
         assert escrow.observe(working, other, SOON) == (working, [])
     # Past the deadline, another run is the same as no news: the pinned run ran over.
-    other = seen(ObservedStatus.COMPLETED, run_id="run-the-sellers-own", closed_at=SOON)
+    other = seen(ObservedStatus.COMPLETED, pin="run-the-sellers-own", closed_at=SOON)
     record, effects = escrow.observe(working, other, AFTER_DEADLINE)
     assert (record.state, record.reason) == (JobState.FAILED, "max_duration exceeded")
     assert [e.kind for e in effects] == [EffectKind.TERMINATE_WORKFLOW, EffectKind.REFUND]
@@ -171,7 +171,7 @@ def test_the_pinned_run_closing_decides_the_job() -> None:
         "seller workflow terminated",
     )
     record, _ = escrow.observe(working, seen(ObservedStatus.COMPLETED, closed_at=SOON), SOON)
-    assert (record.state, record.run_id) == (JobState.COMPLETED, RUN)
+    assert (record.state, record.pin) == (JobState.COMPLETED, RUN)
 
 
 def test_a_pinned_run_that_vanished_refunds_at_the_deadline() -> None:
@@ -199,7 +199,7 @@ def test_no_sequence_of_runs_not_from_the_buyer_ever_pays_the_seller() -> None:
                 obs = seen(
                     rng.choice(statuses),
                     rng.choice([*NOT_THE_BUYERS, Provenance.OCCUPIED]),
-                    run_id=rng.choice([None, "run-x", RUN]),
+                    pin=rng.choice([None, "run-x", RUN]),
                     closed_at=now,
                     result_sha256="x",
                     result_size=1,
@@ -207,7 +207,7 @@ def test_no_sequence_of_runs_not_from_the_buyer_ever_pays_the_seller() -> None:
                 record, effects = escrow.observe(record, obs, now)
             assert record.state is not JobState.COMPLETED
             assert record.escrow in (Escrow.HELD, Escrow.REFUNDED)
-            assert record.run_id is None
+            assert record.pin is None
             assert all(e.kind is not EffectKind.RELEASE for e in effects)
             with pytest.raises(escrow.EscrowError):
                 escrow.accept(record, "bob", now)
@@ -226,10 +226,10 @@ def test_the_control_planes_placeholder_is_no_run_and_blames_no_seller(
     """``Control.occupy_job``'s placeholder (a cancel took ``job-<id>`` before any run
     existed) moves nothing and is never pinned; an open job that only ever shows it refunds
     at the deadline saying so, not "seller workflow terminated"."""
-    obs = seen(status, Provenance.OCCUPIED, run_id="run-placeholder")
+    obs = seen(status, Provenance.OCCUPIED, pin="run-placeholder")
     assert escrow.observe(job(), obs, SOON) == (job(), [])
     record, effects = escrow.observe(job(), obs, AFTER_DEADLINE)
-    assert (record.state, record.escrow, record.reason, record.run_id) == (
+    assert (record.state, record.escrow, record.reason, record.pin) == (
         JobState.FAILED,
         Escrow.REFUNDED,
         OCCUPIED_REASON,
@@ -272,7 +272,7 @@ def test_a_buyer_cancel_flag_on_a_run_not_from_the_buyer_moves_nothing() -> None
 
 def working() -> JobRecord:
     record, _ = escrow.observe(job(), seen(ObservedStatus.RUNNING, started_at=T0), SOON)
-    assert (record.state, record.run_id) == (JobState.WORKING, RUN)
+    assert (record.state, record.pin) == (JobState.WORKING, RUN)
     return record
 
 
@@ -399,7 +399,7 @@ def test_no_interleaving_refunds_a_cancel_whose_run_may_still_deliver() -> None:
             kinds = [e.kind for e in effects]
             if EffectKind.REFUND in kinds:
                 assert kinds[-1] is EffectKind.REFUND
-                if before.cancel_requested_at is not None or record.run_id is not None:
+                if before.cancel_requested_at is not None or record.pin is not None:
                     closed_alone = obs is not None and obs.status not in (
                         ObservedStatus.RUNNING,
                         ObservedStatus.COMPLETED,
@@ -415,3 +415,58 @@ def test_no_interleaving_refunds_a_cancel_whose_run_may_still_deliver() -> None:
             if delivered or completes_in_time:
                 assert record.state is JobState.COMPLETED
                 assert EffectKind.REFUND not in kinds
+
+
+# --------------------------------------------------------------------------- unsealed
+
+
+def test_an_unsealed_completion_refunds_against_the_seller() -> None:
+    """A verified completion whose result is not Kontra ciphertext (decisions I32, owner
+    decision OD3 of #55): the adapter withheld its bytes; never a delivery, refunded at once
+    with the reason a gate counts against the seller."""
+    record, effects = escrow.observe(job(), seen(ObservedStatus.UNSEALED, closed_at=SOON), SOON)
+    assert (record.state, record.escrow, record.reason, record.pin) == (
+        JobState.FAILED,
+        Escrow.REFUNDED,
+        UNSEALED_REASON,
+        RUN,
+    )
+    assert (record.delivered_at, record.delivery_sha256) == (None, None)
+    assert [e.kind for e in effects] == [EffectKind.REFUND]
+
+
+def test_an_unsealed_completion_refunds_whatever_a_cancel_asked() -> None:
+    """A buyer's cancel pending (step two of :func:`escrow.cancel`) does not make an
+    unsealed completion the buyer's cancel: the seller's run completed, unsealed."""
+    working, _ = escrow.observe(job(), seen(ObservedStatus.RUNNING, started_at=T0), SOON)
+    requested, effects = escrow.cancel(working, "bob", SOON)
+    assert [e.kind for e in effects] == [EffectKind.TERMINATE_RUN]
+    record, effects = escrow.observe(requested, seen(ObservedStatus.UNSEALED, closed_at=SOON), SOON)
+    assert (record.state, record.escrow, record.reason) == (
+        JobState.FAILED,
+        Escrow.REFUNDED,
+        UNSEALED_REASON,
+    )
+
+
+@pytest.mark.parametrize("provenance", NOT_THE_BUYERS)
+def test_an_unsealed_run_not_the_buyers_moves_nothing(provenance: Provenance) -> None:
+    record, effects = escrow.observe(job(), seen(ObservedStatus.UNSEALED, provenance), SOON)
+    assert (record, effects) == (job(), [])
+
+
+def test_an_unsealed_run_outside_the_pin_is_ignored() -> None:
+    working, _ = escrow.observe(job(), seen(ObservedStatus.RUNNING, started_at=T0), SOON)
+    other = seen(ObservedStatus.UNSEALED, pin="run-the-sellers-own", closed_at=SOON)
+    record, effects = escrow.observe(working, other, SOON)
+    assert (record.state, record.escrow, effects) == (JobState.WORKING, Escrow.HELD, [])
+
+
+def test_the_job_record_is_engine_neutral() -> None:
+    """Owner decision OD2 of #55: the record names the lineage by an opaque pin and keeps no
+    engine coordinate (``seller_ns`` lives in the engine's handle)."""
+    fields = set(JobRecord.__dataclass_fields__)
+    assert "pin" in fields
+    assert not fields & {"run_id", "seller_ns", "workflow_id", "namespace"}
+    assert "pin" in Observation.__dataclass_fields__
+    assert "run_id" not in Observation.__dataclass_fields__
