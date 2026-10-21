@@ -19,7 +19,6 @@ import asyncio
 import importlib.util
 import json
 import os
-import re
 import shutil
 import signal
 import stat
@@ -38,6 +37,7 @@ from kontra.cli import cli
 from kontra.cli._graph import load_static, static_path
 from kontra.cli._mock import explore, server_dir
 from kontra.cli._project import load_worker
+from tests.graph.readme import MERMAID, readme_graph
 
 pytestmark = pytest.mark.temporal
 
@@ -53,16 +53,9 @@ SELLERS = sorted(p.parent.name for p in EXAMPLES.glob("*/worker.py"))
 HANDLERS = ("recon-harness",)
 #: The ones ``kontra graph`` draws.
 DRAWN = [s for s in SELLERS if s not in HANDLERS]
+
+
 #: The one ```mermaid block of a README.
-_MERMAID = re.compile(r"^```mermaid\n(.*?)^```$", re.MULTILINE | re.DOTALL)
-
-
-def readme_graph(example: str) -> str:
-    """The graph ``examples/<example>/README.md`` documents."""
-    [block] = _MERMAID.findall((EXAMPLES / example / "README.md").read_text(encoding="utf-8"))
-    return block
-
-
 @pytest.fixture(scope="module", autouse=True)
 def test_server() -> None:
     """Temporal's time-skipping test server, which ``kontra graph`` downloads into its own
@@ -173,7 +166,7 @@ def test_the_graph_of_every_seller_example_is_its_readmes(home: Path, example: s
     if os.environ.get("UPDATE_GOLDEN") == "1":
         readme = EXAMPLES / example / "README.md"
         text = readme.read_text(encoding="utf-8")
-        [old] = _MERMAID.findall(text)
+        [old] = MERMAID.findall(text)
         readme.write_text(text.replace(old, result.stdout, 1), encoding="utf-8")
     assert result.stdout == readme_graph(example)
 

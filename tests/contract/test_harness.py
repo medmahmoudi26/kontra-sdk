@@ -336,8 +336,7 @@ def test_an_example_handler_agrees_with_the_harness(name: str) -> None:
     root = EXAMPLES / name
     with load_worker(root) as worker:
         sold = [b for b in worker.offerings if b.agent is not None and b.handler is not None]
-        if not sold:
-            pytest.skip(f"examples/{name} uses the harness but sells no handler")
+        assert sold, f"examples/{name} uses the harness but sells no handler"
         golden = from_yaml((root / "contract.yaml").read_text(encoding="utf-8"))
         for bound in sold:
             assert bound.document() == golden

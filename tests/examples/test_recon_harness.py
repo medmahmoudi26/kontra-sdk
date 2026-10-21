@@ -37,7 +37,7 @@ from kontra.gate_client import models as m
 from kontra.hire import QuoteRejected
 from kontra.serve import _agent_events as ae
 from tests.cli.session_console import PAGE, consoles, get, row, rows
-from tests.graph.test_cli import readme_graph
+from tests.graph.readme import readme_graph
 
 from .support import EXAMPLES, START, Market, example_module, serving
 
