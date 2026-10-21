@@ -95,8 +95,10 @@ async def test_the_agent_hires_the_seller_as_a_tool_within_its_spending_policy(
             reply, said = await run_main(buyer, ["example.com", "example.org"], cap=None)
         assert "approve?" not in said
         assert reply["hired"] is True
-        assert reply["targets"] == 2  # the typed SweepReport's, through the tool
-        assert reply["answer"] == f"2 hosts swept: {reply['expired']} expired, {reply['weak']} weak"
+        # The typed SweepReport's counts, through the tool: by fetch_cert's rule (the seller's
+        # activities.py), www.example.org's certificate is weak, and none has expired.
+        assert (reply["targets"], reply["expired"], reply["weak"]) == (2, 0, 1)
+        assert reply["answer"] == "2 hosts swept: 0 expired, 1 weak"
         [job] = await buyer.k.jobs()
         assert [r.max_price_minor for r in asked] == [2]  # the approved quote, to the cent
         assert (job.offering, job.state, job.escrow) == (
@@ -198,3 +200,57 @@ def test_the_glue_sends_and_reads_the_contracts_json() -> None:
     assert sent == {"domains": ["a.example"]}
     assert read == ["SweepReport", 1, None]
     assert refused == "ApplicationError"  # temporalio's payload validation error
+
+
+# --------------------------------------------------------------------------- the policy
+
+#: ``under_the_cap`` on its own, as auto mode calls it for a ``spend``: a price, its currency,
+#: and the agent's criteria (the default 0.05 USD).
+_JUDGE = """
+import asyncio, json
+from temporal_agent_harness.harness.agent_protocol import AutoApprovalContext
+from tools import SPEND
+from workflows import spending, under_the_cap
+
+criteria = spending()
+for tool_input in json.loads(input()):
+    ctx = AutoApprovalContext(
+        tool_name=SPEND,
+        tool_input=tool_input,
+        inherently_safe=False,
+        criteria=criteria,
+        criteria_set=criteria.sets[SPEND],
+        criteria_set_name=SPEND,
+    )
+    decision = asyncio.run(under_the_cap(ctx))
+    print(json.dumps([decision.verdict.value, decision.reason]))
+"""
+
+
+def test_the_spending_policy_compares_a_price_only_in_the_caps_currency() -> None:
+    """At or under the cap, in its currency: approved. Above it, in another currency (never
+    compared: 0.01 EUR is not "under 0.05"), or with nothing to judge: put to a person. The
+    evaluator never denies."""
+    spends = [
+        {"offering": OFFERING, "price": "0.05", "currency": "USD"},
+        {"offering": OFFERING, "price": "0.06", "currency": "USD"},
+        {"offering": OFFERING, "price": "0.01", "currency": "EUR"},
+        {"offering": OFFERING, "price": "0.01"},
+    ]
+    done = subprocess.run(
+        [sys.executable, "-c", _JUDGE],
+        cwd=BUYER,
+        input=json.dumps(spends) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    judged = [json.loads(line) for line in done.stdout.strip().splitlines()[-len(spends) :]]
+    assert judged == [
+        ["approve", "0.05 USD is within the cap"],
+        ["escalate", "0.06 USD is above the cap of 0.05 USD"],
+        ["escalate", "0.01 EUR is not in the cap's currency, USD"],
+        ["escalate", "no price or no cap to judge"],
+    ]

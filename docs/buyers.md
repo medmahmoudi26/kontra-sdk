@@ -323,8 +323,10 @@ the agent waits durably for the escrowed job.
 
 **Spend control is the harness's approval policy.** Each hire goes through a tool that is not
 inherently safe, with the quote as its input, so the agent's policy decides it: the example's
-auto-mode evaluator approves a price under a cap and puts anything above it to a person ("agent
-wants to spend 0.06 USD hiring acme/recon-harness@0.1.0 -- approve?"). A denial hires nothing
+auto-mode evaluator approves a price under a cap, in the cap's currency, and puts anything
+above it, or in another currency, to a person ("agent wants to spend 0.06 USD hiring
+acme/recon-harness@0.1.0 -- approve?"). The model is given the hiring tool, never the spending
+one, so it cannot put a price of its own to approval. A denial hires nothing
 and locks nothing; an approval hires with `max_price` set to the approved price, so the hold can
 never be more than what was approved. The seller's agent behind the offering takes one message
 and gives one reply: a hire is one turn, without approvals on its side (kontra-sdk#60 is the

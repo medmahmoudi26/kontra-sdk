@@ -87,6 +87,8 @@ class Quotes:
             raise ApplicationError(
                 f"{q.offering} will not take it: {q.reason or q.status.value}", non_retryable=True
             )
+        if q.price is None or q.currency is None:  # never for an ok quote; not worth a retry
+            raise ApplicationError(f"{q.offering} quoted no price", non_retryable=True)
         return Quoted(offering=q.offering, price=str(q.price), currency=q.currency)
 
 
@@ -116,5 +118,8 @@ async def sweep_domains(
     return await from_wire(delivered.to_dict(), SweepReport)
 
 
+#: The tools a model is given (workflows.py): the hiring tool, never `spend`, which only
+#: `sweep_domains` calls, with its own quote -- so no price the model picks is put to approval.
+MODEL_TOOLS = [sweep_domains]
 #: The agent's tools: `AgentHarnessPlugin(tools=TOOLS)` (main.py).
-TOOLS = [sweep_domains, spend]
+TOOLS = [*MODEL_TOOLS, spend]

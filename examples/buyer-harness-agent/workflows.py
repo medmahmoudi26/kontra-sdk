@@ -4,15 +4,18 @@ any harness agent does; Kontra sees a buyer hiring an offering, nothing else.
 
 **Spend control is the harness's approval policy.** Every hire goes through the `spend` tool,
 which is not inherently safe, so the policy decides it. Auto mode is on, with this agent's
-evaluator, `under_the_cap`: a price at or under the spending cap (the `spend` criteria's
-`spend_cap`, which whoever starts the agent may set in its `AgentConfig`) is approved, one
-above it is put to a person -- "agent wants to spend 0.05 USD hiring acme/recon-harness --
-approve?" -- who allows or denies it with the harness's `tool_approval` Update (main.py asks in
-the terminal). The evaluator only ever approves or escalates: a person is the one who denies.
+evaluator, `under_the_cap`: a price in the cap's currency and at or under the spending cap (the
+`spend` criteria's `spend_cap` and `spend_currency`, which whoever starts the agent may set in
+its `AgentConfig`) is approved; one above it, or in another currency, is put to a person --
+"agent wants to spend 0.06 USD hiring acme/recon-harness@0.1.0 -- approve? [y/N]" -- who allows
+or denies it with the harness's `tool_approval` Update (main.py asks in the terminal). The
+evaluator only ever approves or escalates: a person is the one who denies.
 
 The model here is scripted (no LLM, as in the seller's example): `audit` asks for the sweep
-and words the answer. A real model gets `TOOLS` through the harness's integration of its SDK
-(`as_openai_agent_tools`, the Gemini plugin) and calls the same tool."""
+and words the answer. A real model gets `MODEL_TOOLS` through the harness's integration of its
+SDK (`as_openai_agent_tools`, the Gemini plugin) and calls the same tool. `spend` is not among
+them: only the hiring tool calls it, with its own quote, so the model never puts a price of its
+own choosing to approval."""
 
 from decimal import Decimal, InvalidOperation
 
@@ -35,35 +38,53 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.contrib.workflow_streams import WorkflowStream
     from tools import OFFERING, SPEND, sweep_domains
 
-#: The spending cap when whoever starts the agent sets none, in the quote's currency.
+#: The spending cap when whoever starts the agent sets none, and the currency it is in.
 DEFAULT_CAP = "0.05"
+DEFAULT_CURRENCY = "USD"
 
 
-def spending(cap: str = DEFAULT_CAP) -> AutoApprovalCriteria:
-    """The criteria auto mode judges a spend by: the `spend` tool's set, and the cap."""
+def spending(cap: str = DEFAULT_CAP, currency: str = DEFAULT_CURRENCY) -> AutoApprovalCriteria:
+    """The criteria auto mode judges a spend by: the `spend` tool's set, and the cap in its
+    currency."""
     rules = AutoApprovalCriteriaSet(
         effect="Locks an escrow hold of the buyer's money for the quoted price: paid to the "
         "seller if the job delivers, refunded if it does not.",
-        approve_when=("the price is at or under the spending cap",),
-        escalate_when=("the price is above the spending cap",),
+        approve_when=("the price is in the cap's currency and at or under the spending cap",),
+        escalate_when=(
+            "the price is above the spending cap",
+            "the price is in another currency than the cap",
+        ),
     )
-    return AutoApprovalCriteria(sets={SPEND: rules}, context={"spend_cap": cap})
+    return AutoApprovalCriteria(
+        sets={SPEND: rules}, context={"spend_cap": cap, "spend_currency": currency}
+    )
 
 
 async def under_the_cap(ctx: AutoApprovalContext) -> AutoApprovalDecision:
-    """Approve a spend at or under the cap; put anything else to a person. Never a denial."""
+    """Approve a spend at or under the cap, in the cap's currency; put anything else to a
+    person (a price in another currency is not compared at all). Never a denial."""
     try:
         price = Decimal(str(ctx.tool_input["price"]))
+        currency = str(ctx.tool_input["currency"])
         cap = Decimal(str(ctx.criteria.context["spend_cap"]))
+        cap_currency = str(ctx.criteria.context["spend_currency"])
     except (KeyError, InvalidOperation):
         return AutoApprovalDecision(AutoApprovalVerdict.ESCALATE, "no price or no cap to judge")
-    details = {"price": str(price), "cap": str(cap)}
+    details = {"price": f"{price} {currency}", "cap": f"{cap} {cap_currency}"}
+    if currency != cap_currency:
+        return AutoApprovalDecision(
+            AutoApprovalVerdict.ESCALATE,
+            f"{price} {currency} is not in the cap's currency, {cap_currency}",
+            details,
+        )
     if price.is_finite() and cap.is_finite() and 0 <= price <= cap:
         return AutoApprovalDecision(
-            AutoApprovalVerdict.APPROVE, f"{price} is within the cap", details
+            AutoApprovalVerdict.APPROVE, f"{price} {currency} is within the cap", details
         )
     return AutoApprovalDecision(
-        AutoApprovalVerdict.ESCALATE, f"{price} is above the cap of {cap}", details
+        AutoApprovalVerdict.ESCALATE,
+        f"{price} {currency} is above the cap of {cap} {cap_currency}",
+        details,
     )
 
 

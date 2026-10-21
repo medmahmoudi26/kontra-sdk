@@ -10,7 +10,7 @@ page of `tools.py`, and nothing of it is in `kontra`.
 | File | Owner of |
 |---|---|
 | `gen/recon_harness/` | what `kontra pull acme/recon-harness --lang python` wrote: the verified contract (`contract.nexusrpc.yaml`) and nexgen's typed client of it (`SweepRequest`, `SweepReport`, the `AcmeReconHarness` service) |
-| `tools.py` | the glue: the pulled offering as a harness tool, `sweep_domains`, and the `spend` tool every hire goes through; the quote activity |
+| `tools.py` | the glue: the pulled offering as a harness tool, `sweep_domains` (the one tool a model is given, `MODEL_TOOLS`), and the `spend` tool every hire goes through; the quote activity |
 | `workflows.py` | `BuyerAgent` (`@agent.defn`, `@agent.accepts audit`) and its spending policy: auto mode with an evaluator that approves under a cap |
 | `main.py` | runs the agent on `kontra.hire.worker` for one audit, asks you in the terminal when a spend is above the cap, prints the answer |
 
@@ -38,9 +38,12 @@ page of `tools.py`, and nothing of it is in `kontra`.
 ## Spend control is the harness's approval policy
 
 Every hire goes through the `spend` tool, which is not inherently safe, so the agent's
-approval policy decides it, with the quote in hand: `spend(offering, price, currency)`. The
-agent runs auto mode with its own evaluator, `under_the_cap`: a price at or under the spending
-cap is approved; anything above it is put to a person (`main.py` asks):
+approval policy decides it, with the quote in hand: `spend(offering, price, currency)`. Only
+`sweep_domains` calls it, with its own quote: a model is given `MODEL_TOOLS`, which leaves
+`spend` out, so it can never put a price of its own choosing to approval. The agent runs auto
+mode with its own evaluator, `under_the_cap`: a price in the cap's currency and at or under
+the spending cap is approved; anything above it, or in another currency, is put to a person
+(`main.py` asks):
 
 ```text
 agent wants to spend 0.06 USD hiring acme/recon-harness@0.1.0 -- approve? [y/N]
@@ -49,9 +52,9 @@ agent wants to spend 0.06 USD hiring acme/recon-harness@0.1.0 -- approve? [y/N]
 A no is a denial: the tool raises, nothing is hired and nothing is held. A yes, or an approval
 under the cap, hires with `max_price` set to the approved price, so the escrow can never hold
 more than was approved (a later quote above it locks nothing and fails the tool). The cap is
-the `spend` criteria's `spend_cap` (0.05 unless whoever starts the agent passes another in its
-`AgentConfig`: `python main.py --cap 0.01 ...`), and the evaluator never denies on its own: a
-person does. Approvals and the cap are yours, on your side of the seam; the seller's agent
+the `spend` criteria's `spend_cap`, in `spend_currency` (0.05 USD unless whoever starts the
+agent passes another in its `AgentConfig`: `python main.py --cap 0.01 ...`), and the evaluator
+never denies on its own: a person does. Approvals and the cap are yours, on your side of the seam; the seller's agent
 gets one message and gives one reply (one hire is one turn).
 
 ## Run it
@@ -65,6 +68,11 @@ cd ../recon-harness && kontra serve             # the seller; then, in another t
 python main.py example.com example.org          # 0.02 USD: under the cap, no question
 python main.py --cap 0.01 example.com example.org
 ```
+
+The agent's turn ends with the job delivered and its escrow still held: the agent hires, it
+does not judge the delivery. Accept it (`kontra job <job id> --accept`, or `job.accept()`) to
+pay now, or reject it with a reason; silence pays the seller when the review window closes
+(`docs/buyers.md`).
 
 With a real gate, sign in with `kontra login` (or set an API key, `KONTRA_API_KEY`) and hire
 the seller's own offering: pull its client again under its name and point `OFFERING` in

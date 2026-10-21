@@ -24,11 +24,8 @@ from temporal_agent_harness.harness.agent_client import (
     AgentTurnError,
     AgentTurnTimeout,
 )
-from temporal_agent_harness.harness.agent_protocol import (
-    AgentConfig,
-    AgentEventType,
-    AutoApprovalVerdict,
-)
+from temporal_agent_harness.harness.agent_protocol import AgentConfig, AutoApprovalVerdict
+from temporal_agent_harness.harness.agent_protocol import events as hevents
 from temporal_agent_harness.plugin import AgentHarnessPlugin
 from tools import TOOLS, Quotes
 from workflows import BuyerAgent, spending
@@ -36,10 +33,6 @@ from workflows import BuyerAgent, spending
 from kontra.hire import Kontra, worker
 
 TASK_QUEUE = "buyer-harness-agent"
-#: How auto mode ends its judgment of a gated call: a verdict, or a failure (a person decides).
-_JUDGED = frozenset(
-    {AgentEventType.AUTO_APPROVAL_EVALUATION_ENDED, AgentEventType.AUTO_APPROVAL_EVALUATION_ERROR}
-)
 
 
 async def ask(question: str) -> bool:
@@ -89,11 +82,17 @@ async def turn(agent: AgentClient, domains: list[str]) -> dict[str, Any]:
         if isinstance(event, AgentTurnError | AgentTurnTimeout):
             raise event
         e = event.event
-        if e.type is AgentEventType.TOOL_APPROVAL_REQUESTED:
+        if isinstance(e, hevents.ToolApprovalRequested):
             asked[e.tool_id] = e.tool_input
-        elif e.type in _JUDGED:
+        elif isinstance(
+            e, hevents.AutoApprovalEvaluationEnded | hevents.AutoApprovalEvaluationError
+        ):
+            # Auto mode's judgment of a gated call: a verdict, or a failure (a person decides).
             spend = asked.pop(e.tool_id, None)
-            approved = getattr(e, "verdict", None) is AutoApprovalVerdict.APPROVE
+            approved = (
+                isinstance(e, hevents.AutoApprovalEvaluationEnded)
+                and e.verdict is AutoApprovalVerdict.APPROVE
+            )
             if spend is not None and not approved:  # escalated, or the evaluator failed
                 yes = await ask(
                     f"agent wants to spend {spend['price']} {spend['currency']} hiring "
@@ -101,7 +100,7 @@ async def turn(agent: AgentClient, domains: list[str]) -> dict[str, Any]:
                 )
                 reason = "approved at the terminal" if yes else "denied at the terminal"
                 await agent.approve_tool(e.tool_id, approved=yes, reason=reason)
-        elif e.type is AgentEventType.MESSAGE_HANDLER_END:
+        elif isinstance(e, hevents.MessageHandlerEnd):
             reply = e.output
     return reply
 
@@ -109,6 +108,6 @@ async def turn(agent: AgentClient, domains: list[str]) -> dict[str, Any]:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Audit domains with the buyer's agent.")
     parser.add_argument("domains", nargs="+")
-    parser.add_argument("--cap", help="spend at most this much without asking (default 0.05)")
+    parser.add_argument("--cap", help="spend at most this many USD without asking (default 0.05)")
     args = parser.parse_args()
     print(json.dumps(asyncio.run(main(args.domains, args.cap)), indent=2))
