@@ -11,6 +11,8 @@ dist/
 .env
 *.age
 examples/*/gen/
+# ...but the buyer agent's pulled client, which its test runs on without nexgen (decisions I37).
+!examples/buyer-harness-agent/gen/
 node_modules/
 temporal/authorizer/bin/
 .hypothesis/

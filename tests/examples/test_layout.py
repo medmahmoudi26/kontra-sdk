@@ -2,8 +2,9 @@
 next to ``examples/hello``, the smallest offering, two agents: ``examples/chef-agents``
 (an agent as workflow code) and ``examples/chef-claude`` (an agent that is a process), and
 ``examples/sweep`` (a fan-out, a batch and a branch: what the graph page draws), and the agent
-story (decisions I37): ``examples/recon-harness``, a seller whose entry is one typed handler
-of an agent written with Temporal's agent harness. Each
+story on both sides of the seam (decisions I37): ``examples/recon-harness``, a seller whose
+entry is one typed handler of an agent written with Temporal's agent harness, and
+``examples/buyer-harness-agent``, a buyer's own harness agent that hires it as a tool. Each
 seller is in the §6.1 project layout, its ``worker.py`` exposing the module-level ``worker``
 that ``kontra serve`` runs, binding one ``acme/`` offering."""
 
@@ -39,8 +40,12 @@ def test_the_examples() -> None:
         "chef-claude",
         "sweep",
         "recon-harness",
+        "buyer-harness-agent",
     }
     assert {"recon.py", "main.py", "README.md"} <= {p.name for p in (EXAMPLES / "recon").iterdir()}
+    buyer = {p.name for p in (EXAMPLES / "buyer-harness-agent").iterdir()}
+    assert {"README.md", "workflows.py", "tools.py", "main.py", "gen"} <= buyer
+    assert "worker.py" not in buyer  # buyer code: it sells nothing
 
 
 @pytest.mark.parametrize(

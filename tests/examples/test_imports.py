@@ -32,7 +32,12 @@ from kontra.testing.devserver import DevServer
 
 from .support import EXAMPLES, SELLERS
 
-SELLER_CODE = sorted(p for n in ("workflows.py", "activities.py") for p in EXAMPLES.glob(f"*/{n}"))
+SELLER_CODE = sorted(
+    p
+    for n in ("workflows.py", "activities.py")
+    for p in EXAMPLES.glob(f"*/{n}")
+    if (p.parent / "worker.py").is_file()  # a seller's: buyer code hires through kontra.hire
+)
 SELLER_MODULES = sorted(p for name in SELLERS for p in (EXAMPLES / name).glob("*.py"))
 MODELS = sorted(EXAMPLES.glob("*/models.py"))
 SCAFFOLD = {str(rel): text for rel, text in render("acme", "word-count").items()}
@@ -231,6 +236,61 @@ def test_loading_seller_code_loads_at_most_kontra_types(name: str) -> None:
     models = (EXAMPLES / name / "models.py").read_text(encoding="utf-8")
     uses_types = imports_of(models, KONTRA) != []
     assert _loaded_kontra(EXAMPLES / name) == (LOADED_WITH_TYPES if uses_types else set())
+
+
+# --------------------------------------------------------------------------- the buyer's agent
+
+#: examples/buyer-harness-agent: buyer code, so it hires through ``kontra.hire``. Its agent's
+#: module takes nothing from kontra; the glue only the workflow door (``service``) and, for
+#: its quote activity's type, ``Kontra``. ``main.py`` runs it, and imports anything.
+BUYER = EXAMPLES / "buyer-harness-agent"
+BUYER_MAY_IMPORT: Mapping[str, Mapping[str, frozenset[str] | None]] = {
+    "workflows.py": {},
+    "tools.py": {"kontra.hire": frozenset({"service", "Kontra"})},
+}
+#: What loading the agent and its glue loads of kontra: the sandbox-safe half of kontra.hire
+#: (no client, no HTTP, no codec), as a workflow that hires needs.
+LOADED_BY_THE_BUYER_AGENT = frozenset(
+    {
+        "kontra",
+        "kontra.hire",
+        "kontra.hire._errors",
+        "kontra.hire._record",
+        "kontra.hire._service",
+        "kontra.types",
+    }
+)
+
+
+def test_the_buyer_agent_is_not_seller_code() -> None:
+    assert not (BUYER / WORKER).exists()
+    assert BUYER not in {p.parent for p in SELLER_CODE}
+    assert {p.name for p in BUYER.glob("*.py")} == {*BUYER_MAY_IMPORT, "main.py"}
+
+
+@pytest.mark.parametrize("name", sorted(BUYER_MAY_IMPORT))
+def test_the_buyer_agent_imports_temporal_and_hires_through_kontra_hire(name: str) -> None:
+    source = (BUYER / name).read_text(encoding="utf-8")
+    assert imports_temporal(source)
+    assert imports_of(source, KONTRA, allowed=BUYER_MAY_IMPORT[name]) == []
+
+
+def test_loading_the_buyer_agent_loads_only_the_workflow_door_of_kontra_hire() -> None:
+    probe = (
+        "import json, sys\n"
+        "import workflows, tools\n"
+        "print(json.dumps(sorted(m for m in sys.modules if m == 'kontra' or m.startswith('kontra.'))))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=BUYER,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert set(json.loads(result.stdout)) == LOADED_BY_THE_BUYER_AGENT
 
 
 # --------------------------------------------------------------------------- the scaffold
