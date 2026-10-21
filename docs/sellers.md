@@ -12,7 +12,8 @@ login to a paid job, is [`examples/hello`](../examples/hello).
 - [The workflow and activities](#the-workflow-and-activities)
 - [Files: `Artifact`](#files-artifact)
 - [Progress](#progress)
-- [Many activities: `execute_activities_in_parallel`](#many-activities-execute_activities_in_parallel)
+- [Streaming to the buyer](#streaming-to-the-buyer)
+- [Many activities](#many-activities)
 - [Throughput: one heartbeating activity](#throughput-one-heartbeating-activity)
 - [Agents](#agents)
 - [The worker](#the-worker)
@@ -31,10 +32,11 @@ login to a paid job, is [`examples/hello`](../examples/hello).
 wordcount/
   offering.yaml           declarative facts: name, version, limits, display text
   models.py               pydantic input and output types
-  workflows.py            Temporal, through `from kontra import workflow`
-  activities.py           Temporal, through `from kontra import activity`
+  workflows.py            vanilla Temporal: `from temporalio import workflow`, no kontra
+  activities.py           vanilla Temporal: `from temporalio import activity`, no kontra
   quote.py                the price, from the input
-  worker.py               serve(Flow): binds workflow and quote to the offering; all worker tuning
+  worker.py               serve(Flow): binds workflow and quote to the offering; all worker
+                          tuning; the one file that imports kontra
   tests/test_offering.py  the lifecycle against kontra.testing, no containers
   input.json              a sample input, for `kontra quote` and `kontra hire`
   pyproject.toml          one dependency, kontra-sdk; pytest settings
@@ -44,16 +46,18 @@ wordcount/
 The offering is `<party>/wordcount`, where the party is your profile's handle (or
 `--party`).
 
-Each fact has one owner. The rule that matters most: **`workflows.py` and `activities.py`
-reach Temporal only through `kontra`** -- `from kontra import workflow, activity, RetryPolicy,
-ApplicationError` -- **and never import `temporalio`** (D1). The façade is Temporal's own
-objects re-exported, not wrappers: `kontra.workflow.defn` *is* `temporalio.workflow.defn`, so
-the code is ordinary Temporal code, tested and run like any other, and with
-`from temporalio import workflow` in place of `from kontra import workflow` it runs on any
-Temporal. Your project depends on `kontra-sdk` alone, which pins the Temporal SDK it was
-built against. The only other Kontra type your job code may touch is `kontra.types.Artifact`,
-a pydantic model of a file reference, and it reaches it through `models.py`. `kontra publish`
-refuses an offering whose code imports `temporalio` or `nexusrpc`.
+Each fact has one owner. The rule that matters most: **`workflows.py` and `activities.py` are
+vanilla Temporal** -- `from temporalio import workflow, activity` -- **and import nothing from
+`kontra`** (`docs/decisions.md` I29). They are ordinary Temporal code, tested and run like any
+other: delete `worker.py` and they run on any Temporal worker, unmodified -- all but
+[`Artifact`](#files-artifact) I/O, which needs the Kontra runtime that `worker.py`'s plugin
+installs in the process (an offering without `Artifact`, like `examples/hello`, needs
+nothing). **`worker.py` is the one file that imports `kontra`**: it binds the code to the offering. Besides it,
+`quote.py` takes `Quote` from `kontra.serve`, and `models.py` may use `kontra.types.Artifact`, a
+pydantic model of a file reference, which your activities reach through `models.py`. Your
+project depends on `kontra-sdk`, which brings `temporalio` in the range it is tested on
+(see [Versions](#versions)); anything Temporal ships -- `temporalio.contrib`, its plugins, its
+OpenAI Agents integration -- you import as Temporal documents it.
 
 ## offering.yaml
 
@@ -69,6 +73,7 @@ max_concurrent_jobs: 10         # optional; beyond this many open jobs quotes an
 max_output_bytes: 5GB           # the gate refuses artifact uploads beyond this
 artifact_retention: 7d          # after accept; the buyer must download by then
 uses_hosted_model: false        # optional; true when the input goes to a model provider
+streams: [events]               # optional; topics a buyer may read (not hashed, fixed per version)
 ```
 
 | Key | Range |
@@ -78,6 +83,7 @@ uses_hosted_model: false        # optional; true when the input goes to a model 
 | `artifact_retention` | 1s to 90d |
 | `max_output_bytes` | up to 5 TiB (`512MB`, `5GB`, `1GiB`: SI and IEC units both work) |
 | `max_concurrent_jobs` | up to 10,000 |
+| `streams` | up to 8 topic names, each `[A-Za-z][A-Za-z0-9_.-]{0,63}`, `kontra.` reserved ([Streaming to the buyer](#streaming-to-the-buyer)) |
 
 `uses_hosted_model: true` says the job sends the buyer's input to a hosted model (an LLM API),
 where it is plaintext to that provider: Kontra's encryption ends at your worker. It is a fact
@@ -158,19 +164,24 @@ plaintext (the gate must read the price to lock it); its input is encrypted.
 
 ## The workflow and activities
 
-Temporal, through the façade: activities, retries, timers, child workflows, signals, updates.
-`kontra.workflow` re-exports Temporal's workflow API (`defn`, `run`, `signal`, `query`,
-`update`, `execute_activity`, `execute_child_workflow`, `sleep`, `wait_condition`, `now`,
-`uuid4`, `unsafe`, ...) and adds [`execute_activities_in_parallel`](#many-activities-execute_activities_in_parallel);
-`kontra.activity` is Temporal's activity API (`defn`, `heartbeat`, `info`, `logger`, ...);
-`kontra` itself has `RetryPolicy` and `ApplicationError` (raise it with `non_retryable=True`
-to stop retries, as with Temporal).
+Plain Temporal: activities, retries, timers, child workflows, signals, updates, continue-as-new.
+`temporalio.workflow` and `temporalio.activity` are the whole API, `RetryPolicy` comes from
+`temporalio.common`, and `ApplicationError` from `temporalio.exceptions` (raise it with
+`non_retryable=True` to stop retries). Kontra adds nothing to the namespace you import:
+`kontra.workflow`, `kontra.activity` and the `RetryPolicy`, `ApplicationError` and `Page`
+re-exports are gone. Code written for them fails at import with Python's own error, which
+names no replacement: `from kontra import workflow` (or `RetryPolicy`, ...) is an
+`ImportError`, "cannot import name 'workflow' from 'kontra'", and `import kontra.workflow` or
+`from kontra.workflow import defn` a `ModuleNotFoundError`. Only `kontra.workflow` read as an
+attribute says what to write. The replacements: `from temporalio import workflow, activity`,
+`from temporalio.common import RetryPolicy`, `from temporalio.exceptions import
+ApplicationError`, and `from kontra.contrib.parallel import Page` (or a model of your own).
 
 ```python
 # workflows.py
 from datetime import timedelta
 
-from kontra import workflow
+from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from activities import fetch_batch, write_records
@@ -203,6 +214,9 @@ is a failed job, and the hold refunds.
 Keep workflow classes in an importable module (not `__main__`): Temporal's sandbox
 validates them by import.
 
+Activities need no list: `serve()` registers every function `@activity.defn` decorates in your
+project's modules (see [The worker](#the-worker)).
+
 ## Files: `Artifact`
 
 Temporal payloads are capped at a few MB. Anything larger is an `Artifact`: a reference to a
@@ -210,8 +224,8 @@ file in Kontra's bucket, encrypted with age to the job's parties.
 
 ```python
 # activities.py -- Artifact comes from models.py
-from kontra import activity
 from models import Artifact, Record
+from temporalio import activity
 
 
 @activity.defn
@@ -229,28 +243,166 @@ automatically; use `Artifact` for anything that is a file.
 ## Progress
 
 Nothing to write. Kontra derives progress from what Temporal already records (state, the
-activities running, how many completed) and forwards your activities' heartbeats, encrypted
-to the buyer:
+activities running, how many completed) and forwards your activities' heartbeats, encrypted to
+the job's parties:
 
 ```python
 activity.heartbeat({"percent": 40.0, "message": "400 of 1,000 urls"})
 ```
 
 Details that are a mapping with `percent` or `message` render as such; anything else renders
-as "alive, in `<activity>`, at `<time>`". Heartbeats are forwarded at most once a second per
-job, latest wins (`KONTRA_PROGRESS_INTERVAL` changes the interval). Forwarding is best effort:
-it never raises into, or blocks, your activity.
+as "alive, in `<activity>`, at `<time>`". A forwarded heartbeat is an item on the
+`kontra.progress` topic of the job's own workflow stream (below), so it costs your job's
+history like any publish: about four events. So forwarding is budgeted per job: the latest
+details at most every 5 s (`KONTRA_PROGRESS_INTERVAL` changes it; 0 forwards every heartbeat,
+batched), the interval doubling every 360 forwarded items up to 5 minutes, and at most 1,000
+items per job, after which the worker logs once and forwards no more (history keeps showing
+the job alive). The count is each worker process's own (a job whose activities run on three
+workers can forward up to three times as many) and outlasts a quiet spell: a job that
+heartbeats in phases spends one budget. When an activity returns, its latest heartbeat is forwarded then, whatever the
+interval: the buyer sees the last word. Forwarding is best effort: it never raises into, or
+blocks, your activity.
 
-## Many activities: `execute_activities_in_parallel`
+## Streaming to the buyer
 
-One activity per item, thousands or millions of items, with per-item retries and timeouts,
-and never a `continue_as_new` in your code:
+Publish with Temporal's own workflow streams (`temporalio.contrib.workflow_streams`), as you
+would without Kontra, and list in `offering.yaml` the topics your buyer may read:
+
+```yaml
+# offering.yaml
+streams: [events]        # topic names; kontra.* is reserved; at most 8
+```
+
+```python
+# activities.py -- vanilla Temporal
+from temporalio import activity
+from temporalio.contrib.workflow_streams import WorkflowStreamClient
+
+
+@activity.defn
+async def fetch(urls: list[str]) -> int:
+    stream = WorkflowStreamClient.from_within_activity()
+    async with stream:
+        for url in urls:
+            ...
+            stream.topic("events").publish({"url": url, "status": 200})
+            stream.topic("debug").publish({"url": url, "raw": "..."})  # not listed: stays yours
+    return len(urls)
+```
+
+The buyer reads `events` with `job.stream("events", type=...)`; `debug` never leaves your side.
+What happens on the way (`docs/decisions.md` I31):
+
+- **The job hosts the stream.** Kontra hosts one on your job's workflow (`job-<id>`) when your
+  code builds none. If your workflow builds its own `WorkflowStream()` in `@workflow.init`,
+  Kontra uses yours. Publish from activities (`from_within_activity()`, as above) or from the
+  workflow (`self.stream.topic(...).publish(...)` on your own stream).
+- **Sealed item by item.** When the gate's relay reads the stream, each item is encrypted on its
+  own: a listed topic to you and the job's buyer, named in the clear; any other topic to you
+  alone, its name hidden. Your own subscribers (`WorkflowStreamClient.subscribe`) read every
+  topic, unchanged.
+- **Live.** The gate relays a job's stream once its buyer listens, from the start of the log,
+  and keeps what it relayed for later listeners. A buyer who never listens before the job
+  ends sees none of it. Items above 256 KiB reach the buyer as a gap with their size.
+- **Fixed per version.** `streams:` is catalog data, not part of the contract hash, but a
+  published version keeps its list: change it, and `kontra serve` refuses to start until you
+  publish a new version.
+- **Bound handlers.** For `serve(Agent.handler)`, list the agent's topics:
+  `streams: [turn_events]` relays the harness's events (its replies, tool calls, token
+  deltas) to the buyer under the same name. Kontra copies the listed topics from the agent's
+  stream onto the job's; nothing unlisted is copied.
+- **Continue-as-new.** A stream Kontra hosts keeps its offsets across your workflow's
+  continue-as-new by itself (the log does not carry over: what nobody read before it is not
+  relayed). A stream you host follows Temporal's recipe: pass `stream.get_state()` as
+  `prior_state` (`await self.stream.continue_as_new(lambda state: [...])`), or its offsets
+  restart at 0.
+- **Cost.** Every publish signal and every relay poll is written to your job's history (about
+  four and five events). The job refuses relay polls once its history is past half of
+  Temporal's limits, which caps the relay's share near that half -- its polls stay in the
+  history -- so keep your job's own history (your publishing, activities and signals) under
+  the other half: a listened-to job whose own work goes past it can still be terminated.
+
+## Many activities
+
+One activity per item, each with its own retries and timeouts, is plain Temporal: start one
+`workflow.execute_activity` per item, and bound how many are open with an `asyncio.Semaphore`
+([`examples/sweep`](../examples/sweep) does this for up to 200 URLs):
+
+```python
+# workflows.py
+import asyncio
+from datetime import timedelta
+
+from temporalio import workflow
+
+with workflow.unsafe.imports_passed_through():
+    from activities import probe
+    from models import ScanInput, ScanOutput
+
+
+@workflow.defn
+class Scan:
+    @workflow.run
+    async def run(self, inp: ScanInput) -> ScanOutput:
+        slots = asyncio.Semaphore(50)  # at most 50 probes open at once
+
+        async def one(target: str) -> bool:
+            async with slots:
+                return await workflow.execute_activity(
+                    probe, target, start_to_close_timeout=timedelta(seconds=30)
+                )
+
+        hits = await asyncio.gather(*(one(t) for t in inp.targets))
+        return ScanOutput(hits=sum(hits))
+```
+
+Every item is then an activity of your workflow, so its input and result are in the job's
+history: about six events per item (the activity's three, and the workflow task its result
+wakes). Temporal allows one history 51,200 events and 50 MB (and warns from 10,240 events and
+10 MB), so this shape suits hundreds to a few thousand items. Past that, keep the history
+bounded yourself: run the items in child workflows, one per slice, or continue as new
+(`workflow.continue_as_new`, when `workflow.info().is_continue_as_new_suggested()`) carrying
+only a cursor and what you have folded so far. Continuing as new is yours to use: nothing in
+Kontra refuses it.
+
+One workflow runs a few hundred activities a second. Past that, partition the items and run
+one child workflow per partition -- Temporal's own composition, in your code:
+
+```python
+import asyncio
+
+from temporalio import workflow
+
+with workflow.unsafe.imports_passed_through():
+    from scanpart import ScanPart  # a workflow over part p of the items
+
+
+@workflow.defn
+class Scan:
+    @workflow.run
+    async def run(self, parts: int) -> int:
+        runs = [workflow.execute_child_workflow(ScanPart.run, p) for p in range(parts)]
+        return sum(await asyncio.gather(*runs))
+```
+
+Pass the children to `serve()` as `workflows=[ScanPart]` (see [The worker](#the-worker)).
+
+### The optional helper: `kontra.contrib.parallel`
+
+`execute_activities_in_parallel` does the bounded fan-out and the continue-as-new for you, over
+a paged source of any size, in a child workflow, `kontra.batch.v1`. It is an optional helper,
+not part of Kontra's core (`docs/decisions.md` I29), and it costs the rule above: the workflow
+that calls it imports `kontra.contrib.parallel`, so it runs only on a worker that has
+kontra-sdk installed and the helper's plugin -- any Temporal worker with
+`plugins=[ParallelPlugin()]`, but no longer one without.
 
 ```python
 # workflows.py
 from datetime import timedelta
 
-from kontra import Page, activity, workflow
+from temporalio import activity, workflow
+
+from kontra.contrib.parallel import Page, execute_activities_in_parallel
 
 
 @activity.defn
@@ -271,7 +423,7 @@ def count_hits(acc: int, hit: bool) -> int:
 class Scan:
     @workflow.run
     async def run(self, scope: str) -> int:
-        return await workflow.execute_activities_in_parallel(
+        return await execute_activities_in_parallel(
             probe,
             pages=next_page,
             reduce=count_hits,
@@ -281,10 +433,21 @@ class Scan:
         )
 ```
 
-- **`pages=`** is the source: an activity `(cursor) -> Page(items, next)`, called first with
-  `None` and then with each page's `next` until one is `None`. The cursor is anything
-  serializable: an offset, a continuation token. Pages are fetched by activity, so no item
-  list ever enters your workflow's history.
+```python
+# worker.py
+from workflows import Scan
+
+from kontra import serve
+from kontra.contrib.parallel import ParallelPlugin
+
+serve(Scan, plugins=[ParallelPlugin()])  # registers kontra.batch.v1, passes the helper through
+```
+
+- **`pages=`** is the source: an activity `(cursor) -> page`, called first with `None` and then
+  with each page's `next` until one is `None`. A page is anything with a list `items` and a
+  `next`: `Page`, or a pydantic model of your own, so `activities.py` needs nothing from
+  `kontra`. The cursor is anything serializable: an offset, a continuation token. Pages are
+  fetched by activity, so no item list ever enters your workflow's history.
 - **`items=[...]`** instead is one page held in memory. The list travels in the batch's input,
   so it must fit one Temporal payload (a few MB); anything larger is `pages=`.
 - **`reduce=`** folds each result into an accumulator, starting from `init=`, in the order
@@ -300,34 +463,13 @@ class Scan:
   `schedule_to_close_timeout` required, `retry_policy`, `heartbeat_timeout`, ...), applied to
   every item and page activity. The task queue is your offering's, never an option.
 
-It runs as a child workflow, `kontra.batch.v1`, on your worker (`serve()` registers it). That
-child continues as new when Temporal suggests it, after letting what is in flight finish, and
-carries only the cursor, the accumulator and the current page's unstarted items into the next
-run: history is bounded by `max_concurrent`, never by the number of items, and your workflow
-just awaits one call. That is why your code never needs `continue_as_new` (the façade does not
-offer it): the iteration that would have needed it is this call. An item that fails after its
-retries fails the batch -- what is in flight is cancelled first -- and the call raises
-Temporal's `ChildWorkflowError`, with the activity's own error below it.
-
-One workflow runs a few hundred activities a second. Past that, partition the source and run
-one batch per partition as child workflows -- Temporal's own composition, in your code:
-
-```python
-import asyncio
-
-from kontra import workflow
-
-with workflow.unsafe.imports_passed_through():
-    from scanpart import ScanPart  # a workflow running execute_activities_in_parallel over part p
-
-
-@workflow.defn
-class Scan:
-    @workflow.run
-    async def run(self, parts: int) -> int:
-        runs = [workflow.execute_child_workflow(ScanPart.run, p) for p in range(parts)]
-        return sum(await asyncio.gather(*runs))
-```
+The child runs on your worker's task queue (`ParallelPlugin` registers it; without the plugin
+the call fails, as any unregistered workflow does). It continues as new when Temporal suggests
+it, after letting what is in flight finish, and carries only the cursor, the accumulator and
+the current page's unstarted items into the next run: history is bounded by
+`max_concurrent`, never by the number of items, and your workflow just awaits one call. An item
+that fails after its retries fails the batch -- what is in flight is cancelled first -- and the
+call raises Temporal's `ChildWorkflowError`, with the activity's own error below it.
 
 ## Throughput: one heartbeating activity
 
@@ -339,7 +481,7 @@ concurrency and heartbeating its cursor:
 # activities.py
 import asyncio
 
-from kontra import activity
+from temporalio import activity
 
 
 async def probe_host(host: str) -> bool: ...
@@ -361,32 +503,35 @@ async def probe_all(hosts: list[str]) -> int:
     return hits
 ```
 
-Three history events in all, whatever the count; a retry resumes at the last heartbeat (give
-the activity a `heartbeat_timeout`); scale by running several of them, one per slice. Nothing
-here needs Kontra beyond `activity.heartbeat` and `activity.info`. A real one reads its hosts
+A handful of history events, whatever the count: the activity's three, and the heartbeats
+Kontra forwards as the buyer's progress, which its budget bounds (at most one every 5 s, at
+most 1,000 per job: [Progress](#progress)). A retry resumes at the last heartbeat (give the
+activity a `heartbeat_timeout`); scale by running several of them, one per slice. Nothing here
+is Kontra's: `activity.heartbeat` and `activity.info` are Temporal's. A real one reads its hosts
 from a page source rather than its input, which, like any input, must fit a payload.
 
 ## Agents
 
-A workflow can run an agent, and nothing switches that on: the workflow does what it wants,
-and no `serve()` or `Worker` keyword changes what workflow code may do (`docs/decisions.md`
-I25). There are two shapes, with an example each.
+A workflow can run an agent, and Kontra switches nothing on: the agent's SDK is your
+dependency, and its Temporal plugin is your worker's config, passed in `serve(plugins=[...])`
+as on any Temporal worker (`docs/decisions.md` I29). There are three shapes.
 
 **An agent as workflow code**, [`examples/chef-agents`](../examples/chef-agents). OpenAI's
 [Agents SDK](https://openai.github.io/openai-agents-python/) runs its loop in the workflow,
-durably, through Temporal's integration (the extra: `pip install 'kontra-sdk[agents]'`): every
-model call and every tool call is an activity, retried and recorded like any other.
+durably, through Temporal's integration (`pip install temporalio-openai-agents`): every model
+call and every tool call is an activity, retried and recorded like any other.
 
 ```python
 # workflows.py
 from datetime import timedelta
 
-from kontra import workflow
+from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from activities import lookup_pantry
-    from agents import Agent, Runner  # OpenAI's Agents SDK: your dependency, allowed
+    from agents import Agent, Runner  # OpenAI's Agents SDK: your dependency
     from models import CookInput, Dish
+    from temporalio.openai_agents.workflow import activity_as_tool
 
 
 @workflow.defn
@@ -396,11 +541,7 @@ class ChefFlow:
         chef = Agent(
             name="chef",
             instructions="Look in the pantry, then propose one dish from what is there.",
-            tools=[
-                workflow.activity_as_tool(
-                    lookup_pantry, start_to_close_timeout=timedelta(seconds=30)
-                )
-            ],
+            tools=[activity_as_tool(lookup_pantry, start_to_close_timeout=timedelta(seconds=30))],
         )
         result = await Runner.run(chef, inp.craving)
         return Dish(recipe=str(result.final_output))
@@ -410,8 +551,14 @@ class ChefFlow:
 # worker.py
 import os
 
-from agents import set_default_openai_api, set_default_openai_client, set_tracing_disabled
+from agents import (
+    OpenAIProvider,
+    set_default_openai_api,
+    set_default_openai_client,
+    set_tracing_disabled,
+)
 from openai import AsyncOpenAI
+from temporalio.openai_agents import ModelActivityParameters, OpenAIAgentsPlugin
 from workflows import ChefFlow
 
 from kontra import serve
@@ -423,48 +570,129 @@ set_default_openai_client(
 set_default_openai_api("chat_completions")
 set_tracing_disabled(True)
 
-serve(ChefFlow)
+serve(
+    ChefFlow,
+    plugins=[
+        OpenAIAgentsPlugin(model_params=ModelActivityParameters(), model_provider=OpenAIProvider())
+    ],
+)
 ```
 
 | Runs as | What |
 |---|---|
 | workflow code | the agent loop, handoffs, and `@function_tool` tools: pure computation only (no I/O, no clock, no randomness) |
-| an activity | every model call, every `workflow.activity_as_tool(...)` tool, every MCP operation |
+| an activity | every model call, every `activity_as_tool(...)` tool, every MCP operation |
 
-- **The import is the opt-in.** A workflow that imports `agents` runs an agent: the worker
-  sees the import and puts Temporal's `OpenAIAgentsPlugin` on itself, with the payload
-  converter its activities decode with, which validates more leniently inside your workflows
-  and activities (a buyer's input is still checked against your contract before the job
-  starts). A workflow that does not import `agents` gets neither, whatever is installed.
-  `agents` imported without the extra is a `TypeError` that names it. A `Worker(...)` written
-  out does the same as `serve()`: `kontra publish` lets your code import no `temporalio`, so
-  you could not pass the plugin yourself.
-- **The import is read when `worker.py` imports your workflows**, so make it at the top of
-  `workflows.py`, as above, or of a module it passes through. An `import agents` inside `run`
-  comes too late: the worker was built without the plugin, and the workflow task fails. A
-  module the workflow passes through counts, `activities.py` included: an activity that runs
-  an agent in-process, outside Temporal's loop, imports `agents` inside its function, or the
-  worker gets the plugin and its converter for it. Only OpenAI's `agents` counts: a module of
-  your own named `agents.py` runs no agent (and hides the SDK; rename it).
+- **The plugin is yours.** `serve()` puts `OpenAIAgentsPlugin` on the worker's Temporal
+  client, ahead of Kontra's own plugin, which comes last (see [The worker](#the-worker)). The
+  client's payload converter is then the plugin's `OpenAIPayloadConverter`, which validates
+  more leniently inside your workflows and activities (a buyer's input is still checked
+  against your contract before the job starts), and Kontra's codec encrypts every payload
+  under it: the codec is a payload *codec*, so it stacks under any converter. A worker whose
+  `worker.py` passes no plugin runs none, whatever its workflows import.
 - **The model endpoint is worker config**, never workflow code: the agent names no model and
   no server. `worker.py` sets the Agents SDK's own default client and API before `serve()`,
   and the plugin's model activity dials them, so any OpenAI-compatible server answers --
-  Ollama, vLLM, OpenRouter, Mistral. The model is the SDK's `OPENAI_DEFAULT_MODEL`, in the
+  Ollama, vLLM, OpenRouter, Mistral. That takes `model_provider=OpenAIProvider()`: without it,
+  the plugin builds its own `AsyncOpenAI()` from the environment when the worker is built,
+  and never asks the default client. The model is the SDK's `OPENAI_DEFAULT_MODEL`, in the
   worker's environment. The API is read when the worker is built, the client at the first
   model call, so the worker starts without an `OPENAI_API_KEY`; with no default client set,
   it is the SDK's own, from `OPENAI_API_KEY` (and `OPENAI_BASE_URL`).
-- `serve(ChefFlow, mcp_servers={"name": factory})` serves `workflow.mcp_server("name")`. It is
-  worker config, like `max_concurrent_activities`: a factory runs on the worker, so it holds
+- **MCP servers** are the plugin's too: `OpenAIAgentsPlugin(..., mcp_servers={"name": factory})`
+  serves `temporal_mcp_server("name")` (from `temporalio.openai_agents.workflow`) in the
+  workflow (install `temporalio-openai-agents[mcp]`). A factory runs on the worker, so it holds
   the processes and credentials an MCP server needs, and a name no workflow asks for is unused.
+  Its `factory_argument=` is an activity input, so it is recorded in history: never put a
+  secret there; resolve credentials in the factory.
 - An activity tool gets a **copy** of the run context: what it changes does not come back.
-- `workflow.mcp_server(name, factory_argument=...)`: the argument is an activity input, so it
-  is recorded in history. Never put a secret there; resolve credentials in the factory.
-- A tool that wants scale calls `execute_activities_in_parallel` itself (make it a workflow
-  the agent's activity starts, or a heartbeating activity), rather than having the model issue
-  a thousand tool calls.
+- A tool that wants scale runs [one activity per item](#many-activities) itself (make it a
+  workflow the agent's activity starts, or a heartbeating activity), rather than having the
+  model issue a thousand tool calls.
 - Set `uses_hosted_model: true` in `offering.yaml`: the buyer's input, decrypted on your
   worker, goes to the model provider in plaintext to it. Model calls are activity payloads,
   encrypted in Temporal like the rest of the job.
+
+**One handler of an agent**, written with Temporal's agent harness
+(`pip install temporal-agent-harness`). `serve()` takes the handler itself, and one hire is
+one turn of the agent:
+
+```python
+# recon.py -- vanilla Temporal and the harness, nothing from kontra
+from pydantic import BaseModel
+from temporalio import workflow
+
+with workflow.unsafe.imports_passed_through():
+    from temporal_agent_harness.harness import AgentWorkflowRunner, agent
+    from temporal_agent_harness.harness.agent_protocol import (
+        AgentConfig,
+        MessageContext,
+        ToolApprovalPolicy,
+    )
+    from temporalio.contrib.workflow_streams import WorkflowStream
+
+
+class Sweep(BaseModel):
+    host: str
+
+
+class Report(BaseModel):
+    host: str
+    open: int
+
+
+@agent.defn
+class ReconAgent:
+    @agent.init
+    def __init__(self, config: AgentConfig) -> None:
+        self._runner = AgentWorkflowRunner(
+            config,
+            stream=WorkflowStream(),
+            approval_policy_default=ToolApprovalPolicy.allow_inherently_safe(),
+        )
+
+    @agent.accepts
+    async def sweep(self, req: Sweep, ctx: agent.Injected[MessageContext]) -> Report:
+        """Sweep one host and report its open ports."""
+        ...
+```
+
+```python
+# worker.py
+from recon import ReconAgent
+from temporal_agent_harness.plugin import AgentHarnessPlugin
+
+from kontra import serve
+
+serve(ReconAgent.sweep, plugins=[AgentHarnessPlugin()])
+```
+
+- **The contract is the handler's**: its one pydantic message (`Sweep`) is the input, its
+  pydantic return (`Report`) the output; parameters the harness injects
+  (`agent.Injected[...]`) are not part of it. Pass the handler, `ReconAgent.sweep`, never the
+  class: `serve(ReconAgent)` is refused, naming the fix. The class must be module-level and
+  importable, and its init data, if it takes any, optional: a job starts the agent with none.
+  A handler an agent inherits unchanged from another agent class is refused too
+  (`ReconV2.sweep` *is* `ReconV1.sweep`, so it cannot say which agent you mean): override it
+  in each agent class that sells it. Pydantic aliases work as on a workflow: the message is
+  the input's JSON by alias, and so is the job's result.
+- **A hire is one turn.** The job is Kontra's wrapper workflow, `kontra.turn.v1`, started as
+  `job-<id>` like any job. It starts your agent as a child (its whole history encrypted to you
+  alone), sends the buyer's input as one message to the handler, waits for the handler's
+  reply on the agent's event stream, closes the agent, and delivers the reply, encrypted to
+  the buyer. A handler that raises fails the job with its message, without retrying. A
+  worker that stops mid-turn (a deploy, a crash) loses nothing: the turn's activity is retried
+  on the next worker and picks the same message up where it was.
+- **No approvals, no callbacks.** A job has no buyer to ask: a handler that requests a tool
+  approval or a callback fails the job at once. Run tools that need no approval
+  (`ToolApprovalPolicy.allow_inherently_safe()`, or your own policy): a call the policy
+  approves raises no request at all. That includes the tools an auto-mode evaluator would
+  approve: the harness publishes the approval request before it asks the evaluator, and
+  nothing tells, at that moment, whether a person will be needed, so the job fails there too;
+  allow-list those tools in the policy instead. Session jobs, with buyer approvals, are
+  kontra-sdk#60.
+- A handler offering has no static graph: the [graph page](#the-graph-page) draws what each
+  of its runs did.
 
 **An agent that is a process**, [`examples/chef-claude`](../examples/chef-claude): no SDK at
 all. One activity spawns the binary -- here `claude -p ... --output-format stream-json
@@ -499,11 +727,38 @@ serve(
 ```
 
 `serve(Flow)` binds `offering.yaml` and the `quote` of `quote.py`, both beside `worker.py`, to
-`Flow`, and registers every activity decorated with `kontra.activity.defn` that the process
-imported -- an activity nothing imports cannot be referenced by a workflow either, so there is
-no list to keep. Further workflows (`serve(Flow, Child)`) are registered unbound, for the
-children `Flow` starts. `quote=` passes another quote function; methods decorated as
-activities need their instance (`activities=[obj.method]`).
+`Flow` -- a `@workflow.defn` class, or [one handler of an agent](#agents) -- and registers
+every function `@activity.defn` decorated in your project: the modules loaded from under
+`worker.py`'s directory by then (dot-directories, `tests`, `test`, `venv`, `build`, `dist`,
+`node_modules` and `site-packages` left out), each activity once, in its own module. An
+activity a factory of your project makes (`fetch = make_activity("fetch")` in a module of the
+project, `make_activity` in another) is found where it is bound. An activity nothing imports
+cannot be referenced by a workflow either, so there is no list to keep -- except for the
+activities the scan cannot see: a method (it needs its instance), and one defined or made
+outside the project (a library's), which you pass in `activities=`. Two activities of one
+Temporal name are refused, naming both: rename one (`@activity.defn(name=...)`). Every other keyword is `temporalio.worker.Worker`'s, passed
+through verbatim: `workflows=[Child]` registers further workflows, unbound, for the children
+`Flow` starts; `activities=[...]` adds to what was found (methods decorated as activities need
+their instance: `activities=[obj.method]`); `plugins=[...]` adds Temporal plugins. `quote=`
+passes another quote function. `engine=` names the engine the offering runs on, which serve()
+already derives from the entry -- your code is `temporalio`, so `temporal` -- and may only say
+the same: it is published beside the contract, never in its hash, and fixed per version
+(decisions I32).
+
+**Plugins.** A plugin that is also a client plugin -- any `temporalio.plugin.SimplePlugin`:
+Temporal's `OpenAIAgentsPlugin`, the agent harness's `AgentHarnessPlugin`,
+`kontra.contrib.parallel.ParallelPlugin` -- goes on the worker's Temporal client, in your
+order, and Kontra's own plugin, `KontraPlugin`, comes last: a payload converter yours chose
+stays, and the connection, the namespace and the codec are Kontra's. A worker-only plugin goes
+to the worker, where it runs after Kontra's configuration: one that changes the task queue,
+removes Kontra's Nexus service, puts another interceptor before Kontra's, swaps the entry
+class for another of the same name, or builds the worker on a client without Kontra's codec is
+refused before the worker polls. Kontra also refuses a client plugin that sets another payload
+codec or failure converter (Kontra's encrypt), or external storage that would offload a job's
+payload at or below Kontra's claim-check threshold, where the buyer could not read it -- and
+checks the client again when it builds and starts a worker, so a client plugin placed after
+Kontra (in a worker main of your own) that sets any of them back, or encodes headers, is
+refused there.
 
 `kontra serve` and `python worker.py` run it; `kontra publish` imports `worker.py` and reads
 the offering from it without starting anything (imported, `serve()` only builds the worker
@@ -519,7 +774,7 @@ from workflows import EnrichFlow
 from kontra.serve import Worker, offering
 
 worker = Worker(
-    offerings=[offering("offering.yaml", workflow=EnrichFlow, quote=quote)],
+    offerings=[offering("offering.yaml", entry=EnrichFlow, quote=quote)],
     activities=[fetch_batch, write_records],
     max_concurrent_activities=40,
 )
@@ -528,15 +783,70 @@ if __name__ == "__main__":
     worker.run()
 ```
 
-`kontra.serve.Worker` is `temporalio.worker.Worker` plus exactly five things: a generated
-Nexus service per bound offering (`quote` as a synchronous operation, `execute` as a
-workflow-run operation), the hold-token check before `execute` starts anything, the
-encryption codec, the task queue, derived from `name@version` (passing `task_queue` is a
-`TypeError`), and the `kontra.batch.v1` workflow behind `execute_activities_in_parallel`.
-It passes `kontra` through the workflow sandbox, so the façade loads once per process.
-`workflows`, `nexus_service_handlers` and `interceptors` are merged with Kontra's; every other
-keyword reaches the inner worker unchanged. Written out, `worker.py` exposes a module-level
-`worker`: `kontra serve` runs it and `kontra publish` imports it to find the offerings.
+Written out, a `Worker` registers exactly the activities you list (nothing is discovered).
+`kontra.serve.Worker` is Temporal's client and worker with `KontraPlugin` on them, and the
+plugin adds exactly these: the connection from your profile (the Temporal address, TLS, the
+namespace, a worker token kept fresh), a generated Nexus service per bound offering (`quote`
+as a synchronous operation, `execute` as a workflow-run operation), the hold-token check
+before `execute` starts anything, the encryption codec, the task queue, derived from
+`name@version` (passing `task_queue` is a `TypeError`), and at start the hash lock (see
+[Versions](#versions)). It passes `kontra` through the workflow sandbox: Kontra's own turn
+wrapper runs in it, your models may use `kontra.types`, and a workflow that hires imports
+`kontra.hire`. `workflows`, `nexus_service_handlers` and `interceptors` are merged with
+Kontra's, and a `workflow_runner` that is Temporal's `SandboxedWorkflowRunner` reaches the
+inner worker as a copy with `kontra` added to its passthrough modules (any other runner is
+untouched); every other keyword reaches the inner worker unchanged. Written out, `worker.py`
+exposes a module-level `worker`: `kontra serve` runs it and `kontra publish` imports it to
+find the offerings.
+
+### Your own worker main: `KontraPlugin`
+
+A process of your own, with its own Temporal client and workers, needs no `kontra.serve`: put
+`KontraPlugin` last on the client and build Temporal's own worker. Whatever you pass for the
+target host and the task queue is replaced by the profile's and the offering's:
+
+```python
+# main.py -- offering.yaml and quote.py beside it
+import asyncio
+
+from activities import fetch_batch, write_records
+from temporalio.client import Client
+from temporalio.worker import Worker
+from workflows import EnrichFlow
+
+from kontra import KontraPlugin
+
+
+async def main() -> None:
+    kontra = KontraPlugin.from_profile(EnrichFlow)  # binds offering.yaml beside this file
+    client = await Client.connect("kontra", plugins=[kontra])  # your client plugins first
+    worker = Worker(
+        client, task_queue="kontra", workflows=[EnrichFlow], activities=[fetch_batch, write_records]
+    )
+    try:
+        await worker.run()
+    finally:
+        await kontra.aclose()
+
+
+asyncio.run(main())
+```
+
+`KontraPlugin.from_profile(entry)` binds `offering.yaml` (and `quote.py`, unless `quote=`) beside
+the calling file, as `serve()` does; the entry is required, because the contract, the task
+queue and the Nexus service come from it, and the yaml names no code. It discovers no
+activities: list them on your worker. Any other worker of the same client is left alone; the
+plugin claims a worker by the entry class in its `workflows`. `KontraPlugin(*offerings)` takes
+offerings bound with `offering(...)` instead, for several on one client. Both take
+`stream_upload_budget` (seconds, default 2): how long one workflow task may spend storing its
+jobs' new stream items in the bucket; an item not stored by then reaches the buyer as a gap
+(`unavailable`), never as a failed task, so keep it well under your workflow task timeout
+(at most 8). `kontra serve` and `python worker.py` read it from `KONTRA_STREAM_UPLOAD_BUDGET`
+when set.
+A client built from a service client, `Client(service_client, plugins=[...])`, skips the
+connection hook: `await kontra.prepare()` before it. `kontra publish` still reads the offering
+from `worker.py`, so keep one beside `main.py` (`worker = serve(EnrichFlow)`, never run by
+`main.py`); a `kontra dev` profile publishes at start without it.
 
 Before `execute` starts your workflow, the handler checks the hold token offline (signature
 against the gate's keys, audience, expiry, your namespace, the offering, the contract hash),
@@ -578,147 +888,178 @@ async def lifecycle() -> None:
 
 The test `kontra init` writes does exactly this; read it for a full lifecycle, including a
 seller that never delivers and the refund at the deadline. Install with
-`pip install "kontra-sdk[testing]" pytest`.
+`pip install "kontra-sdk[testing]" pytest`. One setting differs from `kontra serve`: the
+worker's stream upload budget is 8 s, not 2, so a busy test machine stores every stream item;
+to see the gaps a slow bucket leaves, pass `mp.serve(worker, seller, stream_upload_budget=0.5)`.
 
-## The graph: `kontra graph`
+## The graph of a workflow
 
-Temporal keeps no definition of a workflow, only what each run did. `kontra graph` draws
-yours before anyone pays for a run, from mock runs:
+Temporal keeps no definition of a workflow, only what each run did. Kontra draws yours before
+anyone pays for a run, from mock runs, for `kontra dev`'s [graph page](#the-graph-page): under
+a dev profile (`kontra dev up`), `kontra serve` -- and `python worker.py`, whose `serve()`
+knows its directory -- draws the static graph of each workflow offering it serves in the
+background once its start checks have passed, and again whenever the offering's contract hash
+or the project's code differs from what the stored graph was drawn from. There is nothing to
+run for it, and serving never waits for it.
 
-```sh
-kontra graph                     # from the directory with worker.py: one line per edge
-kontra graph --mermaid           # a Mermaid flowchart, for a `mermaid` block GitHub renders
-kontra graph --json              # [{"offering", "runs", "graph", "never_scheduled"}]
-kontra graph --runs 16 --seed 7  # more runs, other random values
-kontra graph --input in.json     # every run starts with this input
-```
-
-For each offering `worker.py` binds (`--offering NAME@VERSION` picks one, `--dir` names
-another directory), the workflow runs `--runs` times (default 8) in Temporal's time-skipping
-test server, with what `serve()` registers -- the bound workflow, the further ones it
-registers (the children it starts) and the batch child, under Kontra's sandbox and payload
-converter -- but none of the worker's other options, and no codec. Every activity is
-answered by a stub with a value of the type it declares, so no activity body runs, nothing
-is fetched and no key is needed; timers are skipped. The input is drawn the same way from the
-workflow's input type, unless `--input` gives one (checked against the type first). Run 0
+The workflow runs 8 times in Temporal's time-skipping test server, in a child process of the
+worker at a lower priority, with what `serve()` registers -- the bound workflow and the
+further ones it registers (the children it starts) -- and `kontra.contrib.parallel`'s batch
+child, under Kontra's sandbox and payload converter, but none of the worker's other options or
+plugins (but one, below), and no codec. Every activity is answered by a stub with a value of
+the type it declares, so no activity body runs, nothing is fetched and no key is needed;
+timers are skipped. The input is drawn the same way from the workflow's input type. Run 0
 draws the smallest values (false, 0, empty lists, no optional fields), run 1 the largest
 (true, 3 items, every field), run 2 large lists near the top of the value (201 items, so a
-loop that batches its input by 50 or 100 goes round), and the others random ones from
-`--seed`: an `if` on a boolean an activity returned shows both branches from two runs on,
-however deep in the value it sits (only a recursive model is cut short, where it recurses),
-and the same command prints the same graph. The runs' graphs are then united: a loop is one
-node with an edge back, the activities one workflow task starts at once share a parallel
-group (an `if`'s branches, which no run starts together, never do), and
+loop that batches its input by 50 or 100 goes round), and the others seeded random ones: an
+`if` on a boolean an activity returned shows both branches from two runs on, however deep in
+the value it sits (only a recursive model is cut short, where it recurses), and the same code
+draws the same graph. The runs' graphs are then united: a loop is one node with an edge back,
+the activities one workflow task starts at once share a parallel group (an `if`'s branches,
+which no run starts together, never do), and the optional helper's
 `execute_activities_in_parallel` is one node, `execute_activities_in_parallel(<activity>)`
 (a `pages=` batch names its page activity too, the two sorted), however many items it ran,
-none included, and however many times it continued as new. [`examples/sweep`](../examples/sweep) shows the three, and every
-example's README shows its graph.
+none included, and however many times it continued as new.
+[`examples/sweep`](../examples/sweep) shows a fan-out, a branch, and one activity per URL as
+one node (with an edge back from the run whose 201 URLs outnumber the 50 it keeps open), and
+every example's README shows its graph.
 
-An agent workflow (one that imports `agents`) runs with a scripted model instead of yours:
-it calls every tool the agent was given once, then answers with a value of the agent's output
-type, so the graph shows model, tools, model. Its `[agents]` extra must be installed to
-import the project at all.
+An agent workflow (one whose `worker.py` passes Temporal's `OpenAIAgentsPlugin` in
+`plugins=`) runs with that integration and a scripted model instead of yours: it calls every
+tool the agent was given once, then answers with a value of the agent's output type, so the
+graph shows model, tools, model. The project's own `temporalio-openai-agents` must be installed
+to import it at all. An offering bound to an agent's handler has no static graph: the page
+draws what each of its runs did.
 
-What the runs could not show goes to stderr, and the exit status stays 0 (it is advice):
+The worker's log says when it draws (`drawing the graph page's static graph of
+acme/sweep@0.1.0 in the background`) and when it drew it; what the runs could not show follows
+at INFO, as `the mock runs said: ...`:
 
 - activities the worker registers that no run of any offering scheduled, once for the worker
   (`never scheduled in 8 mock runs: ship — branches on timers, signals or inputs the runs did
   not reach`): a branch only a signal, a particular input or more runs reach. Activities a
   batch child, a child's child or a local activity ran count as scheduled, and so do another
-  offering's; with `--offering`, the offerings left out ran nothing.
+  offering's.
 - runs that waited for what no timer brings (a signal, a `wait_condition` without a timeout):
   the test server skips to the run's timeout and times it out; the graph holds what it did
-  until then. A run still open after `--timeout` seconds of wall-clock time (default 5), or
-  whose workflow task fails on the mock values every time, is terminated, with the same
-  note. The stub answers an activity the same way every time within a run, so a loop that
-  polls one until it says done (`while not (await status()).done`) ends only in the runs
-  that drew `done`; a loop over a large drawn count (1000 in run 1) can take that long too.
+  until then. A run still open after 5 seconds of wall-clock time, or whose workflow task
+  fails on the mock values every time, is terminated, with the same note. The stub answers an
+  activity the same way every time within a run, so a loop that polls one until it says done
+  (`while not (await status()).done`) ends only in the runs that drew `done`; a loop over a
+  large drawn count (1000 in run 1) can take that long too.
 - a return type no valid value could be drawn for (a pattern with a lookaround, a model
   validator nothing satisfies): the stub returned null, and the workflow may have failed on
   it.
+
+When the graph cannot be drawn -- no test server and no network to download it, a project
+that fails to import there, an input type no valid value can be drawn for, mock runs past
+their time limit (two minutes beyond the runs' own deadlines, after which the child and its
+test server are stopped) -- the worker logs one WARNING line (`the graph page's static graph of ... was not drawn: ...`) and serves anyway; the
+page then draws what each run did, and the next start tries again. Production has no graph
+page: a worker serving under any other profile draws nothing, and so does a home without a
+profile file (a worker on `KONTRA_API_KEY` alone). A `Worker` you build in `worker.py` draws
+under `kontra serve`; run as `python worker.py`, or with `KontraPlugin` on your own main, it
+draws only when told the project's directory (`worker.project = Path(__file__).parent`,
+`KontraPlugin(..., project=...)`).
+
+The contract hash covers the types and `offering.yaml`, not what the workflow does, so the
+stored graph also records a hash of the project's code: every file of the project the worker
+imported (its tests, environments and build output aside), and Kontra's version. An edit to
+the workflow or an activity's module that keeps the types draws the graph again at the next
+start, with nothing to republish; a README does not. A new version is a new task queue, and
+is drawn at its first start.
 
 The test server is a binary temporalio downloads once on first use into
 `~/.cache/kontra/temporal-test-server` (under `$XDG_CACHE_HOME` when that is set), a
 directory made 0700; never the shared temp directory, where whoever creates the file name
 first chooses what runs. Anything in that directory someone else owns or can write is
-refused. Offline, before the download, `kontra graph` says it cannot start it. The server
-cannot be bound to the loopback: while the command runs it listens on every interface, on a
-random port, unauthenticated, so anyone who can reach the machine can read the runs there --
-an `--input` you give included -- and start workflows the mock worker runs. Ctrl-C, SIGTERM
-and SIGHUP stop the command and the server with it. With a profile in
-`$KONTRA_HOME`, each offering's graph is also saved under `$KONTRA_HOME/graphs/`, for
-`kontra dev`'s graph page to paint a live run on (`--no-save` skips it); it is never sent
-anywhere: `kontra publish` does not carry it.
+refused. The server cannot be bound to the loopback: while the mock runs go it listens on
+every interface, on a random port, unauthenticated, so anyone who can reach the machine can
+read the runs there (sampled values, nothing of a buyer's) and start workflows the mock worker
+runs. Stopping the worker stops the child and the server with it, and so does a worker that
+ends without stopping (a closed terminal, SIGKILL): the child's stdin is a pipe from the
+worker, and when it closes the child kills itself and its server. Each offering's graph is
+saved under `$KONTRA_HOME/graphs/` (0600 files in a 0700 directory, by the task queue's hash),
+with the contract hash and the code hash it was drawn from; one worker of a home draws at a time, and a second
+finds the first's graph. It is never sent anywhere: `kontra publish` does not carry it.
 
 ## Running locally: `kontra dev`
 
 ```sh
 kontra dev                    # = kontra dev up
 kontra dev up --ui            # + Temporal's UI, reading your payloads, and the graph page (below)
-kontra dev up --observability # + Prometheus, Grafana, and Loki and Tempo for `kontra serve --otlp` (below)
-kontra dev status             # containers, the gate's health, the codec server, the profile
-kontra dev logs [gate|temporal|postgres|postgres-relay|s3|migrate|ui|prometheus|prometheus-agent|grafana|otelcol|loki|tempo] [-f] [--tail N]
-kontra dev down [--volumes]   # --volumes also deletes the stack's data
+kontra dev up --observability # + Prometheus, Grafana, and Loki and Tempo for `kontra serve --otlp` (Docker)
+kontra dev up --persist       # keep the stack's state across `down` and reboots (remembered)
+kontra dev status             # the gate, Temporal, the codec server, the profile
+kontra dev logs [gate|temporal|codec|grafana|...] [-f] [--tail N]
+kontra dev down [--reset]     # --reset also deletes kept state and the logs
 ```
 
-`kontra dev` runs the same `compose.yaml` that CI and production run: Kontra's Temporal server
-(with the Authorizer), the gate, Postgres and an S3 bucket. It writes random credentials to
-`$KONTRA_HOME/dev.env` on first use, waits for the gate, logs you in as a dev party with play
-money, and waits until Temporal accepts your worker token. It refuses to replace a real login
-in the same `KONTRA_HOME`; use another home (`KONTRA_HOME=~/.kontra-dev kontra dev`) or run
-`kontra dev up --replace-profile`.
+`kontra dev up` runs Kontra on this machine with no containers and nothing to pull: the dev gate
+(the gate's whole API, escrow by the platform's own rules, play money) and a Temporal dev server,
+in one background process. It needs `pip install "kontra-sdk[dev]"` (`[testing]` includes it),
+downloads the Temporal CLI once (checked against the checksums kontra-sdk pins, into a cache only
+you may write; `KONTRA_TEMPORAL_CLI` names one on disk instead, server 1.32 or later), and logs you in as a dev party named after your user name (`--handle`
+picks another) with 100.00 of play money. There is no login step: the profile it writes is what
+`kontra serve`, `kontra hire` and `kontra mcp` use. It refuses to replace a real login in the same
+`KONTRA_HOME` (`KONTRA_HOME=~/.kontra-dev kontra dev`, or `--replace-profile`).
 
-Everything is published on 127.0.0.1 only: the gate on 8080, Temporal on 7233, the bucket on
-8333, Postgres on 5432. When a port is taken, set `KONTRA_DEV_GATE_PORT`,
-`KONTRA_DEV_TEMPORAL_PORT`, `KONTRA_DEV_S3_PORT` or `KONTRA_DEV_PG_PORT` (the header of
-[`compose.yaml`](../compose.yaml) lists every variable). `kontra dev up` remembers these four
-ports in `$KONTRA_HOME/dev.env`, so `kontra dev status`, `logs`, `down` and the next `up` use
-them without being told again; set one in the environment to change it, or set it empty for
-one `up` (`KONTRA_DEV_GATE_PORT= kontra dev up`) to go back to the default. The bind addresses
-(`KONTRA_DEV_BIND`, `KONTRA_DEV_PG_BIND`) are never remembered: a stack published beyond
-loopback (dev login, play money) is one you ask for on that `up`.
-The images are
-`ghcr.io/medmahmoudi26/kontra-temporal:dev` and `ghcr.io/medmahmoudi26/kontra-gate:dev`;
-`KONTRA_TEMPORAL_IMAGE` and `KONTRA_GATE_IMAGE` name others, and `--env-file` adds variables
-from a file. The published Temporal image is `linux/amd64` only; on an arm64 machine, build a
-native one in a checkout (`make temporal`, then `KONTRA_TEMPORAL_IMAGE=kontra-temporal:dev`).
-Temporal's internal frontend, which has no authentication, is never published, and Temporal
-shares a network only with the gate and `postgres-relay`, which carries its database
-connections (see [architecture](architecture.md#one-environment-definition)).
+Everything listens on 127.0.0.1 only: the gate on 8080, Temporal on 7233. `kontra dev up
+--gate-port` and `--temporal-port` move them, and `up` remembers them in `$KONTRA_HOME/dev/`. The
+`KONTRA_DEV_*_PORT` variables belong to the e2e stack (`make e2e`), not to `kontra dev`, so setting
+one does not move its gate. The stack's state is in memory: `kontra dev down` (or a reboot) forgets
+parties, the catalog, jobs and balances, and a `kontra serve` started before has to be restarted.
+`--persist` keeps it all in `$KONTRA_HOME/dev/data/`, and a restarted stack is then the same one,
+the tokens of a running `kontra serve` included. On a dev profile `kontra serve` publishes an
+unpublished version itself, so `kontra dev && kontra serve` is a hireable offering.
 
-On a dev profile, `kontra serve` publishes an unpublished version itself, so
-`kontra dev && kontra serve` is a hireable offering.
+A second party (a buyer, say) is another home: `KONTRA_HOME=~/.kontra-buyer kontra dev up --handle
+bob` finds the stack your user already runs on that gate port and joins it instead of starting
+one (nothing else starts; its own `--ui` starts only its own codec server). `kontra dev down` in
+the joining home says to run it in the home that started the stack. A home that joins as the same
+handle is a second machine of the same party: pass `--handle` to be someone else.
+
+What the dev stack is not: the Temporal dev server runs **no Authorizer**, the gate keeps blobs in
+memory rather than in a bucket (`--persist` also writes them to `$KONTRA_HOME/dev/data/blobs/`),
+and the money is a ledger in memory. A workflow that does something
+the platform's Authorizer refuses works here and fails there (see [security](security.md)); Kontra's
+own end-to-end suite covers that half (`make e2e`, against the prod gate image). The dev server's
+frontend, its HTTP API and (with `--ui`) its UI take no credentials: anyone on this machine's
+loopback can act on its namespaces, and a web page whose name rebinds to 127.0.0.1 can reach the
+HTTP API and the UI. Your payloads stay sealed (they are encrypted to your key, and the gate and
+the codec server check `Host`). Run it on a machine whose loopback is yours.
 
 ### The UI and the dashboards
 
-`--ui` and `--observability` are the two compose profiles of the same `compose.yaml` (`ui`,
-`observability`); production never enables them. `kontra dev up` runs exactly the profiles
-its flags name: alone it is the stack above and nothing more, and it stops what an earlier
-`--ui` or `--observability` started. `kontra dev status`, `logs` and `down` cover every
-profile. Each tool is published on 127.0.0.1 only, whatever `KONTRA_DEV_BIND` says:
+`--ui` is the dev server's own UI; turning it on or off restarts the Temporal child in a second or
+two and keeps every run. `--observability` is the one part that runs containers (Docker with the
+compose plugin): a shipped compose file with Prometheus, Grafana, Loki and Tempo and nothing of
+Kontra's. `kontra dev up` runs exactly what its flags name and stops the rest. Each listens on
+127.0.0.1 only:
 
-| Flag | Service | Address | Port setting |
+| Flag | Service | Address | Moved by |
 |---|---|---|---|
-| `--ui` | Temporal's UI (`temporalio/ui`) | http://localhost:8233 | `KONTRA_DEV_UI_PORT` |
-| `--ui` | the codec server, a process of `kontra dev` on the host, and the [graph page](#the-graph-page) it serves | http://127.0.0.1:8081 | `KONTRA_DEV_CODEC_PORT` |
-| `--observability` | Prometheus | http://localhost:9090 | `KONTRA_DEV_PROMETHEUS_PORT` |
-| `--observability` | Grafana: Temporal's dashboards; Prometheus, Loki and Tempo to explore; no sign-in | http://localhost:3000 | `KONTRA_DEV_GRAFANA_PORT` |
-| `--observability` | an OpenTelemetry Collector, OTLP over gRPC, for `kontra serve --otlp` | http://127.0.0.1:4317 | `KONTRA_DEV_OTLP_PORT` |
+| `--ui` | Temporal's UI (the dev server's own, Temporal UI 2.54) | http://127.0.0.1:8233 | `--ui-port` |
+| `--ui` | the codec server, a process of `kontra dev` on the host, and the [graph page](#the-graph-page) it serves | http://127.0.0.1:8081 | `--codec-port` |
+| `--observability` | the dev server's metrics, for Prometheus | http://127.0.0.1:9463 | `--metrics-port` |
+| `--observability` | Prometheus | http://localhost:9090 | `--prometheus-port` |
+| `--observability` | Grafana: Temporal's dashboards; Prometheus, Loki and Tempo to explore; no sign-in | http://localhost:3000 | `--grafana-port` |
+| `--observability` | an OpenTelemetry Collector, OTLP over gRPC, for `kontra serve --otlp` | http://127.0.0.1:4317 | `--otlp-port` |
 
-The five ports are remembered in `$KONTRA_HOME/dev.env` like the stack's. Loki and Tempo
+The flags are `kontra dev up`'s, remembered in `$KONTRA_HOME/dev/` like the gate's port (the
+`KONTRA_DEV_*_PORT` variables are the e2e stack's and move nothing here). Loki and Tempo
 publish nothing: the collector writes to them and Grafana reads them.
 
 `--ui` is Temporal's own UI, not a Kontra one; after the login, `kontra dev up --ui` prints
 the link to your namespace's workflows. Payloads in Kontra's Temporal are age ciphertext, so
 `kontra dev up --ui` also starts a codec server in the background: Temporal's codec-server
 protocol (`POST /decode` and `/encode`) answered with this machine's key and the job keys
-under `$KONTRA_HOME`. The UI is configured to call it (`TEMPORAL_CODEC_ENDPOINT`), so you read
+under `$KONTRA_HOME`. The UI is configured to call it (the dev server's `--ui-codec-endpoint`), so you read
 your own inputs, results and failures in the UI; a payload encrypted to another party, or one
 claim-checked to the bucket, is shown as stored. `kontra dev down` stops the codec server; it
 writes to `$KONTRA_HOME/codec.log`. It starts only when `$KONTRA_HOME` holds a dev profile
-(the one `kontra dev up` logs in to): with a real login there (`--no-login`, or
-`--replace-profile` against a gate that is not a dev gate) the UI shows payloads as
-ciphertext, and `up` says why. The UI talks to Temporal's internal frontend, which has no
+(the one `kontra dev up` logs in to): with a real login there (a home used with
+`--replace-profile`) the UI shows payloads as ciphertext, and `up` says why. The UI talks to the dev server, which has no
 authentication: it sees and controls every namespace of the local stack, and so does anyone
 who reaches its port, as anyone who reaches the codec server's can have your key decrypt what
 was encrypted to it. Both answer on 127.0.0.1 alone, and the codec server to no web origin but
@@ -728,11 +1069,11 @@ which (as upstream) check no `Host` and ask no sign-in, so it can use the UI's a
 start, signal, terminate a workflow in any namespace -- read the metrics, and read your
 workers' logs and traces and edit dashboards through Grafana. The codec server checks `Host`
 and refuses it, so your payloads stay sealed. `kontra dev up` alone stops
-the profiles when you are not using them.
+the UI and the observability containers when you are not using them.
 
-`--observability` runs Prometheus, Prometheus's agent and Grafana. Prometheus scrapes Kontra's
-Temporal server (`kontra dev up --observability` turns its metrics listener on,
-`KONTRA_TEMPORAL_METRICS_ADDR`), and receives the metrics of every `kontra serve --metrics` on
+`--observability` runs Prometheus, Prometheus's agent and Grafana. Prometheus scrapes the dev
+server (`kontra dev up --observability` turns its metrics listener on, on 127.0.0.1:9463), and
+receives the metrics of every `kontra serve --metrics` on
 this machine on ports 9464 to 9473. Grafana opens on Temporal's SDK dashboard, with its server
 dashboard beside it (see [Dashboards](#dashboards)). Serve the metrics on loopback, one port
 per worker:
@@ -771,8 +1112,8 @@ for example one activity of one run:
 
 A line's `trace_id` links to its trace in Tempo, and a span to its trace's lines in Loki.
 `kontra-worker` is the service name when `OTEL_SERVICE_NAME` sets none. Loki keeps 7 days of
-logs and Tempo 14 days of traces, on volumes of their own (`kontra dev down --volumes`
-deletes them with the rest). From Loki 3.7, Loki refuses every line while the disk its data
+logs and Tempo 14 days of traces, on volumes of their own (`kontra dev down` stops the
+observability containers and keeps their volumes; `kontra dev down --reset` deletes them too). From Loki 3.7, Loki refuses every line while the disk its data
 is on is fuller than a threshold; it is 98% here, not Loki's 90%, at which many a laptop's disk
 already is. Grafana's anonymous user is an Editor here, because Explore needs one in Grafana
 13: an Editor also changes dashboards (the vendored ones are read-only), but adds no data
@@ -784,12 +1125,12 @@ anything out.
 `kontra dev up --ui` also prints the graph page, which the codec server serves:
 
 ```text
-  workflows http://localhost:8233/namespaces/acme/workflows
+  ui        http://127.0.0.1:8233/namespaces/acme/workflows
   graph     http://127.0.0.1:8081/graph
 ```
 
 It lists your namespace's latest 50 runs (the batches' children left out), and opens one as
-its graph: the steps of the workflow as [`kontra graph`](#the-graph-kontra-graph) draws them,
+its graph: the steps of the workflow as [`kontra serve` draws them](#the-graph-of-a-workflow),
 with what this run did painted on. Each step shows its status (scheduled, running,
 completed, failed, timed out, canceled) and duration, `×3` when it is on its third attempt,
 `∥50` when it ran 50 at once; the activities one workflow task started together are boxed as
@@ -803,21 +1144,24 @@ and its pane shows that failure's message), and the page stops once the run has 
 timing, task queue and failure, its input, result and failure message decoded with this
 machine's key, and its links:
 
-- **Temporal UI**: the step's own event in the run's history (a child workflow's own run);
-- **Logs**: Grafana's Explore on Loki, the step's lines over its time range (a second either
+- **temporal ui**: the step's own event in the run's history (a child workflow's own run);
+- **loki**: Grafana's Explore on Loki, the step's lines over its time range (a second either
   side), `{service_name="kontra-worker"} | workflow_id="job-..." | run_id="..." |
   activity_type="..."`;
-- **Trace**: Explore on Tempo, the job's trace.
+- **tempo**: Explore on Tempo, the job's trace.
 
-The header has the same three for the whole run. Logs and Trace need `--observability` and a
-worker serving with `kontra serve --otlp http://127.0.0.1:4317`, which also writes the trace
-context the Trace link reads into the run's history. The Logs link selects `kontra-worker`,
+The header has the same three for the whole run (**Temporal UI**, **Grafana**, **Trace**). The
+Loki and Tempo links need `--observability` and a worker serving with `kontra serve --otlp
+http://127.0.0.1:4317`, which also writes the trace context the Tempo link reads into the run's
+history. The Loki link selects `kontra-worker`,
 or `OTEL_SERVICE_NAME` as `kontra dev up` saw it: give the worker the same one.
 
-The whole workflow, branches this run never takes included, comes from `kontra graph`: run
-`kontra graph --dir <project>` with the dev profile's `KONTRA_HOME` once the workflow changes,
-and the page paints each run on the graph saved for its task queue (the one `kontra serve`
-serves, exactly). Without one, it draws what the run did and says how to get the rest.
+The whole workflow, branches this run never takes included, is the graph `kontra serve` draws
+under the dev profile once it has served the offering, and again when its contract changes
+([above](#the-graph-of-a-workflow)); the page paints each run on the graph saved for its task
+queue (the one `kontra serve` serves, exactly). Without one, it draws what the run did and
+says that starting `kontra serve` once draws the rest; for a handler offering, whose entry is a
+turn of an agent, it draws what the run did and says so.
 
 The run's graph carries names, statuses and times, never an input, result, failure message
 or heartbeat (it is read from history by `kontra.graph`, which emits no payload). A step's
@@ -829,6 +1173,111 @@ nothing but its own script and loads nothing from elsewhere, and its data routes
 own origin alone. The codec server reads Temporal as you, with your dev login's worker token,
 from the first time the page asks (so it starts, and decodes for the UI, without Temporal);
 like the decoding, it runs for a dev profile only.
+
+### The agent session pane
+
+A run of an agent gets a second column on the same page, beside its graph: **SESSION**, the
+agent's turns as it ran them, above the **NODE** pane of the step you selected (on a narrow
+screen the session goes under the graph and the node pane under it). Each turn is a header
+(`── turn 1 · sweep(SweepRequest)`: the handler and its input's type, as the agent's own
+`agent_interface` query names it; the input's first field when it does not answer) over its
+rows, in the order the agent published them:
+
+```text
+▸ turn.started    input: 12 domains          +00:00
+○ model.call      gpt-4o                     +00:01
+○ model.response  "plan first"     820→36    +00:01
+▣ tool.call       plan                       +00:02
+▣ tool.result     plan 12 targets            +00:02
+◆ handoff         → cert-checker             +00:04
+  └ ○ model.call      gpt-4o
+  └ ▣ tool.call       fetch_cert ×12
+  └ ▸ response        {expired:1, weak:2}
+▢ approval.requested post_findings
+▸ response        {domains:12, targets:12, …}
+```
+
+A `tool.call` or `tool.result` row is the tool's activity on the graph: click it and its node is
+selected and flashes, with the node pane's links; click a node and its rows are highlighted. A
+bound handler's job (`serve(Agent.handler)`) draws its agent child as a box inside its node,
+with the agent's own steps (each tool's activity, the subagents it started) as real nodes in
+it. A row is linked by the `tool_id` the harness carries in each tool activity's input,
+decrypted with this machine's key; when an input is sealed to another key, by the tool's name
+and order, and the row says so. A `handoff` row is the subagent's child node (`child · subagent
+· handoff`), with the subagent's own rows nested under it, read from its own history (three
+subagents deep, sixteen in one view; past that the row links to the subagent's own page and
+says why); a nested row selects that child node too. A tool call waiting on an approval marks
+its node `needs ✓` (a placeholder node until the agent schedules it). A batch child shows
+`pages= · 7/12` (`7/≥8` while more pages may come): its items done, of the batch's own count.
+Any other row opens its event's body in the pane, decoded here.
+
+The footer counts the events and gives the last `seq`: an event's offset on the stream, the
+one counter it has, and the one the pane dedupes by. The rows and their short summaries come
+from the same snapshot as the graph, through the same header-gated route as a step's payloads;
+the live stream only says that something changed. **Replay** shows the rows again from seq 0 at
+ten times their pace, and the graph as it stood at each, from what the page already has (Esc
+returns to the live tail).
+
+An approval or a callback the agent waits on is its row. For an agent you run as its own
+workflow, while it runs, the row has **Allow** and **Deny** (a callback: a value and **Send**):
+the console sends the harness's `tool_approval` or `provide_callback_result` Update to that run,
+as your dev party, once per request (see `docs/security.md` for what the route checks); a
+callback's value is sent as the type the tool declares (text for a `str`, JSON otherwise). A hired
+turn ends the job on an approval or a callback (one hire is one turn), so there the row is
+informational; a console under any profile but a dev one answers nothing.
+
+**Where the events come from.** An agent publishes its events into its workflow's in-memory
+stream; they are in history only once something reads it. A hired turn's wrapper reads its
+agent for the whole turn, so its session is always there. An agent you run as its own workflow
+shows "not in history yet" until a client of yours has read its `turn_events`, with **Pull once**:
+one read from seq 0, as your dev party (the pane never reads on its own).
+
+**The schema the console understands** is `temporal-agent-harness/0.6`: the harness's
+`AgentEvent` (`agent_id`, `turn_id`, `turn_number`, `message_id`, `timestamp`, and the typed
+`event`) on the `turn_events` topic, as `temporal-agent-harness==0.6.0` writes it. The
+dependency is the schema, not the package: any agent that publishes these events there -- the
+harness, a hand-rolled loop, a subprocess -- gets the pane. Every type maps to one row, or
+folds into one, or is counted without a row; a type the console does not know is a row of its
+own, with its raw type, never dropped:
+
+| `AgentEvent.event.type` | in the pane |
+|---|---|
+| `message_accepted` | the turn's header: its handler and input line |
+| `message_handler_start` | no row (counted) |
+| `message_handler_end` | `▸ response` |
+| `message_handler_error` | `▸ response` (failed) |
+| `turn_started` | `▸ turn.started` |
+| `turn_end` | closes the turn (its status) |
+| `model_interaction_started` | `○ model.call` |
+| `model_interaction_ended` | `○ model.response`, with its token usage |
+| `reply_delta` | its text folds into the next `model.response` |
+| `thought_summary` | folds into the next `model.response`, off its line |
+| `text_annotation` | folds into the next `model.response` (a citation, not text) |
+| `tool_requested` | `▣ tool.call` |
+| `tool_start` | folds into its `tool.call` (running) |
+| `tool_progress_delta` | folds into its `tool.call` |
+| `tool_end` | `▣ tool.result` |
+| `tool_error` | `▣ tool.result` (failed) |
+| `tool_approval_requested` | `▢ approval.requested` |
+| `tool_approval_resolved` | folds into its `approval.requested` (allowed or denied) |
+| `auto_approval_evaluation_ended` | folds into its `approval.requested` (the auto verdict) |
+| `auto_approval_evaluation_started` | no row (counted) |
+| `auto_approval_evaluation_superseded` | no row (counted) |
+| `auto_approval_evaluation_error` | no row (counted) |
+| `callback_requested` | `▢ callback.requested` |
+| `callback_resolved` | folds into its `callback.requested` (ok, error or timeout) |
+| `subagent_started` | `◆ handoff` |
+| `subagent_message_sent` | nested under its `handoff`, until the subagent's own rows are read |
+| `subagent_reply_received` | `▸ response`, nested likewise |
+| `subagent_stopped` | closes its `handoff` |
+| `subagent_stream_unavailable` | a note under its `handoff` |
+| `state_snapshot` | no row (counted) |
+| `state_patch` | no row (counted) |
+
+A summary, and every other string read from an event, is at most 120 characters (an id 1000),
+never a whole body; a stream item over 256 KiB is a row that says it is too large; past 5000
+turns and rows (a subagent's nested rows included) or 4 MiB of them, one row says how many more
+there are.
 
 ## Publishing and serving
 
@@ -1100,6 +1549,21 @@ for contract X is never served by code running contract Y.
 A new version is a new document, endpoint and task queue. Jobs hired on the old version
 finish on a worker that still serves it.
 
+kontra-sdk declares the `temporalio` range it runs on, `temporalio>=1.34,<1.38` (its suite
+runs on the minor its lock holds: 1.34, today the only one released in the range), and your
+project gets `temporalio` through it: you import it directly, so compatibility is a
+dependency range, not an import path. Outside that range -- read as pip reads it, so
+`1.34.0rc1`, which comes before `1.34`, is outside -- a Kontra worker refuses to start
+(Kontra's codec relies on experimental temporalio APIs a minor release may change), and
+`kontra publish` and `kontra serve` say so first, before they import `worker.py` (`publish`
+on stderr, `serve` in its log):
+
+```text
+warning: temporalio 1.38.0 is outside the range kontra-sdk is tested on (temporalio>=1.34,<1.38); install one in it, e.g. `pip install 'temporalio>=1.34,<1.38'`
+```
+
+If your own dependencies pull in another `temporalio`, pin it into the range.
+
 ## Getting paid
 
 | Event | Money |
@@ -1123,7 +1587,7 @@ Orchestration in your namespace (actions, history) is your cost of goods; price 
 Write the Nexus document yourself and bind it:
 
 ```python
-offering("offering.yaml", workflow=EnrichFlow, quote=quote, contract="contract.yaml")
+offering("offering.yaml", entry=EnrichFlow, quote=quote, contract="contract.yaml")
 ```
 
 `kontra publish` validates it, merges `offering.yaml` into `x-kontra` and otherwise sends it
@@ -1133,9 +1597,9 @@ merged by hand.
 The examples: [`examples/hello`](../examples/hello) (the smallest offering, one field in and
 one out, as a five-minute tutorial), [`examples/enrich`](../examples/enrich) (types-first, with
 an artifact), [`examples/legacy-actor`](../examples/legacy-actor) (an older job turned into
-an offering), [`examples/sweep`](../examples/sweep) (a fan-out, a batch of one activity per
-URL and a branch, and the graph `kontra graph` draws of them), and two agents:
+an offering), [`examples/sweep`](../examples/sweep) (a fan-out, one activity per URL with at
+most 50 open, and a branch, and the graph `kontra serve` draws of them), and two agents:
 [`examples/chef-agents`](../examples/chef-agents) (as workflow code) and
 [`examples/chef-claude`](../examples/chef-claude) (as a process). Each keeps its derived
 `contract.yaml` as a golden file, reproduced byte for byte by the tests, and its README its
-graph, which the tests compare with `kontra graph --mermaid`.
+graph, which the tests compare with the mock runs' (`tests/graph/test_cli.py`).

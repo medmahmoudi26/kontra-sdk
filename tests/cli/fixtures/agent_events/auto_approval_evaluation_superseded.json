@@ -1,0 +1,1 @@
+{"agent_id": "a1b2c3", "event": {"evaluation_id": "eval-1", "evaluator": "policy", "tool_id": "call-post-0", "tool_name": "post_findings", "type": "auto_approval_evaluation_superseded", "verdict": null}, "message_id": "m-0199f0a1", "timestamp": 1760950000.0, "turn_id": "t-0199f0a1", "turn_number": 1}

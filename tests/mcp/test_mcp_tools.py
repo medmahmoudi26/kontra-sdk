@@ -52,30 +52,46 @@ NOW = datetime(2026, 10, 11, tzinfo=UTC)
 KEY = "0123456789abcdef" * 2
 
 
-def event(seq: int, source: m.ProgressSource = m.ProgressSource.HEARTBEAT) -> m.ProgressEvent:
-    return m.ProgressEvent(seq=seq, at=NOW, source=source, activity="work")
+def event(seq: int, source: m.ProgressSource = m.ProgressSource.HEARTBEAT) -> m.StreamEvent:
+    """One event of a job's stream: a progress item (a heartbeat) or a history event."""
+    if source is m.ProgressSource.HEARTBEAT:
+        return m.StreamEvent(
+            cursor=seq,
+            kind=m.StreamEventKind.ITEM,
+            at=NOW,
+            topic="kontra.progress",
+            offset=seq,
+            ciphertext_b64="QQ==",
+        )
+    return m.StreamEvent(
+        cursor=seq, kind=m.StreamEventKind.HISTORY, at=NOW, state=m.JobState.WORKING
+    )
 
 
 @dataclass
 class StubGate:
-    """``progress`` replays ``events`` after ``after``, then stays open (a running job),
+    """``stream`` replays ``events`` after ``after``, then stays open (a running job),
     ends (``closed``), fails, or keeps producing events (``chatty``)."""
 
-    events: list[m.ProgressEvent]
+    events: list[m.StreamEvent]
     closed: bool = False
     fail: bool = False
     chatty: bool = False
     asked: list[int] = field(default_factory=list[int])
     finished: int = 0
 
-    def progress(self, job_id: str, *, after: int = 0) -> AsyncIterator[m.ProgressEvent]:
+    def stream(
+        self, job_id: str, *, topics: Any = (), history: bool = False, after: int = 0
+    ) -> AsyncIterator[m.StreamEvent]:
+        assert list(topics) == ["kontra.progress"]
+        assert history
         self.asked.append(after)
         return self._stream(after)
 
-    async def _stream(self, after: int) -> AsyncIterator[m.ProgressEvent]:
+    async def _stream(self, after: int) -> AsyncIterator[m.StreamEvent]:
         try:
             for e in self.events:
-                if e.seq > after:
+                if e.cursor > after:
                     yield e
             if self.fail:
                 raise GateError(503, "unavailable", "the gate is restarting")
@@ -95,12 +111,18 @@ class StubKontra:
         self.gate = gate or StubGate([])
         self.closed = False
 
-    def _progress(self, e: m.ProgressEvent) -> Progress:
-        if e.source is m.ProgressSource.HEARTBEAT:
+    def _progress(self, e: m.StreamEvent, job_id: str = "") -> Progress | None:
+        if e.kind is m.StreamEventKind.ITEM:
             return Progress(
-                seq=e.seq, at=e.at, source=e.source, activity=e.activity, percent=float(e.seq)
+                seq=e.cursor,
+                at=e.at,
+                source=m.ProgressSource.HEARTBEAT,
+                activity="work",
+                percent=float(e.cursor),
             )
-        return Progress(seq=e.seq, at=e.at, source=e.source, activities_running=("work",))
+        return Progress(
+            seq=e.cursor, at=e.at, source=m.ProgressSource.HISTORY, activities_running=("work",)
+        )
 
     async def aclose(self) -> None:
         self.closed = True
@@ -290,7 +312,25 @@ def error_of(err: BaseException) -> dict[str, Any]:
     return answer.structured_content["error"]
 
 
-def test_failures_carry_the_gates_code_and_say_whether_to_retry() -> None:
+def _dev_profile(home: Path, *, dev: bool) -> None:
+    from kontra.profile import Profile
+
+    Profile(
+        gate_url="http://127.0.0.1:8080",
+        temporal_address="127.0.0.1:7233",
+        party="alice",
+        namespace="alice",
+        refresh_token="r0",
+        auth_time=datetime(2026, 10, 20, tzinfo=UTC),
+        tls=False,
+        dev=dev,
+    ).save(home)
+
+
+def test_failures_carry_the_gates_code_and_say_whether_to_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KONTRA_HOME", str(tmp_path))  # no profile: no dev hint either way
     assert error_of(GateError(404, "job_not_found", "no such job")) == {
         "code": "job_not_found",
         "message": "no such job",
@@ -318,6 +358,25 @@ def test_failures_carry_the_gates_code_and_say_whether_to_retry() -> None:
     }
     assert error_of(TimeoutError())["code"] == "timeout"
     assert error_of(PermissionError("read-only"))["code"] == "local_io_error"
+
+
+def test_a_dev_profile_is_told_kontra_dev_up_never_kontra_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A dev gate that restarted forgot the session; one that is down does not answer: either
+    way the agent is told ``kontra dev up``, never ``kontra login`` (decisions I34, OD14)."""
+    monkeypatch.setenv("KONTRA_HOME", str(tmp_path))
+    _dev_profile(tmp_path, dev=True)
+    refused = error_of(GateError(401, "invalid_grant", "expired"))["message"]
+    assert "kontra dev up" in refused
+    assert "kontra login" not in refused
+    down = error_of(httpx.ConnectError("refused"))
+    assert down["code"] == "gate_unreachable"
+    assert "kontra dev up" in down["message"]
+    _dev_profile(tmp_path, dev=False)  # a real login: as before
+    refused = error_of(GateError(401, "invalid_grant", "expired"))["message"]
+    assert "kontra login" in refused
+    assert "kontra dev up" not in error_of(httpx.ConnectError("refused"))["message"]
 
 
 def test_money_refusals_say_what_was_and_was_not_done() -> None:

@@ -1,5 +1,5 @@
-"""The versioned spec files under ``spec/`` (the x-kontra schema and the reserved
-``Kontra*`` definitions), found wherever the package is installed.
+"""The versioned spec files under ``spec/`` (the x-kontra schema, the reserved
+``Kontra*`` definitions and the ``streams:`` schema), found wherever the package is installed.
 
 They live at the repository root because they are the public, language-neutral contract
 (a Go seller reads them too). An editable install finds them next to the package; a wheel
@@ -17,11 +17,13 @@ from typing import Any
 
 __all__ = [
     "KONTRA_TYPES_FILE",
+    "OFFERING_STREAMS_FILE",
     "RESERVED_PREFIX",
     "X_KONTRA_FILE",
     "X_KONTRA_V1_FILE",
     "find_spec_dir",
     "kontra_types",
+    "offering_streams_schema",
     "reserved_def",
     "reserved_names",
     "spec_dir",
@@ -34,6 +36,8 @@ X_KONTRA_FILE = "x-kontra.v2.json"
 #: never published, quoted or hired (``validate_document(..., read_only=True)``).
 X_KONTRA_V1_FILE = "x-kontra.v1.json"
 KONTRA_TYPES_FILE = "kontra-types.v1.json"
+#: ``offering.yaml`` ``streams:`` (decisions I31): catalog data, never part of ``x-kontra``.
+OFFERING_STREAMS_FILE = "offering-streams.v1.json"
 #: Definitions whose name starts with this belong to the spec, never to a seller.
 RESERVED_PREFIX = "Kontra"
 
@@ -76,6 +80,12 @@ def x_kontra_schema(version: int = 2) -> dict[str, Any]:
 def kontra_types() -> dict[str, Any]:
     """``spec/kontra-types.v1.json`` (a fresh copy)."""
     return copy.deepcopy(_load(KONTRA_TYPES_FILE))
+
+
+def offering_streams_schema() -> dict[str, Any]:
+    """``spec/offering-streams.v1.json``: the language-neutral statement of
+    :func:`kontra.contract.offering.check_streams` (a fresh copy)."""
+    return copy.deepcopy(_load(OFFERING_STREAMS_FILE))
 
 
 def reserved_names() -> frozenset[str]:

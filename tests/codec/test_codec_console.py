@@ -1,8 +1,10 @@
 """The marker-string scan, extended to the graph page of ``kontra dev up --ui`` (seam ⑤,
-decisions I28): the page, ``/api/graph``, ``/api/workflows`` and the live stream carry no
-input, result, failure message or heartbeat -- not the marker, in any case, nor any
-payload's ciphertext or its base64 -- and ``/api/io`` is the one route that answers payload
-content, decoded with this machine's key, only to the page's own requests.
+decisions I28, I36): the page, ``/api/graph``, ``/api/workflows``, ``/api/session`` and the
+live stream (``/api/events``, change signals alone) carry no input, result, failure message or
+heartbeat -- not the marker, in any case, nor any payload's ciphertext or its base64 -- and
+``/api/io`` is the one route that answers payload content, decoded with this machine's key,
+only to the page's own requests. (An agent's session, whose rows carry short summaries, is
+scanned in ``tests/cli/test_session_lifecycle.py``.)
 
 A seller's worker (Kontra's payload codec, this machine's key, Kontra's sandbox and the batch
 child ``serve()`` registers) runs on a real dev server a workflow whose input carries the
@@ -21,6 +23,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -35,11 +38,11 @@ from temporalio.client import Client, WorkflowFailureError
 from temporalio.converter import DataConverter, PayloadCodec
 from temporalio.worker import Worker
 
-from kontra._parallel import _Batch
 from kontra.cli._codec_server import CodecServer
 from kontra.cli._console import Connected, Console
 from kontra.codec import CLAIM_CHECK_ENCODING, ENCODING, KontraCodec
 from kontra.codec.age import generate_identity
+from kontra.contrib.parallel import ParallelPlugin
 from kontra.serve.worker import seller_data_converter, workflow_runner
 from kontra.testing.devserver import (
     CLI_ENV,
@@ -118,6 +121,11 @@ def _preflight(srv: CodecServer, path: str, origin: str) -> httpx.Response:
         )
 
 
+def _post(srv: CodecServer, path: str, body: str, **headers: str) -> httpx.Response:
+    with httpx.Client(trust_env=False, timeout=60) as http:
+        return http.post(f"http://127.0.0.1:{srv.port}{path}", content=body, headers=headers)
+
+
 def _stream(srv: CodecServer, path: str) -> bytes:
     """The whole event stream: it ends after the closed run's graph."""
     out = b""
@@ -190,17 +198,16 @@ async def test_the_graph_page_shows_payloads_through_its_io_route_alone(
     async with Worker(
         client,
         task_queue=queue,
-        workflows=[LeakFlow, RefuseFlow, _Batch],
+        workflows=[LeakFlow, RefuseFlow],
         activities=[heartbeat_then_fail, item],
         workflow_runner=workflow_runner(),
+        plugins=[ParallelPlugin()],
     ):
         handle = await client.start_workflow(
             LeakFlow.run, f"input {MARKER}", id=wf, task_queue=queue
         )
         run = handle.result_run_id or ""
-        stream = asyncio.create_task(
-            asyncio.to_thread(_stream, server, f"/api/graph/events?w={wf}")
-        )
+        stream = asyncio.create_task(asyncio.to_thread(_stream, server, f"/api/events?w={wf}"))
         # While it runs: the graph, and the heartbeat as DescribeWorkflowExecution holds it.
         polls = 0
         while not stream.done():
@@ -282,6 +289,13 @@ async def test_the_graph_page_shows_payloads_through_its_io_route_alone(
     assert all(f"input {MARKER} {i}" in json.dumps(batch_io["input"]) for i in range(3))
     refused_io = _get(server, f"/api/io?w={refused}&node=", **page_req).json()
     assert refused_io["failure"]["message"] == f"refused refuse {MARKER}"
+    # /api/session: the same graph, and LeakFlow's session -- no agent, so no rows (OD2).
+    sess = _get(server, f"/api/session?w={wf}&r={run}", **page_req)
+    assert sess.status_code == 200, sess.text
+    assert sess.json()["graph"] == final
+    assert (sess.json()["session"]["empty"], sess.json()["session"]["reason"]) == (True, "no-agent")
+    _assert_clean("/api/session", sess.text, sealed)
+    assert _get(server, f"/api/io?w={wf}&r={run}&event=0", **page_req).status_code == 404
     same_origin = _get(
         server,
         io,
@@ -304,13 +318,71 @@ async def test_the_graph_page_shows_payloads_through_its_io_route_alone(
         "a same-site fetch": {**page_req, "Sec-Fetch-Site": "same-site"},
     }
     for why, headers in refusals.items():
-        r = _get(server, io, **headers)
-        assert r.status_code == 403, why
-        _assert_clean(why, r.text, sealed)
+        for route in (io, f"/api/session?w={wf}&r={run}", f"/api/io?w={wf}&event=0"):
+            r = _get(server, route, **headers)
+            assert r.status_code == 403, (route, why)
+            _assert_clean(why, r.text, sealed)
     for origin in (UI, f"http://127.0.0.1:{server.port}", "https://evil.example"):
         pre = _preflight(server, io, origin)
         assert pre.status_code == 403, origin
         assert "Access-Control-Allow-Origin" not in pre.headers
+
+    # The dev-only POST routes (decisions I36): state-changing on loopback, so every check is
+    # tested alone, each refusing before any Update -- and LeakFlow, no agent, has none.
+    token = re.search(r'const SESSION_TOKEN = "([^"]+)"', seen[f"/graph?w={wf}"])  # type: ignore[arg-type]
+    assert token is not None
+    own = f"http://127.0.0.1:{server.port}"
+    good = {
+        "Content-Type": "application/json",
+        "Origin": own,
+        "Sec-Fetch-Site": "same-origin",
+        "X-Kontra-Console": "1",
+        "X-Kontra-Session": token.group(1),
+    }
+    body = json.dumps(
+        {"w": wf, "r": run, "offset": 0, "tool_id": "x", "approved": True, "result": 1}
+    )
+
+    def but(**changed: str | None) -> dict[str, str]:
+        out = {**good, **changed}
+        return {k: v for k, v in out.items() if v is not None}
+
+    post_refusals = {
+        "no Origin": (but(Origin=None), 403),
+        "another site": (but(Origin="https://evil.example"), 403),
+        "the UI's origin": (but(Origin=UI), 403),
+        "an opaque origin": (but(Origin="null"), 403),
+        "a rebound name": (but(Host=f"evil.example:{server.port}"), 403),
+        "another port": (but(Host="127.0.0.1:1"), 403),
+        "a cross-site fetch": (but(**{"Sec-Fetch-Site": "cross-site"}), 403),
+        "a same-site fetch": (but(**{"Sec-Fetch-Site": "same-site"}), 403),
+        "a navigation": (but(**{"Sec-Fetch-Site": "none"}), 403),
+        "no header": (but(**{"X-Kontra-Console": None}), 403),
+        "another value": (but(**{"X-Kontra-Console": "true"}), 403),
+        "no token": (but(**{"X-Kontra-Session": None}), 403),
+        "another console's token": (but(**{"X-Kontra-Session": token.group(1)[:-1] + "x"}), 403),
+        "a form": (but(**{"Content-Type": "application/x-www-form-urlencoded"}), 415),
+        "a text body": (but(**{"Content-Type": "text/plain"}), 415),
+    }
+    for route in ("/api/approve", "/api/callback", "/api/pull"):
+        for why, (headers, status) in post_refusals.items():
+            r = _post(server, route, body, **headers)
+            assert r.status_code == status, (route, why, r.status_code, r.text)
+            _assert_clean(f"{route} {why}", r.text, sealed)
+        big = _post(server, route, json.dumps({"pad": "x" * (64 * 1024)}), **good)
+        assert big.status_code == 413, route
+        # Every check passed: still refused, LeakFlow being no agent the console may answer.
+        answered = _post(server, route, body, **good)
+        assert answered.status_code in (403, 409), (route, answered.text)
+        _assert_clean(f"{route} with every check", answered.text, sealed)
+        for origin in (own, UI, "https://evil.example"):
+            pre = _preflight(server, route, origin)
+            assert pre.status_code == 403, (route, origin)
+            assert "Access-Control-Allow-Origin" not in pre.headers
+    after = await client.get_workflow_handle(wf).fetch_history()
+    assert not any(
+        e.HasField("workflow_execution_update_accepted_event_attributes") for e in after.events
+    )
 
 
 async def test_what_this_machine_cannot_open_is_shown_as_a_placeholder(

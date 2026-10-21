@@ -14,6 +14,7 @@ import pytest
 import temporalio
 from google.protobuf.timestamp_pb2 import Timestamp
 from temporalio.api.common.v1 import Payload, WorkerVersionCapabilities
+from temporalio.api.enums.v1 import EventType
 from temporalio.api.taskqueue.v1 import PollerInfo as ApiPollerInfo
 from temporalio.api.worker.v1 import WorkerListInfo
 from temporalio.api.workflowservice.v1 import DescribeTaskQueueResponse
@@ -385,7 +386,7 @@ async def test_observe_reports_any_run_but_only_as_the_buyers_once_verified(
     obs, result = await control.observe(seller.namespace, handle.id, NO_CALL, None)
     assert obs.status is ObservedStatus.COMPLETED
     assert obs.provenance is Provenance.NOT_FROM_BUYER
-    assert obs.run_id == handle.result_run_id
+    assert obs.pin == handle.result_run_id
     assert obs.started_at is not None
     assert obs.closed_at is not None
     assert obs.started_at <= obs.closed_at
@@ -505,6 +506,37 @@ async def test_terminate_with_a_first_run_id_stays_inside_that_chain(
     assert (await handle.describe()).status is WorkflowExecutionStatus.RUNNING
     await control.terminate_workflow(seller.namespace, wf, "buyer canceled", run_id)
     await wait_status(seller.client, wf, [WorkflowExecutionStatus.TERMINATED])
+
+
+async def test_cancel_with_a_first_run_id_stays_inside_that_chain(
+    control: Control, seller: Seller
+) -> None:
+    """An ASK with a pin (seam ⑥, ``Engine.cancel(stop=ASK, pin=...)``) asks only the pinned
+    chain: naming another chain's first run asks nothing (and is no error); naming its own
+    records the request."""
+    wf = unique("job")
+    handle = await seller.client.start_workflow(
+        Job.run, Plan("hang"), id=wf, task_queue=seller.task_queue
+    )
+    run_id = handle.result_run_id
+    assert run_id
+
+    async def asked() -> bool:
+        async for event in handle.fetch_history_events():
+            if event.event_type == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_CANCEL_REQUESTED:
+                return True
+        return False
+
+    await control.cancel_workflow(seller.namespace, wf, "not this chain", str(uuid.uuid4()))
+    await asyncio.sleep(0.2)
+    assert not await asked()
+    await control.cancel_workflow(seller.namespace, wf, "please stop", first_run_id=run_id)
+    for _ in range(100):
+        if await asked():
+            break
+        await asyncio.sleep(0.05)
+    assert await asked()
+    await control.terminate_workflow(seller.namespace, wf, "done")
 
 
 # --------------------------------------------------------------------------- standalone operations

@@ -21,10 +21,10 @@ its CORS headers name), or whose body is not JSON (a cross-site form). It is for
 whose loopback is its user's alone.
 
 It also serves the graph page of ``kontra dev up --ui`` (:mod:`kontra.cli._console`, decisions
-I28): ``GET /graph`` and its ``/api/...`` routes, for the console's own origin
-(``http://127.0.0.1:P``, ``http://localhost:P``) and no other, behind the same ``Host`` check;
-``/decode`` and ``/encode`` keep the UI's origin alone, and a preflight is answered for those
-two only.
+I28, I36): ``GET /graph`` and its ``/api/...`` routes, and the session pane's dev-only ``POST``
+routes, for the console's own origin (``http://127.0.0.1:P``, ``http://localhost:P``) and no
+other, behind the same ``Host`` check (a ``POST`` must name that origin); ``/decode`` and
+``/encode`` keep the UI's origin alone, and a preflight is answered for those two only.
 
 ``kontra dev`` runs it as ``python -m kontra.cli._codec_server --port P --ui-port U
 [--temporal-ui URL] [--grafana URL]`` in the background (the two URLs are where the page's
@@ -147,14 +147,14 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
 
-    def _body(self) -> bytes | None:
+    def _body(self, limit: int = MAX_BODY) -> bytes | None:
         try:
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
             self._refuse(HTTPStatus.LENGTH_REQUIRED, "Content-Length required")
             return None
-        if length < 0 or length > MAX_BODY:
-            self._refuse(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, f"at most {MAX_BODY} bytes")
+        if length < 0 or length > limit:
+            self._refuse(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, f"at most {limit} bytes")
             return None
         return self.rfile.read(length)
 
@@ -202,6 +202,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        url = urlsplit(self.path)
+        console = self.server.console
+        if console is not None and url.path in _console.API_POST_ROUTES:
+            self._console_post(console, url.path)
+            return
         if not self._allowed():
             return
         if self.path == "/stop":
@@ -242,6 +247,25 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(answer)))
         self.end_headers()
         self.wfile.write(answer)
+
+    def _console_post(self, console: _console.Console, path: str) -> None:
+        """A dev-only, state-changing ``POST`` of the console's page (decisions I36): this
+        server's ``Host``, the console's own ``Origin`` -- required, which a browser sends with
+        every ``POST``, and a cross-site form cannot forge -- and a JSON body within bounds; the
+        console checks the rest (:func:`kontra.cli._console.handle_post`)."""
+        if not self._allowed(self.server.console_origins):
+            return
+        if self._origin() is None:
+            self._refuse(HTTPStatus.FORBIDDEN, "the console's own Origin is required")
+            return
+        kind = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if kind != "application/json":
+            self._refuse(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "application/json only")
+            return
+        body = self._body(_console.POST_MAX)
+        if body is None:
+            return
+        _console.handle_post(self, console, path, body)
 
     def _stop(self) -> None:
         if not self._from_kontra_dev():

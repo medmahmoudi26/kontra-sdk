@@ -25,11 +25,14 @@ classifiers = [
   "Topic :: System :: Distributed Computing",
   "Typing :: Typed",
 ]
-# temporalio is pinned to a minor: standalone Nexus operations and serialization
-# context are experimental there, and a minor bump may change them.
+# temporalio: the range kontra-sdk is tested on (decisions I29). Sellers import temporalio
+# directly, so compatibility is a dependency problem, not an import path: the codec relies on
+# experimental APIs (serialization context, Nexus operation info), so the range only widens
+# after a green suite on the new minor. kontra/_compat.py holds the same range (a test keeps
+# them equal); KontraPlugin refuses to start outside it, `kontra serve`/`publish` warn.
 dependencies = [
-  "temporalio>=1.34,<1.35",
-  "pydantic>=2.9,<3",
+  "temporalio>=1.34,<1.38",
+  "pydantic>=2.12,<3",  # Field(exclude_if=), model_validate_json(extra=): both 2.12
   "httpx>=0.27,<1",
   "pyyaml>=6",
   "pyrage>=1.2,<2",
@@ -44,16 +47,16 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp>=2.3,<3"]  # kontra.mcp is written on MCPServer (mcp 2.x)
-# Temporal's OpenAI Agents integration (temporalio.openai_agents): kontra.workflow re-exports
-# activity_as_tool and mcp_server, and serve() installs its plugin for a workflow that imports
-# `agents`. [mcp]: serve(mcp_servers=).
-agents = ["temporalio-openai-agents[mcp]>=1.1,<2"]
 # `kontra serve --otlp`: Temporal's TracingInterceptor (temporalio's own extra of the same
 # name) and the OTLP/gRPC span exporter.
 opentelemetry = [
-  "temporalio[opentelemetry]>=1.34,<1.35",
+  "temporalio[opentelemetry]>=1.34,<1.38",
   "opentelemetry-exporter-otlp-proto-grpc>=1.39,<2",
 ]
+# `kontra dev up` runs the dev gate (kontra.devgate) under FastAPI/uvicorn; a fleet worker that
+# never serves the gate installs neither. [testing] includes [dev] (a packaging test pins dev ⊆
+# testing), so the scaffold's `pip install "kontra-sdk[testing]"` already covers `kontra dev up`.
+dev = ["fastapi>=0.115", "uvicorn>=0.30"]
 # webauthn (duo-labs, BSD): the fake gate verifies real passkey answers with the same code as the
 # platform (kontra._passkeys, decisions I24), and kontra.testing.SoftAuthenticator makes them.
 testing = ["fastapi>=0.115", "uvicorn>=0.30", "hypothesis>=6.100", "webauthn>=3.0.1,<4"]
@@ -81,6 +84,13 @@ dev = [
   "psutil>=6",
   "boto3>=1.35",
   "webauthn>=3.0.1,<4",
+  # A seller's agent dependencies are the seller's (decisions I29): these are for kontra-sdk's
+  # own checks. Temporal's OpenAI Agents integration: `kontra graph`'s scripted model
+  # (kontra/cli/_scripted.py, under pyright strict) and examples/chef-agents' tests.
+  "temporalio-openai-agents[mcp]>=1.1,<2",
+  # Temporal's agent harness (the PRD's pin): the bound-handler tests run a real agent, and
+  # check Kontra's copy of its wire shape (kontra/serve/turn.py). Never a runtime import.
+  "temporal-agent-harness==0.6.0",
 ]
 
 [build-system]
@@ -96,9 +106,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["kontra"]
 
-# The spec files and `kontra dev`'s compose.yaml with the observability/ and docs/dashboards/
-# files it mounts (one copy each, outside the package in a checkout) go into the package: from
-# the checkout, or already there in the sdist.
+# The spec files and `kontra dev up --observability`'s observability/ compose file with the
+# docs/dashboards/ files it mounts (one copy each, outside the package in a checkout) go into the
+# package: from the checkout, or already there in the sdist. The e2e compose.yaml is not shipped.
 [tool.hatch.build.targets.wheel.hooks.custom]
 path = "hatch_build.py"
 
@@ -110,7 +120,6 @@ include = ["/kontra", "/README.md", "/LICENSE", "/hatch_build.py"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "spec" = "kontra/_spec"
-"compose.yaml" = "kontra/_dev/compose.yaml"
 "observability" = "kontra/_dev/observability"
 "docs/dashboards" = "kontra/_dev/docs/dashboards"
 
@@ -145,7 +154,7 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 timeout = 300
 markers = [
-  "e2e: needs the `kontra dev` stack (compose) running",
+  "e2e: needs the e2e stack running (make stack-up: compose.yaml, the prod gate image)",
   "temporal: starts a local Temporal dev server (no containers)",
   "slow: long-running (large artifacts, property tests at full size)",
 ]

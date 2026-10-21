@@ -521,6 +521,12 @@ class Session:
         async with profile_lock(self._home):
             persist = self._adopt_rotated_token()
             if self.profile.refresh_token is None:
+                if self.profile.dev:
+                    raise NotLoggedIn(
+                        f"the dev gate at {self.profile.gate_url} does not know "
+                        f"{self.profile.party}'s session (it restarted?): run `kontra dev up`, "
+                        "then restart `kontra serve`."
+                    )
                 raise NotLoggedIn(
                     f"the profile of {self.profile.party} holds no session. Run `kontra login`."
                 )
@@ -532,6 +538,12 @@ class Session:
                 tok = await self._gate.token(req)
             except GateError as e:
                 if e.code == "invalid_grant":
+                    if self.profile.dev:
+                        raise NotLoggedIn(
+                            f"the dev gate at {self.profile.gate_url} no longer knows "
+                            f"{self.profile.party}'s session ({e.message}; it restarted?): run "
+                            "`kontra dev up`, then restart `kontra serve`."
+                        ) from e
                     raise NotLoggedIn(
                         f"the session of {self.profile.party} at {self.profile.gate_url} is no "
                         f"longer valid ({e.message}). Run `kontra login`."

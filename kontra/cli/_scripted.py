@@ -1,9 +1,9 @@
 """The model ``kontra graph`` gives an agent workflow's mock runs (decisions I27): no network,
 no key, no tokens spent.
 
-An agent workflow (one that imports OpenAI's ``agents``, decisions I25) runs its loop as
-workflow code and every model call as the agents plugin's model activity, whose model comes
-from the plugin's ``model_provider``. The mock runs give the plugin this one. Its first answer
+An agent workflow (one whose worker has Temporal's ``OpenAIAgentsPlugin`` in its ``plugins=``,
+the seller's own dependency) runs its loop as workflow code and every model call as the
+agents plugin's model activity, whose model comes from the plugin's ``model_provider``. The mock runs give the plugin this one. Its first answer
 calls every function tool the agent was given, once each, in one response; once their
 outputs are in its input, it answers with a final output drawn from the agent's output type
 (:func:`kontra._sample.from_schema`), or a short text for a text agent. That is the shape a
@@ -126,7 +126,7 @@ class _ScriptedModel(Model):
         tracing: ModelTracing,
         **kwargs: Any,
     ) -> AsyncIterator[TResponseStreamEvent]:
-        raise NotImplementedError("kontra graph's mock model does not stream")
+        raise NotImplementedError("the mock runs' model does not stream")
 
 
 class _ScriptedProvider(ModelProvider):

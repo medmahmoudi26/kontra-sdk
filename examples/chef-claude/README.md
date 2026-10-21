@@ -20,7 +20,8 @@ rather than workflow code.
 ## How it survives a crash
 
 `cook` starts `claude` with `asyncio.create_subprocess_exec` and reads its `stream-json` events
-one line at a time. Each line is a heartbeat (the buyer sees it as progress), and the
+one line at a time. Each line is a heartbeat (the buyer sees the latest as progress, every few
+seconds), and the
 `result` event is the activity's return value. The workflow runs `cook` with a 20-second
 `heartbeat_timeout`: kill the worker and Temporal notices within it, then retries `cook` on
 whichever worker polls next. While `claude` is quiet (a long model turn) `cook` heartbeats
@@ -64,7 +65,7 @@ Anthropic.
 ## Run it
 
 `claude` must be on the worker's PATH (else `/usr/local/bin/claude` is used). With `kontra dev`
-(a local Kontra in Docker, play money, logged in as `acme`), this directory runs unchanged:
+(a local Kontra with no containers, play money, logged in as `acme`), this directory runs unchanged:
 
 ```sh
 kontra dev up --handle acme      # KONTRA_HOME=~/.kontra-dev keeps it apart from a real login
@@ -78,10 +79,10 @@ and the second `claude` is a `--resume` of the first one's session.
 
 ## Its graph
 
-`kontra graph --mermaid`, from this directory, draws the workflow from mock runs: Temporal's
-test server runs it eight times, every activity answered with a value of the type it
-declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against the
-command:
+Under a dev profile, `kontra serve` draws the workflow for `kontra dev`'s graph page from mock
+runs: Temporal's test server runs it eight times, every activity answered with a value of the
+type it declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against
+those runs:
 
 ```mermaid
 %% acme/chef-claude@0.1.0

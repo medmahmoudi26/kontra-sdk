@@ -99,7 +99,10 @@ async def test_a_worker_whose_login_signed_out_says_so(
         refusal.now()
         with pytest.raises(ServeError) as stopped:
             await run
-    assert "kontra login" in str(stopped.value)
+    # The marketplace's parties are dev logins: a dev profile is pointed at `kontra dev up`
+    # (which mints the profile again), never at `kontra login` (decisions I34, OD14).
+    assert "run `kontra dev up`" in str(stopped.value)
+    assert "kontra login" not in str(stopped.value)
 
 
 async def test_any_other_failure_is_raised_as_it_came(

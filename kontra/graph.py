@@ -70,7 +70,9 @@ __all__ = [
     "links",
     "merge",
     "mermaid",
+    "nested_id",
     "parse",
+    "parse_indexed",
     "union",
     "with_io",
 ]
@@ -87,7 +89,7 @@ Graph = dict[str, Any]
 HistoryJSON = Mapping[str, Any] | Sequence[Any]
 
 _VERSION = 1
-#: ``kontra._parallel.BATCH_WORKFLOW``, written out: that module imports Temporal.
+#: ``kontra.contrib.parallel.BATCH_WORKFLOW``, written out: that module imports Temporal.
 _BATCH_WORKFLOW = "kontra.batch.v1"
 _BATCH_LABEL = "execute_activities_in_parallel"
 #: The marker sdk-core records for a local activity; no other marker is a node.
@@ -103,7 +105,7 @@ _CAUSE_DEPTH = 32
 _PAYLOAD_MAX = 1 << 16
 #: The longest batch child's input (base64) read: Temporal's 2 MiB payload, base64'd.
 _SPEC_MAX = 3 << 20
-#: The fields of ``kontra._parallel._Spec`` that name what a batch runs: its item activity
+#: The fields of ``kontra.contrib.parallel._Spec`` that name what a batch runs: its item activity
 #: and its ``pages=`` activity.
 _SPEC_NAMES = ("activity", "pages")
 #: Grafana Explore's pane key: three of [0-9a-z], one a letter.
@@ -893,6 +895,7 @@ def parse(
     run_id: str | None = None,
     pending: Mapping[str, Any] | Sequence[Any] | None = None,
     children: Mapping[str, HistoryJSON] | None = None,
+    nested: Mapping[str, Mapping[str, Any] | Sequence[Any] | None] | None = None,
 ) -> Graph:
     """One run's graph from its history (see the module docstring for the rules).
 
@@ -903,9 +906,104 @@ def parse(
     history (its first run is enough): a ``kontra.batch.v1`` child is named after the
     activities its input names when no codec encoded it, else the ones it scheduled.
 
-    Total: ``ValueError`` only when ``history`` (or ``pending``, ``children``) is not
-    history-shaped at the top level; whatever the events hold, what cannot be read is
-    skipped. Deterministic, and the inputs are never changed."""
+    ``nested`` names the children to draw inside their own node (the dev console's agent
+    child, decisions I36), each with its ``pending`` (or None); their histories come from
+    ``children``. Such a child's nodes follow the run's, each with ``parent`` (the child's
+    node id), ``within`` (the child's ``workflow_id`` and ``run_id``, which its links
+    point into) and an id :func:`nested_id` builds; its edges carry ``parent`` too, and
+    ``start``/``end`` there are the child's own. Without ``nested`` nothing is nested, and
+    the graph is what it always was.
+
+    Total: ``ValueError`` only when ``history`` (or ``pending``, ``children``, ``nested``)
+    is not history-shaped at the top level; whatever the events hold, what cannot be read
+    is skipped. Deterministic, and the inputs are never changed."""
+    return parse_indexed(
+        history,
+        workflow_id=workflow_id,
+        run_id=run_id,
+        pending=pending,
+        children=children,
+        nested=nested,
+    )[0]
+
+
+def nested_id(parent: str, node_id: str) -> str:
+    """The id of node ``node_id`` of the child drawn inside node ``parent`` (``nested``):
+    built here alone, and never read back -- a nested node names its parent in ``parent``."""
+    return f"{parent}/{node_id}"
+
+
+#: Where a command is: ``(None, event id)`` in the run itself, ``(child workflow id, event
+#: id)`` in a child drawn nested.
+CommandAt = tuple[str | None, int]
+
+
+def parse_indexed(
+    history: HistoryJSON,
+    *,
+    workflow_id: str | None = None,
+    run_id: str | None = None,
+    pending: Mapping[str, Any] | Sequence[Any] | None = None,
+    children: Mapping[str, HistoryJSON] | None = None,
+    nested: Mapping[str, Mapping[str, Any] | Sequence[Any] | None] | None = None,
+) -> tuple[Graph, dict[CommandAt, str]]:
+    """:func:`parse`, and the node each command event became (:data:`CommandAt` -> node
+    id): a node holds the latest of its occurrences alone, while a link to a row of the
+    dev console's agent session names the very command (decisions I36)."""
+    graph, node_of = _parse(history, workflow_id, run_id, pending, children)
+    index: dict[CommandAt, str] = {(None, event_id): node for event_id, node in node_of.items()}
+    if nested is None:
+        return graph, index
+    if _map(nested) is None:
+        raise ValueError(f"nested maps a child workflow id to its pending, got {nested!r}")
+    given = _map(children) or {}
+    taken = {n["id"] for n in graph["nodes"]}
+    for child_id, child_pending in nested.items():
+        child_history = given.get(child_id)
+        host = next(
+            (
+                n
+                for n in reversed(graph["nodes"])
+                if n["kind"] == "child" and n["ref"].get("workflow_id") == child_id
+            ),
+            None,
+        )
+        if child_history is None or host is None:
+            continue
+        child_run = host["ref"].get("run_id")
+        inner, inner_of = _parse(
+            cast("HistoryJSON", child_history), child_id, child_run, child_pending, children
+        )
+        renamed: dict[str, str] = {}
+        for node in inner["nodes"]:
+            new = nested_id(host["id"], node["id"])
+            while new in taken:  # a run's own node of that name: never two of one id
+                new += "'"
+            taken.add(new)
+            renamed[node["id"]] = new
+            node.update(
+                id=new, parent=host["id"], within={"workflow_id": child_id, "run_id": child_run}
+            )
+            graph["nodes"].append(node)
+        for edge in inner["edges"]:
+            graph["edges"].append(
+                {
+                    "from": renamed.get(edge["from"], edge["from"]),
+                    "to": renamed.get(edge["to"], edge["to"]),
+                    "parent": host["id"],
+                }
+            )
+        index.update({(child_id, event_id): renamed[n] for event_id, n in inner_of.items()})
+    return graph, index
+
+
+def _parse(
+    history: HistoryJSON,
+    workflow_id: str | None,
+    run_id: str | None,
+    pending: Mapping[str, Any] | Sequence[Any] | None,
+    children: Mapping[str, HistoryJSON] | None,
+) -> tuple[Graph, dict[int, str]]:
     run = _read(_events(history), _batch_names(children))
     _overlay(run.occurrences, pending)
     _settle(run)
@@ -958,12 +1056,13 @@ def parse(
         for position, signature in enumerate(positions)
         for slot in signature
     ]
-    return {
+    graph = {
         "version": _VERSION,
         "workflow": _workflow(run, workflow_id, run_id),
         "nodes": nodes,
         "edges": _edge_list(edges),
     }
+    return graph, node_of
 
 
 def _node(
@@ -1123,7 +1222,8 @@ def union(graphs: Iterable[Graph]) -> Graph:
 def _predecessors(graph: Graph) -> dict[Any, set[Any]]:
     found: dict[Any, set[Any]] = {}
     for e in graph.get("edges") or []:
-        found.setdefault(e.get("to"), set()).add(e.get("from"))
+        if e.get("parent") is None:  # a nested child's own edges are not the run's
+            found.setdefault(e.get("to"), set()).add(e.get("from"))
     return found
 
 
@@ -1144,7 +1244,12 @@ def _named_batches(static: Graph, live: Graph) -> dict[Any, dict[str, Any]]:
     claims: dict[Any, list[Any]] = {}
     for node in live.get("nodes") or []:
         before = live_before.get(node.get("id"))
-        if node.get("kind") != "child" or node.get("name") != _BATCH_WORKFLOW or not before:
+        if (
+            node.get("kind") != "child"
+            or node.get("name") != _BATCH_WORKFLOW
+            or node.get("parent") is not None
+            or not before
+        ):
             continue
         found = [c for c in candidates if before <= static_before.get(c.get("id"), set())]
         if len(found) == 1:
@@ -1190,13 +1295,16 @@ def merge(static: Graph, live: Graph) -> Graph:
     nodes += [
         {**copy.deepcopy(n), "reached": True} for i, n in live_nodes.items() if i not in static_ids
     ]
-    live_edges = {(e["from"], e["to"]) for e in live.get("edges") or []}
+    live_edges = {(e["from"], e["to"]) for e in live.get("edges") or [] if "parent" not in e}
     every = live_edges | {(e["from"], e["to"]) for e in static.get("edges") or []}
+    # A child drawn nested (parse's ``nested``) is the live run's alone: its edges, as they are.
+    inside = [{**e, "reached": True} for e in live.get("edges") or [] if "parent" in e]
     return {
         "version": _VERSION,
         "workflow": copy.deepcopy(live.get("workflow")),
         "nodes": nodes,
-        "edges": [{"from": a, "to": b, "reached": (a, b) in live_edges} for a, b in sorted(every)],
+        "edges": [{"from": a, "to": b, "reached": (a, b) in live_edges} for a, b in sorted(every)]
+        + inside,
     }
 
 
@@ -1365,12 +1473,14 @@ def links(graph: Graph, cfg: LinkConfig) -> Graph:
                     found["temporal"] = _ui(cfg, child_id, child_run, "history")
             logs_for: tuple[str | None, str | None] = (child_id, None)
         else:
+            # A node of a child drawn nested is an event of that child's history.
+            within = node.get("within") or {}
+            in_id = _str(within.get("workflow_id")) if within else workflow_id
+            in_run = _str(within.get("run_id")) if within else run_id
             event_id = _int(ref.get("event_id"))
-            if cfg.temporal_ui and workflow_id and run_id and event_id:
-                found["temporal"] = _ui(
-                    cfg, workflow_id, run_id, "history", "events", str(event_id)
-                )
-            logs_for = (workflow_id, run_id)
+            if cfg.temporal_ui and in_id and in_run and event_id:
+                found["temporal"] = _ui(cfg, in_id, in_run, "history", "events", str(event_id))
+            logs_for = (in_id, in_run)
         activity_type = _str(node.get("name")) if kind == "activity" else None
         found.update(
             _observability(
@@ -1431,10 +1541,16 @@ def mermaid(graph: Graph) -> str:
     ``×n`` for the attempt past the first and ``∥n`` for a fan-out. A class per status,
     ``unreached`` for a node the live run did not reach, and a dotted edge for one it did
     not take."""  # noqa: RUF002 -- the multiplication sign is the label's
-    nodes = [n for n in graph.get("nodes") or [] if isinstance(n.get("id"), str)]
+    nodes = [
+        n for n in graph.get("nodes") or [] if isinstance(n.get("id"), str) and "parent" not in n
+    ]
     names = {n["id"]: f"n{i}" for i, n in enumerate(nodes)}
     names.update({START: "s", END: "e"})
-    edges = [e for e in graph.get("edges") or [] if e.get("from") in names and e.get("to") in names]
+    edges = [
+        e
+        for e in graph.get("edges") or []
+        if e.get("from") in names and e.get("to") in names and "parent" not in e
+    ]
     ends = {e["from"] for e in edges} | {e["to"] for e in edges}
     lines = ["flowchart TD"]
     if START in ends:

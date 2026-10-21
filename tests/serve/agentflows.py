@@ -1,14 +1,16 @@
-"""An agent workflow written as a seller writes one: OpenAI's ``agents`` package and Kontra's
-façade, nothing from ``temporalio`` (imported only when the ``[agents]`` extra is installed)."""
+"""An agent workflow written as a seller writes one: OpenAI's ``agents`` package and
+Temporal's OpenAI Agents integration (both the seller's dependencies; kontra-sdk's dev group
+installs them), vanilla temporalio, nothing from ``kontra``."""
 
 from __future__ import annotations
 
 from datetime import timedelta
 
-from kontra import activity, workflow
+from temporalio import activity, workflow
 
 with workflow.unsafe.imports_passed_through():
     from agents import Agent, Runner
+    from temporalio.openai_agents.workflow import activity_as_tool
 
 
 @activity.defn
@@ -24,7 +26,7 @@ class Triage:
         agent = Agent(
             name="triage",
             instructions="Look the host up, then say what you found.",
-            tools=[workflow.activity_as_tool(lookup, start_to_close_timeout=timedelta(seconds=30))],
+            tools=[activity_as_tool(lookup, start_to_close_timeout=timedelta(seconds=30))],
         )
         result = await Runner.run(agent, host)
         return str(result.final_output)
