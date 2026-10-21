@@ -29,7 +29,8 @@ PYTEST_FLAGS ?= -q -ra
 # The seam tests, ② to ⑥ (CLAUDE.md, PRD §19.1). They run as their own CI job so that a
 # seam break is named as one; `test` runs everything else, so nothing runs twice.
 #   ② gate HTTP API   tests/gate_client/test_routes.py
-#   ③ contract        tests/contract (derivation, canonical form, hash, validation)
+#   ③ contract        tests/contract (derivation, canonical form, hash, validation, and the
+#                     contract against the harness's schema of a bound handler, I33)
 #                     tests/examples/test_golden.py (examples/*/contract.yaml byte for byte)
 #   ④ ledger          tests/ledger (the §9.3 suite, and its teeth)
 #   ⑤ codec           tests/codec, tests/artifacts (round trips, marker scans of history, bucket,

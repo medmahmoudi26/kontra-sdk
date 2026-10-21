@@ -656,8 +656,11 @@ class KontraPlugin(SimplePlugin):
         config["workflow_runner"] = with_kontra_passthrough(config.get("workflow_runner"))
         state.progress.bind(client)
         if bound.kind == "handler":
-            # The agent's listed topics are mirrored onto the job's stream (decisions I31).
-            turn = TurnActivities(client, bound.output_type, mirror=frozenset(bound.streams))
+            # The reply is checked against the served contract's output (decisions I38), and
+            # the agent's listed topics are mirrored onto the job's stream (decisions I31).
+            turn = TurnActivities(
+                client, bound.output_type, bound.validator(), mirror=frozenset(bound.streams)
+            )
             config["activities"] = [*config.get("activities", ()), turn.deliver]
         return config
 

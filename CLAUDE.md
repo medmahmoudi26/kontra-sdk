@@ -56,7 +56,8 @@ crosses a seam updates that seam's test **in the same PR**.
   examples/*/activities.py` must print nothing; `tests/examples/test_imports.py` checks the rest (and
   runs `examples/hello` without `worker.py` on a plain Temporal worker).
 - Kontra never imports `temporal_agent_harness` at runtime: `kontra/serve/turn.py` holds the harness's
-  wire shape as constants, checked against the harness in `tests/serve/test_turn.py`.
+  wire shape as constants, checked against the harness in `tests/serve/test_turn.py`, and
+  `kontra/contract/harness.py` reads its schema through its CLI (`tests/contract/test_harness.py`).
 - Every seam has a fake in `kontra.testing`, so a seller tests a full lifecycle without containers.
 - The dev gate is `kontra.devgate` (`kontra dev`), in process and loopback only; the prod gate stays
   in `kontra-cloud` and is never imported here (`docs/decisions.md` I34). `kontra.testing.FakeGate`

@@ -126,6 +126,27 @@ class EnrichOutput(BaseModel):
 express portably (`anyOf`, tuples, untyped `dict` or `Any`) are refused at derivation with a
 fix-it. Field patterns are matched with RE2 on both sides, so no pattern can stall a handler.
 
+The contract says what each side gets. The input is described as pydantic *validates* it:
+what a buyer may send. The output is described as pydantic *serializes* it: what the buyer
+receives, `model_dump(mode="json", by_alias=True)`, which is what temporalio writes for your
+workflow's result. So in the output a `@computed_field` is a member, a `Field(exclude=True)`
+field is not, a `serialization_alias` is the member's name, a serializer's return type is the
+member's type, and every field is required, defaulted or not, since the result always
+carries it. A model used both ways whose two descriptions differ is published twice, as
+`ReportInput` and `ReportOutput` (your own classes keep their names). A bound written on a
+named type and again where the type is used holds twice: the contract publishes the tighter
+bound and the values both allow, and refuses, naming the field, the two that cannot be
+written as one (two different `pattern`s) or that no value meets, rather than publish a
+contract looser than your model. A `Field` constraint on a model, a `RootModel` or a plain
+`Enum` (`Annotated[Code, Field(max_length=10)]`) is refused: pydantic applies it to the
+instance, not its value, and your model refuses every value; put the constraint inside the
+type. Two outputs are refused because pydantic's schema would not say what it writes: a
+serializer with no return annotation (annotate it), and a `timedelta`, which pydantic writes
+as an ISO duration that `format: duration` refuses whenever it has a fraction of a second
+(write seconds: `model_config = ConfigDict(ser_json_timedelta="float")`). Whatever payload
+converter your client has, your workflow's result is delivered as `model_dump(mode="json",
+by_alias=True)` (decisions I38).
+
 See exactly what you would publish:
 
 ```sh
@@ -633,16 +654,22 @@ with workflow.unsafe.imports_passed_through():
 
 
 class Sweep(BaseModel):
+    """A host to sweep."""
+
     host: str
 
 
 class Report(BaseModel):
+    """What the sweep found."""
+
     host: str
     open: int
 
 
 @agent.defn
 class ReconAgent:
+    """Sweeps hosts, one per message."""
+
     @agent.init
     def __init__(self, config: AgentConfig) -> None:
         self._runner = AgentWorkflowRunner(
@@ -675,7 +702,46 @@ serve(ReconAgent.sweep, plugins=[AgentHarnessPlugin()])
   A handler an agent inherits unchanged from another agent class is refused too
   (`ReconV2.sweep` *is* `ReconV1.sweep`, so it cannot say which agent you mean): override it
   in each agent class that sells it. Pydantic aliases work as on a workflow: the message is
-  the input's JSON by alias, and so is the job's result.
+  the input's JSON by alias, and the job's result is the reply's serialization by alias,
+  exactly a workflow's result. The harness publishes the reply keyed by field name; Kontra
+  re-keys it, checks it against the contract and delivers it, so computed fields, excluded
+  fields and serializers come out as the contract describes them.
+- **Two schemas, one contract.** The harness emits its own schema of the same models
+  (`temporal-agent-harness schema recon:ReconAgent`), and its codegen turns that into
+  TypeScript: use it for your own UI, which is generated from your code. Buyers never see it:
+  `kontra pull` generates a buyer's client from the published contract, after checking the
+  catalog's hash -- the only schema a buyer should trust, since your code is exactly what they
+  cannot see. So `kontra publish` and `kontra contract` compare the two for the handler you
+  sell. Both describe the input as validated and the output as your reply is serialized
+  (decisions I38), so once both are in one canonical form they are equal for every kind of
+  field Kontra's tests compare, and nothing is printed: names, titles, descriptions, key
+  order, `anyOf` against `oneOf` for an optional field, a default beside an output field
+  that is always there, a constraint on a type and again where it is used written as one,
+  and the other differences that change no valid value are set aside, as is the contract
+  closing a model that keeps pydantic's default `extra="ignore"`, which changes no value
+  exchanged (decisions I33). What remains is printed on stderr, and the command goes on
+  either way; the contract is what is published.
+  The models above agree; with `model_config = ConfigDict(extra="allow")` on `Report`:
+
+  ```text
+  warning: acme/recon@1.0.0 (ReconAgent.sweep): the contract differs from temporal-agent-harness's schema for this handler in 1 place. Buyers get the contract (`kontra pull`); your harness-codegen types follow the harness's:
+    output $defs.Report.additionalProperties: contract false, harness true
+    (open output) the contract closes every model (no keys but its fields) and the harness's schema leaves this one open, as extra="allow" does: the model keeps other keys and serializes them into its reply, which the contract refuses, so a reply that carries one fails the job; pydantic's default (extra="ignore", which drops them) or extra="forbid" on the model makes the two agree
+  ```
+
+  Each line is one place, in the contract's terms:
+
+  | Line | What differs | What to do |
+  |---|---|---|
+  | `open` | the harness's schema leaves a model open to other keys (`additionalProperties: true`, or the extras' type with typed extras: `extra="allow"`), and the contract closes every model to its fields. On an `output` line the model keeps those keys and serializes them into your reply, which then fails the job; on an `input` line the contract and the gate refuse them before your model sees one, so no job fails, and only your harness-codegen types accept more than a buyer can send | drop `extra="allow"`: keep pydantic's default, or set `model_config = ConfigDict(extra="forbid")`, with which your agent also refuses unknown keys from any caller, as the gate does |
+  | any other | the two emitters describe the same model differently, which neither should: a bug in Kontra's derivation or in the harness's | report it, with the model, at the address the warning gives. Buyers still get the contract |
+
+  Nothing is compared, and nothing said, for a workflow entry or when the harness is not
+  installed. The harness's schema comes from its own `schema` command, run by the same Python
+  as `kontra publish`; if it cannot answer (your agent's module fails to import there), the
+  warning says why and publishing goes on. The seam ③ tests hold the two equal for the test
+  agents and a zoo of every kind of field (`tests/contract/test_harness.py`), so a harness
+  release, or a change to Kontra's derivation, that walks models differently fails CI.
 - **A hire is one turn.** The job is Kontra's wrapper workflow, `kontra.turn.v1`, started as
   `job-<id>` like any job. It starts your agent as a child (its whole history encrypted to you
   alone), sends the buyer's input as one message to the handler, waits for the handler's
@@ -1294,7 +1360,9 @@ printed (sign-ups are by invitation; see [buyers.md](buyers.md#setup)).
 `kontra publish`:
 
 1. loads `worker.py` and each bound offering's `offering.yaml`;
-2. derives the contract document and seals it with your public key and its hash;
+2. derives the contract document and seals it with its hash (the party is sealed; no key goes
+   in, decisions I7); for one handler of a harness agent, it then compares the contract with
+   the harness's schema for that handler and warns where they differ ([Agents](#agents));
 3. sends it to the gate, which requires your login, **confirmed within the hour** (a worker
    token never qualifies), validates it, assigns the version an opaque Nexus endpoint name and creates the
    endpoint itself, pointed at your namespace and the version's task queue;

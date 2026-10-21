@@ -10,7 +10,12 @@ payload keys are known.
 
 * Workflow side (:class:`_WorkflowInbound`): the job is the workflow's own (root) or the
   incoming header's (anything below it); the outbound interceptor stamps it on every
-  activity, local activity, child workflow and continue-as-new it schedules.
+  activity, local activity, child workflow and continue-as-new it schedules. The root's
+  result, when it is a pydantic model, is handed on as ``model_dump(mode="json",
+  by_alias=True)``: the job's result is the output model's serialization, which is what
+  the contract describes (decisions I38), whatever payload converter the worker's client
+  has -- one that leaves unset fields out (``exclude_unset``, as OpenAI Agents' does) would
+  otherwise deliver less than every result carries.
 * Activity side (:class:`_ActivityInbound`): reads the header, sets
   :func:`kontra._runtime.job_context` for the activity's duration (so
   ``Artifact.from_path`` uploads for the right job) and wraps the outbound interceptor so
@@ -85,9 +90,10 @@ nothing else, so the root hosts the stream (``temporalio.contrib.workflow_stream
   own recipe (``prior_state``) instead.
 
 This module runs inside workflow code: what it calls there is temporalio, the standard
-library, :mod:`kontra.contract.names`, :mod:`kontra._runtime` (a context variable; no I/O,
-deterministic), the pure marking helpers of :mod:`kontra.codec.stream` and the turn
-activity's name, and the workflow interceptor class is handed to the sandbox as an object.
+library, pydantic (passed through by temporalio's sandbox), :mod:`kontra.contract.names`,
+:mod:`kontra._runtime` (a context variable; no I/O, deterministic), the pure marking helpers
+of :mod:`kontra.codec.stream` and the turn activity's name, and the workflow interceptor
+class is handed to the sandbox as an object.
 
 Known gap: a *descendant* workflow learns its job when its run method starts; an activity
 scheduled by a signal handler that runs before that (a signal in the very first activation)
@@ -104,6 +110,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import timedelta
 from typing import Any, NoReturn, Protocol
 
+from pydantic import BaseModel
 from temporalio import activity, workflow
 from temporalio.api.common.v1 import Payload
 from temporalio.common import RawValue
@@ -408,6 +415,10 @@ class _WorkflowInbound(WorkflowInboundInterceptor):
             await self._drain()
             raise
         await self._drain()
+        if isinstance(result, BaseModel):
+            # The job's result: the model's serialization, not the converter's options'
+            # (decisions I38).
+            return result.model_dump(mode="json", by_alias=True)
         return result
 
     def _adopt(self) -> None:
