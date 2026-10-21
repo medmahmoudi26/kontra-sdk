@@ -1,0 +1,18 @@
+# offering.yaml: declarative facts only; nothing in here names code (D11). The catalog,
+# the console and agents read this file without running any Python.
+#
+# A published version is fixed: bump `version` whenever this file or the types in
+# models.py change, or `kontra serve` refuses to start ("republish or bump the version").
+name: acme/recon-harness   # <your party handle>/<offering>: change acme before publishing
+version: 0.1.0
+description: Sweep domains' hosts and certificates, one turn of an agent
+pricing_hint: "$0.01 per domain"     # display only; the price comes from quote()
+tags: [example, agents]
+max_duration: 10m          # no delivery by then refunds the buyer
+review_window: 24h         # the buyer may reject a delivery until then; silence accepts
+max_concurrent_jobs: 10    # beyond this many open jobs, quotes answer busy
+max_output_bytes: 1MB      # the gate refuses artifact uploads beyond this
+artifact_retention: 7d     # after accept; the buyer must download artifacts by then
+# The topics of the job's stream that reach the buyer, by the harness's own name: the
+# agent's events (decisions I31). Any other topic stays the seller's.
+streams: [turn_events]

@@ -48,6 +48,11 @@ AGENTS = importlib.util.find_spec("temporalio.openai_agents") is not None
 
 #: Every seller example: a directory with a worker.py (examples/recon is buyer code).
 SELLERS = sorted(p.parent.name for p in EXAMPLES.glob("*/worker.py"))
+#: The ones that sell an agent's handler, which has no static graph (decisions I35): their
+#: README draws a hired run instead (tests/examples/test_recon_harness.py checks it).
+HANDLERS = ("recon-harness",)
+#: The ones ``kontra graph`` draws.
+DRAWN = [s for s in SELLERS if s not in HANDLERS]
 #: The one ```mermaid block of a README.
 _MERMAID = re.compile(r"^```mermaid\n(.*?)^```$", re.MULTILINE | re.DOTALL)
 
@@ -133,10 +138,29 @@ def test_kontra_graph_is_hidden_from_help_and_still_answers_its_own() -> None:
 
 
 def test_every_seller_example_is_drawn() -> None:
-    assert SELLERS == ["chef-agents", "chef-claude", "enrich", "hello", "legacy-actor", "sweep"]
+    assert SELLERS == [
+        "chef-agents",
+        "chef-claude",
+        "enrich",
+        "hello",
+        "legacy-actor",
+        "recon-harness",
+        "sweep",
+    ]
+    assert DRAWN == ["chef-agents", "chef-claude", "enrich", "hello", "legacy-actor", "sweep"]
 
 
-@pytest.mark.parametrize("example", SELLERS)
+def test_a_handler_example_is_refused_with_where_its_graph_is(home: Path) -> None:
+    """examples/recon-harness sells ``ReconAgent.sweep``: one hire is one turn of the agent,
+    so there is no workflow to explore, and the refusal says the page draws its runs."""
+    result = kontra(home, "graph", "--dir", str(EXAMPLES / "recon-harness"), "--mermaid")
+    assert result.exit_code != 0
+    assert "an agent's handler has no static graph: acme/recon-harness@0.1.0 is " in result.stderr
+    assert "ReconAgent.sweep, and the graph page draws what its runs did" in result.stderr
+    assert not home.exists()
+
+
+@pytest.mark.parametrize("example", DRAWN)
 def test_the_graph_of_every_seller_example_is_its_readmes(home: Path, example: str) -> None:
     """Golden: the README's ```mermaid block is what ``kontra graph --mermaid`` prints (8
     runs, seed 0). After a deliberate change, ``UPDATE_GOLDEN=1 pytest tests/graph/test_cli.py``

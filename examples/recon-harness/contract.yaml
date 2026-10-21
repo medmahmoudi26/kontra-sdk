@@ -1,0 +1,138 @@
+# GOLDEN FILE (seam ③), checked by tests/examples/test_golden.py: the contract `kontra
+# publish` derives from models.py and offering.yaml. No key is sealed into a contract
+# (spec x-kontra.v2.json), so this is the document -- and the contract_hash -- that
+# anyone publishing this example gets.
+# Regenerate after a deliberate contract change:
+#   UPDATE_GOLDEN=1 pytest tests/examples/test_golden.py
+nexusrpc: "1.0.0"
+$schema: https://json-schema.org/draft/2020-12/schema
+services:
+  AcmeReconHarness:
+    fqn: acme.recon-harness
+    description: Sweep domains' hosts and certificates, one turn of an agent
+    operations:
+      quote:
+        fqn: quote
+        description: 'Price this input. Cheap and synchronous: answers ok with a fixed price, rejected with a reason, or busy with an ETA. Nothing runs and nothing is charged.'
+        input:
+          $ref: '#/$defs/SweepRequest'
+        output:
+          $ref: '#/$defs/KontraQuote'
+      execute:
+        fqn: execute
+        description: Run the job on this input. Requires a Kontra hold token in the kontra-hold header; the result is delivered encrypted to the buyer and paid from escrow.
+        input:
+          $ref: '#/$defs/SweepRequest'
+        output:
+          $ref: '#/$defs/SweepReport'
+$defs:
+  KontraQuote:
+    description: 'The answer of the quote operation. ok: a fixed price (amount_minor in the currency''s minor unit, e.g. cents) valid for a job of at most max_duration_seconds. rejected: the seller will not take this input, with a reason. busy: try again after eta_seconds.'
+    type: object
+    additionalProperties: false
+    properties:
+      amount_minor:
+        type: integer
+        maximum: 9007199254740991
+        minimum: 0
+      currency:
+        type: string
+        pattern: ^[A-Z][A-Z0-9]{2,7}$
+      eta_seconds:
+        type: integer
+        maximum: 2592000
+        minimum: 0
+      max_duration_seconds:
+        type: integer
+        maximum: 2592000
+        minimum: 1
+      reason:
+        type: string
+        maxLength: 1000
+        minLength: 1
+      status:
+        type: string
+        enum:
+        - ok
+        - rejected
+        - busy
+    required:
+    - status
+  SweepReport:
+    description: What the sweep found, and what was done with it.
+    type: object
+    additionalProperties: false
+    properties:
+      confirmed:
+        description: What the person answered, if they were asked.
+        oneOf:
+        - type: string
+        - type: "null"
+      domains:
+        description: How many domains were swept.
+        type: integer
+      expired:
+        description: Hosts whose certificate has expired.
+        type: integer
+      posted:
+        description: Where the findings were posted, if they were.
+        oneOf:
+        - type: string
+        - type: "null"
+      summary:
+        description: The model's summary of the sweep.
+        type: string
+      targets:
+        description: How many hosts were probed.
+        type: integer
+      weak:
+        description: Hosts whose certificate is weak.
+        type: integer
+    required:
+    - confirmed
+    - domains
+    - expired
+    - posted
+    - summary
+    - targets
+    - weak
+  SweepRequest:
+    description: |-
+      The domains to sweep, in one turn of the agent. `want_approval` and `want_callback` ask
+      for steps a person takes part in, which a hire has no one for: its quote refuses them.
+    type: object
+    additionalProperties: false
+    properties:
+      domains:
+        description: The domains to sweep.
+        type: array
+        items:
+          type: string
+          maxLength: 253
+          minLength: 1
+        maxItems: 20
+        minItems: 1
+      want_approval:
+        description: Post the findings once a person approves (not in a hire).
+        type: boolean
+        default: false
+      want_callback:
+        description: Ask a person to confirm the report (not in a hire).
+        type: boolean
+        default: false
+    required:
+    - domains
+x-kontra:
+  name: acme/recon-harness
+  version: "0.1.0"
+  description: Sweep domains' hosts and certificates, one turn of an agent
+  pricing_hint: $0.01 per domain
+  tags:
+  - agents
+  - example
+  max_duration: "10m"
+  review_window: "1d"
+  max_concurrent_jobs: 10
+  max_output_bytes: "1MB"
+  artifact_retention: "7d"
+  contract_hash: sha256:7473da5f4b07e7c5aa2805278c7a7dcbde336b7309d0150940aec0d8e086bb17

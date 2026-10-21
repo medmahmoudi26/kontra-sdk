@@ -311,8 +311,7 @@ def test_a_harness_that_fails_is_one_warning(
 # --------------------------------------------------------------------------- the examples
 
 #: The seller examples that use the harness (a worker.py, and the harness imported in some
-#: module beside it). None yet: kontra-sdk#58 adds examples/recon-harness, and this check
-#: then covers its golden contract too.
+#: module beside it): examples/recon-harness (kontra-sdk#58, decisions I37).
 HARNESS_EXAMPLES = sorted(
     w.parent.name
     for w in EXAMPLES.glob("*/worker.py")
@@ -320,19 +319,13 @@ HARNESS_EXAMPLES = sorted(
 )
 
 
-@pytest.mark.parametrize(
-    "name",
-    HARNESS_EXAMPLES
-    or [
-        pytest.param(
-            None,
-            marks=pytest.mark.skip(
-                reason="no example sells a harness handler yet (kontra-sdk#58 adds "
-                "examples/recon-harness)"
-            ),
-        )
-    ],
-)
+def test_the_harness_examples_are_found() -> None:
+    """The hook below runs, never skips: an example that sells a handler is found by its
+    imports, and the one there is, is."""
+    assert HARNESS_EXAMPLES == ["recon-harness"]
+
+
+@pytest.mark.parametrize("name", HARNESS_EXAMPLES)
 def test_an_example_handler_agrees_with_the_harness(name: str) -> None:
     """What a seller copies publishes without a warning: the golden contract of an example
     that sells a handler (``examples/<name>/contract.yaml``, held byte for byte by
