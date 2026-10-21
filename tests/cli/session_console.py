@@ -6,7 +6,7 @@ and its job keys, and the page's own requests. ``tests/cli/test_session_lifecycl
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from typing import Any
 
@@ -72,7 +72,7 @@ class Consoles:
 
 
 @contextmanager
-def consoles() -> Iterator[Consoles]:
+def consoles() -> Generator[Consoles]:
     opened = Consoles()
     try:
         yield opened

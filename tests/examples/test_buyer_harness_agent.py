@@ -19,7 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +41,7 @@ asynchronous = pytest.mark.asyncio(loop_scope="package")
 
 
 @contextlib.contextmanager
-def hires(market: Market) -> Iterator[list[m.HireRequest]]:
+def hires(market: Market) -> Generator[list[m.HireRequest]]:
     """Every hire request the gate receives meanwhile: what a buyer's client asked to lock."""
     gate = market.mp.gate
     real = gate.hire

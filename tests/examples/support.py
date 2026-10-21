@@ -12,7 +12,7 @@ import signal
 import subprocess
 import sys
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -214,7 +214,7 @@ def seller_env(home: Path, sites: Sites) -> dict[str, str]:
 
 
 @contextlib.asynccontextmanager
-async def serving(market: Market, name: str, log: Path, **env: str) -> AsyncIterator[Seller]:
+async def serving(market: Market, name: str, log: Path, **env: str) -> AsyncGenerator[Seller]:
     """``examples/<name>``'s ``python worker.py`` as ``acme`` for the block (its log's tail in
     the report if a test fails), stopped gracefully after it."""
     environ = seller_env(market.seller.home, market.sites)

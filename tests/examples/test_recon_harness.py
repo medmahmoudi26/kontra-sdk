@@ -41,7 +41,8 @@ from tests.graph.test_cli import readme_graph
 
 from .support import EXAMPLES, START, Market, example_module, serving
 
-pytestmark = [pytest.mark.temporal, pytest.mark.asyncio(loop_scope="package")]
+#: The lifecycle tests run on the package's marketplace, on its event loop.
+asynchronous = pytest.mark.asyncio(loop_scope="package")
 
 NAME = "recon-harness"
 EXAMPLE = EXAMPLES / NAME
@@ -67,6 +68,8 @@ def run_graph(root: dict[str, Any], root_id: str, agent: dict[str, Any], agent_i
     return README_HEADER + graph.mermaid(g, nested=True)
 
 
+@pytest.mark.temporal
+@asynchronous
 async def test_a_hire_is_one_turn_of_the_agent(market: Market, tmp_path: Path) -> None:
     report_type = example_module(NAME, "models").SweepReport
     async with serving(market, NAME, tmp_path / f"{NAME}.log"):
@@ -153,6 +156,8 @@ async def test_a_hire_is_one_turn_of_the_agent(market: Market, tmp_path: Path) -
     assert drawn == readme_graph(NAME)
 
 
+@pytest.mark.temporal
+@asynchronous
 async def test_a_sweep_that_asks_for_a_person_is_refused_at_the_quote(
     market: Market, tmp_path: Path
 ) -> None:
