@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from kontra.codec.age import AgeError, decrypt
+from kontra.codec.age import AgeError, decrypt, generate_identity
 from kontra.gate_client import models as m
 from kontra.hire import Progress
 from kontra.testing.fake_gate import AGE_MAGIC
@@ -87,15 +87,18 @@ async def test_enrich_end_to_end(market: Market, tmp_path: Path) -> None:
         _record(refused, error="ConnectError"),
     ]
 
-    # The gate holds ciphertext only: the progress events and the records file.
+    # The gate holds ciphertext only: the job stream's progress items (sealed to the job's
+    # parties, decisions I31) and the records file.
     stored = await market.gate(lambda g: list(g.jobs[job.job_id].events))
     sealed = [base64.b64decode(e.ciphertext_b64) for e in stored if e.ciphertext_b64]
     assert len(sealed) == 100
+    stranger = generate_identity()[0]
     for raw in sealed:
         assert raw.startswith(AGE_MAGIC)
         assert b"records" not in raw
+        decrypt(raw, market.seller.identity)  # the seller wrote it
         with pytest.raises(AgeError):
-            decrypt(raw, market.seller.identity)  # for the buyer only
+            decrypt(raw, stranger)
     stored_file = await market.gate(lambda g: g.artifacts[records.key].data())
     assert stored_file.startswith(AGE_MAGIC)
     assert b"Page 0" not in stored_file

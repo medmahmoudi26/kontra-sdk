@@ -89,6 +89,8 @@ def test_missing_profile_says_how_to_log_in(tmp_path: Path) -> None:
     with pytest.raises(NotLoggedIn, match="kontra login") as ei:
         Profile.load(tmp_path)
     assert str(tmp_path / PROFILE_FILE) in str(ei.value)
+    # ... or how to get a local dev stack, which logs in by itself (decisions I34, OD14).
+    assert "`kontra dev up`" in str(ei.value)
 
 
 @pytest.mark.parametrize(

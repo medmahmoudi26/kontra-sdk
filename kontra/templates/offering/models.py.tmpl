@@ -3,8 +3,8 @@
 becomes `additionalProperties: false`), so a field added here is a field buyers see, and
 a change here needs a new `version` in offering.yaml.
 
-Files are never fields of bytes: use `kontra.types.Artifact`, the one Kontra type allowed
-in this file (D1).
+Files are never fields of bytes: use `kontra.types.Artifact`, the one Kontra import this
+file may have (decisions I29).
 """
 
 from pydantic import BaseModel, ConfigDict, Field

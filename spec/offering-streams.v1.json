@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kontra.run/spec/offering-streams.v1.json",
+  "title": "offering.yaml streams",
+  "description": "The topics of a job's workflow stream that a buyer may read (kontra-sdk decisions I31). Catalog data: never part of x-kontra, never in the contract hash. Fixed per published version. kontra.progress is relayed for every job and may not be listed.",
+  "type": "array",
+  "maxItems": 8,
+  "uniqueItems": true,
+  "items": {
+    "type": "string",
+    "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$",
+    "not": {
+      "pattern": "^[Kk][Oo][Nn][Tt][Rr][Aa]\\."
+    }
+  }
+}

@@ -36,7 +36,15 @@ import math
 import re
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncGenerator, Hashable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Hashable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import aclosing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -89,10 +97,12 @@ from temporalio.api.workflowservice.v1 import (
 from temporalio.client import Client
 from temporalio.service import RPCError, RPCStatusCode
 
+from kontra._relay import RelayService
 from kontra.codec import CLAIM_CHECK_ENCODING
 from kontra.codec import _parse_reference as _reference  # pyright: ignore[reportPrivateUsage]
 from kontra.contract.names import is_endpoint_name
 from kontra.contract.offering import MAX_DURATION_RANGE
+from kontra.engine import hold_digest  # re-exported: kontra-cloud imports it from here
 from kontra.escrow import Observation, ObservedStatus, Provenance
 from kontra.gate_client import models as m
 
@@ -120,6 +130,7 @@ __all__ = [
     "TemporalError",
     "hold_digest",
     "input_size",
+    "internal_relay_service",
 ]
 
 #: Above the contract's max_duration cap (see :data:`DEFAULT_RETENTION`): the gate's grace
@@ -274,30 +285,6 @@ class EndpointInfo:
     task_queue: str
 
 
-#: What HTTP drops from both ends of a Nexus header value on its way to the seller's
-#: handler (server 1.32, measured): the buyer's call records ``" <token>\t"`` and the
-#: handler is handed ``"<token>"``. Nothing else is changed; other bytes are refused or kept.
-_HTTP_OWS = " \t"
-
-
-def hold_digest(token: str) -> str:
-    """How a hold is matched: sha256 hex of the bytes its signature covers (the JWS signing
-    input, everything before the last ``.``; all of it when there is none), after dropping
-    the spaces and tabs HTTP drops on the way to the handler.
-
-    The gate digests each token it issues with this, and :meth:`Control.observe` digests
-    the header a buyer's call carried with it. The signature segment is left out because
-    it is not the gate's to fix: ES256 accepts ``(r, n - s)`` for ``(r, s)`` and the
-    verifier's base64url decoder ignores padding, so one issued token has many spellings
-    the seller's handler accepts. Matched byte for byte, a buyer could call with one of
-    them, have the job done, and have escrow refund it as "not the buyer's call". A string
-    with the gate's signed part is the gate's statement whatever signature follows it. The
-    token is never decoded: no claim is read, only bytes compared."""
-    value = token.strip(_HTTP_OWS).encode("utf-8")
-    signed, dot, _signature = value.rpartition(b".")
-    return sha256(signed if dot else value).hexdigest()
-
-
 def input_size(payload: Payload) -> int:
     """The size, in bytes, of an ``execute`` input as the seller's handler receives it: what
     a claim-check reference says the stored ciphertext is (its ``size``: what the handler
@@ -418,7 +405,11 @@ class TemporalControl(Protocol):
         self, namespace: str, workflow_id: str, pinned: str | None = None
     ) -> HistorySummary | None: ...
 
-    async def cancel_workflow(self, namespace: str, workflow_id: str, reason: str) -> None: ...
+    async def history_size(self, namespace: str, workflow_id: str) -> tuple[int, int] | None: ...
+
+    async def cancel_workflow(
+        self, namespace: str, workflow_id: str, reason: str, first_run_id: str = ""
+    ) -> None: ...
 
     async def terminate_workflow(
         self, namespace: str, workflow_id: str, reason: str, first_run_id: str = ""
@@ -441,6 +432,27 @@ class TemporalControl(Protocol):
         headers: Mapping[str, str],
         schedule_to_close: timedelta,
     ) -> None: ...
+
+
+def internal_relay_service(
+    control: TemporalControl,
+) -> Callable[[str], Awaitable[RelayService]] | None:
+    """The stream relay's frontend where it is the control plane's own: a dev server (and a
+    fake gate on one), whose single frontend judges no relay token, so the token is not sent
+    and the relay reads through this control plane's client. None for a control plane
+    without a client of its own (a test double). A production gate relays on the PUBLIC
+    frontend with the relay token instead (decisions I30); this is the one place the relay
+    is handed the internal frontend, in the only code that talks to it (seam ⑥: the
+    ``relay_service`` of :class:`kontra.engine.temporal.TemporalEngine`)."""
+    client: Any = getattr(control, "client", None)
+    if client is None:
+        return None
+    service: RelayService = client.workflow_service
+
+    async def connect(token: str) -> RelayService:
+        return service
+
+    return connect
 
 
 def _time(ts: Timestamp, present: bool) -> datetime | None:
@@ -1263,14 +1275,14 @@ class Control:
         once a verified run completed, the result payload exactly as stored -- a serialized
         ``Payload``, ciphertext -- with that byte string's sha256 and size.
 
-        ``pinned``: the chain escrow pinned (``JobRecord.run_id``). With it, only that chain
+        ``pinned``: the chain escrow pinned (``JobRecord.pin``). With it, only that chain
         is reported: the latest run of the id when the server says it descends from
         ``pinned`` (its ``first_run_id``), else the chain's own last run, reached by following
         each continue-as-new, retry or cron successor the server recorded, each accepted only
         if its start names the run before it (:class:`ObservationIncomplete` when that takes
         more than one call). Any other run of the id is never reported. Without it, the latest
         run of the id is reported with the provenance of its chain's first run, and
-        ``run_id`` is that first run: escrow pins it when it is verified.
+        ``pin`` is that first run's id: escrow pins it when it is verified.
 
         A chain's first run is the server's ``first_run_id``, which only the server sets (on
         a continue-as-new, retry or cron successor; no start request carries it), read in one
@@ -1312,7 +1324,7 @@ class Control:
             started_at=_time(info.start_time, info.HasField("start_time")),
             closed_at=_time(info.close_time, info.HasField("close_time")),
             provenance=provenance,
-            run_id=root,
+            pin=root,
         )
         if status is ObservedStatus.CANCELED and provenance is Provenance.VERIFIED and root:
             canceled = await self._buyer_canceled(namespace, workflow_id, root, call)
@@ -1354,7 +1366,7 @@ class Control:
         for _ in range(CHAIN_READS):
             d = await self._describe(namespace, workflow_id, run)
             if d is None:
-                return Observation(status=ObservedStatus.NOT_FOUND, run_id=root), None
+                return Observation(status=ObservedStatus.NOT_FOUND, pin=root), None
             if d.workflow_execution_info.status not in _MAY_HAND_OVER:
                 return await self._report(
                     namespace, workflow_id, call, d, root, Provenance.VERIFIED
@@ -1659,6 +1671,17 @@ class Control:
         # Scheduled, and no Started event says otherwise (none yet, or it named this run).
         return _Found(Provenance.VERIFIED, cancel_requested)
 
+    async def history_size(self, namespace: str, workflow_id: str) -> tuple[int, int] | None:
+        """How long (events) and how large (bytes) the latest run of ``workflow_id``'s
+        history is, as the server describes it, or None when there is no run: what a job's
+        stream relay is paced against (:func:`kontra._relay.pace_for`, decisions I31). Raises
+        :class:`TemporalError` when it cannot say."""
+        d = await self._describe(namespace, workflow_id)
+        if d is None:
+            return None
+        info = d.workflow_execution_info
+        return info.history_length, info.history_size_bytes
+
     async def history_summary(
         self, namespace: str, workflow_id: str, pinned: str | None = None
     ) -> HistorySummary | None:
@@ -1669,7 +1692,7 @@ class Control:
         type names; ``activities_completed`` and ``continue_as_new_count`` cover the whole
         chain (lower bounds while a very long chain is still being counted).
 
-        ``pinned``: the chain escrow pinned (``JobRecord.run_id``, decisions I15). The
+        ``pinned``: the chain escrow pinned (``JobRecord.pin``, decisions I15). The
         summary is then of that chain only, read where :meth:`observe` reads it (the latest
         run of the id when the server says it descends from ``pinned``, else the chain's own
         last run), so another run of the id -- one the seller started itself -- never feeds
@@ -1792,15 +1815,20 @@ class Control:
 
     # ------------------------------------------------------------------ stopping
 
-    async def cancel_workflow(self, namespace: str, workflow_id: str, reason: str) -> None:
+    async def cancel_workflow(
+        self, namespace: str, workflow_id: str, reason: str, first_run_id: str = ""
+    ) -> None:
         """Ask ``workflow_id`` to cancel. A workflow that is gone or already closed is not
-        an error: there is nothing left to stop. A missing namespace is."""
+        an error: there is nothing left to stop. A missing namespace is. With
+        ``first_run_id`` (a job's pinned run) only the open run of THAT chain is asked:
+        Temporal refuses when the open run started a different chain."""
         req = RequestCancelWorkflowExecutionRequest(
             namespace=namespace,
             workflow_execution=WorkflowExecution(workflow_id=workflow_id),
             identity=self._identity,
             request_id=str(uuid.uuid4()),
             reason=reason,
+            first_execution_run_id=first_run_id,
         )
         try:
             await self._wf.request_cancel_workflow_execution(req, retry=True, timeout=_RPC_TIMEOUT)

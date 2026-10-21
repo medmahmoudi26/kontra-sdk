@@ -14,3 +14,6 @@ examples/*/gen/
 node_modules/
 temporal/authorizer/bin/
 .hypothesis/
+
+# The e2e stack's gitignored credentials and env file (tests/e2e/stack.py)
+.stack/

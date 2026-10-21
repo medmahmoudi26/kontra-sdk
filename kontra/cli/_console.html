@@ -7,7 +7,7 @@
 <link rel="icon" href="data:,">
 <title>Kontra Run Graph</title>
 <style nonce="__NONCE__">
-/* kontra dev's run graph: the whole workflow (kontra graph's static layer), the live run painted on it.
+/* kontra dev's run graph: the whole workflow (the static layer kontra serve draws), the live run painted on it.
    Served by the dev codec server on loopback; no external resources (its CSP allows none). */
 :root{
   --ground:#f2f4f2;--panel:#ffffff;--ink:#1a1f1c;--mute:#5f6b65;--line:#d6dcd8;--edge:#9aa49f;--ghost:#b3bbb7;
@@ -504,9 +504,9 @@ function pane() {
     el("div", { class: "chips" }, el("span", { class: `pill s-${st}` }, STATUS[st] || st), el("span", { class: "chip" }, kind),
       n.id !== title(n) ? el("span", { class: "chip" }, n.id) : null)];
   if (st === "unreached" || st === "pending") {
-    parts.push(el("p", { class: "muted" }, st === "pending"
-      ? "This run has not reached this step yet. It appears because kontra graph's mock runs reached it."
-      : "This run did not take this branch. It appears because kontra graph's mock runs took it."));
+    parts.push(st === "pending"
+      ? el("p", { class: "muted" }, "This run has not reached this step yet. It appears because the mock runs ", el("code", {}, "kontra serve"), " drew the graph from reached it.")
+      : el("p", { class: "muted" }, "This run did not take this branch. It appears because the mock runs ", el("code", {}, "kontra serve"), " drew the graph from took it."));
     box.replaceChildren(...parts);
     return;
   }
@@ -563,8 +563,8 @@ function header(g) {
   $("wf-links").replaceChildren(...(nav ? nav.childNodes : []));
   const note = $("notice");
   if (g.static_graph === false) {
-    note.replaceChildren("No static graph for this offering yet, so only what this run did is drawn. Run ",
-      el("code", {}, "kontra graph --dir <project>"), " to see every branch, including the ones this run never takes.");
+    if (g.handler) note.replaceChildren("This offering's entry is a handler, so only what this run did is drawn.");
+    else note.replaceChildren("No static graph for this offering yet: start ", el("code", {}, "kontra serve"), " once and it is drawn in the background.");
     note.hidden = false;
   } else note.hidden = true;
 }

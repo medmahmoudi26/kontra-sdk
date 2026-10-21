@@ -990,7 +990,7 @@ def batch_child(*scheduled: str, spec: Any = None, encrypted: bool = False) -> d
 
 
 def spec(activity: str, pages: str | None = None, items: list[Any] | None = None) -> dict[str, Any]:
-    """``kontra._parallel._Spec`` as the pydantic converter writes it."""
+    """``kontra.contrib.parallel._Spec`` as the pydantic converter writes it."""
     return {
         "activity": activity,
         "activity_ref": {"module": "activities", "qualname": activity},
@@ -1036,7 +1036,7 @@ def test_a_batch_is_named_from_what_its_input_asked_for_when_that_is_plain() -> 
 
 
 def test_the_batch_workflow_name_is_kontras() -> None:
-    from kontra._parallel import BATCH_WORKFLOW
+    from kontra.contrib.parallel import BATCH_WORKFLOW
 
     assert BATCH_WORKFLOW == kontra.graph._BATCH_WORKFLOW
 
@@ -1938,3 +1938,96 @@ def test_mermaid_escapes_labels() -> None:
     assert '    n0["a#quot;b#lt;c#gt;d#96;e f#35;g#amp;h"]\n' in text
     assert len(text.splitlines()) == 8
     assert nasty not in text
+
+
+# --------------------------------------------------------------------------- nested (I36)
+
+SETTLE_ID = f"{WORKFLOW_ID}/settle"
+SETTLE_RUN = "0199f0a1-8c32-7e60-8b44-3d5f7a9b1c23"
+
+
+def _nested() -> tuple[dict[str, Any], dict[str, Any]]:
+    """The ``child`` fixture's ``Settle`` child, drawn inside its node (the dev console's
+    agent child, decisions I36): its history is ``sequence``'s three activities."""
+    children = {BATCH_ID: fixture("child_batch"), SETTLE_ID: fixture("sequence")}
+    flat = graph("child", run_id=RUN_ID, children=children)
+    return flat, graph("child", run_id=RUN_ID, children=children, nested={SETTLE_ID: None})
+
+
+def test_a_nested_child_adds_its_own_nodes_and_leaves_the_run_s_alone() -> None:
+    flat, nested = _nested()
+    own = [n for n in nested["nodes"] if "parent" not in n]
+    assert own == flat["nodes"]
+    assert [e for e in nested["edges"] if "parent" not in e] == flat["edges"]
+    inside = [n for n in nested["nodes"] if "parent" in n]
+    assert [n["id"] for n in inside] == [
+        kontra.graph.nested_id("Settle", name)
+        for name in ("fetch_batch", "enrich", "write_records")
+    ]
+    assert {n["parent"] for n in inside} == {"Settle"}
+    assert all(n["within"] == {"workflow_id": SETTLE_ID, "run_id": SETTLE_RUN} for n in inside)
+    assert all(n["kind"] == "activity" and n["status"] == "completed" for n in inside)
+    assert {(e["from"], e["to"]) for e in nested["edges"] if e.get("parent") == "Settle"} == {
+        (START, "Settle/fetch_batch"),
+        ("Settle/fetch_batch", "Settle/enrich"),
+        ("Settle/enrich", "Settle/write_records"),
+        ("Settle/write_records", END),
+    }
+
+
+def test_nesting_is_asked_for_and_needs_the_child_s_history() -> None:
+    children = {BATCH_ID: fixture("child_batch"), SETTLE_ID: fixture("sequence")}
+    assert graph("child", children=children) == graph("child", children=children, nested={})
+    # No history for it, or no such child: nothing nested.
+    absent = graph("child", children={BATCH_ID: fixture("child_batch")}, nested={SETTLE_ID: None})
+    assert absent == graph("child", children={BATCH_ID: fixture("child_batch")})
+    assert graph("child", children=children, nested={"no-such": None}) == graph(
+        "child", children=children
+    )
+    with pytest.raises(ValueError, match="nested maps"):
+        graph("child", children=children, nested=[SETTLE_ID])  # type: ignore[arg-type]
+
+
+def test_parse_indexed_names_the_node_of_every_command() -> None:
+    history = fixture("child")
+    children = {BATCH_ID: fixture("child_batch"), SETTLE_ID: fixture("sequence")}
+    g, index = kontra.graph.parse_indexed(history, children=children, nested={SETTLE_ID: None})
+    assert g == parse(history, children=children, nested={SETTLE_ID: None})
+    for n in g["nodes"]:
+        at = (n["within"]["workflow_id"] if "parent" in n else None, n["ref"]["event_id"])
+        assert index[at] == n["id"]
+    # Every command of the run and of the nested child, and only those.
+    assert {at[0] for at in index} == {None, SETTLE_ID}
+    assert len(index) == len(g["nodes"])
+
+
+def test_a_nested_node_links_into_its_child_s_own_history() -> None:
+    _, nested = _nested()
+    g = links(nested, CFG)
+    inner = node(g, "Settle/enrich")
+    event_id = inner["ref"]["event_id"]
+    assert (
+        inner["links"]["temporal"]
+        == f"{UI}/{quote(SETTLE_ID, safe='')}/{SETTLE_RUN}/history/events/{event_id}"
+    )
+    logs = json.loads(parse_qs(urlsplit(inner["links"]["logs"]).query)["panes"][0])
+    assert f'workflow_id="{SETTLE_ID}"' in logs["kon"]["queries"][0]["expr"]
+    assert f'run_id="{SETTLE_RUN}"' in logs["kon"]["queries"][0]["expr"]
+    # The run's own nodes link as they always did.
+    assert node(g, "fetch_batch")["links"] == node(links(_nested()[0], CFG), "fetch_batch")["links"]
+
+
+def test_merge_and_mermaid_keep_a_nested_child_to_itself() -> None:
+    flat, nested = _nested()
+    static = union([flat])
+    painted = merge(static, nested)
+    assert [e for e in painted["edges"] if "parent" not in e] == merge(static, flat)["edges"]
+    inside = [e for e in painted["edges"] if "parent" in e]
+    assert len(inside) == 4
+    assert all(e["reached"] is True for e in inside)
+    assert {n["id"] for n in painted["nodes"] if "parent" in n} == {
+        "Settle/fetch_batch",
+        "Settle/enrich",
+        "Settle/write_records",
+    }
+    assert mermaid(nested) == mermaid(flat)

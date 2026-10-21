@@ -1,6 +1,8 @@
-"""``workflow.execute_activities_in_parallel`` and its ``kontra.batch.v1`` child, on a real dev
-server: both sources, the fold, backpressure, failure, refusals at call time, replay, and a
-batch that continues as new mid-page on a server that suggests it early."""
+"""``kontra.contrib.parallel.execute_activities_in_parallel`` and its ``kontra.batch.v1`` child,
+on a real dev server with :class:`~kontra.contrib.parallel.ParallelPlugin` on a plain
+temporalio worker: both sources (a page of the helper's and one of the seller's own), the
+fold, backpressure, failure, refusals at call time, replay, and a batch that continues as new
+mid-page on a server that suggests it early."""
 
 from __future__ import annotations
 
@@ -20,26 +22,29 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ActivityError, ApplicationError, ChildWorkflowError
 from temporalio.worker import Replayer
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
-from kontra._parallel import (
+from kontra.codec import KontraCodec
+from kontra.codec.age import generate_identity
+from kontra.contrib.parallel import (
     BATCH_WORKFLOW,
     Page,
+    ParallelPlugin,
     _Batch,
     _Cursor,
     _Options,
+    _page,
     _Ref,
     _Spec,
     execute_activities_in_parallel,
 )
-from kontra.codec import KontraCodec
-from kontra.codec.age import generate_identity
-from kontra.serve.worker import seller_data_converter, workflow_runner
+from kontra.serve.worker import seller_data_converter
 from kontra.testing.devserver import DevServer, start_dev_server
 
 from . import acts
 from .conftest import serving
 from .flows import Parent
-from .models import Hit, Tally
+from .models import Hit, Tally, Words
 
 _T = timedelta(seconds=30)
 #: The server suggests continue-as-new past this many history events (default: thousands).
@@ -86,9 +91,7 @@ async def _runs(client: Client, workflow_id: str, run_id: str) -> list[str]:
 async def _replay(client: Client, workflow_id: str, run_id: str | None = None) -> None:
     history = await client.get_workflow_handle(workflow_id, run_id=run_id).fetch_history()
     await Replayer(
-        workflows=[Parent, _Batch],
-        workflow_runner=workflow_runner(),
-        data_converter=pydantic_data_converter,
+        workflows=[Parent], plugins=[ParallelPlugin()], data_converter=pydantic_data_converter
     ).replay_workflow(history)
 
 
@@ -122,6 +125,7 @@ async def test_an_int_cursor_pages_and_reduce_folds(worker: tuple[Client, str]) 
 
 
 async def test_a_str_cursor_pages_through_an_empty_page(worker: tuple[Client, str]) -> None:
+    """``tokens`` returns the seller's own model (``Words``), not the helper's ``Page``."""
     client, tq = worker
     out = await (await _start(client, tq, "tokens")).result()
     assert sorted(out) == ["ALPHA", "BETA", "GAMMA"]
@@ -289,7 +293,6 @@ async def test_an_undecorated_or_nested_activity_is_refused() -> None:
     with pytest.raises(TypeError, match=r"@activity\.defn"):
         await execute_activities_in_parallel(acts.add, items=[1], start_to_close_timeout=_T)
 
-    # Temporal's own defn: kontra's would add it to the process's registry for serve().
     @temporal_activity.defn(name="local_double")
     async def local(x: int) -> int:
         return x
@@ -303,7 +306,7 @@ async def test_an_undecorated_or_nested_activity_is_refused() -> None:
 
 async def test_spec_and_cursor_round_trip_through_the_seller_converter() -> None:
     """timedelta, RetryPolicy, Priority and the enum inside the options come back as
-    themselves through the converter ``kontra.serve.Worker`` uses -- typed options, not a
+    themselves through the converter a Kontra worker's client uses -- typed options, not a
     dict, are what make that true."""
     identity, recipient = generate_identity()
     codec = KontraCodec(identity, [recipient], role="seller")
@@ -334,3 +337,46 @@ async def test_spec_and_cursor_round_trip_through_the_seller_converter() -> None
     assert converter.from_payloads(page, [Page[Hit]]) == [
         Page(items=[Hit(target="h", open=True)], next=3)
     ]
+
+
+# --------------------------------------------------------------------------- the plugin
+
+
+async def test_the_plugin_registers_the_child_and_passes_the_helper_through() -> None:
+    """``ParallelPlugin`` is all a worker needs: ``kontra.batch.v1`` after the seller's
+    workflows, and the helper's module passed through a sandbox (the seller's own included);
+    a runner that is not Temporal's sandbox is the seller's choice, kept as it is."""
+    plugin = ParallelPlugin()
+    assert plugin.name() == "kontra.ParallelPlugin"
+    mine = SandboxedWorkflowRunner()
+    config: Any = plugin.configure_worker(
+        {"workflows": [Parent], "workflow_runner": mine}  # type: ignore[typeddict-item]
+    )
+    assert config["workflows"] == [Parent, _Batch]
+    runner = config["workflow_runner"]
+    assert isinstance(runner, SandboxedWorkflowRunner)
+    assert "kontra.contrib.parallel" in runner.restrictions.passthrough_modules
+    assert "kontra.contrib.parallel" not in mine.restrictions.passthrough_modules  # a copy
+    other = object()
+    config = plugin.configure_worker({"workflows": [], "workflow_runner": other})  # type: ignore[typeddict-item]
+    assert config["workflow_runner"] is other
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        Page(items=[1, 2], next=3),
+        Words(items=["a"], next=None),
+        {"items": ["x"], "next": "n"},
+    ],
+)
+async def test_a_page_is_anything_with_a_list_of_items_and_a_next(page: Any) -> None:
+    items, following = _page("pager", page)
+    assert isinstance(items, list)
+    assert following == (page["next"] if isinstance(page, dict) else page.next)
+
+
+@pytest.mark.parametrize("page", [[1, 2], {"items": [1]}, Hit(target="h", open=True), None])
+async def test_anything_else_from_a_pager_is_its_bug(page: Any) -> None:
+    with pytest.raises(TypeError, match=r"pager returned \w+, not a page"):
+        _page("pager", page)

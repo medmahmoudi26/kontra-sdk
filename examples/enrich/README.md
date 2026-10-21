@@ -7,9 +7,9 @@ delivered as an encrypted JSONL `Artifact` plus a small inline summary.
 |---|---|
 | `offering.yaml` | name, version, limits, display text — declarative, no code names |
 | `models.py` | the In/Out types; the published contract is derived from them |
-| `workflows.py`, `activities.py` | Temporal through the façade (`from kontra import workflow, activity`); never `temporalio` |
+| `workflows.py`, `activities.py` | vanilla Temporal (`from temporalio import workflow, activity`); never `kontra`, so they run on any Temporal worker as they are -- all but the `Artifact` upload of `activities.py`, which needs the Kontra runtime `worker.py` installs |
 | `quote.py` | the price, from the input |
-| `worker.py` | `serve(EnrichFlow, ...)`: the binding of workflow + quote to the offering, and all worker tuning |
+| `worker.py` | `serve(EnrichFlow, ...)`: the binding of workflow + quote to the offering, and all worker tuning; the one file that imports `kontra` |
 | `contract.yaml` | the derived contract document, kept as a golden file (seam ③) |
 
 ```sh
@@ -48,10 +48,10 @@ byte for byte. It seals no key (spec v2): the same offering derives the same doc
 
 ## Its graph
 
-`kontra graph --mermaid`, from this directory, draws the workflow from mock runs: Temporal's
-test server runs it eight times, every activity answered with a value of the type it
-declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against the
-command:
+Under a dev profile, `kontra serve` draws the workflow for `kontra dev`'s graph page from mock
+runs: Temporal's test server runs it eight times, every activity answered with a value of the
+type it declares, so nothing runs for real. `tests/graph/test_cli.py` checks this copy against
+those runs:
 
 ```mermaid
 %% acme/enrich@1.2.0

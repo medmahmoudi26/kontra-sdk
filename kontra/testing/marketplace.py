@@ -9,7 +9,8 @@ directory, a profile, an age key registered with the gate, a :class:`kontra.auth
 and funded with play money. A seller's or buyer's whole job lifecycle -- quote, hire,
 delivery, review window, timeout and refund -- runs in a unit test with no containers
 (PRD §19.3). ``async with mp.serve(worker, party):`` runs a :class:`kontra.serve.Worker` as
-that party for the block, as ``kontra serve`` would with the party's profile.
+that party for the block, as ``kontra serve`` would with the party's profile, but for one
+setting: its stream upload budget is :data:`SERVE_UPLOAD_BUDGET`.
 
 Defaults are fast: the sweeper runs every 0.2 s and the refund grace is 1 s, so deadlines
 and review windows can be driven with ``mp.gate.advance(...)`` within a test's patience.
@@ -33,18 +34,27 @@ from temporalio.client import Client
 from kontra._control import Control
 from kontra.auth import Session, login
 from kontra.contract.names import validate_handle
+from kontra.devgate.gate import DevGate as FakeGate
 from kontra.gate_client import GateClient
 from kontra.gate_client import models as m
 from kontra.ledger import Money
 from kontra.profile import Profile
 from kontra.testing.devserver import DevServer, start_dev_server
-from kontra.testing.fake_gate import FakeGate
 
 if TYPE_CHECKING:
     from kontra.hire import Kontra
     from kontra.serve import Worker
 
-__all__ = ["Marketplace", "TestParty"]
+__all__ = ["SERVE_UPLOAD_BUDGET", "Marketplace", "TestParty"]
+
+#: The stream upload budget (seconds) of a worker :meth:`Marketplace.serve` runs, where
+#: ``kontra serve`` gives 2 (:data:`kontra.codec.stream.STREAM_UPLOAD_BUDGET`, the codec's
+#: ``stream_upload_budget``). A test machine under load can take longer than 2 s to store one
+#: poll answer's 64 items in the fake gate's bucket, and an item not stored in time is a stub,
+#: a gap for the buyer: a test that counts every item would lose some. 8 s still leaves the
+#: worker time to complete the workflow task within Temporal's 10 s timeout. A test of the
+#: stubs a slow bucket leaves passes its own (``mp.serve(..., stream_upload_budget=0.5)``).
+SERVE_UPLOAD_BUDGET = 8.0
 
 
 @dataclass
@@ -245,6 +255,7 @@ class Marketplace:
         *,
         session: Session | None = None,
         client: Client | None = None,
+        stream_upload_budget: float = SERVE_UPLOAD_BUDGET,
     ) -> AsyncGenerator[Worker]:
         """Run ``worker`` as ``party`` for the block: what ``kontra serve`` does with that
         party's profile (on a dev profile its unpublished offerings are published), until it
@@ -253,10 +264,16 @@ class Marketplace:
 
         ``session`` replaces the party's own (e.g. one on a request-counting transport);
         ``client`` shares an existing Temporal connection instead of dialling a new one.
+        ``stream_upload_budget``: the worker's codec's (:data:`SERVE_UPLOAD_BUDGET`).
         """
         who = self.parties[party] if isinstance(party, str) else party
         run = asyncio.create_task(
-            worker.run_async(session=session or who.session, client=client, handle_signals=False),
+            worker.run_async(
+                session=session or who.session,
+                client=client,
+                handle_signals=False,
+                stream_upload_budget=stream_upload_budget,
+            ),
             name=f"kontra-serve {who.handle}",
         )
         ready = asyncio.create_task(worker.wait_ready())

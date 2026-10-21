@@ -7,15 +7,15 @@ your own machine as a Temporal worker. Made by `kontra init`.
 |---|---|
 | `offering.yaml` | name, version, limits, display text: declarative, no code names |
 | `models.py` | the input and output types; the published contract is derived from them |
-| `workflows.py`, `activities.py` | the job itself: Temporal, imported only through `kontra` (`from kontra import workflow, activity`) |
+| `workflows.py`, `activities.py` | the job itself: vanilla Temporal (`from temporalio import workflow, activity`), no `kontra` import, so they run on any Temporal worker as they are |
 | `quote.py` | the price, from the input |
-| `worker.py` | `serve({{Class}}Flow, ...)`: the binding of workflow and quote to the offering, and all worker tuning |
+| `worker.py` | `serve({{Class}}Flow, ...)`: the binding of workflow and quote to the offering, and all worker tuning; the one file that imports `kontra` |
 | `tests/test_offering.py` | the whole lifecycle (quote, hire, deliver, accept; a refund) with no containers |
 
 ## Try it locally
 
 ```sh
-kontra dev                                    # a local Kontra in Docker, with play money
+kontra dev                                    # a local Kontra, no containers, with play money
 kontra serve                                  # serve this offering (a dev profile publishes it)
 kontra quote {{party}}/{{name}} -f input.json
 kontra hire {{party}}/{{name}} -f input.json --max-price 1 --wait --accept

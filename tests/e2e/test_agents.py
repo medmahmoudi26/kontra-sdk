@@ -37,7 +37,7 @@ async def _ok(client: Client, tool: str, **arguments: Any) -> dict[str, Any]:
 
 
 @pytest.mark.timeout(600)
-async def test_ac12_mcp_search_quote_hire_result_accept_against_kontra_dev(
+async def test_ac12_mcp_search_quote_hire_result_accept_against_the_platform_gate(
     stack: Stack, tmp_path: Path
 ) -> None:
     seller = await stack.party("ac12")

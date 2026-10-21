@@ -8,9 +8,12 @@ on the same port and behind the same ``Host`` check.
 ``GET /api/workflows``         the latest :data:`WORKFLOWS_LIMIT` executions in the party's
                                namespace (batch children left out): metadata only
 ``GET /api/graph?w=&r=``       :func:`kontra.graph.links` of the run painted on the static
-                               graph ``kontra graph`` saved for its task queue
-                               (:func:`kontra.cli._graph.load_static`); ``static_graph: false``
-                               when there is none
+                               graph ``kontra serve`` drew for its task queue
+                               (:func:`kontra._graphs.load_static`, decisions I35);
+                               ``static_graph: false`` when there is none, and
+                               ``handler: true`` when the run is a handler offering's (its
+                               job, ``kontra.turn.v1``, or the agent that job started), which
+                               has none
 ``GET /api/graph/events?...``  the same graph as server-sent events (``event: graph``) each
                                time ``DescribeWorkflowExecution`` says the run changed, about
                                once a second, then ``event: end`` once it closed; at most
@@ -108,6 +111,11 @@ TEMPO_UID = "tempo"
 _PAGE_FILE = "_console.html"
 _NONCE = "__NONCE__"
 _BATCH = "kontra.batch.v1"
+#: A handler offering's job workflow (``kontra.serve.turn.TURN_WORKFLOW``, without importing
+#: the serving side): it has no static graph.
+_TURN = "kontra.turn.v1"
+#: Parent runs whose type was looked up, remembered (a run's type never changes).
+_PARENT_CACHE = 256
 #: How long a request waits for Temporal (and the gate, for a token) before it gives up.
 _TIMEOUT = 30.0
 #: How often a stream asks Temporal whether the run changed, and says it is alive.
@@ -360,6 +368,7 @@ class Console:
         self._temporal: Connected | None = None
         self._connecting: asyncio.Lock | None = None
         self._children: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self._turns: OrderedDict[tuple[str, str], bool] = OrderedDict()
 
     # ------------------------------------------------------------------ the loop
 
@@ -449,13 +458,36 @@ class Console:
             log_selector=self._selector,
         )
 
+    async def _handler_run(self, client: Client, desc: WorkflowExecutionDescription) -> bool:
+        """Whether the run is a handler offering's: its job (``kontra.turn.v1``), or the agent
+        that job started (its parent is one). Told by the types Temporal reports, never by
+        an id."""
+        if desc.workflow_type == _TURN:
+            return True
+        if not desc.parent_id or not desc.parent_run_id:
+            return False
+        key = (desc.parent_id, desc.parent_run_id)
+        turn = self._turns.get(key)
+        if turn is None:
+            try:
+                parent = await client.get_workflow_handle(key[0], run_id=key[1]).describe()
+            except RPCError:
+                return False
+            turn = parent.workflow_type == _TURN
+            self._turns[key] = turn
+            while len(self._turns) > _PARENT_CACHE:
+                self._turns.popitem(last=False)
+        else:
+            self._turns.move_to_end(key)
+        return turn
+
     async def _snapshot(
         self,
         workflow_id: str,
         run_id: str | None,
         desc: WorkflowExecutionDescription | None = None,
     ) -> _Snapshot:
-        from kontra.cli._graph import load_static
+        from kontra._graphs import load_static
 
         temporal = await self._client()
         client = temporal.client
@@ -476,6 +508,7 @@ class Console:
         static = load_static(self.home, desc.task_queue)
         painted = graph.merge(static, live) if static is not None else live
         painted["static_graph"] = static is not None
+        painted["handler"] = static is None and await self._handler_run(client, desc)
         return _Snapshot(
             graph=graph.links(painted, self._links(temporal.namespace)),
             history=history,

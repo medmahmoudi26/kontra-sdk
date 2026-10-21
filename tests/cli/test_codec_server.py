@@ -247,8 +247,7 @@ def test_kontra_dev_starts_and_stops_it_in_the_background(
     monkeypatch.setenv("KONTRA_HOME", str(home))
     monkeypatch.delenv(KEY_FILE_ENV, raising=False)
     port = _free_port()
-    config = _ui_config(port, 8233)
-    url = dev_module._start_codec(home, config)
+    url = dev_module._start_codec(home, codec_port=port, ui_port=8233)
     try:
         assert url == f"http://127.0.0.1:{port}"
         state = json.loads((home / dev_module.CODEC_STATE).read_text())
@@ -273,7 +272,7 @@ def test_kontra_dev_starts_and_stops_it_in_the_background(
         assert runs.status_code == 502
         assert runs.json()["error"].startswith("NotLoggedIn: not logged in")
         # Started again (a second `up --ui`): the first is stopped, one runs.
-        assert dev_module._start_codec(home, config) == url
+        assert dev_module._start_codec(home, codec_port=port, ui_port=8233) == url
     finally:
         stopped = dev_module._stop_codec(home)
     assert stopped
@@ -304,14 +303,13 @@ def test_another_home_s_server_on_the_port_is_not_taken_for_ours(
     monkeypatch.delenv(KEY_FILE_ENV, raising=False)
     a, b = _home(tmp_path / "a"), _home(tmp_path / "b")
     port = _free_port()
-    config = _ui_config(port, 8233)
     monkeypatch.setenv("KONTRA_HOME", str(a))
-    dev_module._start_codec(a, config)
+    dev_module._start_codec(a, codec_port=port, ui_port=8233)
     try:
         theirs = json.loads((a / dev_module.CODEC_STATE).read_text())["token"]
         monkeypatch.setenv("KONTRA_HOME", str(b))
         with pytest.raises(ClickException, match="did not start"):
-            dev_module._start_codec(b, config)
+            dev_module._start_codec(b, codec_port=port, ui_port=8233)
         assert not (b / dev_module.CODEC_STATE).exists()
         assert dev_module._stop_codec(b) is False
         assert dev_module._codec_running(port, theirs)  # a's still serves, untouched
@@ -327,33 +325,8 @@ def test_without_a_key_it_says_why(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("KONTRA_HOME", str(home))
     monkeypatch.delenv(KEY_FILE_ENV, raising=False)
     with pytest.raises(ClickException, match="no encryption key"):
-        dev_module._start_codec(home, _ui_config(_free_port(), 8233))
+        dev_module._start_codec(home, codec_port=_free_port(), ui_port=8233)
     assert not (home / dev_module.CODEC_STATE).exists()
-
-
-def test_only_a_loopback_endpoint_is_served(tmp_path: Path) -> None:
-    from click.exceptions import ClickException
-
-    for endpoint in ("http://0.0.0.0:8081", "http://localhost:8081", "https://127.0.0.1:8081"):
-        with pytest.raises(ClickException, match=r"127\.0\.0\.1"):
-            dev_module._codec_ports(_ui_config(8081, 8233, endpoint))
-    assert dev_module._codec_ports(_ui_config(8081, 8234)) == (8081, 8234)
-
-
-def test_the_page_s_links_are_where_this_up_published_them() -> None:
-    config = _ui_config(8081, 8234)
-    config["services"]["grafana"] = {
-        "ports": [{"host_ip": "127.0.0.1", "published": "3300", "target": 3000}]
-    }
-    assert dev_module._link_bases(config, observability=True) == [
-        *("--temporal-ui", "http://localhost:8234"),
-        *("--grafana", "http://localhost:3300"),
-    ]
-    # Without the observability profile no Grafana runs: the page links none.
-    assert dev_module._link_bases(config, observability=False) == [
-        "--temporal-ui",
-        "http://localhost:8234",
-    ]
 
 
 def test_a_link_base_that_is_not_an_http_url_is_refused(tmp_path: Path) -> None:

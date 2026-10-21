@@ -118,20 +118,21 @@ def contract(
 def publish(directory: Path, only: str | None, as_json: bool) -> None:
     """Publish worker.py's offerings to the catalog (needs your login, confirmed within the
     hour: a terminal asks in place)."""
-    from kontra.cli._seller_code import check_project
+    from kontra._compat import temporalio_warning
     from kontra.contract import contract_hash
     from kontra.gate_client import models as m
 
-    root = directory.resolve()
-    refused = "\n".join("  " + f.render(root) for f in check_project(root))
+    # Before worker.py is imported: a temporalio outside the tested range may be why it
+    # fails to (decisions I29). Publishing is not refused for it; serving is.
+    outside = temporalio_warning()
+    if outside is not None:
+        click.echo(f"warning: {outside}", err=True)
     with load_worker(directory) as worker:
         chosen = _pick(worker.offerings, only)
 
         async def go() -> list[m.CatalogEntry]:
             async with cli_session() as session:
                 profile = await session.resolve()
-                if refused and not profile.dev:  # kontra dev is the seller's own
-                    fail("seller code must stay behind the kontra façade:\n" + refused)
                 # No key is sealed into a document any more (spec v2, decisions I7), so
                 # publishing needs none: a seller may add or revoke a recipient without
                 # republishing.
@@ -144,13 +145,20 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
                 entries: list[m.CatalogEntry] = []
                 for b in chosen:
                     doc = b.document()
-                    entry = await session.gate.publish(doc)
+                    # streams and the engine: beside the document, never in it (catalog
+                    # data, I31, I32).
+                    entry = await session.gate.publish(doc, streams=b.streams, engine=b.engine)
                     ours = contract_hash(doc)
                     if (entry.offering, entry.contract_hash) != (b.key, ours):
                         fail(
                             f"the catalog recorded {printable(entry.offering)} with contract "
                             f"{printable(entry.contract_hash)} for {b.key} {ours}; `kontra serve` "
                             "would refuse it -- check the gate"
+                        )
+                    if tuple(sorted(entry.streams)) != b.streams:
+                        fail(
+                            f"the catalog recorded streams {printable(str(entry.streams))} for "
+                            f"{b.key}, not {list(b.streams)}; `kontra serve` would refuse it"
                         )
                     entries.append(entry)
                 return entries
@@ -164,6 +172,8 @@ def publish(directory: Path, only: str | None, as_json: bool) -> None:
         click.echo(f"  contract  {printable(e.contract_hash)}")
         click.echo(f"  endpoint  {printable(e.endpoint)}")
         click.echo(f"  queue     {printable(e.task_queue)}")
+        if e.streams:
+            click.echo(f"  streams   {printable(', '.join(e.streams))}")
 
 
 @click.command()
@@ -184,6 +194,7 @@ def serve(directory: Path, metrics: str | None, otlp: str | None) -> None:
     it gracefully)."""
     import logging
 
+    from kontra._compat import temporalio_warning
     from kontra.serve.telemetry import TelemetryError, metrics_runtime, otlp_logs, otlp_tracing
 
     if not logging.getLogger().handlers:
@@ -204,8 +215,16 @@ def serve(directory: Path, metrics: str | None, otlp: str | None) -> None:
         log.info("serving the Temporal SDK's metrics at http://%s/metrics", metrics)
     if tracing is not None:
         log.info("exporting traces and logs to %s", otlp)
+    # Before worker.py is imported (it may fail to on another temporalio); the worker
+    # itself then refuses to start (kontra.plugin.KontraPlugin.prepare).
+    outside = temporalio_warning()
+    if outside is not None:
+        log.warning("%s", outside)
     try:
         with load_worker(directory) as worker:
+            # The project it serves: under a dev profile, the graph page's static graphs
+            # are drawn from it (decisions I35).
+            worker.project = directory
             worker.run(
                 runtime=runtime, interceptors=[tracing.interceptor] if tracing is not None else []
             )
