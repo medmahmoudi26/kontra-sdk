@@ -3511,7 +3511,11 @@ kontra-sdk#50 directs; it is listed on #58 for the owner to confirm or overturn.
 - **Every seller example is vanilla temporalio** (I29; the rewrite and the inverted
   `tests/examples/test_imports.py` landed with #51): `hello`, `enrich`, `sweep`, `chef-agents`,
   `chef-claude`, `legacy-actor`. #58 changes no contract of theirs: every golden is
-  byte-for-byte what it was.
+  byte-for-byte what it was on the two lines it joins. Against #54's line alone one golden
+  differs, by Step 0's merge of #68, not by #58: `examples/legacy-actor/contract.yaml`, which
+  #63 regenerated (I38: outputs derived in serialization mode, so the output's `server` loses
+  its `default: ""`, `error`, `server` and `status` become required, and the contract hash
+  changes); nothing pins the old hash.
 - **`examples/recon-harness`, the seller.** An agent is a workflow whose entry is one typed
   handler, and the word "agent" appears nowhere in Kontra's surface: `ReconAgent.sweep`
   (`@agent.defn`, `@agent.init`, `@agent.accepts`, an `AgentWorkflowRunner` on a
@@ -3527,7 +3531,10 @@ kontra-sdk#50 directs; it is listed on #58 for the owner to confirm or overturn.
   offering of its own, and `tests/serve/recon_harness.py` is gone (one copy).
 - **The model is the worker's.** `think`, an activity, is the model: scripted with no
   `LLM_BASE_URL` in the worker's environment, an OpenAI-compatible endpoint (`LLM_MODEL`,
-  `LLM_API_KEY`) with one -- the chef examples' switch. The steps are the agent's code; the
+  `LLM_API_KEY`) with one -- the same `LLM_BASE_URL` switch as `chef-agents`, except that
+  unset it means the scripted model, not Ollama's address, and the model is named by
+  `LLM_MODEL`, the worker calling the endpoint itself, where `chef-agents` takes the OpenAI
+  Agents SDK's `OPENAI_DEFAULT_MODEL`. The steps are the agent's code; the
   model says each one and writes the report's summary, its prompt carrying counts, never the
   buyer's domains. Rejected: the harness's OpenAI Agents integration with a fake model, whose
   model events come only from the SDK's streamed path, which a scripted model would have to
@@ -3556,10 +3563,12 @@ kontra-sdk#50 directs; it is listed on #58 for the owner to confirm or overturn.
   escrowed job as a Nexus operation of the agent's workflow.
 - **Spend control is the harness's approval policy.** Every hire goes through `spend(offering,
   price, currency)`, a tool that is not inherently safe, called by the hiring tool with its own
-  quote, so the price approved is the price quoted, not a number the model chose. Auto mode
-  with the agent's evaluator approves a price at or under the cap (`spend_cap` in its criteria'
-  context, settable per session through `AgentConfig`) and escalates anything above it to a
-  person; it never denies on its own. A denial hires nothing and locks nothing; an approval
+  quote, so the price approved is the price quoted, not a number the model chose; a model is
+  given `MODEL_TOOLS`, the hiring tool alone, never `spend`. Auto mode with the agent's
+  evaluator approves a price in the cap's currency and at or under the cap (`spend_cap` and
+  `spend_currency` in its criteria' context, settable per session through `AgentConfig`) and
+  escalates anything above it, or in another currency, to a person; it never denies on its
+  own. A denial hires nothing and locks nothing; an approval
   hires with `max_price` the approved price, so the escrow can never hold more than was
   approved.
 - **No `kontra.contrib` adapter.** A generic one would build a tool from any pulled client:
