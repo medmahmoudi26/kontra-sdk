@@ -446,7 +446,7 @@ services:
 
   ui:
     # temporalio/ui:2.55.0
-    image: temporalio/ui:2.55.0@sha256:3899d5cf749b5555c9f798d46f2423b1d6190ea391ca713db5d1bba961759e58
+    image: temporalio/ui:2.57.0@sha256:d944f959d0923c35cd991a17a0edbe087770eff843724b181933e0cfdd563ab2
     profiles: [ui]
     environment:
       # The internal frontend: no token to present, and every namespace (see the header).
