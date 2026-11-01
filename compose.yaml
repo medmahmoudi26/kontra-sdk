@@ -629,7 +629,7 @@ services:
   otelcol:
     # otel/opentelemetry-collector-contrib:0.163.1 (the contrib build: the core one has no
     # exporter Loki takes)
-    image: otel/opentelemetry-collector-contrib:0.163.1@sha256:1175b03003053962012f5a231f5567f66a3e8fdb960c7835c0e48f7aa1555806
+    image: otel/opentelemetry-collector-contrib:0.163.2-386@sha256:bd0aac7fc525d8016b7bba1e35287b1f3a43c1e2d52e2426e2496d8d45668784
     profiles: [observability]
     command: ["--config=/etc/otelcol/config.yaml"]
     configs:
