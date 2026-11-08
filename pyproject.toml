@@ -87,7 +87,7 @@ dev = [
 # Exact: the backend decides what goes into the sdist and the wheel PyPI serves, so a new
 # hatchling reaches a release only through a reviewed bump, never by being the newest
 # release on the day `uv build` runs.
-requires = ["hatchling==1.32.4"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 # What PyPI gets: the package, the README and the licence. No tests/, temporal/, docs/ or
